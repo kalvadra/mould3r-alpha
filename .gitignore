@@ -1,0 +1,83 @@
+#############################
+# Visual Studio cache files
+#############################
+
+.vs/
+*.VC.db
+*.VC.VC.opendb
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+#############################
+# IntelliSense / compilation
+#############################
+
+ipch/
+*.ipch
+
+#############################
+# Build output directories
+#############################
+
+[Bb]in/
+[Oo]bj/
+x64/
+x86/
+Debug/
+Release/
+DebugPublic/
+ReleasePublic/
+
+#############################
+# Visual Studio generated
+#############################
+
+*.aps
+*.pch
+*.pdb
+*.obj
+*.idb
+*.ilk
+*.tlog
+*.tlog/
+*.lastbuildstate
+
+#############################
+# CMake (if used)
+#############################
+
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+build/
+
+#############################
+# OpenGL / asset temp files
+#############################
+
+*.log
+*.tmp
+*.cache
+
+#############################
+# Package managers
+#############################
+
+vcpkg_installed/
+.vcpkg-root/
+
+#############################
+# OS files
+#############################
+
+.DS_Store
+Thumbs.db
+
+#############################
+# wxWidgets build outputs
+#############################
+
+**/wxWidgets*/build/
+**/wxWidgets*/lib/
