@@ -145,7 +145,10 @@
     <ClCompile Include="MeshUtils.cpp" />
     <ClCompile Include="Mould3r.cpp" />
     <ClCompile Include="main.cpp" />
+    <ClCompile Include="RotateDialog.cpp" />
+    <ClCompile Include="ScaleDialog.cpp" />
     <ClCompile Include="shaders.cpp" />
+    <ClCompile Include="TranslateDialog.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="camera.h" />
@@ -156,7 +159,10 @@
     <ClInclude Include="MeshOps.h" />
     <ClInclude Include="MeshUtils.h" />
     <ClInclude Include="Mould3r.h" />
+    <ClInclude Include="RotateDialog.h" />
+    <ClInclude Include="ScaleDialog.h" />
     <ClInclude Include="shaders.h" />
+    <ClInclude Include="TranslateDialog.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="vcpkg.json" />
