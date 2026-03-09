@@ -9,7 +9,7 @@ public:
     // --- Matrices ---
     glm::mat4 View() const;
     glm::mat4 Projection() const;
-    glm::mat4 RotationOnlyView() const; // for view-cube overlays
+    glm::mat4 RotationOnlyView() const;
 
     // --- Configuration ---
     void SetAspect(float aspect);
@@ -20,33 +20,33 @@ public:
     void SetDistance(float distance);
     void SetYawPitchDegrees(float yawDeg, float pitchDeg);
 
-    // --- Interaction (call from mouse/scroll) ---
-    // dx/dy are usually mouse deltas in pixels
+    // --- Interaction ---
     void Orbit(float dx, float dy);
     void Pan(float dx, float dy);
-    // delta > 0 should move closer (feel free to invert in caller)
     void Dolly(float delta);
 
-    // --- Convenience ---
+    // --- Getters ---
     glm::vec3 Position() const;
     glm::vec3 Forward() const;
     glm::vec3 Right() const;
     glm::vec3 Up() const;
 
-    // Useful for "zoom to fit"
+    float GetDistance() const { return m_distance; }   // used by GLCanvas translate
+
+    // Zoom to fit
     void FrameSphere(const glm::vec3& center, float radius);
 
-    // Sensitivities (tweak to taste)
+    // Sensitivities
     void SetOrbitSensitivity(float degPerPixel);
     void SetPanSensitivity(float unitsPerPixelAtDist1);
     void SetDollySensitivity(float dollyStrength);
 
 private:
     glm::vec3 m_target{ 0.0f, 0.0f, 0.0f };
-    float m_distance = 5.0f;
+    float m_distance = 350.0f;
 
-    float m_yawDeg = 45.0f;     // rotation around world up
-    float m_pitchDeg = -20.0f;  // rotation around camera right
+    float m_yawDeg = 45.0f;
+    float m_pitchDeg = -35.0f;
 
     glm::vec3 m_worldUp{ 0.0f, 1.0f, 0.0f };
 

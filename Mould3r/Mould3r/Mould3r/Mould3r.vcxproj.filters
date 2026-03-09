@@ -45,6 +45,15 @@
     <ClCompile Include="MeshOps.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="RotateDialog.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="ScaleDialog.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="TranslateDialog.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Mould3r.h">
@@ -72,6 +81,15 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="MeshOps.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="RotateDialog.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ScaleDialog.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="TranslateDialog.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
