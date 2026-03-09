@@ -148,6 +148,7 @@
     <ClCompile Include="RotateDialog.cpp" />
     <ClCompile Include="ScaleDialog.cpp" />
     <ClCompile Include="shaders.cpp" />
+    <ClCompile Include="StartupDialog.cpp" />
     <ClCompile Include="TranslateDialog.cpp" />
   </ItemGroup>
   <ItemGroup>
@@ -162,6 +163,7 @@
     <ClInclude Include="RotateDialog.h" />
     <ClInclude Include="ScaleDialog.h" />
     <ClInclude Include="shaders.h" />
+    <ClInclude Include="StartupDialog.h" />
     <ClInclude Include="TranslateDialog.h" />
   </ItemGroup>
   <ItemGroup>

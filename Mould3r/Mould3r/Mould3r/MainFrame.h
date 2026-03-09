@@ -4,6 +4,7 @@
 #include "RotateDialog.h"
 #include "TranslateDialog.h"
 #include "ScaleDialog.h"
+#include "StartupDialog.h"
 
 class GLCanvas;
 
@@ -12,7 +13,7 @@ enum class TransformMode { Select, Translate, Rotate, Scale };
 class MainFrame : public wxFrame
 {
 public:
-    MainFrame();
+    MainFrame(const StartupConfig& config);
 
 private:
     // Menu handlers

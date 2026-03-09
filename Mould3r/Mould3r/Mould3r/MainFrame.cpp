@@ -31,7 +31,7 @@ static void StyleRibbonBtn(wxToggleButton* btn, bool active = false)
 // ---------------------------------------------------------------------------
 // MainFrame
 // ---------------------------------------------------------------------------
-MainFrame::MainFrame()
+MainFrame::MainFrame(const StartupConfig& config)
     : wxFrame(nullptr, wxID_ANY, "Mould3r",
         wxDefaultPosition, wxSize(1200, 800))
 {
@@ -74,6 +74,12 @@ MainFrame::MainFrame()
 
     // Start with Select active
     SetActiveTool(TransformMode::Select);
+
+    // Load models from startup config
+    if (!config.modelAPath.empty())
+        m_canvas->ImportStepFile(config.modelAPath);
+    if (!config.modelBPath.empty())
+        m_canvas->ImportStepFile(config.modelBPath);
 }
 
 // ---------------------------------------------------------------------------
