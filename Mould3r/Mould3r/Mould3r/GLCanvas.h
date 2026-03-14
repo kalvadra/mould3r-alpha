@@ -7,6 +7,20 @@
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
+#include <opencascade/TopoDS.hxx>
+#include <opencascade/TopoDS_Face.hxx>
+#include <opencascade/TopExp_Explorer.hxx>
+#include <opencascade/BRep_Tool.hxx>
+#include <opencascade/Poly_Triangulation.hxx>
+#include <opencascade/TopLoc_Location.hxx>
+#include <opencascade/gp_Pnt.hxx>
+#include <opencascade/gp_Trsf.hxx>
+#include <opencascade/BRepBuilderAPI_Transform.hxx>
+#include <opencascade/STEPControl_Reader.hxx>
+#include <opencascade/STEPControl_Writer.hxx>
+#include <opencascade/IFSelect_ReturnStatus.hxx>
+#include <opencascade/TopoDS_Shape.hxx>
+
 #include "camera.h"
 #include "FileImporter.h"
 #include "GridRenderer.h"
@@ -36,6 +50,8 @@ struct SceneObject
     GPUMesh   mesh;
     ObjectRole role = ObjectRole::Imported;
     std::string sourcePath;   // original file path, used for STEP export
+    TopoDS_Shape mouldShape;   // populated after GenerateMould, used for export
+    bool         hasMould = false;
 
     glm::vec3 pos{ 0.0f, 0.0f, 0.0f };
     float     yawDeg = 0.0f;
@@ -74,6 +90,7 @@ public:
 
     bool HasSelection() const { return m_selectedIndex >= 0; }
 
+    void GenerateMould();
     void ExportFixtures(const std::string& pathA, const std::string& pathB);
 
 private:

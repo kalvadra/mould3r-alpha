@@ -230,10 +230,22 @@ wxPanel* MainFrame::CreateSidePanel(wxWindow* parent)
             sizer->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 12);
         };
 
+    // ---- Generate section ----------------------------------------------------
+    addSection("MOULD");
+
+    auto* btnGenerate = new wxButton(panel, ID_GenerateMould, "Generate Mould",
+        wxDefaultPosition, wxSize(-1, 36));
+    btnGenerate->SetBackgroundColour(wxColour(0x1A, 0x6B, 0x3A));   // dark green
+    btnGenerate->SetForegroundColour(*wxWHITE);
+    btnGenerate->SetFont(wxFont(10, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_BOLD, false, "Segoe UI"));
+    sizer->Add(btnGenerate, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 12);
+
+    Bind(wxEVT_BUTTON, &MainFrame::OnGenerateMould, this, ID_GenerateMould);
+
     // ---- Export section ----------------------------------------------------
     addSection("EXPORT");
-    addPathRow("Model A output:", m_exportPathA, ID_BrowseExportA);
-    addPathRow("Model B output:", m_exportPathB, ID_BrowseExportB);
+    addPathRow("Output folder:", m_exportPath, ID_BrowseExport);
 
     // ---- Spacer pushes export button to bottom -----------------------------
     sizer->AddStretchSpacer();
@@ -254,8 +266,7 @@ wxPanel* MainFrame::CreateSidePanel(wxWindow* parent)
     panel->SetSizer(sizer);
 
     // ---- Binds -------------------------------------------------------------
-    Bind(wxEVT_BUTTON, &MainFrame::OnBrowseExportA, this, ID_BrowseExportA);
-    Bind(wxEVT_BUTTON, &MainFrame::OnBrowseExportB, this, ID_BrowseExportB);
+    Bind(wxEVT_BUTTON, &MainFrame::OnBrowseExport, this, ID_BrowseExport);
     Bind(wxEVT_BUTTON, &MainFrame::OnExport, this, ID_Export);
 
     return panel;
@@ -383,31 +394,30 @@ void MainFrame::OnImport(wxCommandEvent&)
     m_canvas->ImportStepFile(dlg.GetPath().ToStdString());
 }
 
-void MainFrame::OnBrowseExportA(wxCommandEvent&)
+void MainFrame::OnBrowseExport(wxCommandEvent&)
 {
-    wxFileDialog dlg(this, "Export Model A as", "", "model_a.step",
-        "STEP files (*.step)|*.step", wxFD_SAVE | wxFD_OVERWRITE_PROMPT);
+    wxDirDialog dlg(this, "Select export folder", "",
+        wxDD_DEFAULT_STYLE | wxDD_DIR_MUST_EXIST);
     if (dlg.ShowModal() == wxID_OK)
-        m_exportPathA->SetValue(dlg.GetPath());
-}
-
-void MainFrame::OnBrowseExportB(wxCommandEvent&)
-{
-    wxFileDialog dlg(this, "Export Model B as", "", "model_b.step",
-        "STEP files (*.step)|*.step", wxFD_SAVE | wxFD_OVERWRITE_PROMPT);
-    if (dlg.ShowModal() == wxID_OK)
-        m_exportPathB->SetValue(dlg.GetPath());
+        m_exportPath->SetValue(dlg.GetPath());
 }
 
 void MainFrame::OnExport(wxCommandEvent&)
 {
-    if (m_exportPathA->GetValue().IsEmpty() || m_exportPathB->GetValue().IsEmpty())
+    if (m_exportPath->GetValue().IsEmpty())
     {
-        wxMessageBox("Please set both export paths before exporting.",
-            "Missing Paths", wxOK | wxICON_WARNING, this);
+        wxMessageBox("Please set an export folder before exporting.",
+            "Missing Path", wxOK | wxICON_WARNING, this);
         return;
     }
 
-    m_canvas->ExportFixtures(m_exportPathA->GetValue().ToStdString(),
-        m_exportPathB->GetValue().ToStdString());
+    const std::string folder = m_exportPath->GetValue().ToStdString();
+    m_canvas->ExportFixtures(folder + "/model_a.step",
+        folder + "/model_b.step");
+}
+
+void MainFrame::OnGenerateMould(wxCommandEvent&)
+{
+    if (!m_canvas) return;
+    m_canvas->GenerateMould();
 }

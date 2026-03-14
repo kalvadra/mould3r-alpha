@@ -43,12 +43,11 @@ private:
     wxButton* m_btnCenter = nullptr;  // regular button, not toggle
 
     wxPanel* m_sidePanel = nullptr;
-    wxTextCtrl* m_exportPathA = nullptr;
-    wxTextCtrl* m_exportPathB = nullptr;
+    wxTextCtrl* m_exportPath = nullptr;
 
-    void OnBrowseExportA(wxCommandEvent&);
-    void OnBrowseExportB(wxCommandEvent&);
+    void OnBrowseExport(wxCommandEvent&);
     void OnExport(wxCommandEvent&);
+    void OnGenerateMould(wxCommandEvent&);
 
     wxPanel* CreateSidePanel(wxWindow* parent);
 
@@ -59,8 +58,8 @@ private:
         ID_ToolRotate,
         ID_ToolScale,
         ID_ToolCenter,
-        ID_BrowseExportA,
-        ID_BrowseExportB,
-        ID_Export
+        ID_BrowseExport,
+        ID_Export,
+        ID_GenerateMould
     };
 };

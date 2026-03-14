@@ -17,6 +17,8 @@
 #include <opencascade/gp_Trsf.hxx>
 #include <opencascade/gp_Mat.hxx>
 #include <opencascade/gp_XYZ.hxx>
+#include <opencascade/BRepAlgoAPI_Cut.hxx>
+#include <opencascade/BRepMesh_IncrementalMesh.hxx>
 
 #include <algorithm>
 #include <string>
@@ -185,6 +187,156 @@ void GLCanvas::CenterSelectedObject()
 }
 
 // ---------------------------------------------------------------------------
+// Generate Mould Operation — Cuts objects, vents, runners, and sprues from blank mold halves
+// ---------------------------------------------------------------------------
+void GLCanvas::GenerateMould()
+{
+    if (m_fixtures.empty())
+    {
+        wxMessageBox("No fixtures loaded.",
+            "Generate Mould", wxOK | wxICON_WARNING, this);
+        return;
+    }
+    if (m_objects.empty())
+    {
+        wxMessageBox("No imported objects to subtract.",
+            "Generate Mould", wxOK | wxICON_WARNING, this);
+        return;
+    }
+
+    SetCurrent(*m_context);
+    InitGLOnce();
+
+    // For each fixture, subtract all imported objects from it
+    for (int fi = 0; fi < (int)m_fixtures.size(); ++fi)
+    {
+        SceneObject& fix = m_fixtures[fi];
+        if (fix.sourcePath.empty()) continue;
+
+        // Re-read fixture shape
+        STEPControl_Reader fixReader;
+        if (fixReader.ReadFile(fix.sourcePath.c_str()) != IFSelect_RetDone)
+        {
+            wxMessageBox("Failed to re-read fixture: " + fix.sourcePath,
+                "Generate Mould", wxOK | wxICON_ERROR, this);
+            continue;
+        }
+        fixReader.TransferRoots();
+        TopoDS_Shape fixtureShape = fixReader.OneShape();
+        if (fixtureShape.IsNull()) continue;
+
+        // Apply fixture transform
+        gp_Trsf fixTrsf;
+        glm::mat4 fm = fix.BuildModelMatrix();
+        fixTrsf.SetValues(
+            fm[0][0], fm[1][0], fm[2][0], fm[3][0],
+            fm[0][1], fm[1][1], fm[2][1], fm[3][1],
+            fm[0][2], fm[1][2], fm[2][2], fm[3][2]
+        );
+        BRepBuilderAPI_Transform fixXform(fixtureShape, fixTrsf, true);
+        TopoDS_Shape result = fixXform.Shape();
+
+        // Subtract each imported object
+        for (int oi = 0; oi < (int)m_objects.size(); ++oi)
+        {
+            const SceneObject& obj = m_objects[oi];
+            if (obj.sourcePath.empty()) continue;
+
+            // Re-read object shape
+            STEPControl_Reader objReader;
+            if (objReader.ReadFile(obj.sourcePath.c_str()) != IFSelect_RetDone)
+                continue;
+            objReader.TransferRoots();
+            TopoDS_Shape objShape = objReader.OneShape();
+            if (objShape.IsNull()) continue;
+
+            // Apply object transform
+            gp_Trsf objTrsf;
+            glm::mat4 om = obj.BuildModelMatrix();
+            objTrsf.SetValues(
+                om[0][0], om[1][0], om[2][0], om[3][0],
+                om[0][1], om[1][1], om[2][1], om[3][1],
+                om[0][2], om[1][2], om[2][2], om[3][2]
+            );
+            BRepBuilderAPI_Transform objXform(objShape, objTrsf, true);
+            TopoDS_Shape transformedObj = objXform.Shape();
+
+            // Boolean subtract
+            BRepAlgoAPI_Cut cut(result, transformedObj);
+            cut.Build();
+            if (!cut.IsDone() || cut.Shape().IsNull())
+            {
+                wxMessageBox("Boolean subtract failed for object " +
+                    std::to_string(oi + 1),
+                    "Generate Mould", wxOK | wxICON_WARNING, this);
+                continue;
+            }
+            result = cut.Shape();
+        }
+
+        fix.mouldShape = result;
+        fix.hasMould = true;
+
+        // Re-tessellate and re-upload result back into the fixture
+        BRepMesh_IncrementalMesh mesher(result, 0.05, false, 0.5, true);
+
+        FileImporter::MeshData meshData;
+        meshData.aabbMin = glm::vec3(std::numeric_limits<float>::infinity());
+        meshData.aabbMax = glm::vec3(-std::numeric_limits<float>::infinity());
+
+        for (TopExp_Explorer ex(result, TopAbs_FACE); ex.More(); ex.Next())
+        {
+            const TopoDS_Face face = TopoDS::Face(ex.Current());
+            TopLoc_Location loc;
+            Handle(Poly_Triangulation) tri = BRep_Tool::Triangulation(face, loc);
+            if (tri.IsNull()) continue;
+
+            const gp_Trsf tr = loc.Transformation();
+            const uint32_t baseIndex = (uint32_t)(meshData.vertices.size() / 3);
+
+            for (int i = 1; i <= tri->NbNodes(); ++i)
+            {
+                gp_Pnt p = tri->Node(i);
+                p.Transform(tr);
+                meshData.vertices.push_back((float)p.X());
+                meshData.vertices.push_back((float)p.Y());
+                meshData.vertices.push_back((float)p.Z());
+            }
+            for (int t = 1; t <= tri->NbTriangles(); ++t)
+            {
+                int n1, n2, n3;
+                tri->Triangle(t).Get(n1, n2, n3);
+                meshData.indices.push_back(baseIndex + (uint32_t)(n1 - 1));
+                meshData.indices.push_back(baseIndex + (uint32_t)(n2 - 1));
+                meshData.indices.push_back(baseIndex + (uint32_t)(n3 - 1));
+            }
+        }
+
+        if (meshData.vertices.empty() || meshData.indices.empty())
+            continue;
+
+        // Compute normals on the result
+        ComputeVertexNormals_Pos3(meshData.vertices, meshData.indices, meshData.posNorm);
+        auto split = SplitByCreaseAngle_Pos3(meshData.vertices, meshData.indices, 35.0f);
+        meshData.posNorm = std::move(split.posNorm);
+        meshData.indices = std::move(split.indices);
+
+        // Reset fixture transform since it's now baked into the geometry
+        fix.pos = glm::vec3(0.0f);
+        fix.yawDeg = 0.0f;
+        fix.pitchDeg = 0.0f;
+        fix.rollDeg = 0.0f;
+        fix.scale = 1.0f;
+
+        UploadMeshToGPU(meshData, fix);
+    }
+
+    Refresh(false);
+    wxMessageBox("Mould generated successfully.",
+        "Generate Mould", wxOK | wxICON_INFORMATION, this);
+}
+
+// ---------------------------------------------------------------------------
 // GL init
 // ---------------------------------------------------------------------------
 static void* GetAnyGLFuncAddress(const char* name)
@@ -342,43 +494,44 @@ void GLCanvas::ExportFixtures(const std::string& pathA, const std::string& pathB
     for (int i = 0; i < (int)m_fixtures.size() && i < 2; ++i)
     {
         const SceneObject& fix = m_fixtures[i];
-        if (fix.sourcePath.empty() || outPaths[i].empty()) continue;
+        if (outPaths[i].empty()) continue;
 
-        // Re-read original STEP
-        STEPControl_Reader reader;
-        if (reader.ReadFile(fix.sourcePath.c_str()) != IFSelect_RetDone)
+        TopoDS_Shape shapeToExport;
+
+        if (fix.hasMould)
         {
-            wxMessageBox("Failed to re-read: " + fix.sourcePath,
-                "Export Failed", wxOK | wxICON_ERROR, this);
-            continue;
+            // Use the post-cut shape directly — transform already baked in
+            shapeToExport = fix.mouldShape;
         }
-        reader.TransferRoots();
-        TopoDS_Shape shape = reader.OneShape();
-        if (shape.IsNull()) continue;
+        else
+        {
+            // Fall back to re-reading source and applying current transform
+            if (fix.sourcePath.empty()) continue;
 
-        // Build OCC transform from SceneObject state
-        glm::mat4 m = fix.BuildModelMatrix();
+            STEPControl_Reader reader;
+            if (reader.ReadFile(fix.sourcePath.c_str()) != IFSelect_RetDone)
+            {
+                wxMessageBox("Failed to re-read: " + fix.sourcePath,
+                    "Export Failed", wxOK | wxICON_ERROR, this);
+                continue;
+            }
+            reader.TransferRoots();
+            TopoDS_Shape shape = reader.OneShape();
+            if (shape.IsNull()) continue;
 
-        gp_Mat occMat(
-            m[0][0], m[1][0], m[2][0],
-            m[0][1], m[1][1], m[2][1],
-            m[0][2], m[1][2], m[2][2]
-        );
-        gp_XYZ occTrans(m[3][0], m[3][1], m[3][2]);
+            gp_Trsf trsf;
+            glm::mat4 m = fix.BuildModelMatrix();
+            trsf.SetValues(
+                m[0][0], m[1][0], m[2][0], m[3][0],
+                m[0][1], m[1][1], m[2][1], m[3][1],
+                m[0][2], m[1][2], m[2][2], m[3][2]
+            );
+            BRepBuilderAPI_Transform xform(shape, trsf, true);
+            shapeToExport = xform.Shape();
+        }
 
-        gp_Trsf trsf;
-        trsf.SetValues(
-            m[0][0], m[1][0], m[2][0], m[3][0],
-            m[0][1], m[1][1], m[2][1], m[3][1],
-            m[0][2], m[1][2], m[2][2], m[3][2]
-        );
-
-        BRepBuilderAPI_Transform xform(shape, trsf, true);
-        TopoDS_Shape transformed = xform.Shape();
-
-        // Write STEP
         STEPControl_Writer writer;
-        writer.Transfer(transformed, STEPControl_AsIs);
+        writer.Transfer(shapeToExport, STEPControl_AsIs);
         if (writer.Write(outPaths[i].c_str()) != IFSelect_RetDone)
         {
             wxMessageBox("Failed to write: " + outPaths[i],
@@ -389,6 +542,7 @@ void GLCanvas::ExportFixtures(const std::string& pathA, const std::string& pathB
     wxMessageBox("Fixtures exported successfully.",
         "Export Complete", wxOK | wxICON_INFORMATION, this);
 }
+
 // ---------------------------------------------------------------------------
 // Import — appends a new SceneObject
 // ---------------------------------------------------------------------------
@@ -416,6 +570,7 @@ void GLCanvas::ImportStepFile(const std::string& path)
 
     // Append a fresh SceneObject
     m_objects.emplace_back();
+    m_objects.back().sourcePath = path;
     UploadMeshToGPU(res.meshes[0], m_objects.back());
 
     Refresh(false);
