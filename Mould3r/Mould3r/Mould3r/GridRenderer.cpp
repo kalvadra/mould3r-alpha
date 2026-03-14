@@ -100,12 +100,13 @@ bool GridRenderer::Init()
             float intensity = minor * 0.25 + major * 0.75;
 
             // Subtle edge fade (optional)
-            float edgeX = 1.0 - smoothstep(uHalfExtents.x * 0.95, uHalfExtents.x, abs(vWorld.x));
-            float edgeZ = 1.0 - smoothstep(uHalfExtents.y * 0.95, uHalfExtents.y, abs(vWorld.z));
-            float edgeFade = min(edgeX, edgeZ);
+            //float edgeX = 1.0 - smoothstep(uHalfExtents.x * 0.95, uHalfExtents.x, abs(vWorld.x));
+            //float edgeZ = 1.0 - smoothstep(uHalfExtents.y * 0.95, uHalfExtents.y, abs(vWorld.z));
+            //float edgeFade = min(edgeX, edgeZ);
 
-            vec3 color = vec3(intensity) * edgeFade;
-            FragColor = vec4(color, 1.0);
+            //vec3 color = vec3(intensity) * edgeFade;
+            vec3 color = vec3(intensity);
+            FragColor = vec4(color, intensity);
         }
     )GLSL";
 
@@ -206,6 +207,8 @@ void GridRenderer::Draw(const glm::mat4& view, const glm::mat4& proj)
     glUniform2f(m_locHalfExtents, hx, hz);
 
     // Avoid z-fighting with models on the plane
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glEnable(GL_POLYGON_OFFSET_FILL);
     glPolygonOffset(1.0f, 1.0f);
 
@@ -214,6 +217,5 @@ void GridRenderer::Draw(const glm::mat4& view, const glm::mat4& proj)
     glBindVertexArray(0);
 
     glDisable(GL_POLYGON_OFFSET_FILL);
-
-    glUseProgram(0);
+    glDisable(GL_BLEND);
 }

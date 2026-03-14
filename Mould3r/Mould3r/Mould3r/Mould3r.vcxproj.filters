@@ -13,6 +13,12 @@
       <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
       <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
     </Filter>
+    <Filter Include="Header Files\TransformHandlers">
+      <UniqueIdentifier>{bbafa30d-e7dd-4783-ba3d-883d3208d3df}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\TransformHandlers">
+      <UniqueIdentifier>{b94244fb-aed7-4a1f-9214-ea840e957206}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="Mould3r.cpp">
@@ -45,14 +51,17 @@
     <ClCompile Include="MeshOps.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="RotateDialog.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="ScaleDialog.cpp">
+    <ClCompile Include="StartupDialog.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="TranslateDialog.cpp">
-      <Filter>Source Files</Filter>
+      <Filter>Source Files\TransformHandlers</Filter>
+    </ClCompile>
+    <ClCompile Include="ScaleDialog.cpp">
+      <Filter>Source Files\TransformHandlers</Filter>
+    </ClCompile>
+    <ClCompile Include="RotateDialog.cpp">
+      <Filter>Source Files\TransformHandlers</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
@@ -83,14 +92,17 @@
     <ClInclude Include="MeshOps.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="RotateDialog.h">
-      <Filter>Header Files</Filter>
+    <ClInclude Include="TranslateDialog.h">
+      <Filter>Header Files\TransformHandlers</Filter>
     </ClInclude>
     <ClInclude Include="ScaleDialog.h">
+      <Filter>Header Files\TransformHandlers</Filter>
+    </ClInclude>
+    <ClInclude Include="StartupDialog.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="TranslateDialog.h">
-      <Filter>Header Files</Filter>
+    <ClInclude Include="RotateDialog.h">
+      <Filter>Header Files\TransformHandlers</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>

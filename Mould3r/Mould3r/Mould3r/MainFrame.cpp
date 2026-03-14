@@ -31,7 +31,7 @@ static void StyleRibbonBtn(wxToggleButton* btn, bool active = false)
 // ---------------------------------------------------------------------------
 // MainFrame
 // ---------------------------------------------------------------------------
-MainFrame::MainFrame()
+MainFrame::MainFrame(const StartupConfig& config)
     : wxFrame(nullptr, wxID_ANY, "Mould3r",
         wxDefaultPosition, wxSize(1200, 800))
 {
@@ -55,15 +55,22 @@ MainFrame::MainFrame()
     auto* vSizer = new wxBoxSizer(wxVERTICAL);
 
     wxPanel* ribbon = CreateRibbon(root);
-    vSizer->Add(ribbon, 0, wxEXPAND);
 
     // 1-px separator line
     auto* sep = new wxPanel(root, wxID_ANY, wxDefaultPosition, wxSize(-1, 1));
     sep->SetBackgroundColour(wxColour(0x00, 0x7A, 0xCC));
-    vSizer->Add(sep, 0, wxEXPAND);
 
+    // In MainFrame constructor, replace the vSizer canvas Add with:
+    auto* contentSizer = new wxBoxSizer(wxHORIZONTAL);
     m_canvas = new GLCanvas(root);
-    vSizer->Add(m_canvas, 1, wxEXPAND);
+    m_sidePanel = CreateSidePanel(root);
+
+    contentSizer->Add(m_canvas, 1, wxEXPAND);
+    contentSizer->Add(m_sidePanel, 0, wxEXPAND);
+
+    vSizer->Add(ribbon, 0, wxEXPAND);
+    vSizer->Add(sep, 0, wxEXPAND);
+    vSizer->Add(contentSizer, 1, wxEXPAND);
 
     root->SetSizer(vSizer);
 
@@ -74,6 +81,12 @@ MainFrame::MainFrame()
 
     // Start with Select active
     SetActiveTool(TransformMode::Select);
+
+    // Load models from startup config
+    if (!config.modelAPath.empty())
+        m_canvas->ImportStepFileAsFixture(config.modelAPath);
+    if (!config.modelBPath.empty())
+        m_canvas->ImportStepFileAsFixture(config.modelBPath);
 }
 
 // ---------------------------------------------------------------------------
@@ -110,6 +123,20 @@ wxPanel* MainFrame::CreateRibbon(wxWindow* parent)
             return btn;
         };
 
+    // Change addTool lambda return type and add a regular button helper
+    auto addAction = [&](int id, const wxString& label, const wxString& tooltip)
+        -> wxButton*
+        {
+            auto* btn = new wxButton(panel, id, label,
+                wxDefaultPosition, wxSize(90, 32));
+            btn->SetToolTip(tooltip);
+            btn->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
+            btn->SetForegroundColour(kTextDefault);
+            btn->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+                wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
+            return btn;
+        };
+
     // ---- TRANSFORM group ---------------------------------------------------
     auto* transformSizer = new wxBoxSizer(wxVERTICAL);
 
@@ -118,10 +145,12 @@ wxPanel* MainFrame::CreateRibbon(wxWindow* parent)
     m_btnTranslate = addTool(ID_ToolTranslate, "+    Translate", "Drag to translate  (LMB)");
     m_btnRotate = addTool(ID_ToolRotate, "O    Rotate", "Drag to rotate  (LMB)");
     m_btnScale = addTool(ID_ToolScale, "<>   Scale", "Drag up/down to scale  (LMB)");
+    m_btnCenter = addAction(ID_ToolCenter, "[ ] Center", "Move selected object to origin");
 
     toolRow->Add(m_btnTranslate, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
     toolRow->Add(m_btnRotate, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
     toolRow->Add(m_btnScale, 0, wxALIGN_CENTER_VERTICAL);
+    toolRow->Add(m_btnCenter, 0, wxALIGN_CENTER_VERTICAL);
 
     transformSizer->Add(toolRow, 0, wxALIGN_CENTER_HORIZONTAL);
     transformSizer->Add(addLabel("TRANSFORM"), 0, wxALIGN_CENTER_HORIZONTAL | wxTOP, 2);
@@ -150,10 +179,98 @@ wxPanel* MainFrame::CreateRibbon(wxWindow* parent)
     Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolTranslate, this, ID_ToolTranslate);
     Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolRotate, this, ID_ToolRotate);
     Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolScale, this, ID_ToolScale);
+    Bind(wxEVT_BUTTON, &MainFrame::OnToolCenter, this, ID_ToolCenter);
 
     return panel;
 }
 
+wxPanel* MainFrame::CreateSidePanel(wxWindow* parent)
+{
+    auto* panel = new wxPanel(parent, wxID_ANY, wxDefaultPosition, wxSize(220, -1));
+    panel->SetBackgroundColour(kRibbonBg);
+
+    auto* sizer = new wxBoxSizer(wxVERTICAL);
+
+    // ---- Section label helper ----------------------------------------------
+    auto addSection = [&](const wxString& text)
+        {
+            auto* lbl = new wxStaticText(panel, wxID_ANY, text);
+            lbl->SetForegroundColour(wxColour(0x00, 0x7A, 0xCC));
+            lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+                wxFONTWEIGHT_BOLD, false, "Segoe UI"));
+            sizer->Add(lbl, 0, wxLEFT | wxTOP, 12);
+
+            auto* line = new wxPanel(panel, wxID_ANY, wxDefaultPosition, wxSize(-1, 1));
+            line->SetBackgroundColour(wxColour(0x2A, 0x38, 0x4A));
+            sizer->Add(line, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 12);
+        };
+
+    // ---- Path row helper ---------------------------------------------------
+    auto addPathRow = [&](const wxString& label, wxTextCtrl*& ctrl, int browseId)
+        {
+            auto* lbl = new wxStaticText(panel, wxID_ANY, label);
+            lbl->SetForegroundColour(kTextDefault);
+            lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+                wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+            sizer->Add(lbl, 0, wxLEFT | wxTOP, 12);
+
+            auto* row = new wxBoxSizer(wxHORIZONTAL);
+            ctrl = new wxTextCtrl(panel, wxID_ANY, "",
+                wxDefaultPosition, wxSize(140, 24), wxTE_READONLY);
+            ctrl->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
+            ctrl->SetForegroundColour(kTextDefault);
+
+            auto* browse = new wxButton(panel, browseId, "...",
+                wxDefaultPosition, wxSize(28, 24));
+            browse->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
+            browse->SetForegroundColour(kTextDefault);
+
+            row->Add(ctrl, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
+            row->Add(browse, 0, wxALIGN_CENTER_VERTICAL);
+            sizer->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 12);
+        };
+
+    // ---- Generate section ----------------------------------------------------
+    addSection("MOULD");
+
+    auto* btnGenerate = new wxButton(panel, ID_GenerateMould, "Generate Mould",
+        wxDefaultPosition, wxSize(-1, 36));
+    btnGenerate->SetBackgroundColour(wxColour(0x1A, 0x6B, 0x3A));   // dark green
+    btnGenerate->SetForegroundColour(*wxWHITE);
+    btnGenerate->SetFont(wxFont(10, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_BOLD, false, "Segoe UI"));
+    sizer->Add(btnGenerate, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 12);
+
+    Bind(wxEVT_BUTTON, &MainFrame::OnGenerateMould, this, ID_GenerateMould);
+
+    // ---- Export section ----------------------------------------------------
+    addSection("EXPORT");
+    addPathRow("Output folder:", m_exportPath, ID_BrowseExport);
+
+    // ---- Spacer pushes export button to bottom -----------------------------
+    sizer->AddStretchSpacer();
+
+    // 1px separator above button
+    auto* bottomLine = new wxPanel(panel, wxID_ANY, wxDefaultPosition, wxSize(-1, 1));
+    bottomLine->SetBackgroundColour(wxColour(0x00, 0x7A, 0xCC));
+    sizer->Add(bottomLine, 0, wxEXPAND);
+
+    auto* btnExport = new wxButton(panel, ID_Export, "Export",
+        wxDefaultPosition, wxSize(-1, 36));
+    btnExport->SetBackgroundColour(wxColour(0x00, 0x7A, 0xCC));
+    btnExport->SetForegroundColour(*wxWHITE);
+    btnExport->SetFont(wxFont(10, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_BOLD, false, "Segoe UI"));
+    sizer->Add(btnExport, 0, wxEXPAND);
+
+    panel->SetSizer(sizer);
+
+    // ---- Binds -------------------------------------------------------------
+    Bind(wxEVT_BUTTON, &MainFrame::OnBrowseExport, this, ID_BrowseExport);
+    Bind(wxEVT_BUTTON, &MainFrame::OnExport, this, ID_Export);
+
+    return panel;
+}
 // ---------------------------------------------------------------------------
 // SetActiveTool – mutually exclusive toggle + notify canvas
 // ---------------------------------------------------------------------------
@@ -243,6 +360,18 @@ void MainFrame::OnToolScale(wxCommandEvent&)
     m_canvas->ApplyScale(v.uniform);
 }
 
+void MainFrame::OnToolCenter(wxCommandEvent&)
+{
+    if (!m_canvas) return;
+
+    if (!m_canvas->HasSelection())
+    {
+        return;
+    }
+
+    m_canvas->CenterSelectedObject();
+}
+
 // ---------------------------------------------------------------------------
 // Menu handlers
 // ---------------------------------------------------------------------------
@@ -263,4 +392,32 @@ void MainFrame::OnImport(wxCommandEvent&)
         return;
 
     m_canvas->ImportStepFile(dlg.GetPath().ToStdString());
+}
+
+void MainFrame::OnBrowseExport(wxCommandEvent&)
+{
+    wxDirDialog dlg(this, "Select export folder", "",
+        wxDD_DEFAULT_STYLE | wxDD_DIR_MUST_EXIST);
+    if (dlg.ShowModal() == wxID_OK)
+        m_exportPath->SetValue(dlg.GetPath());
+}
+
+void MainFrame::OnExport(wxCommandEvent&)
+{
+    if (m_exportPath->GetValue().IsEmpty())
+    {
+        wxMessageBox("Please set an export folder before exporting.",
+            "Missing Path", wxOK | wxICON_WARNING, this);
+        return;
+    }
+
+    const std::string folder = m_exportPath->GetValue().ToStdString();
+    m_canvas->ExportFixtures(folder + "/model_a.step",
+        folder + "/model_b.step");
+}
+
+void MainFrame::OnGenerateMould(wxCommandEvent&)
+{
+    if (!m_canvas) return;
+    m_canvas->GenerateMould();
 }

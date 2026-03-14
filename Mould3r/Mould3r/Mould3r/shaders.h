@@ -68,6 +68,7 @@ public:
         uniform vec3 uLightDir;   // direction *toward* surface (world), normalized
         uniform vec3 uLightColor;
         uniform vec3 uBaseColor;
+        uniform float uAlpha;
 
         uniform float uAmbient;   // e.g. 0.25
         uniform float uDiffuse;   // e.g. 0.85
@@ -89,7 +90,7 @@ public:
             vec3 color = uBaseColor * (uAmbient + uDiffuse * ndotl) * uLightColor;
             color += uLightColor * (uSpecular * spec);
 
-            FragColor = vec4(color, 1.0);
+            FragColor = vec4(color, uAlpha);
         }
         )GLSL";
 
