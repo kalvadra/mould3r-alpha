@@ -10,6 +10,7 @@
 #include <wx/dcclient.h>
 #include <wx/log.h>
 #include <wx/msgdlg.h>
+#include <wx/progdlg.h>
 
 #include <opencascade/STEPControl_Reader.hxx>
 #include <opencascade/STEPControl_Writer.hxx>
@@ -204,28 +205,48 @@ void GLCanvas::GenerateMould()
         return;
     }
 
+    // Steps per fixture: 1 read + 1 transform + (1 per object subtract) + 1 tessellate + 1 upload
+    const int stepsPerFixture = 3 + (int)m_objects.size();
+    const int totalSteps = stepsPerFixture * (int)m_fixtures.size();
+
+    wxProgressDialog progress(
+        "Generating Mould",
+        "Initialising...",
+        totalSteps,
+        nullptr,
+        wxPD_APP_MODAL | wxPD_AUTO_HIDE | wxPD_SMOOTH | wxPD_ELAPSED_TIME
+    );
+
+    int step = 0;
+
     SetCurrent(*m_context);
     InitGLOnce();
 
-    // For each fixture, subtract all imported objects from it
     for (int fi = 0; fi < (int)m_fixtures.size(); ++fi)
     {
         SceneObject& fix = m_fixtures[fi];
         if (fix.sourcePath.empty()) continue;
 
-        // Re-read fixture shape
+        const std::string fixLabel = "Fixture " + std::to_string(fi + 1);
+
+        // Step: read fixture
+        progress.Update(step++, fixLabel + ": reading source file...");
+
         STEPControl_Reader fixReader;
         if (fixReader.ReadFile(fix.sourcePath.c_str()) != IFSelect_RetDone)
         {
             wxMessageBox("Failed to re-read fixture: " + fix.sourcePath,
                 "Generate Mould", wxOK | wxICON_ERROR, this);
+            step += stepsPerFixture - 1;  // skip remaining steps for this fixture
             continue;
         }
         fixReader.TransferRoots();
         TopoDS_Shape fixtureShape = fixReader.OneShape();
         if (fixtureShape.IsNull()) continue;
 
-        // Apply fixture transform
+        // Step: apply fixture transform
+        progress.Update(step++, fixLabel + ": applying transform...");
+
         gp_Trsf fixTrsf;
         glm::mat4 fm = fix.BuildModelMatrix();
         fixTrsf.SetValues(
@@ -236,13 +257,17 @@ void GLCanvas::GenerateMould()
         BRepBuilderAPI_Transform fixXform(fixtureShape, fixTrsf, true);
         TopoDS_Shape result = fixXform.Shape();
 
-        // Subtract each imported object
+        // Steps: subtract each object
         for (int oi = 0; oi < (int)m_objects.size(); ++oi)
         {
             const SceneObject& obj = m_objects[oi];
+            progress.Update(step++,
+                fixLabel + ": subtracting object " +
+                std::to_string(oi + 1) + " of " +
+                std::to_string((int)m_objects.size()) + "...");
+
             if (obj.sourcePath.empty()) continue;
 
-            // Re-read object shape
             STEPControl_Reader objReader;
             if (objReader.ReadFile(obj.sourcePath.c_str()) != IFSelect_RetDone)
                 continue;
@@ -250,7 +275,6 @@ void GLCanvas::GenerateMould()
             TopoDS_Shape objShape = objReader.OneShape();
             if (objShape.IsNull()) continue;
 
-            // Apply object transform
             gp_Trsf objTrsf;
             glm::mat4 om = obj.BuildModelMatrix();
             objTrsf.SetValues(
@@ -261,7 +285,6 @@ void GLCanvas::GenerateMould()
             BRepBuilderAPI_Transform objXform(objShape, objTrsf, true);
             TopoDS_Shape transformedObj = objXform.Shape();
 
-            // Boolean subtract
             BRepAlgoAPI_Cut cut(result, transformedObj);
             cut.Build();
             if (!cut.IsDone() || cut.Shape().IsNull())
@@ -274,10 +297,12 @@ void GLCanvas::GenerateMould()
             result = cut.Shape();
         }
 
+        // Step: tessellate + upload
+        progress.Update(step++, fixLabel + ": tessellating result...");
+
         fix.mouldShape = result;
         fix.hasMould = true;
 
-        // Re-tessellate and re-upload result back into the fixture
         BRepMesh_IncrementalMesh mesher(result, 0.05, false, 0.5, true);
 
         FileImporter::MeshData meshData;
@@ -315,13 +340,11 @@ void GLCanvas::GenerateMould()
         if (meshData.vertices.empty() || meshData.indices.empty())
             continue;
 
-        // Compute normals on the result
         ComputeVertexNormals_Pos3(meshData.vertices, meshData.indices, meshData.posNorm);
         auto split = SplitByCreaseAngle_Pos3(meshData.vertices, meshData.indices, 35.0f);
         meshData.posNorm = std::move(split.posNorm);
         meshData.indices = std::move(split.indices);
 
-        // Reset fixture transform since it's now baked into the geometry
         fix.pos = glm::vec3(0.0f);
         fix.yawDeg = 0.0f;
         fix.pitchDeg = 0.0f;
@@ -331,6 +354,7 @@ void GLCanvas::GenerateMould()
         UploadMeshToGPU(meshData, fix);
     }
 
+    progress.Update(totalSteps, "Done.");
     Refresh(false);
     wxMessageBox("Mould generated successfully.",
         "Generate Mould", wxOK | wxICON_INFORMATION, this);
@@ -551,6 +575,17 @@ void GLCanvas::ImportStepFile(const std::string& path)
     SetCurrent(*m_context);
     InitGLOnce();
 
+    wxProgressDialog progress(
+        "Importing File",
+        "Reading STEP file...",
+        5,
+        nullptr,
+        wxPD_APP_MODAL | wxPD_AUTO_HIDE | wxPD_SMOOTH | wxPD_ELAPSED_TIME
+    );
+
+    int step = 0;
+
+    progress.Update(step++, "Reading STEP file...");
     FileImporter importer;
     auto res = importer.ImportSTEP(path, 0.05, 0.5);
 
@@ -559,20 +594,23 @@ void GLCanvas::ImportStepFile(const std::string& path)
         return;
     }
 
+    progress.Update(step++, "Computing vertex normals...");
     ComputeVertexNormals_Pos3(res.meshes[0].vertices,
         res.meshes[0].indices,
         res.meshes[0].posNorm);
 
+    progress.Update(step++, "Splitting by crease angle...");
     auto split = SplitByCreaseAngle_Pos3(res.meshes[0].vertices,
         res.meshes[0].indices, 35.0f);
     res.meshes[0].posNorm = std::move(split.posNorm);
     res.meshes[0].indices = std::move(split.indices);
 
-    // Append a fresh SceneObject
+    progress.Update(step++, "Uploading to GPU...");
     m_objects.emplace_back();
     m_objects.back().sourcePath = path;
     UploadMeshToGPU(res.meshes[0], m_objects.back());
 
+    progress.Update(step++, "Done.");
     Refresh(false);
 }
 
@@ -581,6 +619,17 @@ void GLCanvas::ImportStepFileAsFixture(const std::string& path)
     SetCurrent(*m_context);
     InitGLOnce();
 
+    wxProgressDialog progress(
+        "Importing Fixture",
+        "Reading STEP file...",
+        5,
+        nullptr,
+        wxPD_APP_MODAL | wxPD_AUTO_HIDE | wxPD_SMOOTH | wxPD_ELAPSED_TIME
+    );
+
+    int step = 0;
+
+    progress.Update(step++, "Reading STEP file...");
     FileImporter importer;
     auto res = importer.ImportSTEP(path, 0.05, 0.5);
 
@@ -589,22 +638,27 @@ void GLCanvas::ImportStepFileAsFixture(const std::string& path)
         return;
     }
 
+    progress.Update(step++, "Computing vertex normals...");
     ComputeVertexNormals_Pos3(res.meshes[0].vertices,
         res.meshes[0].indices,
         res.meshes[0].posNorm);
 
+    progress.Update(step++, "Splitting by crease angle...");
     auto split = SplitByCreaseAngle_Pos3(res.meshes[0].vertices,
         res.meshes[0].indices, 35.0f);
     res.meshes[0].posNorm = std::move(split.posNorm);
     res.meshes[0].indices = std::move(split.indices);
 
+    progress.Update(step++, "Uploading to GPU...");
     m_fixtures.emplace_back();
     m_fixtures.back().role = ObjectRole::Fixture;
-    m_fixtures.back().sourcePath = path;   // store for export
+    m_fixtures.back().sourcePath = path;
     UploadMeshToGPU(res.meshes[0], m_fixtures.back());
 
+    progress.Update(step++, "Done.");
     Refresh(false);
 }
+
 // ---------------------------------------------------------------------------
 // Paint
 // ---------------------------------------------------------------------------
