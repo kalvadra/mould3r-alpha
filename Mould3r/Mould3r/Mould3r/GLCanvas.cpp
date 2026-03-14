@@ -11,6 +11,13 @@
 #include <wx/log.h>
 #include <wx/msgdlg.h>
 
+#include <opencascade/STEPControl_Reader.hxx>
+#include <opencascade/STEPControl_Writer.hxx>
+#include <opencascade/BRepBuilderAPI_Transform.hxx>
+#include <opencascade/gp_Trsf.hxx>
+#include <opencascade/gp_Mat.hxx>
+#include <opencascade/gp_XYZ.hxx>
+
 #include <algorithm>
 #include <string>
 #include <vector>
@@ -110,6 +117,7 @@ GLCanvas::GLCanvas(wxWindow* parent)
     Bind(wxEVT_RIGHT_UP, &GLCanvas::OnMouse, this);
     Bind(wxEVT_MOTION, &GLCanvas::OnMouse, this);
     Bind(wxEVT_MOUSEWHEEL, &GLCanvas::OnMouseWheel, this);
+    Bind(wxEVT_KEY_DOWN, &GLCanvas::OnKeyDown, this);
 
     SetFocus();
 }
@@ -166,6 +174,13 @@ void GLCanvas::ApplyScale(float factor)
     if (!HasSelection()) return;
     m_objects[m_selectedIndex].scale =
         std::max(0.001f, m_objects[m_selectedIndex].scale * factor);
+    Refresh(false);
+}
+
+void GLCanvas::CenterSelectedObject()
+{
+    if (!HasSelection()) return;
+    m_objects[m_selectedIndex].pos = glm::vec3(0.0f);
     Refresh(false);
 }
 
@@ -250,8 +265,9 @@ void GLCanvas::InitGLOnce()
 
 void GLCanvas::DestroyGL()
 {
-    for (auto& obj : m_objects)
-        obj.mesh.Destroy();
+    for (auto& obj : m_fixtures) obj.mesh.Destroy();
+    m_fixtures.clear();
+    for (auto& obj : m_objects)  obj.mesh.Destroy();
     m_objects.clear();
 
     if (m_outlineProgram) { glDeleteProgram(m_outlineProgram);        m_outlineProgram = 0; }
@@ -312,6 +328,67 @@ void GLCanvas::UploadMeshToGPU(const FileImporter::MeshData& mesh, SceneObject& 
     obj.mesh = newMesh;
 }
 
+void GLCanvas::ExportFixtures(const std::string& pathA, const std::string& pathB)
+{
+    if (m_fixtures.empty())
+    {
+        wxMessageBox("No fixtures loaded to export.",
+            "Export Failed", wxOK | wxICON_WARNING, this);
+        return;
+    }
+
+    const std::vector<std::string> outPaths = { pathA, pathB };
+
+    for (int i = 0; i < (int)m_fixtures.size() && i < 2; ++i)
+    {
+        const SceneObject& fix = m_fixtures[i];
+        if (fix.sourcePath.empty() || outPaths[i].empty()) continue;
+
+        // Re-read original STEP
+        STEPControl_Reader reader;
+        if (reader.ReadFile(fix.sourcePath.c_str()) != IFSelect_RetDone)
+        {
+            wxMessageBox("Failed to re-read: " + fix.sourcePath,
+                "Export Failed", wxOK | wxICON_ERROR, this);
+            continue;
+        }
+        reader.TransferRoots();
+        TopoDS_Shape shape = reader.OneShape();
+        if (shape.IsNull()) continue;
+
+        // Build OCC transform from SceneObject state
+        glm::mat4 m = fix.BuildModelMatrix();
+
+        gp_Mat occMat(
+            m[0][0], m[1][0], m[2][0],
+            m[0][1], m[1][1], m[2][1],
+            m[0][2], m[1][2], m[2][2]
+        );
+        gp_XYZ occTrans(m[3][0], m[3][1], m[3][2]);
+
+        gp_Trsf trsf;
+        trsf.SetValues(
+            m[0][0], m[1][0], m[2][0], m[3][0],
+            m[0][1], m[1][1], m[2][1], m[3][1],
+            m[0][2], m[1][2], m[2][2], m[3][2]
+        );
+
+        BRepBuilderAPI_Transform xform(shape, trsf, true);
+        TopoDS_Shape transformed = xform.Shape();
+
+        // Write STEP
+        STEPControl_Writer writer;
+        writer.Transfer(transformed, STEPControl_AsIs);
+        if (writer.Write(outPaths[i].c_str()) != IFSelect_RetDone)
+        {
+            wxMessageBox("Failed to write: " + outPaths[i],
+                "Export Failed", wxOK | wxICON_ERROR, this);
+        }
+    }
+
+    wxMessageBox("Fixtures exported successfully.",
+        "Export Complete", wxOK | wxICON_INFORMATION, this);
+}
 // ---------------------------------------------------------------------------
 // Import — appends a new SceneObject
 // ---------------------------------------------------------------------------
@@ -344,6 +421,35 @@ void GLCanvas::ImportStepFile(const std::string& path)
     Refresh(false);
 }
 
+void GLCanvas::ImportStepFileAsFixture(const std::string& path)
+{
+    SetCurrent(*m_context);
+    InitGLOnce();
+
+    FileImporter importer;
+    auto res = importer.ImportSTEP(path, 0.05, 0.5);
+
+    if (!res.ok()) {
+        wxMessageBox(res.error, "Import failed", wxOK | wxICON_ERROR, this);
+        return;
+    }
+
+    ComputeVertexNormals_Pos3(res.meshes[0].vertices,
+        res.meshes[0].indices,
+        res.meshes[0].posNorm);
+
+    auto split = SplitByCreaseAngle_Pos3(res.meshes[0].vertices,
+        res.meshes[0].indices, 35.0f);
+    res.meshes[0].posNorm = std::move(split.posNorm);
+    res.meshes[0].indices = std::move(split.indices);
+
+    m_fixtures.emplace_back();
+    m_fixtures.back().role = ObjectRole::Fixture;
+    m_fixtures.back().sourcePath = path;   // store for export
+    UploadMeshToGPU(res.meshes[0], m_fixtures.back());
+
+    Refresh(false);
+}
 // ---------------------------------------------------------------------------
 // Paint
 // ---------------------------------------------------------------------------
@@ -390,6 +496,13 @@ void GLCanvas::OnPaint(wxPaintEvent&)
     glUniformMatrix4fv(glGetUniformLocation(m_program, "uView"), 1, GL_FALSE, &view[0][0]);
     glUniformMatrix4fv(glGetUniformLocation(m_program, "uProj"), 1, GL_FALSE, &proj[0][0]);
 
+    // Draw fixtures
+    const bool cameraAboveGrid = m_camera.Position().y > 0.0f;
+
+   
+    // Draw imported objects — restore alpha to 1.0 for all regular objects
+    glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 1.0f);
+
     // Draw each object
     for (int i = 0; i < (int)m_objects.size(); ++i)
     {
@@ -403,6 +516,50 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         glDrawElements(GL_TRIANGLES, obj.mesh.indexCount, GL_UNSIGNED_INT, 0);
         glBindVertexArray(0);
     }
+
+    // Determine which fixture is transparent this frame
+// Above grid: A (index 0) is transparent. Below grid: B (index 1) is transparent.
+    const int transparentIndex = cameraAboveGrid ? 0 : 1;
+    const int opaqueIndex = cameraAboveGrid ? 1 : 0;
+
+    // Draw opaque fixture first
+    if (opaqueIndex < (int)m_fixtures.size())
+    {
+        const SceneObject& obj = m_fixtures[opaqueIndex];
+        if (obj.mesh.vao && obj.mesh.indexCount > 0)
+        {
+            const glm::mat4 model = obj.BuildModelMatrix();
+            glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &model[0][0]);
+            glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 1.0f);
+            glBindVertexArray(obj.mesh.vao);
+            glDrawElements(GL_TRIANGLES, obj.mesh.indexCount, GL_UNSIGNED_INT, 0);
+            glBindVertexArray(0);
+        }
+    }
+
+    // Draw transparent fixture second so it blends over everything behind it
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    if (transparentIndex < (int)m_fixtures.size())
+    {
+        const SceneObject& obj = m_fixtures[transparentIndex];
+        if (obj.mesh.vao && obj.mesh.indexCount > 0)
+        {
+            const glm::mat4 model = obj.BuildModelMatrix();
+            glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &model[0][0]);
+            glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 0.1f);
+            glBindVertexArray(obj.mesh.vao);
+            glDrawElements(GL_TRIANGLES, obj.mesh.indexCount, GL_UNSIGNED_INT, 0);
+            glBindVertexArray(0);
+        }
+    }
+
+    glDisable(GL_BLEND);
+
+    // Restore alpha for regular objects
+    glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 1.0f);
+
 
     glUseProgram(0);
 
@@ -495,13 +652,38 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
     }
     else if (m_lmb && m_transformMode == TransformMode::Select)
     {
-        if (shift)
-            m_camera.Pan(dx, -dy);
-        else if (ctrl)
-            m_camera.Dolly(dy * 0.05f);
+        if (m_selectedIndex >= 0)
+        {
+            const float dist = m_camera.GetDistance();
+            const float unitsPerPx = dist * 0.0015f;
+
+            glm::vec3 right = m_camera.Right();
+            right.y = 0.0f;
+            if (glm::length(right) > 1e-4f)
+                right = glm::normalize(right);
+
+            glm::vec3 forward = glm::normalize(
+                glm::cross(glm::vec3(0, 1, 0), right));
+
+            // Flip dy when camera is below the grid to keep drag direction consistent
+            const float dyAdjusted = (m_camera.Position().y < 0.0f) ? -dy : dy;
+
+            m_objects[m_selectedIndex].pos += right * (dx * unitsPerPx);
+            m_objects[m_selectedIndex].pos += forward * (-dyAdjusted * unitsPerPx);
+
+            Refresh(false);
+        }
         else
-            m_camera.Orbit(dx, dy);
-        Refresh(false);
+        {
+            // Nothing selected — orbit as normal
+            if (shift)
+                m_camera.Pan(dx, -dy);
+            else if (ctrl)
+                m_camera.Dolly(dy * 0.05f);
+            else
+                m_camera.Orbit(dx, dy);
+            Refresh(false);
+        }
     }
 
     evt.Skip();
@@ -514,6 +696,21 @@ void GLCanvas::OnMouseWheel(wxMouseEvent& evt)
     if (delta == 0) return;
     m_camera.Dolly(float(rot) / float(delta));
     Refresh(false);
+}
+
+void GLCanvas::OnKeyDown(wxKeyEvent& evt)
+{
+    if (evt.GetKeyCode() == WXK_DELETE && m_selectedIndex >= 0)
+    {
+        m_objects[m_selectedIndex].mesh.Destroy();
+        m_objects.erase(m_objects.begin() + m_selectedIndex);
+        m_selectedIndex = -1;
+        Refresh(false);
+    }
+    else
+    {
+        evt.Skip();
+    }
 }
 
 void GLCanvas::OnResize(wxSizeEvent& evt)

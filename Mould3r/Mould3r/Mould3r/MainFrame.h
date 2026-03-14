@@ -5,6 +5,8 @@
 #include "TranslateDialog.h"
 #include "ScaleDialog.h"
 #include "StartupDialog.h"
+#include <wx/textctrl.h>
+
 
 class GLCanvas;
 
@@ -25,6 +27,7 @@ private:
     void OnToolTranslate(wxCommandEvent& evt);
     void OnToolRotate(wxCommandEvent& evt);
     void OnToolScale(wxCommandEvent& evt);
+    void OnToolCenter(wxCommandEvent& evt);
 
     // Activates a tool button and deactivates the others
     void SetActiveTool(TransformMode mode);
@@ -37,12 +40,27 @@ private:
     wxToggleButton* m_btnTranslate = nullptr;
     wxToggleButton* m_btnRotate = nullptr;
     wxToggleButton* m_btnScale = nullptr;
+    wxButton* m_btnCenter = nullptr;  // regular button, not toggle
+
+    wxPanel* m_sidePanel = nullptr;
+    wxTextCtrl* m_exportPathA = nullptr;
+    wxTextCtrl* m_exportPathB = nullptr;
+
+    void OnBrowseExportA(wxCommandEvent&);
+    void OnBrowseExportB(wxCommandEvent&);
+    void OnExport(wxCommandEvent&);
+
+    wxPanel* CreateSidePanel(wxWindow* parent);
 
     enum {
         ID_Import = wxID_HIGHEST + 100,
         ID_ToolSelect,
         ID_ToolTranslate,
         ID_ToolRotate,
-        ID_ToolScale
+        ID_ToolScale,
+        ID_ToolCenter,
+        ID_BrowseExportA,
+        ID_BrowseExportB,
+        ID_Export
     };
 };

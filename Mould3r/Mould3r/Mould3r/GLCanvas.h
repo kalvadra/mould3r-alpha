@@ -29,9 +29,13 @@ struct GPUMesh
     }
 };
 
+enum class ObjectRole { Fixture, Imported };
+
 struct SceneObject
 {
     GPUMesh   mesh;
+    ObjectRole role = ObjectRole::Imported;
+    std::string sourcePath;   // original file path, used for STEP export
 
     glm::vec3 pos{ 0.0f, 0.0f, 0.0f };
     float     yawDeg = 0.0f;
@@ -57,6 +61,7 @@ public:
     ~GLCanvas() override;
 
     void ImportStepFile(const std::string& path);
+    void ImportStepFileAsFixture(const std::string& path);
 
     // Called by MainFrame ribbon buttons
     void SetTransformMode(TransformMode mode);
@@ -65,7 +70,11 @@ public:
     void ApplyRotation(float xDeg, float yDeg, float zDeg);
     void ApplyTranslation(float x, float y, float z);
     void ApplyScale(float factor);
+    void CenterSelectedObject();
+
     bool HasSelection() const { return m_selectedIndex >= 0; }
+
+    void ExportFixtures(const std::string& pathA, const std::string& pathB);
 
 private:
     void OnPaint(wxPaintEvent& evt);
@@ -73,6 +82,8 @@ private:
 
     void OnMouse(wxMouseEvent& evt);
     void OnMouseWheel(wxMouseEvent& evt);
+
+    void OnKeyDown(wxKeyEvent& evt);
 
     void InitGLOnce();
     void DestroyGL();
@@ -95,6 +106,7 @@ private:
     shaders      m_shaders;
 
     // Scene
+    std::vector<SceneObject> m_fixtures;    // Model A + B from startup
     std::vector<SceneObject> m_objects;
     int                      m_selectedIndex = -1;
 
