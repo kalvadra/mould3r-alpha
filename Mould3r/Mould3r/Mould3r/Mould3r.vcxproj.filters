@@ -63,6 +63,9 @@
     <ClCompile Include="RotateDialog.cpp">
       <Filter>Source Files\TransformHandlers</Filter>
     </ClCompile>
+    <ClCompile Include="FixtureFile.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Mould3r.h">
@@ -103,6 +106,9 @@
     </ClInclude>
     <ClInclude Include="RotateDialog.h">
       <Filter>Header Files\TransformHandlers</Filter>
+    </ClInclude>
+    <ClInclude Include="FixtureFile.h">
+      <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>

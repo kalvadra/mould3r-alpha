@@ -1,0 +1,3 @@
+[fixture]
+modelA = CircleMoldBlankTop.step
+modelB = CircleBlankMoldBottom.step

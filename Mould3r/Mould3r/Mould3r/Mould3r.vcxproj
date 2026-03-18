@@ -138,6 +138,7 @@
   <ItemGroup>
     <ClCompile Include="camera.cpp" />
     <ClCompile Include="FileImporter.cpp" />
+    <ClCompile Include="FixtureFile.cpp" />
     <ClCompile Include="GLCanvas.cpp" />
     <ClCompile Include="GridRenderer.cpp" />
     <ClCompile Include="MainFrame.cpp" />
@@ -154,6 +155,7 @@
   <ItemGroup>
     <ClInclude Include="camera.h" />
     <ClInclude Include="FileImporter.h" />
+    <ClInclude Include="FixtureFile.h" />
     <ClInclude Include="GLCanvas.h" />
     <ClInclude Include="GridRenderer.h" />
     <ClInclude Include="MainFrame.h" />

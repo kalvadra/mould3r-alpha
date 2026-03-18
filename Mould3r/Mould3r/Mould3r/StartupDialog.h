@@ -1,25 +1,32 @@
 #pragma once
 #include <wx/wx.h>
-
-struct StartupConfig
-{
-    std::string modelAPath;
-    std::string modelBPath;
-};
+#include <wx/listctrl.h>
+#include "FixtureFile.h"
 
 class StartupDialog : public wxDialog
 {
 public:
     StartupDialog(wxWindow* parent);
-    StartupConfig GetConfig() const;
+    FixtureDefinition GetFixture() const { return m_fixture; }
 
 private:
-    void OnBrowseA(wxCommandEvent&);
-    void OnBrowseB(wxCommandEvent&);
+    void ScanFixturesFolder();
+    void OnListSelect(wxListEvent& evt);
+    void OnListDoubleClick(wxListEvent& evt);
+    void OnBrowseFolder(wxCommandEvent&);
+    void OnNewFixture(wxCommandEvent&);
     void OnOK(wxCommandEvent&);
 
-    wxTextCtrl* m_pathA = nullptr;
-    wxTextCtrl* m_pathB = nullptr;
+    void RefreshPreview();
 
-    enum { ID_BrowseA = wxID_HIGHEST + 200, ID_BrowseB };
+    wxListCtrl* m_list = nullptr;
+    wxStaticText* m_lblFolder = nullptr;
+    wxStaticText* m_lblModelA = nullptr;
+    wxStaticText* m_lblModelB = nullptr;
+
+    std::string              m_fixturesFolder;
+    std::vector<std::string> m_fixturePaths;   // parallel to list items
+    FixtureDefinition        m_fixture;
+
+    enum { ID_BrowseFolder = wxID_HIGHEST + 300, ID_NewFixture };
 };

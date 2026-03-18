@@ -907,7 +907,7 @@ void GLCanvas::OnMouseWheel(wxMouseEvent& evt)
     Refresh(false);
 }
 
-void GLCanvas::OnKeyDown(wxKeyEvent& evt)
+void GLCanvas::OnKeyDown(wxKeyEvent& evt) 
 {
     if (evt.GetKeyCode() == WXK_DELETE && m_selectedIndex >= 0)
     {

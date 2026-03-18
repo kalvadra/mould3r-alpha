@@ -6,6 +6,7 @@
 #include "ScaleDialog.h"
 #include "StartupDialog.h"
 #include <wx/textctrl.h>
+#include "FixtureFile.h"
 
 
 class GLCanvas;
@@ -15,7 +16,7 @@ enum class TransformMode { Select, Translate, Rotate, Scale };
 class MainFrame : public wxFrame
 {
 public:
-    MainFrame(const StartupConfig& config);
+    MainFrame(const FixtureDefinition& FixtureDefinition);
 
 private:
     // Menu handlers

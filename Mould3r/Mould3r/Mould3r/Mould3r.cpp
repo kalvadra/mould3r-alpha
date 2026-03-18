@@ -5,11 +5,13 @@
 
 bool MyApp::OnInit()
 {
-	StartupDialog startup(nullptr);
-	if (startup.ShowModal() != wxID_OK)
-		return false;   // user hit Cancel — exit cleanly
+    StartupDialog startup(nullptr);
+    if (startup.ShowModal() != wxID_OK)
+        return false;
 
-	MainFrame* frame = new MainFrame(startup.GetConfig());
-	frame->Show(true);
-	return true;
+    FixtureDefinition fixture = startup.GetFixture();
+
+    MainFrame* frame = new MainFrame(fixture);
+    frame->Show(true);
+    return true;
 }

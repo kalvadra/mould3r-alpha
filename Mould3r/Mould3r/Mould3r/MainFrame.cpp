@@ -31,7 +31,7 @@ static void StyleRibbonBtn(wxToggleButton* btn, bool active = false)
 // ---------------------------------------------------------------------------
 // MainFrame
 // ---------------------------------------------------------------------------
-MainFrame::MainFrame(const StartupConfig& config)
+MainFrame::MainFrame(const FixtureDefinition& fixture)
     : wxFrame(nullptr, wxID_ANY, "Mould3r",
         wxDefaultPosition, wxSize(1200, 800))
 {
@@ -83,10 +83,10 @@ MainFrame::MainFrame(const StartupConfig& config)
     SetActiveTool(TransformMode::Select);
 
     // Load models from startup config
-    if (!config.modelAPath.empty())
-        m_canvas->ImportStepFileAsFixture(config.modelAPath);
-    if (!config.modelBPath.empty())
-        m_canvas->ImportStepFileAsFixture(config.modelBPath);
+    if (!fixture.modelAPath.empty())
+        m_canvas->ImportStepFileAsFixture(fixture.modelAPath);
+    if (!fixture.modelBPath.empty())
+        m_canvas->ImportStepFileAsFixture(fixture.modelBPath);
 }
 
 // ---------------------------------------------------------------------------
@@ -99,8 +99,21 @@ wxPanel* MainFrame::CreateRibbon(wxWindow* parent)
 
     auto* hSizer = new wxBoxSizer(wxHORIZONTAL);
 
-    // Left padding
     hSizer->AddSpacer(12);
+
+    // Import button
+    auto* btnImport = new wxButton(panel, ID_Import, "Import Model",
+        wxDefaultPosition, wxSize(110, 32));
+    btnImport->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
+    btnImport->SetForegroundColour(kTextDefault);
+    btnImport->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
+    hSizer->Add(btnImport, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 12);
+
+    // Vertical divider
+    auto* importDivider = new wxPanel(panel, wxID_ANY, wxDefaultPosition, wxSize(1, 36));
+    importDivider->SetBackgroundColour(wxColour(0x38, 0x44, 0x55));
+    hSizer->Add(importDivider, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 16);
 
     // ----- Group label helper -----------------------------------------------
     auto addLabel = [&](const wxString& text)
@@ -176,6 +189,7 @@ wxPanel* MainFrame::CreateRibbon(wxWindow* parent)
     panel->SetSizer(hSizer);
 
     // ---- Bind toggle events ------------------------------------------------
+    Bind(wxEVT_BUTTON, &MainFrame::OnImport, this, ID_Import);
     Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolTranslate, this, ID_ToolTranslate);
     Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolRotate, this, ID_ToolRotate);
     Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolScale, this, ID_ToolScale);
