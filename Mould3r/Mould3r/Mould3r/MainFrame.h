@@ -7,7 +7,8 @@
 #include "StartupDialog.h"
 #include <wx/textctrl.h>
 #include "FixtureFile.h"
-
+#include "AppConfig.h"
+#include "StartupDialog.h"
 
 class GLCanvas;
 
@@ -21,6 +22,7 @@ public:
 private:
     // Menu handlers
     void OnImport(wxCommandEvent& evt);
+    void OnChangeFixture(wxCommandEvent&);
     void OnExit(wxCommandEvent& evt);
 
     // Ribbon tool handlers
@@ -61,6 +63,7 @@ private:
         ID_ToolCenter,
         ID_BrowseExport,
         ID_Export,
-        ID_GenerateMould
+        ID_GenerateMould,
+        ID_ChangeFixture
     };
 };

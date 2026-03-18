@@ -1075,3 +1075,12 @@ void GLCanvas::RenderPickPass_NoRead(int w, int h)
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glViewport(0, 0, w, h);
 }
+
+void GLCanvas::ClearFixtures()
+{
+    SetCurrent(*m_context);
+    for (auto& fix : m_fixtures)
+        fix.mesh.Destroy();
+    m_fixtures.clear();
+    Refresh(false);
+}

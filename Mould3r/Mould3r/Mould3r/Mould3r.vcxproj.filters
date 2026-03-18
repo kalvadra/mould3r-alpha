@@ -66,6 +66,9 @@
     <ClCompile Include="FixtureFile.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="AppConfig.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Mould3r.h">
@@ -108,6 +111,9 @@
       <Filter>Header Files\TransformHandlers</Filter>
     </ClInclude>
     <ClInclude Include="FixtureFile.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="AppConfig.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

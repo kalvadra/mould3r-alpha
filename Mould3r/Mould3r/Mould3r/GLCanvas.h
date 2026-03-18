@@ -93,6 +93,8 @@ public:
     void GenerateMould();
     void ExportFixtures(const std::string& pathA, const std::string& pathB);
 
+    void ClearFixtures();
+
 private:
     void OnPaint(wxPaintEvent& evt);
     void OnResize(wxSizeEvent& evt);

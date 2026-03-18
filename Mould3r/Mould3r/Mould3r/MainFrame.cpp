@@ -5,6 +5,7 @@
 #include "RotateDialog.h"
 #include "TranslateDialog.h"
 #include "ScaleDialog.h"
+#include "AppConfig.h"
 
 // ---------------------------------------------------------------------------
 // Ribbon colours
@@ -38,6 +39,7 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
     // ---- Menu bar ----------------------------------------------------------
     auto* fileMenu = new wxMenu();
     fileMenu->Append(ID_Import, "Import...\tCtrl+I");
+    fileMenu->Append(ID_ChangeFixture, "Change Fixture...");  // add this
     fileMenu->AppendSeparator();
     fileMenu->Append(wxID_EXIT, "Exit\tAlt+F4");
 
@@ -47,6 +49,7 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
 
     Bind(wxEVT_MENU, &MainFrame::OnExit, this, wxID_EXIT);
     Bind(wxEVT_MENU, &MainFrame::OnImport, this, ID_Import);
+    Bind(wxEVT_MENU, &MainFrame::OnChangeFixture, this, ID_ChangeFixture);
 
     // ---- Layout: ribbon on top, canvas below --------------------------------
     auto* root = new wxPanel(this, wxID_ANY);
@@ -406,6 +409,28 @@ void MainFrame::OnImport(wxCommandEvent&)
         return;
 
     m_canvas->ImportStepFile(dlg.GetPath().ToStdString());
+}
+
+void MainFrame::OnChangeFixture(wxCommandEvent&)
+{
+    const std::string lastFixture = AppConfig::LoadLastFixture();
+
+    StartupDialog dlg(this);
+    dlg.PreSelectFixture(lastFixture);
+
+    if (dlg.ShowModal() != wxID_OK)
+        return;
+
+    FixtureDefinition fixture = dlg.GetFixture();
+    AppConfig::SaveLastFixture(fixture.fixturePath);
+
+    // Clear existing fixtures and reload
+    m_canvas->ClearFixtures();
+
+    if (!fixture.modelAPath.empty())
+        m_canvas->ImportStepFileAsFixture(fixture.modelAPath);
+    if (!fixture.modelBPath.empty())
+        m_canvas->ImportStepFileAsFixture(fixture.modelBPath);
 }
 
 void MainFrame::OnBrowseExport(wxCommandEvent&)

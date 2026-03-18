@@ -9,6 +9,8 @@ public:
     StartupDialog(wxWindow* parent);
     FixtureDefinition GetFixture() const { return m_fixture; }
 
+    void PreSelectFixture(const std::string& path);
+
 private:
     void ScanFixturesFolder();
     void OnListSelect(wxListEvent& evt);

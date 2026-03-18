@@ -293,3 +293,22 @@ void StartupDialog::RefreshPreview()
     }
     Layout();
 }
+
+void StartupDialog::PreSelectFixture(const std::string& path)
+{
+    if (path.empty()) return;
+
+    for (int i = 0; i < (int)m_fixturePaths.size(); ++i)
+    {
+        if (m_fixturePaths[i] == path)
+        {
+            m_list->SetItemState(i, wxLIST_STATE_SELECTED, wxLIST_STATE_SELECTED);
+            m_list->EnsureVisible(i);
+
+            std::string error;
+            FixtureFile::Load(path, m_fixture, error);
+            RefreshPreview();
+            return;
+        }
+    }
+}
