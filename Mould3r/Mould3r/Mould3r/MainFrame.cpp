@@ -182,6 +182,35 @@ wxPanel* MainFrame::CreateRibbon(wxWindow* parent)
     hSizer->Add(divider, 0, wxALIGN_CENTER_VERTICAL);
     hSizer->AddSpacer(16);
 
+    // ---- VENTS group -------------------------------------------------------
+    auto* ventsSizer = new wxBoxSizer(wxVERTICAL);
+    auto* ventsRow = new wxBoxSizer(wxHORIZONTAL);
+
+    m_btnPlaceVent = addTool(ID_ToolPlaceVent, "Place Vent", "Click a surface to place a vent point");
+
+    ventsRow->Add(m_btnPlaceVent, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
+
+    auto* btnClearVents = new wxButton(panel, ID_ClearVentPoints, "Clear",
+        wxDefaultPosition, wxSize(50, 32));
+    btnClearVents->SetToolTip("Remove all vent placement points");
+    btnClearVents->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
+    btnClearVents->SetForegroundColour(kTextDefault);
+    btnClearVents->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
+    ventsRow->Add(btnClearVents, 0, wxALIGN_CENTER_VERTICAL);
+
+    ventsSizer->Add(ventsRow, 0, wxALIGN_CENTER_HORIZONTAL);
+    ventsSizer->Add(addLabel("VENTS"), 0, wxALIGN_CENTER_HORIZONTAL | wxTOP, 2);
+
+    hSizer->Add(ventsSizer, 0, wxALIGN_CENTER_VERTICAL | wxTOP | wxBOTTOM, 6);
+
+    // Vertical divider
+    hSizer->AddSpacer(16);
+    auto* divider2 = new wxPanel(panel, wxID_ANY, wxDefaultPosition, wxSize(1, 36));
+    divider2->SetBackgroundColour(wxColour(0x38, 0x44, 0x55));
+    hSizer->Add(divider2, 0, wxALIGN_CENTER_VERTICAL);
+    hSizer->AddSpacer(16);
+
     // ---- Hint label --------------------------------------------------------
     auto* hint = new wxStaticText(panel, wxID_ANY,
         "LMB: orbit / transform    MMB: pan    Scroll: zoom    Shift+LMB: pan");
@@ -199,6 +228,8 @@ wxPanel* MainFrame::CreateRibbon(wxWindow* parent)
     Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolRotate, this, ID_ToolRotate);
     Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolScale, this, ID_ToolScale);
     Bind(wxEVT_BUTTON, &MainFrame::OnToolCenter, this, ID_ToolCenter);
+    Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolPlaceVent, this, ID_ToolPlaceVent);
+    Bind(wxEVT_BUTTON, &MainFrame::OnClearVentPoints, this, ID_ClearVentPoints);
 
     return panel;
 }
@@ -297,18 +328,30 @@ void MainFrame::SetActiveTool(TransformMode mode)
 {
     // Reset all buttons
     StyleRibbonBtn(m_btnTranslate, false); m_btnTranslate->SetValue(false);
-    StyleRibbonBtn(m_btnRotate, false); m_btnRotate->SetValue(false);
-    StyleRibbonBtn(m_btnScale, false); m_btnScale->SetValue(false);
+    StyleRibbonBtn(m_btnRotate, false);    m_btnRotate->SetValue(false);
+    StyleRibbonBtn(m_btnScale, false);     m_btnScale->SetValue(false);
+    if (m_btnPlaceVent)
+    {
+        StyleRibbonBtn(m_btnPlaceVent, false);
+        m_btnPlaceVent->SetValue(false);
+    }
 
     // Activate selected
     switch (mode)
     {
     case TransformMode::Translate:
-        StyleRibbonBtn(m_btnTranslate, true); m_btnTranslate->SetValue(true); break;
+        StyleRibbonBtn(m_btnTranslate, true);  m_btnTranslate->SetValue(true);  break;
     case TransformMode::Rotate:
-        StyleRibbonBtn(m_btnRotate, true);    m_btnRotate->SetValue(true);    break;
+        StyleRibbonBtn(m_btnRotate, true);     m_btnRotate->SetValue(true);     break;
     case TransformMode::Scale:
-        StyleRibbonBtn(m_btnScale, true);     m_btnScale->SetValue(true);     break;
+        StyleRibbonBtn(m_btnScale, true);      m_btnScale->SetValue(true);      break;
+    case TransformMode::PlaceVent:
+        if (m_btnPlaceVent)
+        {
+            StyleRibbonBtn(m_btnPlaceVent, true);
+            m_btnPlaceVent->SetValue(true);
+        }
+        break;
     }
 
     if (m_canvas)
@@ -389,6 +432,21 @@ void MainFrame::OnToolCenter(wxCommandEvent&)
     }
 
     m_canvas->CenterSelectedObject();
+}
+
+void MainFrame::OnToolPlaceVent(wxCommandEvent&)
+{
+    // Toggle: if already in PlaceVent mode, return to Select
+    if (m_canvas && m_canvas->GetTransformMode() == TransformMode::PlaceVent)
+        SetActiveTool(TransformMode::Select);
+    else
+        SetActiveTool(TransformMode::PlaceVent);
+}
+
+void MainFrame::OnClearVentPoints(wxCommandEvent&)
+{
+    if (m_canvas)
+        m_canvas->ClearVentPoints();
 }
 
 // ---------------------------------------------------------------------------

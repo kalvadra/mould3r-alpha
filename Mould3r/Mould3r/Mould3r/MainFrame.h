@@ -12,12 +12,15 @@
 
 class GLCanvas;
 
-enum class TransformMode { Select, Translate, Rotate, Scale };
+enum class TransformMode { Select, Translate, Rotate, Scale, PlaceVent };
 
 class MainFrame : public wxFrame
 {
 public:
     MainFrame(const FixtureDefinition& FixtureDefinition);
+
+    // Called by GLCanvas when Escape is pressed to sync button state
+    void SetActiveTool(TransformMode mode);
 
 private:
     // Menu handlers
@@ -31,9 +34,9 @@ private:
     void OnToolRotate(wxCommandEvent& evt);
     void OnToolScale(wxCommandEvent& evt);
     void OnToolCenter(wxCommandEvent& evt);
+    void OnToolPlaceVent(wxCommandEvent& evt);
 
-    // Activates a tool button and deactivates the others
-    void SetActiveTool(TransformMode mode);
+    // Activates a tool button and deactivates the others (also called by GLCanvas on Escape)
 
     //Creates the left panel
     wxPanel* m_leftPanel = nullptr;
@@ -55,10 +58,14 @@ private:
 
     GLCanvas* m_canvas = nullptr;
 
+    // Transform tool buttons
     wxToggleButton* m_btnTranslate = nullptr;
     wxToggleButton* m_btnRotate = nullptr;
     wxToggleButton* m_btnScale = nullptr;
-    wxButton* m_btnCenter = nullptr;  // regular button, not toggle
+    wxButton* m_btnCenter = nullptr;
+
+    // Vent tool button (ribbon — Vents group)
+    wxToggleButton* m_btnPlaceVent = nullptr;
 
     wxPanel* m_sidePanel = nullptr;
     wxTextCtrl* m_exportPath = nullptr;
@@ -66,6 +73,7 @@ private:
     void OnBrowseExport(wxCommandEvent&);
     void OnExport(wxCommandEvent&);
     void OnGenerateMould(wxCommandEvent&);
+    void OnClearVentPoints(wxCommandEvent&);
 
     wxPanel* CreateSidePanel(wxWindow* parent);
 
@@ -76,9 +84,11 @@ private:
         ID_ToolRotate,
         ID_ToolScale,
         ID_ToolCenter,
+        ID_ToolPlaceVent,
         ID_BrowseExport,
         ID_Export,
         ID_GenerateMould,
-        ID_ChangeFixture
+        ID_ChangeFixture,
+        ID_ClearVentPoints
     };
 };

@@ -147,11 +147,13 @@
     <ClCompile Include="MeshUtils.cpp" />
     <ClCompile Include="Mould3r.cpp" />
     <ClCompile Include="main.cpp" />
+    <ClCompile Include="MouldFeature.cpp" />
     <ClCompile Include="RotateDialog.cpp" />
     <ClCompile Include="ScaleDialog.cpp" />
     <ClCompile Include="shaders.cpp" />
     <ClCompile Include="StartupDialog.cpp" />
     <ClCompile Include="TranslateDialog.cpp" />
+    <ClCompile Include="VentFeature.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="AppConfig.h" />
@@ -164,11 +166,13 @@
     <ClInclude Include="MeshOps.h" />
     <ClInclude Include="MeshUtils.h" />
     <ClInclude Include="Mould3r.h" />
+    <ClInclude Include="MouldFeature.h" />
     <ClInclude Include="RotateDialog.h" />
     <ClInclude Include="ScaleDialog.h" />
     <ClInclude Include="shaders.h" />
     <ClInclude Include="StartupDialog.h" />
     <ClInclude Include="TranslateDialog.h" />
+    <ClInclude Include="VentFeature.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="vcpkg.json" />

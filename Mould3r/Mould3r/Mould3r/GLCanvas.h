@@ -26,6 +26,7 @@
 #include "GridRenderer.h"
 #include "shaders.h"
 #include "MainFrame.h"
+#include "MouldFeature.h"
 
 struct GPUMesh
 {
@@ -47,11 +48,15 @@ enum class ObjectRole { Fixture, Imported };
 
 struct SceneObject
 {
-    GPUMesh   mesh;
+    GPUMesh    mesh;
     ObjectRole role = ObjectRole::Imported;
-    std::string sourcePath;   // original file path, used for STEP export
-    TopoDS_Shape mouldShape;   // populated after GenerateMould, used for export
+    std::string sourcePath;
+    TopoDS_Shape mouldShape;
     bool         hasMould = false;
+
+    // CPU-side geometry for ray casting (position-only, object space)
+    std::vector<float>    cpuVerts;    // 3 floats per vertex
+    std::vector<uint32_t> cpuIndices;  // triangle indices
 
     glm::vec3 pos{ 0.0f, 0.0f, 0.0f };
     float     yawDeg = 0.0f;
@@ -89,19 +94,22 @@ public:
     void CenterSelectedObject();
 
     bool HasSelection() const { return m_selectedIndex >= 0; }
+    TransformMode GetTransformMode() const { return m_transformMode; }
 
     void GenerateMould();
     void ExportFixtures(const std::string& pathA, const std::string& pathB);
 
     void ClearFixtures();
 
+    // Vent point placement
+    const std::vector<VentPoint>& GetVentPoints() const { return m_ventPoints; }
+    void ClearVentPoints();
+
 private:
     void OnPaint(wxPaintEvent& evt);
     void OnResize(wxSizeEvent& evt);
-
     void OnMouse(wxMouseEvent& evt);
     void OnMouseWheel(wxMouseEvent& evt);
-
     void OnKeyDown(wxKeyEvent& evt);
 
     void InitGLOnce();
@@ -112,9 +120,15 @@ private:
     void EnsurePickFBO(int w, int h);
     void DestroyPickFBO();
 
-    int  PickObjectAt(int mouseX, int mouseY);   // returns index, -1 = miss
-
+    int  PickObjectAt(int mouseX, int mouseY);
     void RenderPickPass_NoRead(int w, int h);
+
+    // Vent point ray casting
+    bool RayCastObjects(int mouseX, int mouseY,
+        glm::vec3& outPos, glm::vec3& outNormal);
+
+    // Sphere mesh for vent point markers
+    void BuildSphereGPU(float radius, int stacks, int slices);
 
 private:
     wxGLContext* m_context = nullptr;
@@ -125,9 +139,12 @@ private:
     shaders      m_shaders;
 
     // Scene
-    std::vector<SceneObject> m_fixtures;    // Model A + B from startup
+    std::vector<SceneObject> m_fixtures;
     std::vector<SceneObject> m_objects;
     int                      m_selectedIndex = -1;
+
+    // Vent placement points
+    std::vector<VentPoint> m_ventPoints;
 
     // Fallback test geometry (pyramid)
     unsigned int m_vao = 0;
@@ -138,6 +155,12 @@ private:
     unsigned int m_program = 0;
     GLuint       m_pickProgram = 0;
     GLuint       m_outlineProgram = 0;
+
+    // Sphere GPU resources (vent point markers)
+    GLuint  m_sphereVAO = 0;
+    GLuint  m_sphereVBO = 0;
+    GLuint  m_sphereEBO = 0;
+    GLsizei m_sphereIndexCount = 0;
 
     // Uniform locations — picking
     GLint m_pick_uMVP = -1;

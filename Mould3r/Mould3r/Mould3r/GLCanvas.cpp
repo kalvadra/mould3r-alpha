@@ -31,6 +31,10 @@
 #include "shaders.h"
 #include "MeshUtils.h"
 #include "MeshOps.h"
+#include "MouldFeature.h"
+
+// Radius of the green sphere drawn at each vent placement point (world units)
+static constexpr float kVentMarkerRadius = 1.5f;
 
 // ---------------------------------------------------------------------------
 // Shader helpers
@@ -143,13 +147,15 @@ void GLCanvas::SetTransformMode(TransformMode mode)
     switch (mode)
     {
     case TransformMode::Select:
-        SetCursor(wxCursor(wxCURSOR_ARROW));   break;
+        SetCursor(wxCursor(wxCURSOR_ARROW));    break;
     case TransformMode::Translate:
-        SetCursor(wxCursor(wxCURSOR_SIZING));  break;
+        SetCursor(wxCursor(wxCURSOR_SIZING));   break;
     case TransformMode::Rotate:
-        SetCursor(wxCursor(wxCURSOR_CROSS));   break;
+        SetCursor(wxCursor(wxCURSOR_CROSS));    break;
     case TransformMode::Scale:
-        SetCursor(wxCursor(wxCURSOR_SIZENS));  break;
+        SetCursor(wxCursor(wxCURSOR_SIZENS));   break;
+    case TransformMode::PlaceVent:
+        SetCursor(wxCursor(wxCURSOR_CROSS));    break;
     }
 }
 
@@ -162,6 +168,7 @@ void GLCanvas::ApplyRotation(float xDeg, float yDeg, float zDeg)
     m_objects[m_selectedIndex].pitchDeg += xDeg;
     m_objects[m_selectedIndex].yawDeg += yDeg;
     m_objects[m_selectedIndex].rollDeg += zDeg;
+    m_ventPoints.clear();
     Refresh(false);
 }
 
@@ -169,6 +176,7 @@ void GLCanvas::ApplyTranslation(float x, float y, float z)
 {
     if (!HasSelection()) return;
     m_objects[m_selectedIndex].pos += glm::vec3(x, y, z);
+    m_ventPoints.clear();
     Refresh(false);
 }
 
@@ -177,6 +185,7 @@ void GLCanvas::ApplyScale(float factor)
     if (!HasSelection()) return;
     m_objects[m_selectedIndex].scale =
         std::max(0.001f, m_objects[m_selectedIndex].scale * factor);
+    m_ventPoints.clear();
     Refresh(false);
 }
 
@@ -184,6 +193,13 @@ void GLCanvas::CenterSelectedObject()
 {
     if (!HasSelection()) return;
     m_objects[m_selectedIndex].pos = glm::vec3(0.0f);
+    m_ventPoints.clear();
+    Refresh(false);
+}
+
+void GLCanvas::ClearVentPoints()
+{
+    m_ventPoints.clear();
     Refresh(false);
 }
 
@@ -361,6 +377,171 @@ void GLCanvas::GenerateMould()
 }
 
 // ---------------------------------------------------------------------------
+// BuildSphereGPU — generates a UV sphere and uploads it to the GPU.
+// Vertex layout: [pos(3), normal(3)] — compatible with vsLit/fsLit.
+// ---------------------------------------------------------------------------
+void GLCanvas::BuildSphereGPU(float radius, int stacks, int slices)
+{
+    std::vector<float>    verts;
+    std::vector<uint32_t> idx;
+
+    for (int i = 0; i <= stacks; ++i)
+    {
+        const float phi = glm::pi<float>() * float(i) / float(stacks);
+        const float sinPhi = sinf(phi);
+        const float cosPhi = cosf(phi);
+
+        for (int j = 0; j <= slices; ++j)
+        {
+            const float theta = 2.0f * glm::pi<float>() * float(j) / float(slices);
+            const float x = sinPhi * cosf(theta);
+            const float y = cosPhi;
+            const float z = sinPhi * sinf(theta);
+
+            verts.push_back(x * radius);  verts.push_back(y * radius);  verts.push_back(z * radius);
+            verts.push_back(x);           verts.push_back(y);           verts.push_back(z);
+        }
+    }
+
+    for (int i = 0; i < stacks; ++i)
+    {
+        for (int j = 0; j < slices; ++j)
+        {
+            const uint32_t a = uint32_t(i * (slices + 1) + j);
+            const uint32_t b = uint32_t(a + slices + 1);
+            idx.push_back(a);     idx.push_back(b);     idx.push_back(a + 1);
+            idx.push_back(b);     idx.push_back(b + 1); idx.push_back(a + 1);
+        }
+    }
+
+    glGenVertexArrays(1, &m_sphereVAO);
+    glGenBuffers(1, &m_sphereVBO);
+    glGenBuffers(1, &m_sphereEBO);
+
+    glBindVertexArray(m_sphereVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, m_sphereVBO);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(verts.size() * sizeof(float)), verts.data(), GL_STATIC_DRAW);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m_sphereEBO);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)(idx.size() * sizeof(uint32_t)), idx.data(), GL_STATIC_DRAW);
+
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+    glBindVertexArray(0);
+
+    m_sphereIndexCount = (GLsizei)idx.size();
+}
+
+// ---------------------------------------------------------------------------
+// RayCastObjects — Möller–Trumbore ray-mesh intersection.
+// Tests all triangles of all imported objects (CPU side) and returns the
+// closest hit in world space.  Returns false if no surface was hit.
+// ---------------------------------------------------------------------------
+static bool RayTriangle(const glm::vec3& orig, const glm::vec3& dir,
+    const glm::vec3& v0, const glm::vec3& v1, const glm::vec3& v2,
+    float& outT)
+{
+    constexpr float EPS = 1e-7f;
+    const glm::vec3 e1 = v1 - v0;
+    const glm::vec3 e2 = v2 - v0;
+    const glm::vec3 h = glm::cross(dir, e2);
+    const float     a = glm::dot(e1, h);
+    // a < EPS rejects back-facing triangles (standard front-face-only MT).
+    // This prevents hits on the far side of a cavity when the near face is
+    // occluded by the fixture (which has no CPU geometry to block the ray).
+    if (a < EPS) return false;
+    const float     f = 1.0f / a;
+    const glm::vec3 s = orig - v0;
+    const float     u = f * glm::dot(s, h);
+    if (u < 0.0f || u > 1.0f) return false;
+    const glm::vec3 q = glm::cross(s, e1);
+    const float     v = f * glm::dot(dir, q);
+    if (v < 0.0f || u + v > 1.0f) return false;
+    outT = f * glm::dot(e2, q);
+    return outT > EPS;
+}
+
+bool GLCanvas::RayCastObjects(int mouseX, int mouseY,
+    glm::vec3& outPos, glm::vec3& outNormal)
+{
+    const wxSize sz = GetClientSize();
+    const int    w = std::max(1, sz.x);
+    const int    h = std::max(1, sz.y);
+
+    // Build world-space ray from NDC mouse position
+    const float ndcX = (2.0f * float(mouseX)) / float(w) - 1.0f;
+    const float ndcY = 1.0f - (2.0f * float(mouseY)) / float(h);
+
+    m_camera.SetAspect(float(w) / float(h));
+    const glm::mat4 view = m_camera.View();
+    const glm::mat4 proj = m_camera.Projection();
+    const glm::mat4 invVP = glm::inverse(proj * view);
+
+    glm::vec4 nearH = invVP * glm::vec4(ndcX, ndcY, -1.0f, 1.0f);
+    glm::vec4 farH = invVP * glm::vec4(ndcX, ndcY, 1.0f, 1.0f);
+    nearH /= nearH.w;
+    farH /= farH.w;
+
+    const glm::vec3 rayOrig = glm::vec3(nearH);
+    const glm::vec3 rayDir = glm::normalize(glm::vec3(farH) - glm::vec3(nearH));
+
+    float     bestWorldT = std::numeric_limits<float>::max();
+    bool      hit = false;
+
+    for (const auto& obj : m_objects)
+    {
+        if (obj.cpuVerts.empty() || obj.cpuIndices.empty()) continue;
+
+        const glm::mat4 model = obj.BuildModelMatrix();
+        const glm::mat4 invModel = glm::inverse(model);
+
+        // Transform ray into object (local) space for intersection test
+        const glm::vec3 localOrig = glm::vec3(invModel * glm::vec4(rayOrig, 1.0f));
+        const glm::vec3 localDir = glm::normalize(glm::vec3(invModel * glm::vec4(rayDir, 0.0f)));
+
+        for (size_t i = 0; i + 2 < obj.cpuIndices.size(); i += 3)
+        {
+            const uint32_t i0 = obj.cpuIndices[i];
+            const uint32_t i1 = obj.cpuIndices[i + 1];
+            const uint32_t i2 = obj.cpuIndices[i + 2];
+
+            const glm::vec3 v0(obj.cpuVerts[i0 * 3], obj.cpuVerts[i0 * 3 + 1], obj.cpuVerts[i0 * 3 + 2]);
+            const glm::vec3 v1(obj.cpuVerts[i1 * 3], obj.cpuVerts[i1 * 3 + 1], obj.cpuVerts[i1 * 3 + 2]);
+            const glm::vec3 v2(obj.cpuVerts[i2 * 3], obj.cpuVerts[i2 * 3 + 1], obj.cpuVerts[i2 * 3 + 2]);
+
+            float localT = 0.0f;
+            if (!RayTriangle(localOrig, localDir, v0, v1, v2, localT))
+                continue;
+
+            // Convert local hit back to world space to get a consistent depth
+            const glm::vec3 localHit = localOrig + localDir * localT;
+            const glm::vec3 worldHit = glm::vec3(model * glm::vec4(localHit, 1.0f));
+            const float     worldT = glm::length(worldHit - rayOrig);
+
+            if (worldT < bestWorldT)
+            {
+                bestWorldT = worldT;
+                outPos = worldHit;
+
+                // Face normal → transform to world space
+                const glm::vec3 faceN = glm::normalize(glm::cross(v1 - v0, v2 - v0));
+                const glm::mat3 normMat = glm::transpose(glm::inverse(glm::mat3(model)));
+                outNormal = glm::normalize(normMat * faceN);
+
+                // Flip normal to face the camera
+                if (glm::dot(outNormal, rayDir) > 0.0f)
+                    outNormal = -outNormal;
+
+                hit = true;
+            }
+        }
+    }
+
+    return hit;
+}
+
+// ---------------------------------------------------------------------------
 // GL init
 // ---------------------------------------------------------------------------
 static void* GetAnyGLFuncAddress(const char* name)
@@ -436,6 +617,9 @@ void GLCanvas::InitGLOnce()
     glEnableVertexAttribArray(1);
     glBindVertexArray(0);
 
+    // Build vent-point marker sphere
+    BuildSphereGPU(1.0f, 12, 16);
+
     m_inited = true;
 }
 
@@ -448,6 +632,9 @@ void GLCanvas::DestroyGL()
 
     if (m_outlineProgram) { glDeleteProgram(m_outlineProgram);        m_outlineProgram = 0; }
     if (m_fullscreenVAO) { glDeleteVertexArrays(1, &m_fullscreenVAO); m_fullscreenVAO = 0; }
+    if (m_sphereEBO) { glDeleteBuffers(1, &m_sphereEBO);          m_sphereEBO = 0; }
+    if (m_sphereVBO) { glDeleteBuffers(1, &m_sphereVBO);          m_sphereVBO = 0; }
+    if (m_sphereVAO) { glDeleteVertexArrays(1, &m_sphereVAO);     m_sphereVAO = 0; }
     if (m_vbo) { glDeleteBuffers(1, &m_vbo);               m_vbo = 0; }
     if (m_vao) { glDeleteVertexArrays(1, &m_vao);          m_vao = 0; }
     if (m_ebo) { glDeleteBuffers(1, &m_ebo);               m_ebo = 0; }
@@ -595,6 +782,12 @@ void GLCanvas::ImportStepFile(const std::string& path)
     }
 
     progress.Update(step++, "Computing vertex normals...");
+
+    // Snapshot position-only geometry for CPU ray casting BEFORE the crease
+    // split duplicates vertices and replaces the index buffer.
+    std::vector<float>    cpuVerts = res.meshes[0].vertices;
+    std::vector<uint32_t> cpuIndices = res.meshes[0].indices;
+
     ComputeVertexNormals_Pos3(res.meshes[0].vertices,
         res.meshes[0].indices,
         res.meshes[0].posNorm);
@@ -608,6 +801,8 @@ void GLCanvas::ImportStepFile(const std::string& path)
     progress.Update(step++, "Uploading to GPU...");
     m_objects.emplace_back();
     m_objects.back().sourcePath = path;
+    m_objects.back().cpuVerts = std::move(cpuVerts);
+    m_objects.back().cpuIndices = std::move(cpuIndices);
     UploadMeshToGPU(res.meshes[0], m_objects.back());
 
     progress.Update(step++, "Done.");
@@ -708,7 +903,7 @@ void GLCanvas::OnPaint(wxPaintEvent&)
     // Draw fixtures
     const bool cameraAboveGrid = m_camera.Position().y > 0.0f;
 
-   
+
     // Draw imported objects — restore alpha to 1.0 for all regular objects
     glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 1.0f);
 
@@ -749,6 +944,7 @@ void GLCanvas::OnPaint(wxPaintEvent&)
     // Draw transparent fixture second so it blends over everything behind it
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDepthMask(GL_FALSE);   // don't write depth — keeps vent markers visible through the tint
 
     if (transparentIndex < (int)m_fixtures.size())
     {
@@ -764,6 +960,7 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         }
     }
 
+    glDepthMask(GL_TRUE);
     glDisable(GL_BLEND);
 
     // Restore alpha for regular objects
@@ -808,6 +1005,37 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         }
     }
 
+    // ---- Vent point markers (green spheres) --------------------------------
+    if (!m_ventPoints.empty() && m_program && m_sphereVAO && m_sphereIndexCount > 0)
+    {
+        glEnable(GL_DEPTH_TEST);
+        glUseProgram(m_program);
+
+        const glm::vec3 ventColor(0.10f, 0.92f, 0.25f);
+        glUniform3fv(glGetUniformLocation(m_program, "uCameraPos"), 1, &camPos[0]);
+        glUniform3fv(glGetUniformLocation(m_program, "uLightDir"), 1, &lightDir[0]);
+        glUniform3fv(glGetUniformLocation(m_program, "uLightColor"), 1, &lightColor[0]);
+        glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &ventColor[0]);
+        glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 1.0f);
+        glUniform1f(glGetUniformLocation(m_program, "uAmbient"), 0.35f);
+        glUniform1f(glGetUniformLocation(m_program, "uDiffuse"), 0.75f);
+        glUniform1f(glGetUniformLocation(m_program, "uSpecular"), 0.60f);
+        glUniform1f(glGetUniformLocation(m_program, "uShininess"), 48.0f);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uView"), 1, GL_FALSE, &view[0][0]);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uProj"), 1, GL_FALSE, &proj[0][0]);
+
+        glBindVertexArray(m_sphereVAO);
+        for (const VentPoint& vp : m_ventPoints)
+        {
+            glm::mat4 model = glm::translate(glm::mat4(1.0f), vp.worldPos);
+            model = glm::scale(model, glm::vec3(kVentMarkerRadius));
+            glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &model[0][0]);
+            glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
+        }
+        glBindVertexArray(0);
+        glUseProgram(0);
+    }
+
     SwapBuffers();
 }
 
@@ -826,6 +1054,16 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
             const wxPoint p = evt.GetPosition();
             m_selectedIndex = PickObjectAt(p.x, p.y);
             Refresh(false);
+        }
+        else if (m_transformMode == TransformMode::PlaceVent)
+        {
+            const wxPoint p = evt.GetPosition();
+            glm::vec3 hitPos, hitNormal;
+            if (RayCastObjects(p.x, p.y, hitPos, hitNormal))
+            {
+                m_ventPoints.push_back({ hitPos, hitNormal });
+                Refresh(false);
+            }
         }
     }
 
@@ -879,7 +1117,7 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
 
             m_objects[m_selectedIndex].pos += right * (dx * unitsPerPx);
             m_objects[m_selectedIndex].pos += forward * (-dyAdjusted * unitsPerPx);
-
+            m_ventPoints.clear();
             Refresh(false);
         }
         else
@@ -894,6 +1132,17 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
             Refresh(false);
         }
     }
+    else if (m_lmb && m_transformMode == TransformMode::PlaceVent)
+    {
+        // Orbit while holding LMB in PlaceVent mode (no object to drag)
+        if (shift)
+            m_camera.Pan(dx, -dy);
+        else if (ctrl)
+            m_camera.Dolly(dy * 0.05f);
+        else
+            m_camera.Orbit(dx, dy);
+        Refresh(false);
+    }
 
     evt.Skip();
 }
@@ -907,9 +1156,18 @@ void GLCanvas::OnMouseWheel(wxMouseEvent& evt)
     Refresh(false);
 }
 
-void GLCanvas::OnKeyDown(wxKeyEvent& evt) 
+void GLCanvas::OnKeyDown(wxKeyEvent& evt)
 {
-    if (evt.GetKeyCode() == WXK_DELETE && m_selectedIndex >= 0)
+    if (evt.GetKeyCode() == WXK_ESCAPE)
+    {
+        if (m_transformMode != TransformMode::Select)
+        {
+            SetTransformMode(TransformMode::Select);
+            if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+                frame->SetActiveTool(TransformMode::Select);
+        }
+    }
+    else if (evt.GetKeyCode() == WXK_DELETE && m_selectedIndex >= 0)
     {
         m_objects[m_selectedIndex].mesh.Destroy();
         m_objects.erase(m_objects.begin() + m_selectedIndex);
