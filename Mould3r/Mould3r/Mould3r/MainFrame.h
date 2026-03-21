@@ -35,6 +35,21 @@ private:
     // Activates a tool button and deactivates the others
     void SetActiveTool(TransformMode mode);
 
+    //Creates the left panel
+    wxPanel* m_leftPanel = nullptr;
+    wxPanel* CreateLeftPanel(wxWindow* parent);
+
+    // Collapsible section helper
+    wxPanel* CreateCollapsibleSection(wxWindow* parent, wxSizer* parentSizer,
+        const wxString& title, wxPanel** contentOut = nullptr);
+    wxPanel* CreateVentsContent(wxWindow* parent);
+
+    // Vent field members
+    wxChoice* m_ventTypeChoice = nullptr;
+    wxPanel* m_ventDimsPanel = nullptr;
+    wxTextCtrl* m_ventLength = nullptr;
+    wxTextCtrl* m_ventWidth = nullptr;
+
     // Creates the top ribbon panel
     wxPanel* CreateRibbon(wxWindow* parent);
 
