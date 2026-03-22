@@ -3,7 +3,7 @@ class shaders
 {
 public:
     //Define basic vertex shader
-	const char* vsSrc = R"GLSL(
+    const char* vsSrc = R"GLSL(
     #version 330 core
     layout (location = 0) in vec3 aPos;
     layout (location = 1) in vec3 aColor;
@@ -29,7 +29,7 @@ public:
             FragColor = vec4(vColor, 1.0);
         }
     )GLSL";
-    
+
     //Define expanded vertex shader for more advanced lighting
     const char* vsLit = R"GLSL(
         #version 330 core
@@ -56,8 +56,8 @@ public:
         }
         )GLSL";
 
-        //Define expanded fragment shader for more advanced lighting
-        const char* fsLit = R"GLSL(
+    //Define expanded fragment shader for more advanced lighting
+    const char* fsLit = R"GLSL(
         #version 330 core
         in vec3 vWorldPos;
         in vec3 vWorldNormal;
@@ -94,7 +94,7 @@ public:
         }
         )GLSL";
 
-        const char* vsPick = R"GLSL(
+    const char* vsPick = R"GLSL(
         #version 330 core
         layout(location=0) in vec3 aPos;
 
@@ -105,7 +105,7 @@ public:
         }
         )GLSL";
 
-        const char* fsPick = R"GLSL(
+    const char* fsPick = R"GLSL(
         #version 330 core
         layout(location=0) out uint outId;
 
@@ -116,7 +116,7 @@ public:
         }
         )GLSL";
 
-        const char* vsFullscreen = R"GLSL(
+    const char* vsFullscreen = R"GLSL(
     #version 330 core
 
     out vec2 vUV;
@@ -133,7 +133,7 @@ public:
     }
 )GLSL";
 
-        const char* fsOutline = R"GLSL(
+    const char* fsOutline = R"GLSL(
     #version 330 core
 
     in vec2 vUV;
@@ -184,5 +184,26 @@ public:
         outColor = vec4(outlineRGB, uAlpha);
     }
 )GLSL";
+
+    // Flat (unlit) shaders — used for vent path lines
+    const char* vsFlat = R"GLSL(
+        #version 330 core
+        layout(location = 0) in vec3 aPos;
+        uniform mat4 uVP;   // proj * view (paths are already in world space)
+        void main()
+        {
+            gl_Position = uVP * vec4(aPos, 1.0);
+        }
+        )GLSL";
+
+    const char* fsFlat = R"GLSL(
+        #version 330 core
+        out vec4 FragColor;
+        uniform vec4 uColor;
+        void main()
+        {
+            FragColor = uColor;
+        }
+        )GLSL";
 
 };

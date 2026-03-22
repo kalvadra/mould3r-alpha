@@ -136,8 +136,10 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="AppConfig.cpp" />
     <ClCompile Include="camera.cpp" />
     <ClCompile Include="FileImporter.cpp" />
+    <ClCompile Include="FixtureFile.cpp" />
     <ClCompile Include="GLCanvas.cpp" />
     <ClCompile Include="GridRenderer.cpp" />
     <ClCompile Include="MainFrame.cpp" />
@@ -145,26 +147,32 @@
     <ClCompile Include="MeshUtils.cpp" />
     <ClCompile Include="Mould3r.cpp" />
     <ClCompile Include="main.cpp" />
+    <ClCompile Include="MouldFeature.cpp" />
     <ClCompile Include="RotateDialog.cpp" />
     <ClCompile Include="ScaleDialog.cpp" />
     <ClCompile Include="shaders.cpp" />
     <ClCompile Include="StartupDialog.cpp" />
     <ClCompile Include="TranslateDialog.cpp" />
+    <ClCompile Include="VentFeature.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="AppConfig.h" />
     <ClInclude Include="camera.h" />
     <ClInclude Include="FileImporter.h" />
+    <ClInclude Include="FixtureFile.h" />
     <ClInclude Include="GLCanvas.h" />
     <ClInclude Include="GridRenderer.h" />
     <ClInclude Include="MainFrame.h" />
     <ClInclude Include="MeshOps.h" />
     <ClInclude Include="MeshUtils.h" />
     <ClInclude Include="Mould3r.h" />
+    <ClInclude Include="MouldFeature.h" />
     <ClInclude Include="RotateDialog.h" />
     <ClInclude Include="ScaleDialog.h" />
     <ClInclude Include="shaders.h" />
     <ClInclude Include="StartupDialog.h" />
     <ClInclude Include="TranslateDialog.h" />
+    <ClInclude Include="VentFeature.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="vcpkg.json" />
