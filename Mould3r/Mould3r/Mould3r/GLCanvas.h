@@ -127,6 +127,10 @@ private:
     bool RayCastObjects(int mouseX, int mouseY,
         glm::vec3& outPos, glm::vec3& outNormal);
 
+    // Parting-plane snap: finds closest point on the mesh's y=0 intersection
+    bool RayCastParting(int mouseX, int mouseY,
+        glm::vec3& outPos, glm::vec3& outNormal);
+
     // Sphere mesh for vent point markers
     void BuildSphereGPU(float radius, int stacks, int slices);
 
@@ -145,6 +149,11 @@ private:
 
     // Vent placement points
     std::vector<VentPoint> m_ventPoints;
+
+    // Ghost preview for vent placement (follows mouse in PlaceVent mode)
+    VentPoint m_ventGhost;
+    bool      m_ventGhostActive = false;
+    wxPoint   m_ghostMousePos;          // last known cursor pos, ray cast deferred to OnPaint
 
     // Fallback test geometry (pyramid)
     unsigned int m_vao = 0;

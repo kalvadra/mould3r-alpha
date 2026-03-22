@@ -36,6 +36,10 @@
 // Radius of the green sphere drawn at each vent placement point (world units)
 static constexpr float kVentMarkerRadius = 1.5f;
 
+// How close (world units) the cursor's parting-plane hit must be to a parting
+// segment before it snaps — gives a generous click target on the parting line.
+static constexpr float kVentSnapRadius = 8.0f;
+
 // ---------------------------------------------------------------------------
 // Shader helpers
 // ---------------------------------------------------------------------------
@@ -542,6 +546,136 @@ bool GLCanvas::RayCastObjects(int mouseX, int mouseY,
 }
 
 // ---------------------------------------------------------------------------
+// RayCastParting — snaps to the nearest point on the mesh's parting line.
+//
+// Steps:
+//  1. Cast mouse ray to world y=0 plane → planeHit (x, 0, z)
+//  2. Walk every triangle of every imported object in world space.
+//     Triangles that straddle y=0 contribute an intersection segment.
+//  3. Find the closest point on any segment to planeHit.
+//  4. If within kVentSnapRadius, set outPos (y forced to 0) and outNormal
+//     (face normal projected onto the XZ plane so it lies on the parting
+//     plane surface) and return true.
+// ---------------------------------------------------------------------------
+
+// Helper: closest point on segment [a,b] to point p (all in 2D XZ plane)
+static glm::vec3 ClosestPointOnSegment(const glm::vec3& a, const glm::vec3& b, const glm::vec3& p)
+{
+    const glm::vec3 ab = b - a;
+    const float     len2 = glm::dot(ab, ab);
+    if (len2 < 1e-10f) return a;
+    const float t = glm::clamp(glm::dot(p - a, ab) / len2, 0.0f, 1.0f);
+    return a + t * ab;
+}
+
+bool GLCanvas::RayCastParting(int mouseX, int mouseY,
+    glm::vec3& outPos, glm::vec3& outNormal)
+{
+    const wxSize sz = GetClientSize();
+    const int    w = std::max(1, sz.x);
+    const int    h = std::max(1, sz.y);
+
+    // Build world-space ray
+    const float ndcX = (2.0f * float(mouseX)) / float(w) - 1.0f;
+    const float ndcY = 1.0f - (2.0f * float(mouseY)) / float(h);
+
+    m_camera.SetAspect(float(w) / float(h));
+    const glm::mat4 invVP = glm::inverse(m_camera.Projection() * m_camera.View());
+
+    glm::vec4 nearH = invVP * glm::vec4(ndcX, ndcY, -1.0f, 1.0f);
+    glm::vec4 farH = invVP * glm::vec4(ndcX, ndcY, 1.0f, 1.0f);
+    nearH /= nearH.w;
+    farH /= farH.w;
+
+    const glm::vec3 rayOrig = glm::vec3(nearH);
+    const glm::vec3 rayDir = glm::normalize(glm::vec3(farH) - glm::vec3(nearH));
+
+    // Intersect ray with world y=0
+    if (fabsf(rayDir.y) < 1e-6f) return false;   // ray parallel to parting plane
+    const float t = -rayOrig.y / rayDir.y;
+    if (t < 0.0f) return false;                   // plane is behind camera
+    const glm::vec3 planeHit = rayOrig + rayDir * t;   // y == 0
+
+    float     bestDist = kVentSnapRadius;
+    glm::vec3 bestPos(0.0f);
+    glm::vec3 bestNormal(0.0f, 1.0f, 0.0f);
+    bool      found = false;
+
+    for (const auto& obj : m_objects)
+    {
+        if (obj.cpuVerts.empty() || obj.cpuIndices.empty()) continue;
+
+        const glm::mat4 model = obj.BuildModelMatrix();
+        const glm::mat3 normMat = glm::transpose(glm::inverse(glm::mat3(model)));
+
+        for (size_t i = 0; i + 2 < obj.cpuIndices.size(); i += 3)
+        {
+            const uint32_t i0 = obj.cpuIndices[i];
+            const uint32_t i1 = obj.cpuIndices[i + 1];
+            const uint32_t i2 = obj.cpuIndices[i + 2];
+
+            // Transform triangle to world space
+            const glm::vec3 lv0(obj.cpuVerts[i0 * 3], obj.cpuVerts[i0 * 3 + 1], obj.cpuVerts[i0 * 3 + 2]);
+            const glm::vec3 lv1(obj.cpuVerts[i1 * 3], obj.cpuVerts[i1 * 3 + 1], obj.cpuVerts[i1 * 3 + 2]);
+            const glm::vec3 lv2(obj.cpuVerts[i2 * 3], obj.cpuVerts[i2 * 3 + 1], obj.cpuVerts[i2 * 3 + 2]);
+
+            const glm::vec3 wv0 = glm::vec3(model * glm::vec4(lv0, 1.0f));
+            const glm::vec3 wv1 = glm::vec3(model * glm::vec4(lv1, 1.0f));
+            const glm::vec3 wv2 = glm::vec3(model * glm::vec4(lv2, 1.0f));
+
+            // Does this triangle straddle world y=0?
+            const float minY = std::min({ wv0.y, wv1.y, wv2.y });
+            const float maxY = std::max({ wv0.y, wv1.y, wv2.y });
+            if (minY >= 0.0f || maxY <= 0.0f) continue;
+
+            // Find the two edges that cross y=0 and compute intersection points
+            const glm::vec3 verts[3] = { wv0, wv1, wv2 };
+            glm::vec3 seg[2];
+            int       segCount = 0;
+
+            for (int e = 0; e < 3 && segCount < 2; ++e)
+            {
+                const glm::vec3& a = verts[e];
+                const glm::vec3& b = verts[(e + 1) % 3];
+                if ((a.y < 0.0f) == (b.y < 0.0f)) continue;   // same side
+                const float alpha = -a.y / (b.y - a.y);
+                seg[segCount++] = a + alpha * (b - a);          // y == 0
+            }
+            if (segCount < 2) continue;
+
+            // Closest point on this parting segment to the plane hit
+            const glm::vec3 closest = ClosestPointOnSegment(seg[0], seg[1], planeHit);
+            const float     dist = glm::length(glm::vec3(closest.x - planeHit.x,
+                0.0f,
+                closest.z - planeHit.z));
+
+            if (dist < bestDist)
+            {
+                bestDist = dist;
+                bestPos = closest;
+                bestPos.y = 0.0f;   // clamp exactly onto parting plane
+
+                // Face normal projected onto XZ so it lies on the parting surface
+                const glm::vec3 localFaceN = glm::normalize(
+                    glm::cross(lv1 - lv0, lv2 - lv0));
+                glm::vec3 worldFaceN = glm::normalize(normMat * localFaceN);
+                worldFaceN.y = 0.0f;
+                const float nlen = glm::length(worldFaceN);
+                bestNormal = (nlen > 1e-4f) ? worldFaceN / nlen : glm::vec3(0.0f, 0.0f, 1.0f);
+                found = true;
+            }
+        }
+    }
+
+    if (found)
+    {
+        outPos = bestPos;
+        outNormal = bestNormal;
+    }
+    return found;
+}
+
+// ---------------------------------------------------------------------------
 // GL init
 // ---------------------------------------------------------------------------
 static void* GetAnyGLFuncAddress(const char* name)
@@ -1006,17 +1140,24 @@ void GLCanvas::OnPaint(wxPaintEvent&)
     }
 
     // ---- Vent point markers (green spheres) --------------------------------
-    if (!m_ventPoints.empty() && m_program && m_sphereVAO && m_sphereIndexCount > 0)
+    // Resolve ghost position here — one ray cast per rendered frame regardless
+    // of how many motion events queued up since the last paint.
+    if (m_transformMode == TransformMode::PlaceVent)
+    {
+        glm::vec3 hitPos, hitNormal;
+        m_ventGhostActive = RayCastParting(m_ghostMousePos.x, m_ghostMousePos.y, hitPos, hitNormal);
+        m_ventGhost.worldPos = hitPos;
+        m_ventGhost.worldNormal = hitNormal;
+    }
+    if (m_program && m_sphereVAO && m_sphereIndexCount > 0 &&
+        (!m_ventPoints.empty() || m_ventGhostActive))
     {
         glEnable(GL_DEPTH_TEST);
         glUseProgram(m_program);
 
-        const glm::vec3 ventColor(0.10f, 0.92f, 0.25f);
         glUniform3fv(glGetUniformLocation(m_program, "uCameraPos"), 1, &camPos[0]);
         glUniform3fv(glGetUniformLocation(m_program, "uLightDir"), 1, &lightDir[0]);
         glUniform3fv(glGetUniformLocation(m_program, "uLightColor"), 1, &lightColor[0]);
-        glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &ventColor[0]);
-        glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 1.0f);
         glUniform1f(glGetUniformLocation(m_program, "uAmbient"), 0.35f);
         glUniform1f(glGetUniformLocation(m_program, "uDiffuse"), 0.75f);
         glUniform1f(glGetUniformLocation(m_program, "uSpecular"), 0.60f);
@@ -1025,13 +1166,42 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         glUniformMatrix4fv(glGetUniformLocation(m_program, "uProj"), 1, GL_FALSE, &proj[0][0]);
 
         glBindVertexArray(m_sphereVAO);
-        for (const VentPoint& vp : m_ventPoints)
+
+        // Ghost preview — translucent, slightly larger, pulsing not needed but distinct
+        if (m_ventGhostActive)
         {
-            glm::mat4 model = glm::translate(glm::mat4(1.0f), vp.worldPos);
-            model = glm::scale(model, glm::vec3(kVentMarkerRadius));
+            const glm::vec3 ghostColor(0.10f, 0.92f, 0.25f);
+            glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &ghostColor[0]);
+            glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 0.45f);
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glDepthMask(GL_FALSE);
+
+            glm::mat4 model = glm::translate(glm::mat4(1.0f), m_ventGhost.worldPos);
+            model = glm::scale(model, glm::vec3(kVentMarkerRadius * 1.15f));
             glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &model[0][0]);
             glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
+
+            glDepthMask(GL_TRUE);
+            glDisable(GL_BLEND);
         }
+
+        // Confirmed vent points — fully opaque
+        if (!m_ventPoints.empty())
+        {
+            const glm::vec3 ventColor(0.10f, 0.92f, 0.25f);
+            glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &ventColor[0]);
+            glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 1.0f);
+
+            for (const VentPoint& vp : m_ventPoints)
+            {
+                glm::mat4 model = glm::translate(glm::mat4(1.0f), vp.worldPos);
+                model = glm::scale(model, glm::vec3(kVentMarkerRadius));
+                glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &model[0][0]);
+                glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
+            }
+        }
+
         glBindVertexArray(0);
         glUseProgram(0);
     }
@@ -1059,7 +1229,7 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
         {
             const wxPoint p = evt.GetPosition();
             glm::vec3 hitPos, hitNormal;
-            if (RayCastObjects(p.x, p.y, hitPos, hitNormal))
+            if (RayCastParting(p.x, p.y, hitPos, hitNormal))
             {
                 m_ventPoints.push_back({ hitPos, hitNormal });
                 Refresh(false);
@@ -1079,7 +1249,18 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
     if (!evt.Moving() && !evt.Dragging()) { evt.Skip(); return; }
 
     const wxPoint pos = evt.GetPosition();
-    if (!m_hasLast) { m_lastPos = pos; m_hasLast = true; evt.Skip(); return; }
+    if (!m_hasLast)
+    {
+        m_lastPos = pos;
+        m_hasLast = true;
+        if (m_transformMode == TransformMode::PlaceVent)
+        {
+            m_ghostMousePos = pos;
+            Refresh(false);
+        }
+        evt.Skip();
+        return;
+    }
 
     const float dx = float(pos.x - m_lastPos.x);
     const float dy = float(pos.y - m_lastPos.y);
@@ -1144,6 +1325,20 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
         Refresh(false);
     }
 
+    // Update ghost preview whenever the mouse moves in PlaceVent mode.
+    // The actual ray cast is deferred to OnPaint so only one cast runs per
+    // rendered frame, regardless of how many motion events have queued up.
+    if (m_transformMode == TransformMode::PlaceVent)
+    {
+        m_ghostMousePos = evt.GetPosition();
+        Refresh(false);
+    }
+    else if (m_ventGhostActive)
+    {
+        m_ventGhostActive = false;
+        Refresh(false);
+    }
+
     evt.Skip();
 }
 
@@ -1162,6 +1357,7 @@ void GLCanvas::OnKeyDown(wxKeyEvent& evt)
     {
         if (m_transformMode != TransformMode::Select)
         {
+            m_ventGhostActive = false;
             SetTransformMode(TransformMode::Select);
             if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
                 frame->SetActiveTool(TransformMode::Select);
