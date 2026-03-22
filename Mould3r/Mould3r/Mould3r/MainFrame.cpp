@@ -449,6 +449,21 @@ void MainFrame::OnClearVentPoints(wxCommandEvent&)
         m_canvas->ClearVentPoints();
 }
 
+void MainFrame::GetVentDimensions(float& outLength, float& outWidth) const
+{
+    // Safe parse helper — returns defaultVal if text is empty or non-numeric
+    auto parseField = [](wxTextCtrl* ctrl, float defaultVal) -> float
+        {
+            if (!ctrl) return defaultVal;
+            double v = defaultVal;
+            if (!ctrl->GetValue().ToDouble(&v)) return defaultVal;
+            return (v > 0.0) ? static_cast<float>(v) : defaultVal;
+        };
+
+    outLength = parseField(m_ventLength, 5.0f);
+    outWidth = parseField(m_ventWidth, 2.0f);
+}
+
 // ---------------------------------------------------------------------------
 // Menu handlers
 // ---------------------------------------------------------------------------

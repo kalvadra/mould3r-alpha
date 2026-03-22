@@ -20,8 +20,14 @@
 #include <opencascade/gp_XYZ.hxx>
 #include <opencascade/BRepAlgoAPI_Cut.hxx>
 #include <opencascade/BRepMesh_IncrementalMesh.hxx>
+#include <opencascade/BRepBuilderAPI_MakeEdge.hxx>
+#include <opencascade/BRepBuilderAPI_MakeWire.hxx>
+#include <opencascade/BRepBuilderAPI_MakeFace.hxx>
+#include <opencascade/BRepPrimAPI_MakePrism.hxx>
+#include <opencascade/gp_Vec.hxx>
 
 #include <algorithm>
+#include <array>
 #include <string>
 #include <vector>
 
@@ -172,7 +178,7 @@ void GLCanvas::ApplyRotation(float xDeg, float yDeg, float zDeg)
     m_objects[m_selectedIndex].pitchDeg += xDeg;
     m_objects[m_selectedIndex].yawDeg += yDeg;
     m_objects[m_selectedIndex].rollDeg += zDeg;
-    m_ventPoints.clear(); m_ventPaths.clear(); RebuildPathVBO();
+    for (auto& s : m_ventSolids) s.Destroy(); m_ventSolids.clear(); m_ventPoints.clear(); m_ventPaths.clear(); m_ventCrossSections.clear(); RebuildPathVBO(); RebuildCrossSectionVBO();
     Refresh(false);
 }
 
@@ -180,7 +186,7 @@ void GLCanvas::ApplyTranslation(float x, float y, float z)
 {
     if (!HasSelection()) return;
     m_objects[m_selectedIndex].pos += glm::vec3(x, y, z);
-    m_ventPoints.clear(); m_ventPaths.clear(); RebuildPathVBO();
+    for (auto& s : m_ventSolids) s.Destroy(); m_ventSolids.clear(); m_ventPoints.clear(); m_ventPaths.clear(); m_ventCrossSections.clear(); RebuildPathVBO(); RebuildCrossSectionVBO();
     Refresh(false);
 }
 
@@ -189,7 +195,7 @@ void GLCanvas::ApplyScale(float factor)
     if (!HasSelection()) return;
     m_objects[m_selectedIndex].scale =
         std::max(0.001f, m_objects[m_selectedIndex].scale * factor);
-    m_ventPoints.clear(); m_ventPaths.clear(); RebuildPathVBO();
+    for (auto& s : m_ventSolids) s.Destroy(); m_ventSolids.clear(); m_ventPoints.clear(); m_ventPaths.clear(); m_ventCrossSections.clear(); RebuildPathVBO(); RebuildCrossSectionVBO();
     Refresh(false);
 }
 
@@ -197,15 +203,19 @@ void GLCanvas::CenterSelectedObject()
 {
     if (!HasSelection()) return;
     m_objects[m_selectedIndex].pos = glm::vec3(0.0f);
-    m_ventPoints.clear(); m_ventPaths.clear(); RebuildPathVBO();
+    for (auto& s : m_ventSolids) s.Destroy(); m_ventSolids.clear(); m_ventPoints.clear(); m_ventPaths.clear(); m_ventCrossSections.clear(); RebuildPathVBO(); RebuildCrossSectionVBO();
     Refresh(false);
 }
 
 void GLCanvas::ClearVentPoints()
 {
+    for (auto& s : m_ventSolids) s.Destroy();
+    m_ventSolids.clear();
     m_ventPoints.clear();
     m_ventPaths.clear();
+    m_ventCrossSections.clear();
     RebuildPathVBO();
+    RebuildCrossSectionVBO();
     Refresh(false);
 }
 
@@ -227,8 +237,8 @@ void GLCanvas::GenerateMould()
         return;
     }
 
-    // Steps per fixture: 1 read + 1 transform + (1 per object subtract) + 1 tessellate + 1 upload
-    const int stepsPerFixture = 3 + (int)m_objects.size();
+    // Steps per fixture: 1 read + 1 transform + (1 per object subtract) + (1 per vent subtract) + 1 tessellate + 1 upload
+    const int stepsPerFixture = 3 + (int)m_objects.size() + (int)m_ventCrossSections.size();
     const int totalSteps = stepsPerFixture * (int)m_fixtures.size();
 
     wxProgressDialog progress(
@@ -317,6 +327,62 @@ void GLCanvas::GenerateMould()
                 continue;
             }
             result = cut.Shape();
+        }
+
+        // Steps: subtract each vent
+        for (int vi = 0; vi < (int)m_ventCrossSections.size(); ++vi)
+        {
+            const VentCrossSection& xs = m_ventCrossSections[vi];
+            const VentPath& vp = m_ventPaths[vi];
+
+            progress.Update(step++,
+                fixLabel + ": cutting vent " +
+                std::to_string(vi + 1) + " of " +
+                std::to_string((int)m_ventCrossSections.size()) + "...");
+
+            if (!xs.valid || !vp.valid) continue;
+
+            // Build a planar wire from the 4 cross-section corners
+            auto toOCC = [](const glm::vec3& v) { return gp_Pnt(v.x, v.y, v.z); };
+
+            const gp_Pnt p0 = toOCC(xs.corners[0]);
+            const gp_Pnt p1 = toOCC(xs.corners[1]);
+            const gp_Pnt p2 = toOCC(xs.corners[2]);
+            const gp_Pnt p3 = toOCC(xs.corners[3]);
+
+            BRepBuilderAPI_MakeEdge e0(p0, p1);
+            BRepBuilderAPI_MakeEdge e1(p1, p2);
+            BRepBuilderAPI_MakeEdge e2(p2, p3);
+            BRepBuilderAPI_MakeEdge e3(p3, p0);
+
+            if (!e0.IsDone() || !e1.IsDone() || !e2.IsDone() || !e3.IsDone()) continue;
+
+            BRepBuilderAPI_MakeWire wire;
+            wire.Add(e0.Edge());
+            wire.Add(e1.Edge());
+            wire.Add(e2.Edge());
+            wire.Add(e3.Edge());
+            if (!wire.IsDone()) continue;
+
+            BRepBuilderAPI_MakeFace face(wire.Wire(), /*onlyPlane=*/true);
+            if (!face.IsDone()) continue;
+
+            // Extrude face along the vent path vector
+            const glm::vec3 sweep = vp.end - vp.start;
+            const gp_Vec    sweepVec(sweep.x, sweep.y, sweep.z);
+
+            BRepPrimAPI_MakePrism prism(face.Face(), sweepVec);
+            if (!prism.IsDone() || prism.Shape().IsNull()) continue;
+
+            BRepAlgoAPI_Cut ventCut(result, prism.Shape());
+            ventCut.Build();
+            if (!ventCut.IsDone() || ventCut.Shape().IsNull())
+            {
+                wxMessageBox("Vent cut failed for vent " + std::to_string(vi + 1),
+                    "Generate Mould", wxOK | wxICON_WARNING, this);
+                continue;
+            }
+            result = ventCut.Shape();
         }
 
         // Step: tessellate + upload
@@ -889,6 +955,201 @@ void GLCanvas::RebuildPathVBO()
 }
 
 // ---------------------------------------------------------------------------
+// BuildVentCrossSection — constructs a rectangular profile at the vent origin,
+// centred on the parting plane, perpendicular to the path direction.
+//
+// Orientation:
+//   pathDir  = normalised XZ direction from start to end (lies on y=0 plane)
+//   sideAxis = pathDir rotated 90° in XZ  (the "width" axis)
+//   upAxis   = world Y                    (the "depth" axis, into each half)
+//
+// The rectangle has:
+//   half-width  = width / 2  along sideAxis
+//   half-depth  = depth / 2  along ±Y
+// ---------------------------------------------------------------------------
+VentCrossSection GLCanvas::BuildVentCrossSection(const VentPath& path,
+    float width, float depth)
+{
+    VentCrossSection xs;
+    xs.valid = false;
+
+    if (!path.valid) return xs;
+
+    const glm::vec3 start = path.start;
+    const glm::vec3 diff = path.end - path.start;
+    const float     len = glm::length(glm::vec2(diff.x, diff.z));
+    if (len < 1e-6f) return xs;
+
+    // Path direction in XZ (y=0)
+    const glm::vec3 pathDir(diff.x / len, 0.0f, diff.z / len);
+
+    // Perpendicular in XZ: rotate pathDir 90° around Y
+    const glm::vec3 sideAxis(-pathDir.z, 0.0f, pathDir.x);
+    const glm::vec3 upAxis(0.0f, 1.0f, 0.0f);
+
+    const float hw = width * 0.5f;
+    const float hd = depth * 0.5f;
+
+    // BL, BR, TR, TL  (B=below parting plane, T=above, L=left, R=right)
+    xs.corners[0] = start - sideAxis * hw - upAxis * hd;
+    xs.corners[1] = start + sideAxis * hw - upAxis * hd;
+    xs.corners[2] = start + sideAxis * hw + upAxis * hd;
+    xs.corners[3] = start - sideAxis * hw + upAxis * hd;
+    xs.valid = true;
+    return xs;
+}
+
+// ---------------------------------------------------------------------------
+// RebuildCrossSectionVBO — packs all cross-section rectangles as line loops
+// into a single VBO (4 verts × 3 floats per cross-section, drawn as
+// GL_LINES with explicit pairs so one Draw call covers all of them).
+// ---------------------------------------------------------------------------
+void GLCanvas::RebuildCrossSectionVBO()
+{
+    if (!m_xsecVAO) return;
+
+    // Each rectangle = 4 edges = 8 verts (pairs: 0-1, 1-2, 2-3, 3-0)
+    std::vector<float> verts;
+    verts.reserve(m_ventCrossSections.size() * 24);
+
+    for (const VentCrossSection& xs : m_ventCrossSections)
+    {
+        if (!xs.valid) continue;
+        auto push = [&](const glm::vec3& v) {
+            verts.push_back(v.x); verts.push_back(v.y); verts.push_back(v.z);
+            };
+        push(xs.corners[0]); push(xs.corners[1]);
+        push(xs.corners[1]); push(xs.corners[2]);
+        push(xs.corners[2]); push(xs.corners[3]);
+        push(xs.corners[3]); push(xs.corners[0]);
+    }
+
+    m_xsecVertexCount = (GLsizei)verts.size() / 3;
+
+    glBindVertexArray(m_xsecVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, m_xsecVBO);
+    glBufferData(GL_ARRAY_BUFFER,
+        (GLsizeiptr)(verts.size() * sizeof(float)),
+        verts.empty() ? nullptr : verts.data(),
+        GL_DYNAMIC_DRAW);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glBindVertexArray(0);
+}
+
+// ---------------------------------------------------------------------------
+// BuildVentSolid — sweeps the rectangular cross-section along the vent path
+// to produce a closed prismatic mesh.
+//
+// The prism has 6 faces:
+//   - Start cap  (at path.start, facing -pathDir)
+//   - End cap    (at path.end,   facing +pathDir)
+//   - 4 side quads connecting corresponding edges of start and end caps
+//
+// Vertex layout per vertex: [px, py, pz, nx, ny, nz]  (compatible with vsLit)
+// ---------------------------------------------------------------------------
+VentSolid GLCanvas::BuildVentSolid(const VentPath& path, float width, float depth)
+{
+    VentSolid solid;
+    solid.valid = false;
+
+    if (!path.valid) return solid;
+
+    const glm::vec3 diff = path.end - path.start;
+    const float     len = glm::length(glm::vec2(diff.x, diff.z));
+    if (len < 1e-6f) return solid;
+
+    // Basis vectors (same as BuildVentCrossSection)
+    const glm::vec3 pathDir(-diff.x / len, 0.0f, -diff.z / len);  // points start→end, reversed for cap normal
+    const glm::vec3 sideAxis(-pathDir.z, 0.0f, pathDir.x);
+    const glm::vec3 upAxis(0.0f, 1.0f, 0.0f);
+
+    const float hw = width * 0.5f;
+    const float hd = depth * 0.5f;
+
+    // Build start and end corner sets (BL, BR, TR, TL)
+    auto makeCorners = [&](const glm::vec3& centre) -> std::array<glm::vec3, 4>
+        {
+            return { {
+                centre - sideAxis * hw - upAxis * hd,   // 0 BL
+                centre + sideAxis * hw - upAxis * hd,   // 1 BR
+                centre + sideAxis * hw + upAxis * hd,   // 2 TR
+                centre - sideAxis * hw + upAxis * hd    // 3 TL
+            } };
+        };
+
+    const auto startC = makeCorners(path.start);
+    const auto endC = makeCorners(path.end);
+
+    // pathDir currently points start←end; sweep direction is start→end
+    const glm::vec3 sweepDir = -pathDir;
+
+    // ---- Accumulate interleaved [pos(3) norm(3)] verts and indices ----
+    std::vector<float>    verts;
+    std::vector<uint32_t> idx;
+
+    auto addQuad = [&](const glm::vec3& a, const glm::vec3& b,
+        const glm::vec3& c, const glm::vec3& d,
+        const glm::vec3& n)
+        {
+            const uint32_t base = (uint32_t)(verts.size() / 6);
+            for (const glm::vec3& p : { a, b, c, d })
+            {
+                verts.push_back(p.x); verts.push_back(p.y); verts.push_back(p.z);
+                verts.push_back(n.x); verts.push_back(n.y); verts.push_back(n.z);
+            }
+            // Two CCW triangles: a-b-c and a-c-d
+            idx.push_back(base + 0); idx.push_back(base + 1); idx.push_back(base + 2);
+            idx.push_back(base + 0); idx.push_back(base + 2); idx.push_back(base + 3);
+        };
+
+    // Start cap — normal faces away from path (−sweepDir)
+    addQuad(startC[0], startC[3], startC[2], startC[1], -sweepDir);
+
+    // End cap — normal faces along sweepDir
+    addQuad(endC[0], endC[1], endC[2], endC[3], sweepDir);
+
+    // Side faces: bottom, right, top, left
+    // bottom (normal = -upAxis)
+    addQuad(startC[0], startC[1], endC[1], endC[0], -upAxis);
+    // right (normal = +sideAxis)
+    addQuad(startC[1], startC[2], endC[2], endC[1], sideAxis);
+    // top (normal = +upAxis)
+    addQuad(startC[2], startC[3], endC[3], endC[2], upAxis);
+    // left (normal = -sideAxis)
+    addQuad(startC[3], startC[0], endC[0], endC[3], -sideAxis);
+
+    // ---- Upload to GPU ----
+    glGenVertexArrays(1, &solid.vao);
+    glGenBuffers(1, &solid.vbo);
+    glGenBuffers(1, &solid.ebo);
+
+    glBindVertexArray(solid.vao);
+    glBindBuffer(GL_ARRAY_BUFFER, solid.vbo);
+    glBufferData(GL_ARRAY_BUFFER,
+        (GLsizeiptr)(verts.size() * sizeof(float)),
+        verts.data(), GL_STATIC_DRAW);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, solid.ebo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+        (GLsizeiptr)(idx.size() * sizeof(uint32_t)),
+        idx.data(), GL_STATIC_DRAW);
+
+    // position (location 0)
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    // normal (location 1)
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float),
+        (void*)(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+
+    glBindVertexArray(0);
+
+    solid.indexCount = (GLsizei)idx.size();
+    solid.valid = true;
+    return solid;
+}
+
+// ---------------------------------------------------------------------------
 // GL init
 // ---------------------------------------------------------------------------
 static void* GetAnyGLFuncAddress(const char* name)
@@ -985,6 +1246,15 @@ void GLCanvas::InitGLOnce()
     glEnableVertexAttribArray(0);
     glBindVertexArray(0);
 
+    // Vent cross-section VBO (dynamic)
+    glGenVertexArrays(1, &m_xsecVAO);
+    glGenBuffers(1, &m_xsecVBO);
+    glBindVertexArray(m_xsecVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, m_xsecVBO);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glBindVertexArray(0);
+
     m_inited = true;
 }
 
@@ -994,12 +1264,16 @@ void GLCanvas::DestroyGL()
     m_fixtures.clear();
     for (auto& obj : m_objects)  obj.mesh.Destroy();
     m_objects.clear();
+    for (auto& s : m_ventSolids) s.Destroy();
+    m_ventSolids.clear();
 
     if (m_outlineProgram) { glDeleteProgram(m_outlineProgram);        m_outlineProgram = 0; }
     if (m_flatProgram) { glDeleteProgram(m_flatProgram);           m_flatProgram = 0; }
     if (m_fullscreenVAO) { glDeleteVertexArrays(1, &m_fullscreenVAO); m_fullscreenVAO = 0; }
     if (m_pathVBO) { glDeleteBuffers(1, &m_pathVBO);              m_pathVBO = 0; }
     if (m_pathVAO) { glDeleteVertexArrays(1, &m_pathVAO);         m_pathVAO = 0; }
+    if (m_xsecVBO) { glDeleteBuffers(1, &m_xsecVBO);              m_xsecVBO = 0; }
+    if (m_xsecVAO) { glDeleteVertexArrays(1, &m_xsecVAO);         m_xsecVAO = 0; }
     if (m_sphereEBO) { glDeleteBuffers(1, &m_sphereEBO);          m_sphereEBO = 0; }
     if (m_sphereVBO) { glDeleteBuffers(1, &m_sphereVBO);          m_sphereVBO = 0; }
     if (m_sphereVAO) { glDeleteVertexArrays(1, &m_sphereVAO);     m_sphereVAO = 0; }
@@ -1468,6 +1742,65 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         glUseProgram(0);
     }
 
+    // ---- Vent cross-sections -----------------------------------------------
+    if (m_flatProgram && m_xsecVAO && m_xsecVertexCount > 0)
+    {
+        glEnable(GL_DEPTH_TEST);
+        glLineWidth(2.0f);
+        glUseProgram(m_flatProgram);
+
+        const glm::mat4 VP = proj * view;
+        glUniformMatrix4fv(m_flat_uVP, 1, GL_FALSE, &VP[0][0]);
+
+        // Slightly brighter yellow-green to distinguish from path lines
+        const glm::vec4 xsecColor(0.60f, 1.00f, 0.20f, 1.0f);
+        glUniform4fv(m_flat_uColor, 1, &xsecColor[0]);
+
+        glBindVertexArray(m_xsecVAO);
+        glDrawArrays(GL_LINES, 0, m_xsecVertexCount);
+        glBindVertexArray(0);
+        glLineWidth(1.0f);
+        glUseProgram(0);
+    }
+
+    // ---- Vent solids (lit, semi-transparent so the path line shows through) -
+    if (m_program && !m_ventSolids.empty())
+    {
+        glEnable(GL_DEPTH_TEST);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glDepthMask(GL_FALSE);
+
+        glUseProgram(m_program);
+
+        const glm::mat4 identity(1.0f);
+        const glm::vec3 ventSolidColor(0.20f, 0.85f, 0.35f);
+        glUniform3fv(glGetUniformLocation(m_program, "uCameraPos"), 1, &camPos[0]);
+        glUniform3fv(glGetUniformLocation(m_program, "uLightDir"), 1, &lightDir[0]);
+        glUniform3fv(glGetUniformLocation(m_program, "uLightColor"), 1, &lightColor[0]);
+        glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &ventSolidColor[0]);
+        glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 0.55f);
+        glUniform1f(glGetUniformLocation(m_program, "uAmbient"), 0.30f);
+        glUniform1f(glGetUniformLocation(m_program, "uDiffuse"), 0.80f);
+        glUniform1f(glGetUniformLocation(m_program, "uSpecular"), 0.40f);
+        glUniform1f(glGetUniformLocation(m_program, "uShininess"), 32.0f);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uView"), 1, GL_FALSE, &view[0][0]);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uProj"), 1, GL_FALSE, &proj[0][0]);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &identity[0][0]);
+
+        for (const VentSolid& vs : m_ventSolids)
+        {
+            if (!vs.valid || vs.vao == 0) continue;
+            glBindVertexArray(vs.vao);
+            glDrawElements(GL_TRIANGLES, vs.indexCount, GL_UNSIGNED_INT, 0);
+        }
+
+        glBindVertexArray(0);
+        glUseProgram(0);
+        glDepthMask(GL_TRUE);
+        glDisable(GL_BLEND);
+    }
+
     // ---- DEBUG: fixture perimeter hull -------------------------------------
     if (m_flatProgram && !m_fixturePerimeter.empty())
     {
@@ -1541,8 +1874,23 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
             {
                 const VentPoint vp{ hitPos, hitNormal };
                 m_ventPoints.push_back(vp);
-                m_ventPaths.push_back(ComputeVentPath(vp));
+
+                const VentPath path = ComputeVentPath(vp);
+                m_ventPaths.push_back(path);
+
+                // Read dimensions from the left-panel UI
+                float ventLength = 5.0f, ventWidth = 2.0f;
+                if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+                    frame->GetVentDimensions(ventLength, ventWidth);
+
+                m_ventCrossSections.push_back(
+                    BuildVentCrossSection(path, ventWidth, ventLength));
+
+                m_ventSolids.push_back(
+                    BuildVentSolid(path, ventWidth, ventLength));
+
                 RebuildPathVBO();
+                RebuildCrossSectionVBO();
                 Refresh(false);
             }
         }
@@ -1609,7 +1957,7 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
 
             m_objects[m_selectedIndex].pos += right * (dx * unitsPerPx);
             m_objects[m_selectedIndex].pos += forward * (-dyAdjusted * unitsPerPx);
-            m_ventPoints.clear(); m_ventPaths.clear(); RebuildPathVBO();
+            for (auto& s : m_ventSolids) s.Destroy(); m_ventSolids.clear(); m_ventPoints.clear(); m_ventPaths.clear(); m_ventCrossSections.clear(); RebuildPathVBO(); RebuildCrossSectionVBO();
             Refresh(false);
         }
         else
@@ -1848,6 +2196,6 @@ void GLCanvas::ClearFixtures()
         fix.mesh.Destroy();
     m_fixtures.clear();
     m_fixturePerimeter.clear();
-    m_ventPoints.clear(); m_ventPaths.clear(); RebuildPathVBO();
+    for (auto& s : m_ventSolids) s.Destroy(); m_ventSolids.clear(); m_ventPoints.clear(); m_ventPaths.clear(); m_ventCrossSections.clear(); RebuildPathVBO(); RebuildCrossSectionVBO();
     Refresh(false);
 }

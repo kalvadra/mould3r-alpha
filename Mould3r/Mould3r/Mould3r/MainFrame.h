@@ -22,6 +22,9 @@ public:
     // Called by GLCanvas when Escape is pressed to sync button state
     void SetActiveTool(TransformMode mode);
 
+    // Read current vent dimensions from the left-panel UI fields
+    void GetVentDimensions(float& outLength, float& outWidth) const;
+
 private:
     // Menu handlers
     void OnImport(wxCommandEvent& evt);

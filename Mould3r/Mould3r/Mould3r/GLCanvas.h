@@ -132,8 +132,16 @@ private:
         glm::vec3& outPos, glm::vec3& outNormal);
 
     // Vent path computation and GPU upload
-    VentPath ComputeVentPath(const VentPoint& vp);
-    void     RebuildPathVBO();
+    VentPath         ComputeVentPath(const VentPoint& vp);
+    void             RebuildPathVBO();
+
+    // Vent cross-section geometry
+    VentCrossSection BuildVentCrossSection(const VentPath& path,
+        float width, float depth);
+    void             RebuildCrossSectionVBO();
+
+    // Vent solid (swept mesh)
+    VentSolid BuildVentSolid(const VentPath& path, float width, float depth);
 
     // Fixture outer perimeter on the parting plane (convex hull in XZ)
     void                   BuildFixturePerimeter();
@@ -156,8 +164,10 @@ private:
     int                      m_selectedIndex = -1;
 
     // Vent placement points
-    std::vector<VentPoint> m_ventPoints;
-    std::vector<VentPath>  m_ventPaths;    // parallel to m_ventPoints
+    std::vector<VentPoint>        m_ventPoints;
+    std::vector<VentPath>         m_ventPaths;          // parallel to m_ventPoints
+    std::vector<VentCrossSection> m_ventCrossSections;  // parallel to m_ventPoints
+    std::vector<VentSolid>        m_ventSolids;         // parallel to m_ventPoints
 
     // Ghost preview for vent placement (follows mouse in PlaceVent mode)
     VentPoint m_ventGhost;
@@ -184,6 +194,11 @@ private:
     GLuint  m_pathVAO = 0;
     GLuint  m_pathVBO = 0;
     GLsizei m_pathVertexCount = 0;
+
+    // Vent cross-section GPU resources
+    GLuint  m_xsecVAO = 0;
+    GLuint  m_xsecVBO = 0;
+    GLsizei m_xsecVertexCount = 0;
 
     // Flat (unlit) shader for vent path lines
     GLuint m_flatProgram = 0;
