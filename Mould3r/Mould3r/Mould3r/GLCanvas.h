@@ -131,6 +131,14 @@ private:
     bool RayCastParting(int mouseX, int mouseY,
         glm::vec3& outPos, glm::vec3& outNormal);
 
+    // Vent path computation and GPU upload
+    VentPath ComputeVentPath(const VentPoint& vp);
+    void     RebuildPathVBO();
+
+    // Fixture outer perimeter on the parting plane (convex hull in XZ)
+    void                   BuildFixturePerimeter();
+    std::vector<glm::vec2> m_fixturePerimeter;   // hull vertices in CCW order
+
     // Sphere mesh for vent point markers
     void BuildSphereGPU(float radius, int stacks, int slices);
 
@@ -149,6 +157,7 @@ private:
 
     // Vent placement points
     std::vector<VentPoint> m_ventPoints;
+    std::vector<VentPath>  m_ventPaths;    // parallel to m_ventPoints
 
     // Ghost preview for vent placement (follows mouse in PlaceVent mode)
     VentPoint m_ventGhost;
@@ -170,6 +179,16 @@ private:
     GLuint  m_sphereVBO = 0;
     GLuint  m_sphereEBO = 0;
     GLsizei m_sphereIndexCount = 0;
+
+    // Vent path line GPU resources
+    GLuint  m_pathVAO = 0;
+    GLuint  m_pathVBO = 0;
+    GLsizei m_pathVertexCount = 0;
+
+    // Flat (unlit) shader for vent path lines
+    GLuint m_flatProgram = 0;
+    GLint  m_flat_uVP = -1;
+    GLint  m_flat_uColor = -1;
 
     // Uniform locations — picking
     GLint m_pick_uMVP = -1;

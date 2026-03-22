@@ -172,7 +172,7 @@ void GLCanvas::ApplyRotation(float xDeg, float yDeg, float zDeg)
     m_objects[m_selectedIndex].pitchDeg += xDeg;
     m_objects[m_selectedIndex].yawDeg += yDeg;
     m_objects[m_selectedIndex].rollDeg += zDeg;
-    m_ventPoints.clear();
+    m_ventPoints.clear(); m_ventPaths.clear(); RebuildPathVBO();
     Refresh(false);
 }
 
@@ -180,7 +180,7 @@ void GLCanvas::ApplyTranslation(float x, float y, float z)
 {
     if (!HasSelection()) return;
     m_objects[m_selectedIndex].pos += glm::vec3(x, y, z);
-    m_ventPoints.clear();
+    m_ventPoints.clear(); m_ventPaths.clear(); RebuildPathVBO();
     Refresh(false);
 }
 
@@ -189,7 +189,7 @@ void GLCanvas::ApplyScale(float factor)
     if (!HasSelection()) return;
     m_objects[m_selectedIndex].scale =
         std::max(0.001f, m_objects[m_selectedIndex].scale * factor);
-    m_ventPoints.clear();
+    m_ventPoints.clear(); m_ventPaths.clear(); RebuildPathVBO();
     Refresh(false);
 }
 
@@ -197,13 +197,15 @@ void GLCanvas::CenterSelectedObject()
 {
     if (!HasSelection()) return;
     m_objects[m_selectedIndex].pos = glm::vec3(0.0f);
-    m_ventPoints.clear();
+    m_ventPoints.clear(); m_ventPaths.clear(); RebuildPathVBO();
     Refresh(false);
 }
 
 void GLCanvas::ClearVentPoints()
 {
     m_ventPoints.clear();
+    m_ventPaths.clear();
+    RebuildPathVBO();
     Refresh(false);
 }
 
@@ -623,23 +625,32 @@ bool GLCanvas::RayCastParting(int mouseX, int mouseY,
             const glm::vec3 wv1 = glm::vec3(model * glm::vec4(lv1, 1.0f));
             const glm::vec3 wv2 = glm::vec3(model * glm::vec4(lv2, 1.0f));
 
-            // Does this triangle straddle world y=0?
+            // Does this triangle touch the parting band [-0.1, +0.1]?
             const float minY = std::min({ wv0.y, wv1.y, wv2.y });
             const float maxY = std::max({ wv0.y, wv1.y, wv2.y });
-            if (minY >= 0.0f || maxY <= 0.0f) continue;
+            static constexpr float kBand = 0.1f;
+            if (minY >= kBand || maxY <= -kBand) continue;
 
-            // Find the two edges that cross y=0 and compute intersection points
+            // Find up to two points on or near y=0 for this triangle.
+            // Vertices inside the band are projected directly; edges crossing
+            // fully (below<->above) are interpolated to y=0.
             const glm::vec3 verts[3] = { wv0, wv1, wv2 };
-            glm::vec3 seg[2];
+            glm::vec3 seg[3];   // up to 3 candidates
             int       segCount = 0;
 
-            for (int e = 0; e < 3 && segCount < 2; ++e)
+            for (int v = 0; v < 3; ++v)
+                if (fabsf(verts[v].y) <= kBand)
+                    seg[segCount++] = glm::vec3(verts[v].x, 0.0f, verts[v].z);
+
+            for (int e = 0; e < 3 && segCount < 3; ++e)
             {
                 const glm::vec3& a = verts[e];
                 const glm::vec3& b = verts[(e + 1) % 3];
-                if ((a.y < 0.0f) == (b.y < 0.0f)) continue;   // same side
+                if (!((a.y < -kBand && b.y > kBand) || (a.y > kBand && b.y < -kBand))) continue;
                 const float alpha = -a.y / (b.y - a.y);
-                seg[segCount++] = a + alpha * (b - a);          // y == 0
+                glm::vec3 cross = a + alpha * (b - a);
+                cross.y = 0.0f;
+                seg[segCount++] = cross;
             }
             if (segCount < 2) continue;
 
@@ -673,6 +684,208 @@ bool GLCanvas::RayCastParting(int mouseX, int mouseY,
         outNormal = bestNormal;
     }
     return found;
+}
+
+// ---------------------------------------------------------------------------
+// BuildFixturePerimeter — collects all y=0 XZ crossing points from every
+// fixture triangle, then computes their 2D convex hull (Graham scan).
+// Result is cached in m_fixturePerimeter and is only rebuilt when fixtures
+// change, not per-frame.
+// ---------------------------------------------------------------------------
+
+// Convex hull helpers (2D in glm::vec2 = XZ plane)
+static float Cross2D(const glm::vec2& O, const glm::vec2& A, const glm::vec2& B)
+{
+    return (A.x - O.x) * (B.y - O.y) - (A.y - O.y) * (B.x - O.x);
+}
+
+static std::vector<glm::vec2> ConvexHull(std::vector<glm::vec2> pts)
+{
+    const int n = (int)pts.size();
+    if (n < 3) return pts;
+
+    // Sort by x, then y
+    std::sort(pts.begin(), pts.end(), [](const glm::vec2& a, const glm::vec2& b) {
+        return a.x < b.x || (a.x == b.x && a.y < b.y);
+        });
+
+    std::vector<glm::vec2> hull;
+    hull.reserve(2 * n);
+
+    // Lower hull
+    for (int i = 0; i < n; ++i)
+    {
+        while (hull.size() >= 2 &&
+            Cross2D(hull[hull.size() - 2], hull[hull.size() - 1], pts[i]) <= 0.0f)
+            hull.pop_back();
+        hull.push_back(pts[i]);
+    }
+
+    // Upper hull
+    const int lower_size = (int)hull.size() + 1;
+    for (int i = n - 2; i >= 0; --i)
+    {
+        while ((int)hull.size() >= lower_size &&
+            Cross2D(hull[hull.size() - 2], hull[hull.size() - 1], pts[i]) <= 0.0f)
+            hull.pop_back();
+        hull.push_back(pts[i]);
+    }
+
+    hull.pop_back();   // last point == first point
+    return hull;
+}
+
+void GLCanvas::BuildFixturePerimeter()
+{
+    m_fixturePerimeter.clear();
+
+    // Half-thickness of the virtual parting band (world units).
+    // Triangles whose Y extent overlaps [-kBand, +kBand] contribute points.
+    static constexpr float kBand = 0.1f;
+
+    // Vertex classification relative to the parting band.
+    enum class Side { Below, Band, Above };
+    auto classify = [](float y) -> Side {
+        if (y < -kBand) return Side::Below;
+        if (y > kBand) return Side::Above;
+        return Side::Band;
+        };
+
+    std::vector<glm::vec2> pts;
+
+    for (const auto& fix : m_fixtures)
+    {
+        if (fix.cpuVerts.empty() || fix.cpuIndices.empty()) continue;
+
+        const glm::mat4 model = fix.BuildModelMatrix();
+
+        for (size_t i = 0; i + 2 < fix.cpuIndices.size(); i += 3)
+        {
+            const uint32_t i0 = fix.cpuIndices[i];
+            const uint32_t i1 = fix.cpuIndices[i + 1];
+            const uint32_t i2 = fix.cpuIndices[i + 2];
+
+            const glm::vec3 lv0(fix.cpuVerts[i0 * 3], fix.cpuVerts[i0 * 3 + 1], fix.cpuVerts[i0 * 3 + 2]);
+            const glm::vec3 lv1(fix.cpuVerts[i1 * 3], fix.cpuVerts[i1 * 3 + 1], fix.cpuVerts[i1 * 3 + 2]);
+            const glm::vec3 lv2(fix.cpuVerts[i2 * 3], fix.cpuVerts[i2 * 3 + 1], fix.cpuVerts[i2 * 3 + 2]);
+
+            const glm::vec3 wv[3] = {
+                glm::vec3(model * glm::vec4(lv0, 1.0f)),
+                glm::vec3(model * glm::vec4(lv1, 1.0f)),
+                glm::vec3(model * glm::vec4(lv2, 1.0f))
+            };
+
+            const Side s[3] = { classify(wv[0].y), classify(wv[1].y), classify(wv[2].y) };
+
+            // Skip triangles entirely above or entirely below the band
+            if (s[0] == Side::Above && s[1] == Side::Above && s[2] == Side::Above) continue;
+            if (s[0] == Side::Below && s[1] == Side::Below && s[2] == Side::Below) continue;
+
+            // Any vertex inside the band is projected directly onto y=0
+            for (int v = 0; v < 3; ++v)
+                if (s[v] == Side::Band)
+                    pts.emplace_back(wv[v].x, wv[v].z);
+
+            // Edges that cross fully (Below<->Above, skipping Band vertices since
+            // those are already included) get an exact y=0 intersection point
+            for (int e = 0; e < 3; ++e)
+            {
+                const int      next = (e + 1) % 3;
+                const Side     sa = s[e];
+                const Side     sb = s[next];
+                const glm::vec3& a = wv[e];
+                const glm::vec3& b = wv[next];
+
+                // Only interpolate across a full Below<->Above crossing
+                if ((sa == Side::Below && sb == Side::Above) ||
+                    (sa == Side::Above && sb == Side::Below))
+                {
+                    const float alpha = -a.y / (b.y - a.y);
+                    const glm::vec3 crossing = a + alpha * (b - a);
+                    pts.emplace_back(crossing.x, crossing.z);
+                }
+            }
+        }
+    }
+
+    if (pts.size() >= 3)
+        m_fixturePerimeter = ConvexHull(pts);
+}
+
+// ---------------------------------------------------------------------------
+// ComputeVentPath — finds the closest point on the fixture perimeter hull
+// to the vent origin and draws a straight line to it on the parting plane.
+// ---------------------------------------------------------------------------
+VentPath GLCanvas::ComputeVentPath(const VentPoint& vp)
+{
+    VentPath result;
+    result.start = vp.worldPos;
+    result.valid = false;
+
+    if (m_fixturePerimeter.size() < 2)
+        return result;
+
+    const glm::vec2 origin(vp.worldPos.x, vp.worldPos.z);
+
+    float     bestDist = std::numeric_limits<float>::max();
+    glm::vec2 bestPt(0.0f);
+
+    const int n = (int)m_fixturePerimeter.size();
+    for (int i = 0; i < n; ++i)
+    {
+        const glm::vec2& A = m_fixturePerimeter[i];
+        const glm::vec2& B = m_fixturePerimeter[(i + 1) % n];
+
+        // Closest point on edge AB to origin
+        const glm::vec2 AB = B - A;
+        const float     len2 = glm::dot(AB, AB);
+        float           t = 0.0f;
+        if (len2 > 1e-10f)
+            t = glm::clamp(glm::dot(origin - A, AB) / len2, 0.0f, 1.0f);
+
+        const glm::vec2 closest = A + t * AB;
+        const float     dist = glm::length(closest - origin);
+
+        if (dist < bestDist)
+        {
+            bestDist = dist;
+            bestPt = closest;
+        }
+    }
+
+    result.end = glm::vec3(bestPt.x, 0.0f, bestPt.y);
+    result.valid = true;
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// RebuildPathVBO — uploads all vent path line vertices to the GPU.
+// Each path = 2 vertices of 3 floats = 6 floats.
+// ---------------------------------------------------------------------------
+void GLCanvas::RebuildPathVBO()
+{
+    if (!m_pathVAO) return;
+
+    std::vector<float> verts;
+    verts.reserve(m_ventPaths.size() * 6);
+    for (const VentPath& p : m_ventPaths)
+    {
+        if (!p.valid) continue;
+        verts.push_back(p.start.x); verts.push_back(p.start.y); verts.push_back(p.start.z);
+        verts.push_back(p.end.x);   verts.push_back(p.end.y);   verts.push_back(p.end.z);
+    }
+
+    m_pathVertexCount = (GLsizei)verts.size() / 3;
+
+    glBindVertexArray(m_pathVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, m_pathVBO);
+    glBufferData(GL_ARRAY_BUFFER,
+        (GLsizeiptr)(verts.size() * sizeof(float)),
+        verts.empty() ? nullptr : verts.data(),
+        GL_DYNAMIC_DRAW);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glBindVertexArray(0);
 }
 
 // ---------------------------------------------------------------------------
@@ -754,6 +967,24 @@ void GLCanvas::InitGLOnce()
     // Build vent-point marker sphere
     BuildSphereGPU(1.0f, 12, 16);
 
+    // Flat shader for vent path lines
+    {
+        GLuint fvs = Compile(GL_VERTEX_SHADER, m_shaders.vsFlat);
+        GLuint ffs = Compile(GL_FRAGMENT_SHADER, m_shaders.fsFlat);
+        m_flatProgram = Link(fvs, ffs);
+        m_flat_uVP = glGetUniformLocation(m_flatProgram, "uVP");
+        m_flat_uColor = glGetUniformLocation(m_flatProgram, "uColor");
+    }
+
+    // Vent path line VBO (dynamic, rebuilt whenever paths change)
+    glGenVertexArrays(1, &m_pathVAO);
+    glGenBuffers(1, &m_pathVBO);
+    glBindVertexArray(m_pathVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, m_pathVBO);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glBindVertexArray(0);
+
     m_inited = true;
 }
 
@@ -765,7 +996,10 @@ void GLCanvas::DestroyGL()
     m_objects.clear();
 
     if (m_outlineProgram) { glDeleteProgram(m_outlineProgram);        m_outlineProgram = 0; }
+    if (m_flatProgram) { glDeleteProgram(m_flatProgram);           m_flatProgram = 0; }
     if (m_fullscreenVAO) { glDeleteVertexArrays(1, &m_fullscreenVAO); m_fullscreenVAO = 0; }
+    if (m_pathVBO) { glDeleteBuffers(1, &m_pathVBO);              m_pathVBO = 0; }
+    if (m_pathVAO) { glDeleteVertexArrays(1, &m_pathVAO);         m_pathVAO = 0; }
     if (m_sphereEBO) { glDeleteBuffers(1, &m_sphereEBO);          m_sphereEBO = 0; }
     if (m_sphereVBO) { glDeleteBuffers(1, &m_sphereVBO);          m_sphereVBO = 0; }
     if (m_sphereVAO) { glDeleteVertexArrays(1, &m_sphereVAO);     m_sphereVAO = 0; }
@@ -968,6 +1202,11 @@ void GLCanvas::ImportStepFileAsFixture(const std::string& path)
     }
 
     progress.Update(step++, "Computing vertex normals...");
+
+    // Snapshot geometry before crease split (same pattern as ImportStepFile)
+    std::vector<float>    cpuVerts = res.meshes[0].vertices;
+    std::vector<uint32_t> cpuIndices = res.meshes[0].indices;
+
     ComputeVertexNormals_Pos3(res.meshes[0].vertices,
         res.meshes[0].indices,
         res.meshes[0].posNorm);
@@ -982,9 +1221,12 @@ void GLCanvas::ImportStepFileAsFixture(const std::string& path)
     m_fixtures.emplace_back();
     m_fixtures.back().role = ObjectRole::Fixture;
     m_fixtures.back().sourcePath = path;
+    m_fixtures.back().cpuVerts = std::move(cpuVerts);
+    m_fixtures.back().cpuIndices = std::move(cpuIndices);
     UploadMeshToGPU(res.meshes[0], m_fixtures.back());
 
     progress.Update(step++, "Done.");
+    BuildFixturePerimeter();
     Refresh(false);
 }
 
@@ -1206,6 +1448,72 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         glUseProgram(0);
     }
 
+    // ---- Vent path lines ---------------------------------------------------
+    if (m_flatProgram && m_pathVAO && m_pathVertexCount > 0)
+    {
+        glEnable(GL_DEPTH_TEST);
+        glLineWidth(2.0f);
+        glUseProgram(m_flatProgram);
+
+        const glm::mat4 VP = proj * view;
+        glUniformMatrix4fv(m_flat_uVP, 1, GL_FALSE, &VP[0][0]);
+
+        const glm::vec4 lineColor(0.10f, 0.92f, 0.25f, 1.0f);
+        glUniform4fv(m_flat_uColor, 1, &lineColor[0]);
+
+        glBindVertexArray(m_pathVAO);
+        glDrawArrays(GL_LINES, 0, m_pathVertexCount);
+        glBindVertexArray(0);
+        glLineWidth(1.0f);
+        glUseProgram(0);
+    }
+
+    // ---- DEBUG: fixture perimeter hull -------------------------------------
+    if (m_flatProgram && !m_fixturePerimeter.empty())
+    {
+        // Pack hull vertices into a temporary float buffer (y = 0)
+        std::vector<float> perimVerts;
+        perimVerts.reserve(m_fixturePerimeter.size() * 3);
+        for (const glm::vec2& p : m_fixturePerimeter)
+        {
+            perimVerts.push_back(p.x);
+            perimVerts.push_back(0.0f);
+            perimVerts.push_back(p.y);
+        }
+
+        GLuint tmpVAO = 0, tmpVBO = 0;
+        glGenVertexArrays(1, &tmpVAO);
+        glGenBuffers(1, &tmpVBO);
+        glBindVertexArray(tmpVAO);
+        glBindBuffer(GL_ARRAY_BUFFER, tmpVBO);
+        glBufferData(GL_ARRAY_BUFFER,
+            (GLsizeiptr)(perimVerts.size() * sizeof(float)),
+            perimVerts.data(), GL_STREAM_DRAW);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+        glEnableVertexAttribArray(0);
+
+        glDisable(GL_DEPTH_TEST);   // always draw on top
+        glLineWidth(2.0f);
+        glUseProgram(m_flatProgram);
+
+        const glm::mat4 VP = proj * view;
+        glUniformMatrix4fv(m_flat_uVP, 1, GL_FALSE, &VP[0][0]);
+
+        const glm::vec4 perimColor(1.0f, 0.4f, 0.0f, 1.0f);   // orange
+        glUniform4fv(m_flat_uColor, 1, &perimColor[0]);
+
+        glDrawArrays(GL_LINE_LOOP, 0,
+            (GLsizei)m_fixturePerimeter.size());
+
+        glLineWidth(1.0f);
+        glEnable(GL_DEPTH_TEST);
+        glUseProgram(0);
+        glBindVertexArray(0);
+
+        glDeleteBuffers(1, &tmpVBO);
+        glDeleteVertexArrays(1, &tmpVAO);
+    }
+
     SwapBuffers();
 }
 
@@ -1231,7 +1539,10 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
             glm::vec3 hitPos, hitNormal;
             if (RayCastParting(p.x, p.y, hitPos, hitNormal))
             {
-                m_ventPoints.push_back({ hitPos, hitNormal });
+                const VentPoint vp{ hitPos, hitNormal };
+                m_ventPoints.push_back(vp);
+                m_ventPaths.push_back(ComputeVentPath(vp));
+                RebuildPathVBO();
                 Refresh(false);
             }
         }
@@ -1298,7 +1609,7 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
 
             m_objects[m_selectedIndex].pos += right * (dx * unitsPerPx);
             m_objects[m_selectedIndex].pos += forward * (-dyAdjusted * unitsPerPx);
-            m_ventPoints.clear();
+            m_ventPoints.clear(); m_ventPaths.clear(); RebuildPathVBO();
             Refresh(false);
         }
         else
@@ -1536,5 +1847,7 @@ void GLCanvas::ClearFixtures()
     for (auto& fix : m_fixtures)
         fix.mesh.Destroy();
     m_fixtures.clear();
+    m_fixturePerimeter.clear();
+    m_ventPoints.clear(); m_ventPaths.clear(); RebuildPathVBO();
     Refresh(false);
 }
