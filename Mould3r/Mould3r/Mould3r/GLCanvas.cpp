@@ -367,11 +367,30 @@ void GLCanvas::GenerateMould()
             BRepBuilderAPI_MakeFace face(wire.Wire(), /*onlyPlane=*/true);
             if (!face.IsDone()) continue;
 
-            // Extrude face along the vent path vector
-            const glm::vec3 sweep = vp.end - vp.start;
-            const gp_Vec    sweepVec(sweep.x, sweep.y, sweep.z);
+            // Extrude face along the vent path vector, extended by the stored overruns.
+            // The cross-section sits at path.start; shift it back by overrunStart,
+            // then extend the sweep by overrunStart + overrunEnd so both ends clear
+            // any surface co-planarity artifacts.
+            const glm::vec3 rawSweep = vp.end - vp.start;
+            const float     rawLen = glm::length(rawSweep);
+            if (rawLen < 1e-6f) continue;
+            const glm::vec3 sweepDir = rawSweep / rawLen;
 
-            BRepPrimAPI_MakePrism prism(face.Face(), sweepVec);
+            // Translate the face back by overrunStart before extruding
+            const glm::vec3 originOffset = -sweepDir * vp.overrunStart;
+            const gp_Trsf   offsetTrsf = [&]() {
+                gp_Trsf t;
+                t.SetTranslation(gp_Vec(originOffset.x, originOffset.y, originOffset.z));
+                return t;
+                }();
+            const TopoDS_Shape offsetFace =
+                BRepBuilderAPI_Transform(face.Face(), offsetTrsf, /*copy=*/true).Shape();
+
+            const float     totalLen = rawLen + vp.overrunStart + vp.overrunEnd;
+            const glm::vec3 totalSweep = sweepDir * totalLen;
+            const gp_Vec    sweepVec(totalSweep.x, totalSweep.y, totalSweep.z);
+
+            BRepPrimAPI_MakePrism prism(offsetFace, sweepVec);
             if (!prism.IsDone() || prism.Shape().IsNull()) continue;
 
             BRepAlgoAPI_Cut ventCut(result, prism.Shape());
@@ -1041,14 +1060,19 @@ void GLCanvas::RebuildCrossSectionVBO()
 // BuildVentSolid — sweeps the rectangular cross-section along the vent path
 // to produce a closed prismatic mesh.
 //
+// overrunStart / overrunEnd extend the solid beyond path.start and path.end
+// respectively (along the path direction) so the cut geometry clears any
+// surface artifacts at both terminations.
+//
 // The prism has 6 faces:
-//   - Start cap  (at path.start, facing -pathDir)
-//   - End cap    (at path.end,   facing +pathDir)
+//   - Start cap  (at extended start, facing -pathDir)
+//   - End cap    (at extended end,   facing +pathDir)
 //   - 4 side quads connecting corresponding edges of start and end caps
 //
 // Vertex layout per vertex: [px, py, pz, nx, ny, nz]  (compatible with vsLit)
 // ---------------------------------------------------------------------------
-VentSolid GLCanvas::BuildVentSolid(const VentPath& path, float width, float depth)
+VentSolid GLCanvas::BuildVentSolid(const VentPath& path, float width, float depth,
+    float overrunStart, float overrunEnd)
 {
     VentSolid solid;
     solid.valid = false;
@@ -1067,6 +1091,15 @@ VentSolid GLCanvas::BuildVentSolid(const VentPath& path, float width, float dept
     const float hw = width * 0.5f;
     const float hd = depth * 0.5f;
 
+    // Sweep direction (start → end).  pathDir was built reversed, so sweep = -pathDir.
+    const glm::vec3 sweepDir = -pathDir;
+
+    // Extend the cap positions outward by the requested overrun amounts.
+    // overrunStart pushes the start cap back (opposite sweepDir).
+    // overrunEnd   pushes the end   cap forward (along sweepDir).
+    const glm::vec3 extendedStart = path.start - sweepDir * overrunStart;
+    const glm::vec3 extendedEnd = path.end + sweepDir * overrunEnd;
+
     // Build start and end corner sets (BL, BR, TR, TL)
     auto makeCorners = [&](const glm::vec3& centre) -> std::array<glm::vec3, 4>
         {
@@ -1078,11 +1111,10 @@ VentSolid GLCanvas::BuildVentSolid(const VentPath& path, float width, float dept
             } };
         };
 
-    const auto startC = makeCorners(path.start);
-    const auto endC = makeCorners(path.end);
+    const auto startC = makeCorners(extendedStart);
+    const auto endC = makeCorners(extendedEnd);
 
     // pathDir currently points start←end; sweep direction is start→end
-    const glm::vec3 sweepDir = -pathDir;
 
     // ---- Accumulate interleaved [pos(3) norm(3)] verts and indices ----
     std::vector<float>    verts;
@@ -1875,19 +1907,24 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
                 const VentPoint vp{ hitPos, hitNormal };
                 m_ventPoints.push_back(vp);
 
-                const VentPath path = ComputeVentPath(vp);
-                m_ventPaths.push_back(path);
-
                 // Read dimensions from the left-panel UI
-                float ventLength = 5.0f, ventWidth = 2.0f;
+                float ventLength = 5.0f, ventWidth = 2.0f,
+                    ventOverrunStart = 0.5f, ventOverrunEnd = 0.5f;
                 if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
-                    frame->GetVentDimensions(ventLength, ventWidth);
+                    frame->GetVentDimensions(ventLength, ventWidth,
+                        ventOverrunStart, ventOverrunEnd);
+
+                VentPath path = ComputeVentPath(vp);
+                path.overrunStart = ventOverrunStart;
+                path.overrunEnd = ventOverrunEnd;
+                m_ventPaths.push_back(path);
 
                 m_ventCrossSections.push_back(
                     BuildVentCrossSection(path, ventWidth, ventLength));
 
                 m_ventSolids.push_back(
-                    BuildVentSolid(path, ventWidth, ventLength));
+                    BuildVentSolid(path, ventWidth, ventLength,
+                        ventOverrunStart, ventOverrunEnd));
 
                 RebuildPathVBO();
                 RebuildCrossSectionVBO();

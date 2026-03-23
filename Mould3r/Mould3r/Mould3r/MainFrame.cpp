@@ -449,7 +449,8 @@ void MainFrame::OnClearVentPoints(wxCommandEvent&)
         m_canvas->ClearVentPoints();
 }
 
-void MainFrame::GetVentDimensions(float& outLength, float& outWidth) const
+void MainFrame::GetVentDimensions(float& outLength, float& outWidth,
+    float& outOverrunStart, float& outOverrunEnd) const
 {
     // Safe parse helper — returns defaultVal if text is empty or non-numeric
     auto parseField = [](wxTextCtrl* ctrl, float defaultVal) -> float
@@ -462,6 +463,8 @@ void MainFrame::GetVentDimensions(float& outLength, float& outWidth) const
 
     outLength = parseField(m_ventLength, 5.0f);
     outWidth = parseField(m_ventWidth, 2.0f);
+    outOverrunStart = parseField(m_ventOverrunStart, 0.5f);
+    outOverrunEnd = parseField(m_ventOverrunEnd, 0.5f);
 }
 
 // ---------------------------------------------------------------------------
@@ -618,17 +621,18 @@ wxPanel* MainFrame::CreateVentsContent(wxWindow* parent)
     auto* dimsSizer = new wxBoxSizer(wxVERTICAL);
 
     // Helper: labelled mm field
-    auto addDimRow = [&](const wxString& label, wxTextCtrl*& ctrl)
+    auto addDimRow = [&](const wxString& label, wxTextCtrl*& ctrl,
+        const wxString& defaultVal)
         {
             auto* row = new wxBoxSizer(wxHORIZONTAL);
 
             auto* lbl = new wxStaticText(m_ventDimsPanel, wxID_ANY, label,
-                wxDefaultPosition, wxSize(52, -1));
+                wxDefaultPosition, wxSize(90, -1));
             lbl->SetForegroundColour(kTextDefault);
             lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
                 wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
 
-            ctrl = new wxTextCtrl(m_ventDimsPanel, wxID_ANY, "0.0",
+            ctrl = new wxTextCtrl(m_ventDimsPanel, wxID_ANY, defaultVal,
                 wxDefaultPosition, wxSize(70, 22));
             ctrl->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
             ctrl->SetForegroundColour(kTextDefault);
@@ -645,8 +649,10 @@ wxPanel* MainFrame::CreateVentsContent(wxWindow* parent)
             dimsSizer->Add(row, 0, wxLEFT | wxTOP, 10);
         };
 
-    addDimRow("Length:", m_ventLength);
-    addDimRow("Width:", m_ventWidth);
+    addDimRow("Length:", m_ventLength, "5.0");
+    addDimRow("Width:", m_ventWidth, "2.0");
+    addDimRow("Overrun (start):", m_ventOverrunStart, "0.5");
+    addDimRow("Overrun (end):", m_ventOverrunEnd, "0.5");
 
     m_ventDimsPanel->SetSizer(dimsSizer);
     sizer->Add(m_ventDimsPanel, 0, wxEXPAND | wxBOTTOM, 10);

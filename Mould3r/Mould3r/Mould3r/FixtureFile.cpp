@@ -57,26 +57,102 @@ bool FixtureFile::Load(const std::string& path,
 
     const std::string baseDir = GetDirectory(path);
     out.fixturePath = path;
+    out.injectionPoints.clear();
+
+    // Section-aware parsing.
+    // Sections: [fixture], [injection_point.N]
+    // An injection_point block is committed to the list when the next section
+    // header (or EOF) is encountered.
+    enum class Section { None, Fixture, InjectionPoint };
+    Section     currentSection = Section::None;
+    InjectionPoint pendingPoint;
+    bool           hasPending = false;
+
+    auto commitPending = [&]()
+        {
+            if (hasPending)
+            {
+                out.injectionPoints.push_back(pendingPoint);
+                pendingPoint = InjectionPoint{};
+                hasPending = false;
+            }
+        };
 
     std::string line;
     while (std::getline(file, line))
     {
         line = Trim(line);
-        if (line.empty() || line[0] == '#' || line[0] == '[')
-            continue;
+        if (line.empty() || line[0] == '#') continue;
 
+        // ---- Section header ------------------------------------------------
+        if (line[0] == '[')
+        {
+            commitPending();
+
+            const std::string sectionName = Trim(line.substr(1, line.size() - 2));
+
+            if (sectionName == "fixture")
+            {
+                currentSection = Section::Fixture;
+            }
+            else if (sectionName.rfind("injection_point.", 0) == 0)
+            {
+                currentSection = Section::InjectionPoint;
+                hasPending = true;   // start accumulating a new point
+            }
+            else
+            {
+                currentSection = Section::None;
+            }
+            continue;
+        }
+
+        // ---- Key = value ---------------------------------------------------
         const auto eq = line.find('=');
         if (eq == std::string::npos) continue;
 
         const std::string key = Trim(line.substr(0, eq));
         const std::string value = Trim(line.substr(eq + 1));
 
-        // Resolve relative paths against the fixture file's directory
-        if (key == "modelA")
-            out.modelAPath = ResolveRelative(value, baseDir);
-        else if (key == "modelB")
-            out.modelBPath = ResolveRelative(value, baseDir);
+        if (currentSection == Section::Fixture)
+        {
+            if (key == "modelA")
+                out.modelAPath = ResolveRelative(value, baseDir);
+            else if (key == "modelB")
+                out.modelBPath = ResolveRelative(value, baseDir);
+        }
+        else if (currentSection == Section::InjectionPoint && hasPending)
+        {
+            if (key == "label")
+            {
+                pendingPoint.label = value;
+            }
+            else if (key == "type")
+            {
+                pendingPoint.type = (value == "axial")
+                    ? InjectionType::Axial
+                    : InjectionType::Radial;
+            }
+            else if (key == "x")
+            {
+                try { pendingPoint.x = std::stof(value); }
+                catch (...) {}
+            }
+            else if (key == "y")
+            {
+                try { pendingPoint.y = std::stof(value); }
+                catch (...) {}
+            }
+            else if (key == "z")
+            {
+                try { pendingPoint.z = std::stof(value); }
+                catch (...) {}
+            }
+        }
     }
+
+    // Commit any point that reached EOF without a following section header
+    commitPending();
 
     if (!out.IsValid())
     {
@@ -107,6 +183,19 @@ bool FixtureFile::Save(const std::string& path,
     file << "[fixture]\n";
     file << "modelA = " << relA << "\n";
     file << "modelB = " << relB << "\n";
+
+    // Write each injection point as its own numbered section
+    for (int i = 0; i < (int)def.injectionPoints.size(); ++i)
+    {
+        const InjectionPoint& ip = def.injectionPoints[i];
+
+        file << "\n[injection_point." << i << "]\n";
+        file << "label = " << ip.label << "\n";
+        file << "type  = " << (ip.type == InjectionType::Axial ? "axial" : "radial") << "\n";
+        file << "x     = " << ip.x << "\n";
+        file << "y     = " << ip.y << "\n";
+        file << "z     = " << ip.z << "\n";
+    }
 
     return true;
 }

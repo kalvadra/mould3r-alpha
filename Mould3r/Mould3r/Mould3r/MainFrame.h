@@ -23,7 +23,8 @@ public:
     void SetActiveTool(TransformMode mode);
 
     // Read current vent dimensions from the left-panel UI fields
-    void GetVentDimensions(float& outLength, float& outWidth) const;
+    void GetVentDimensions(float& outLength, float& outWidth,
+        float& outOverrunStart, float& outOverrunEnd) const;
 
 private:
     // Menu handlers
@@ -55,6 +56,8 @@ private:
     wxPanel* m_ventDimsPanel = nullptr;
     wxTextCtrl* m_ventLength = nullptr;
     wxTextCtrl* m_ventWidth = nullptr;
+    wxTextCtrl* m_ventOverrunStart = nullptr;
+    wxTextCtrl* m_ventOverrunEnd = nullptr;
 
     // Creates the top ribbon panel
     wxPanel* CreateRibbon(wxWindow* parent);

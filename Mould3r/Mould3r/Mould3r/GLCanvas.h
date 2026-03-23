@@ -141,7 +141,8 @@ private:
     void             RebuildCrossSectionVBO();
 
     // Vent solid (swept mesh)
-    VentSolid BuildVentSolid(const VentPath& path, float width, float depth);
+    VentSolid BuildVentSolid(const VentPath& path, float width, float depth,
+        float overrunStart = 0.0f, float overrunEnd = 0.0f);
 
     // Fixture outer perimeter on the parting plane (convex hull in XZ)
     void                   BuildFixturePerimeter();

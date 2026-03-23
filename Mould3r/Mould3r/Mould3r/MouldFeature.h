@@ -23,6 +23,11 @@ struct VentPath
     glm::vec3 start{ 0.0f };
     glm::vec3 end{ 0.0f };
     bool      valid = false;   // false if no fixture boundary was found
+
+    // Extra length added beyond start/end when building the cut solid,
+    // so the boolean subtraction clears any surface co-planarity artifacts.
+    float overrunStart = 0.0f;
+    float overrunEnd = 0.0f;
 };
 
 // ---------------------------------------------------------------------------
