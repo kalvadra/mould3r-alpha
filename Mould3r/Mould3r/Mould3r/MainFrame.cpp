@@ -92,6 +92,10 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
         m_canvas->ImportStepFileAsFixture(fixture.modelAPath);
     if (!fixture.modelBPath.empty())
         m_canvas->ImportStepFileAsFixture(fixture.modelBPath);
+
+    // Set the active injection point (first in the list for now)
+    if (!fixture.injectionPoints.empty())
+        m_canvas->SetActiveInjectionPoint(fixture.injectionPoints[0]);
 }
 
 // ---------------------------------------------------------------------------
@@ -211,6 +215,40 @@ wxPanel* MainFrame::CreateRibbon(wxWindow* parent)
     hSizer->Add(divider2, 0, wxALIGN_CENTER_VERTICAL);
     hSizer->AddSpacer(16);
 
+    // ---- SPRUES group ------------------------------------------------------
+    auto* spruesSizer = new wxBoxSizer(wxVERTICAL);
+    auto* spruesRow = new wxBoxSizer(wxHORIZONTAL);
+
+    m_btnPlaceSprue = new wxButton(panel, ID_PlaceSprue, "Place Sprue",
+        wxDefaultPosition, wxSize(90, 32));
+    m_btnPlaceSprue->SetToolTip("Place a sprue sphere at the active injection point");
+    m_btnPlaceSprue->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
+    m_btnPlaceSprue->SetForegroundColour(kTextDefault);
+    m_btnPlaceSprue->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
+    spruesRow->Add(m_btnPlaceSprue, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
+
+    auto* btnClearSprue = new wxButton(panel, ID_ClearSprue, "Clear",
+        wxDefaultPosition, wxSize(50, 32));
+    btnClearSprue->SetToolTip("Remove the placed sprue sphere");
+    btnClearSprue->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
+    btnClearSprue->SetForegroundColour(kTextDefault);
+    btnClearSprue->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
+    spruesRow->Add(btnClearSprue, 0, wxALIGN_CENTER_VERTICAL);
+
+    spruesSizer->Add(spruesRow, 0, wxALIGN_CENTER_HORIZONTAL);
+    spruesSizer->Add(addLabel("SPRUES"), 0, wxALIGN_CENTER_HORIZONTAL | wxTOP, 2);
+
+    hSizer->Add(spruesSizer, 0, wxALIGN_CENTER_VERTICAL | wxTOP | wxBOTTOM, 6);
+
+    // Vertical divider
+    hSizer->AddSpacer(16);
+    auto* divider3 = new wxPanel(panel, wxID_ANY, wxDefaultPosition, wxSize(1, 36));
+    divider3->SetBackgroundColour(wxColour(0x38, 0x44, 0x55));
+    hSizer->Add(divider3, 0, wxALIGN_CENTER_VERTICAL);
+    hSizer->AddSpacer(16);
+
     // ---- Hint label --------------------------------------------------------
     auto* hint = new wxStaticText(panel, wxID_ANY,
         "LMB: orbit / transform    MMB: pan    Scroll: zoom    Shift+LMB: pan");
@@ -230,6 +268,8 @@ wxPanel* MainFrame::CreateRibbon(wxWindow* parent)
     Bind(wxEVT_BUTTON, &MainFrame::OnToolCenter, this, ID_ToolCenter);
     Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolPlaceVent, this, ID_ToolPlaceVent);
     Bind(wxEVT_BUTTON, &MainFrame::OnClearVentPoints, this, ID_ClearVentPoints);
+    Bind(wxEVT_BUTTON, &MainFrame::OnPlaceSprue, this, ID_PlaceSprue);
+    Bind(wxEVT_BUTTON, &MainFrame::OnClearSprue, this, ID_ClearSprue);
 
     return panel;
 }
@@ -447,6 +487,18 @@ void MainFrame::OnClearVentPoints(wxCommandEvent&)
 {
     if (m_canvas)
         m_canvas->ClearVentPoints();
+}
+
+void MainFrame::OnPlaceSprue(wxCommandEvent&)
+{
+    if (m_canvas)
+        m_canvas->PlaceSprue();
+}
+
+void MainFrame::OnClearSprue(wxCommandEvent&)
+{
+    if (m_canvas)
+        m_canvas->ClearSprue();
 }
 
 void MainFrame::GetVentDimensions(float& outLength, float& outWidth,

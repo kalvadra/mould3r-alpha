@@ -40,6 +40,9 @@ private:
     void OnToolCenter(wxCommandEvent& evt);
     void OnToolPlaceVent(wxCommandEvent& evt);
 
+    void OnPlaceSprue(wxCommandEvent&);
+    void OnClearSprue(wxCommandEvent&);
+
     // Activates a tool button and deactivates the others (also called by GLCanvas on Escape)
 
     //Creates the left panel
@@ -73,6 +76,9 @@ private:
     // Vent tool button (ribbon — Vents group)
     wxToggleButton* m_btnPlaceVent = nullptr;
 
+    // Sprue tool buttons (ribbon — Sprues group)
+    wxButton* m_btnPlaceSprue = nullptr;
+
     wxPanel* m_sidePanel = nullptr;
     wxTextCtrl* m_exportPath = nullptr;
 
@@ -95,6 +101,8 @@ private:
         ID_Export,
         ID_GenerateMould,
         ID_ChangeFixture,
-        ID_ClearVentPoints
+        ID_ClearVentPoints,
+        ID_PlaceSprue,
+        ID_ClearSprue
     };
 };

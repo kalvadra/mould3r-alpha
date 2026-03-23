@@ -105,6 +105,11 @@ public:
     const std::vector<VentPoint>& GetVentPoints() const { return m_ventPoints; }
     void ClearVentPoints();
 
+    // Sprue placement
+    void SetActiveInjectionPoint(const InjectionPoint& ip);
+    void PlaceSprue();
+    void ClearSprue();
+
 private:
     void OnPaint(wxPaintEvent& evt);
     void OnResize(wxSizeEvent& evt);
@@ -144,6 +149,15 @@ private:
     VentSolid BuildVentSolid(const VentPath& path, float width, float depth,
         float overrunStart = 0.0f, float overrunEnd = 0.0f);
 
+    // World-space ray cast against imported objects (no mouse unprojection).
+    // Fires from 'origin' along 'dir' up to 'maxDist' world units.
+    // Returns true and fills outPos with the closest hit; outPos is undefined on miss.
+    bool RayCastWorldRay(const glm::vec3& origin, const glm::vec3& dir,
+        float maxDist, glm::vec3& outPos);
+
+    // Sprue path GPU upload
+    void RebuildSpruePathVBO();
+
     // Fixture outer perimeter on the parting plane (convex hull in XZ)
     void                   BuildFixturePerimeter();
     std::vector<glm::vec2> m_fixturePerimeter;   // hull vertices in CCW order
@@ -170,6 +184,14 @@ private:
     std::vector<VentCrossSection> m_ventCrossSections;  // parallel to m_ventPoints
     std::vector<VentSolid>        m_ventSolids;         // parallel to m_ventPoints
 
+    // Sprue state
+    InjectionPoint m_activeInjectionPoint;         // set from fixture on load
+    bool           m_hasActiveInjectionPoint = false;
+    glm::vec3      m_sprueWorldPos{ 0.0f };        // world-space position of placed sphere
+    bool           m_hasSpruePoint = false;
+    glm::vec3      m_spruePathStart{ 0.0f };       // injection point (= m_sprueWorldPos)
+    glm::vec3      m_spruePathEnd{ 0.0f };         // object hit or y=0 projection
+
     // Ghost preview for vent placement (follows mouse in PlaceVent mode)
     VentPoint m_ventGhost;
     bool      m_ventGhostActive = false;
@@ -195,6 +217,11 @@ private:
     GLuint  m_pathVAO = 0;
     GLuint  m_pathVBO = 0;
     GLsizei m_pathVertexCount = 0;
+
+    // Sprue path line GPU resources
+    GLuint  m_spruePathVAO = 0;
+    GLuint  m_spruePathVBO = 0;
+    GLsizei m_spruePathVertexCount = 0;
 
     // Vent cross-section GPU resources
     GLuint  m_xsecVAO = 0;

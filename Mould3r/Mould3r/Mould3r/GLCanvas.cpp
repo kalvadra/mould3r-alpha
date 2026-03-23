@@ -220,6 +220,92 @@ void GLCanvas::ClearVentPoints()
 }
 
 // ---------------------------------------------------------------------------
+// Sprue placement
+// ---------------------------------------------------------------------------
+
+// RebuildSpruePathVBO — uploads the two path endpoints as a single GL_LINES pair.
+void GLCanvas::RebuildSpruePathVBO()
+{
+    if (!m_spruePathVAO) return;
+
+    glBindVertexArray(m_spruePathVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, m_spruePathVBO);
+
+    if (m_hasSpruePoint)
+    {
+        const float verts[6] = {
+            m_spruePathStart.x, m_spruePathStart.y, m_spruePathStart.z,
+            m_spruePathEnd.x,   m_spruePathEnd.y,   m_spruePathEnd.z
+        };
+        glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_DYNAMIC_DRAW);
+        m_spruePathVertexCount = 2;
+    }
+    else
+    {
+        glBufferData(GL_ARRAY_BUFFER, 0, nullptr, GL_DYNAMIC_DRAW);
+        m_spruePathVertexCount = 0;
+    }
+
+    glBindVertexArray(0);
+}
+
+void GLCanvas::SetActiveInjectionPoint(const InjectionPoint& ip)
+{
+    m_activeInjectionPoint = ip;
+    m_hasActiveInjectionPoint = true;
+    // Clear any previously placed sphere so stale geometry isn't shown
+    // after a fixture change.
+    m_hasSpruePoint = false;
+    RebuildSpruePathVBO();
+    Refresh(false);
+}
+
+void GLCanvas::PlaceSprue()
+{
+    if (!m_hasActiveInjectionPoint) return;
+
+    // Transform the injection point from fixture-local space to world space.
+    glm::vec4 localPos(m_activeInjectionPoint.x,
+        m_activeInjectionPoint.y,
+        m_activeInjectionPoint.z,
+        1.0f);
+
+    glm::mat4 fixtureMatrix(1.0f);
+    if (!m_fixtures.empty())
+        fixtureMatrix = m_fixtures[0].BuildModelMatrix();
+
+    m_sprueWorldPos = glm::vec3(fixtureMatrix * localPos);
+    m_hasSpruePoint = true;
+    m_spruePathStart = m_sprueWorldPos;
+
+    // Fire a ray straight down toward y=0, max 1000mm (1m).
+    constexpr float kMaxDist = 1000.0f;
+    const glm::vec3 rayDir(0.0f, -1.0f, 0.0f);
+
+    glm::vec3 hitPos;
+    if (RayCastWorldRay(m_sprueWorldPos, rayDir, kMaxDist, hitPos))
+    {
+        // Ray hit an object — path terminates at the surface
+        m_spruePathEnd = hitPos;
+    }
+    else
+    {
+        // No object hit — path terminates at the y=0 parting plane
+        m_spruePathEnd = glm::vec3(m_sprueWorldPos.x, 0.0f, m_sprueWorldPos.z);
+    }
+
+    RebuildSpruePathVBO();
+    Refresh(false);
+}
+
+void GLCanvas::ClearSprue()
+{
+    m_hasSpruePoint = false;
+    RebuildSpruePathVBO();
+    Refresh(false);
+}
+
+// ---------------------------------------------------------------------------
 // Generate Mould Operation — Cuts objects, vents, runners, and sprues from blank mold halves
 // ---------------------------------------------------------------------------
 void GLCanvas::GenerateMould()
@@ -624,6 +710,56 @@ bool GLCanvas::RayCastObjects(int mouseX, int mouseY,
                 if (glm::dot(outNormal, rayDir) > 0.0f)
                     outNormal = -outNormal;
 
+                hit = true;
+            }
+        }
+    }
+
+    return hit;
+}
+
+// ---------------------------------------------------------------------------
+// RayCastWorldRay — fires a pre-built world-space ray against all imported
+// objects (Möller–Trumbore, front-faces only).  Returns the closest hit.
+// Unlike RayCastObjects this takes an explicit origin + direction rather than
+// unprojecting mouse coordinates, so it can be called without a mouse event.
+// ---------------------------------------------------------------------------
+bool GLCanvas::RayCastWorldRay(const glm::vec3& origin, const glm::vec3& dir,
+    float maxDist, glm::vec3& outPos)
+{
+    float bestT = maxDist;
+    bool  hit = false;
+
+    for (const auto& obj : m_objects)
+    {
+        if (obj.cpuVerts.empty() || obj.cpuIndices.empty()) continue;
+
+        const glm::mat4 model = obj.BuildModelMatrix();
+        const glm::mat4 invModel = glm::inverse(model);
+
+        const glm::vec3 localOrig = glm::vec3(invModel * glm::vec4(origin, 1.0f));
+        const glm::vec3 localDir = glm::normalize(glm::vec3(invModel * glm::vec4(dir, 0.0f)));
+
+        for (size_t i = 0; i + 2 < obj.cpuIndices.size(); i += 3)
+        {
+            const uint32_t i0 = obj.cpuIndices[i];
+            const uint32_t i1 = obj.cpuIndices[i + 1];
+            const uint32_t i2 = obj.cpuIndices[i + 2];
+
+            const glm::vec3 v0(obj.cpuVerts[i0 * 3], obj.cpuVerts[i0 * 3 + 1], obj.cpuVerts[i0 * 3 + 2]);
+            const glm::vec3 v1(obj.cpuVerts[i1 * 3], obj.cpuVerts[i1 * 3 + 1], obj.cpuVerts[i1 * 3 + 2]);
+            const glm::vec3 v2(obj.cpuVerts[i2 * 3], obj.cpuVerts[i2 * 3 + 1], obj.cpuVerts[i2 * 3 + 2]);
+
+            float localT = 0.0f;
+            if (!RayTriangle(localOrig, localDir, v0, v1, v2, localT)) continue;
+
+            const glm::vec3 worldHit = glm::vec3(model * glm::vec4(localOrig + localDir * localT, 1.0f));
+            const float     worldT = glm::length(worldHit - origin);
+
+            if (worldT < bestT)
+            {
+                bestT = worldT;
+                outPos = worldHit;
                 hit = true;
             }
         }
@@ -1287,6 +1423,15 @@ void GLCanvas::InitGLOnce()
     glEnableVertexAttribArray(0);
     glBindVertexArray(0);
 
+    // Sprue path line VBO (dynamic, holds a single start→end segment)
+    glGenVertexArrays(1, &m_spruePathVAO);
+    glGenBuffers(1, &m_spruePathVBO);
+    glBindVertexArray(m_spruePathVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, m_spruePathVBO);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glBindVertexArray(0);
+
     m_inited = true;
 }
 
@@ -1306,6 +1451,8 @@ void GLCanvas::DestroyGL()
     if (m_pathVAO) { glDeleteVertexArrays(1, &m_pathVAO);         m_pathVAO = 0; }
     if (m_xsecVBO) { glDeleteBuffers(1, &m_xsecVBO);              m_xsecVBO = 0; }
     if (m_xsecVAO) { glDeleteVertexArrays(1, &m_xsecVAO);         m_xsecVAO = 0; }
+    if (m_spruePathVBO) { glDeleteBuffers(1, &m_spruePathVBO);         m_spruePathVBO = 0; }
+    if (m_spruePathVAO) { glDeleteVertexArrays(1, &m_spruePathVAO);    m_spruePathVAO = 0; }
     if (m_sphereEBO) { glDeleteBuffers(1, &m_sphereEBO);          m_sphereEBO = 0; }
     if (m_sphereVBO) { glDeleteBuffers(1, &m_sphereVBO);          m_sphereVBO = 0; }
     if (m_sphereVAO) { glDeleteVertexArrays(1, &m_sphereVAO);     m_sphereVAO = 0; }
@@ -1751,6 +1898,57 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         }
 
         glBindVertexArray(0);
+        glUseProgram(0);
+    }
+
+    // ---- Sprue sphere (purple) ---------------------------------------------
+    if (m_program && m_sphereVAO && m_sphereIndexCount > 0 && m_hasSpruePoint)
+    {
+        glEnable(GL_DEPTH_TEST);
+        glUseProgram(m_program);
+
+        glUniform3fv(glGetUniformLocation(m_program, "uCameraPos"), 1, &camPos[0]);
+        glUniform3fv(glGetUniformLocation(m_program, "uLightDir"), 1, &lightDir[0]);
+        glUniform3fv(glGetUniformLocation(m_program, "uLightColor"), 1, &lightColor[0]);
+        glUniform1f(glGetUniformLocation(m_program, "uAmbient"), 0.35f);
+        glUniform1f(glGetUniformLocation(m_program, "uDiffuse"), 0.75f);
+        glUniform1f(glGetUniformLocation(m_program, "uSpecular"), 0.60f);
+        glUniform1f(glGetUniformLocation(m_program, "uShininess"), 48.0f);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uView"), 1, GL_FALSE, &view[0][0]);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uProj"), 1, GL_FALSE, &proj[0][0]);
+
+        const glm::vec3 sprueColor(0.65f, 0.10f, 0.90f);   // purple
+        glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &sprueColor[0]);
+        glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 1.0f);
+
+        glBindVertexArray(m_sphereVAO);
+        glm::mat4 model = glm::translate(glm::mat4(1.0f), m_sprueWorldPos);
+        model = glm::scale(model, glm::vec3(kVentMarkerRadius * 1.5f));  // slightly larger than vent spheres
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &model[0][0]);
+        glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
+        glBindVertexArray(0);
+
+        glUseProgram(0);
+    }
+
+    // ---- Sprue path line (purple) ------------------------------------------
+    if (m_flatProgram && m_spruePathVAO && m_spruePathVertexCount > 0)
+    {
+        glEnable(GL_DEPTH_TEST);
+        glLineWidth(2.5f);
+        glUseProgram(m_flatProgram);
+
+        const glm::mat4 VP = proj * view;
+        glUniformMatrix4fv(m_flat_uVP, 1, GL_FALSE, &VP[0][0]);
+
+        const glm::vec4 sprueLineColor(0.65f, 0.10f, 0.90f, 1.0f);   // purple
+        glUniform4fv(m_flat_uColor, 1, &sprueLineColor[0]);
+
+        glBindVertexArray(m_spruePathVAO);
+        glDrawArrays(GL_LINES, 0, m_spruePathVertexCount);
+        glBindVertexArray(0);
+
+        glLineWidth(1.0f);
         glUseProgram(0);
     }
 
