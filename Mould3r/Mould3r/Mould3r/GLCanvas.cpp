@@ -255,6 +255,7 @@ void GLCanvas::SetActiveInjectionPoint(const InjectionPoint& ip)
     m_hasActiveInjectionPoint = true;
     // Clear any previously placed sphere so stale geometry isn't shown
     // after a fixture change.
+    m_isDirectInjection = false;
     m_hasSpruePoint = false;
     RebuildSpruePathVBO();
     Refresh(false);
@@ -285,13 +286,15 @@ void GLCanvas::PlaceSprue()
     glm::vec3 hitPos;
     if (RayCastWorldRay(m_sprueWorldPos, rayDir, kMaxDist, hitPos))
     {
-        // Ray hit an object — path terminates at the surface
+        // Ray hit an object — this is a direct-injection mould
         m_spruePathEnd = hitPos;
+        m_isDirectInjection = true;
     }
     else
     {
         // No object hit — path terminates at the y=0 parting plane
         m_spruePathEnd = glm::vec3(m_sprueWorldPos.x, 0.0f, m_sprueWorldPos.z);
+        m_isDirectInjection = false;
     }
 
     RebuildSpruePathVBO();
@@ -301,6 +304,7 @@ void GLCanvas::PlaceSprue()
 void GLCanvas::ClearSprue()
 {
     m_hasSpruePoint = false;
+    m_isDirectInjection = false;
     RebuildSpruePathVBO();
     Refresh(false);
 }

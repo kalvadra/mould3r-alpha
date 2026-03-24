@@ -53,6 +53,7 @@ private:
     wxPanel* CreateCollapsibleSection(wxWindow* parent, wxSizer* parentSizer,
         const wxString& title, wxPanel** contentOut = nullptr);
     wxPanel* CreateVentsContent(wxWindow* parent);
+    wxPanel* CreateSpruesContent(wxWindow* parent);
 
     // Vent field members
     wxChoice* m_ventTypeChoice = nullptr;
@@ -61,6 +62,10 @@ private:
     wxTextCtrl* m_ventWidth = nullptr;
     wxTextCtrl* m_ventOverrunStart = nullptr;
     wxTextCtrl* m_ventOverrunEnd = nullptr;
+
+    // Sprue field members
+    wxChoice* m_sprueTypeChoice = nullptr;
+    wxTextCtrl* m_sprueDiameter = nullptr;
 
     // Creates the top ribbon panel
     wxPanel* CreateRibbon(wxWindow* parent);

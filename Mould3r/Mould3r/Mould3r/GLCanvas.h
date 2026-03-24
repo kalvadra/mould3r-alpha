@@ -109,6 +109,7 @@ public:
     void SetActiveInjectionPoint(const InjectionPoint& ip);
     void PlaceSprue();
     void ClearSprue();
+    bool IsDirectInjection() const { return m_isDirectInjection; }
 
 private:
     void OnPaint(wxPaintEvent& evt);
@@ -187,6 +188,7 @@ private:
     // Sprue state
     InjectionPoint m_activeInjectionPoint;         // set from fixture on load
     bool           m_hasActiveInjectionPoint = false;
+    bool           m_isDirectInjection = false;    // true when sprue ray hits a body directly
     glm::vec3      m_sprueWorldPos{ 0.0f };        // world-space position of placed sphere
     bool           m_hasSpruePoint = false;
     glm::vec3      m_spruePathStart{ 0.0f };       // injection point (= m_sprueWorldPos)

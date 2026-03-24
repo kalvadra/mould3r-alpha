@@ -722,6 +722,75 @@ wxPanel* MainFrame::CreateVentsContent(wxWindow* parent)
     return panel;
 }
 
+wxPanel* MainFrame::CreateSpruesContent(wxWindow* parent)
+{
+    auto* panel = new wxPanel(parent, wxID_ANY);
+    panel->SetBackgroundColour(kRibbonBg);
+
+    auto* sizer = new wxBoxSizer(wxVERTICAL);
+
+    // ---- Sprue type dropdown -----------------------------------------------
+    auto* typeLabel = new wxStaticText(panel, wxID_ANY, "Sprue type:");
+    typeLabel->SetForegroundColour(kTextDefault);
+    typeLabel->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+    sizer->Add(typeLabel, 0, wxLEFT | wxTOP, 10);
+
+    m_sprueTypeChoice = new wxChoice(panel, wxID_ANY);
+    m_sprueTypeChoice->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
+    m_sprueTypeChoice->SetForegroundColour(kTextDefault);
+    m_sprueTypeChoice->Append("Cylinder");
+    m_sprueTypeChoice->SetSelection(0);
+    sizer->Add(m_sprueTypeChoice, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
+
+    // ---- Dimensions panel (shown for Cylinder) -----------------------------
+    auto* dimsPanel = new wxPanel(panel, wxID_ANY);
+    dimsPanel->SetBackgroundColour(kRibbonBg);
+
+    auto* dimsSizer = new wxBoxSizer(wxVERTICAL);
+
+    // Diameter row
+    {
+        auto* row = new wxBoxSizer(wxHORIZONTAL);
+
+        auto* lbl = new wxStaticText(dimsPanel, wxID_ANY, "Diameter:",
+            wxDefaultPosition, wxSize(60, -1));
+        lbl->SetForegroundColour(kTextDefault);
+        lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+
+        m_sprueDiameter = new wxTextCtrl(dimsPanel, wxID_ANY, "5.0",
+            wxDefaultPosition, wxSize(70, 22));
+        m_sprueDiameter->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
+        m_sprueDiameter->SetForegroundColour(kTextDefault);
+
+        auto* unit = new wxStaticText(dimsPanel, wxID_ANY, "mm");
+        unit->SetForegroundColour(wxColour(0x55, 0x6A, 0x85));
+        unit->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+
+        row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
+        row->Add(m_sprueDiameter, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
+        row->Add(unit, 0, wxALIGN_CENTER_VERTICAL);
+        dimsSizer->Add(row, 0, wxLEFT | wxTOP, 10);
+    }
+
+    dimsPanel->SetSizer(dimsSizer);
+    sizer->Add(dimsPanel, 0, wxEXPAND | wxBOTTOM, 10);
+
+    panel->SetSizer(sizer);
+
+    // Show/hide dims based on type selection (future-proofed for more types)
+    m_sprueTypeChoice->Bind(wxEVT_CHOICE, [dimsPanel, this](wxCommandEvent&)
+        {
+            dimsPanel->Show(m_sprueTypeChoice->GetStringSelection() == "Cylinder");
+            dimsPanel->GetParent()->Layout();
+            dimsPanel->GetParent()->GetParent()->Layout();
+        });
+
+    return panel;
+}
+
 wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
 {
     auto* panel = new wxPanel(parent, wxID_ANY,
@@ -745,7 +814,9 @@ wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
     sizer->AddSpacer(4);
 
     // ---- Collapsible sections ----------------------------------------------
-    CreateCollapsibleSection(panel, sizer, "Sprues");
+    // Sprues — custom content
+    wxPanel* spruesContent = CreateSpruesContent(panel);
+    CreateCollapsibleSection(panel, sizer, "Sprues", &spruesContent);
     CreateCollapsibleSection(panel, sizer, "Runners");
     CreateCollapsibleSection(panel, sizer, "Gates");
     // Vents — custom content
