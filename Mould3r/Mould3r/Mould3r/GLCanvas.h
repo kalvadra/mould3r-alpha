@@ -159,6 +159,13 @@ private:
     // Sprue path GPU upload
     void RebuildSpruePathVBO();
 
+    // Sprue cross-section circle GPU upload (N-segment line-loop approximation)
+    void RebuildSprueXsecVBO();
+
+    // Sprue solid — swept cylinder mesh (same GPU layout as VentSolid)
+    VentSolid BuildSprueSolid(const glm::vec3& start, const glm::vec3& end,
+        float radius, int segments = 32);
+
     // Fixture outer perimeter on the parting plane (convex hull in XZ)
     void                   BuildFixturePerimeter();
     std::vector<glm::vec2> m_fixturePerimeter;   // hull vertices in CCW order
@@ -189,10 +196,12 @@ private:
     InjectionPoint m_activeInjectionPoint;         // set from fixture on load
     bool           m_hasActiveInjectionPoint = false;
     bool           m_isDirectInjection = false;    // true when sprue ray hits a body directly
+    float          m_sprueRadius = 2.5f;           // radius of the sprue cylinder (mm)
     glm::vec3      m_sprueWorldPos{ 0.0f };        // world-space position of placed sphere
     bool           m_hasSpruePoint = false;
     glm::vec3      m_spruePathStart{ 0.0f };       // injection point (= m_sprueWorldPos)
     glm::vec3      m_spruePathEnd{ 0.0f };         // object hit or y=0 projection
+    VentSolid      m_sprueSolid;                   // swept cylinder mesh for preview
 
     // Ghost preview for vent placement (follows mouse in PlaceVent mode)
     VentPoint m_ventGhost;
@@ -224,6 +233,11 @@ private:
     GLuint  m_spruePathVAO = 0;
     GLuint  m_spruePathVBO = 0;
     GLsizei m_spruePathVertexCount = 0;
+
+    // Sprue cross-section circle GPU resources
+    GLuint  m_sprueXsecVAO = 0;
+    GLuint  m_sprueXsecVBO = 0;
+    GLsizei m_sprueXsecVertexCount = 0;
 
     // Vent cross-section GPU resources
     GLuint  m_xsecVAO = 0;

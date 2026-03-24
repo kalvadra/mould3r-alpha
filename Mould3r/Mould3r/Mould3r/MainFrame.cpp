@@ -519,6 +519,14 @@ void MainFrame::GetVentDimensions(float& outLength, float& outWidth,
     outOverrunEnd = parseField(m_ventOverrunEnd, 0.5f);
 }
 
+float MainFrame::GetSprueDiameter() const
+{
+    if (!m_sprueDiameter) return 5.0f;
+    double v = 5.0;
+    if (!m_sprueDiameter->GetValue().ToDouble(&v)) return 5.0f;
+    return (v > 0.0) ? static_cast<float>(v) : 5.0f;
+}
+
 // ---------------------------------------------------------------------------
 // Menu handlers
 // ---------------------------------------------------------------------------

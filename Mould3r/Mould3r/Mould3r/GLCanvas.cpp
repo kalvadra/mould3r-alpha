@@ -28,8 +28,11 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <string>
 #include <vector>
+
+#include <glm/gtc/constants.hpp>
 
 #include "camera.h"
 #include "FileImporter.h"
@@ -249,6 +252,187 @@ void GLCanvas::RebuildSpruePathVBO()
     glBindVertexArray(0);
 }
 
+// RebuildSprueXsecVBO — builds a circle of kSprueCircleSegments line pairs
+// centred at m_spruePathStart, lying in the plane perpendicular to the sprue
+// path direction, with radius m_sprueRadius.
+void GLCanvas::RebuildSprueXsecVBO()
+{
+    if (!m_sprueXsecVAO) return;
+
+    glBindVertexArray(m_sprueXsecVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, m_sprueXsecVBO);
+
+    if (!m_hasSpruePoint)
+    {
+        glBufferData(GL_ARRAY_BUFFER, 0, nullptr, GL_DYNAMIC_DRAW);
+        m_sprueXsecVertexCount = 0;
+        glBindVertexArray(0);
+        return;
+    }
+
+    // Path direction — normalise; fall back to world-Y if degenerate
+    glm::vec3 axisZ = m_spruePathEnd - m_spruePathStart;
+    const float axisLen = glm::length(axisZ);
+    axisZ = (axisLen > 1e-6f) ? axisZ / axisLen : glm::vec3(0.0f, -1.0f, 0.0f);
+
+    // Build two axes perpendicular to axisZ using Gram-Schmidt
+    glm::vec3 axisX = glm::abs(axisZ.x) < 0.9f
+        ? glm::vec3(1.0f, 0.0f, 0.0f)
+        : glm::vec3(0.0f, 1.0f, 0.0f);
+    axisX = glm::normalize(axisX - glm::dot(axisX, axisZ) * axisZ);
+    const glm::vec3 axisY = glm::cross(axisZ, axisX);
+
+    // Generate N evenly-spaced points around the circle, packed as GL_LINES pairs
+    constexpr int N = 32;
+    std::vector<float> verts;
+    verts.reserve(N * 6);   // 2 verts per segment × 3 floats
+
+    auto push = [&](const glm::vec3& v)
+        {
+            verts.push_back(v.x); verts.push_back(v.y); verts.push_back(v.z);
+        };
+
+    for (int i = 0; i < N; ++i)
+    {
+        const float t0 = (float(i) / float(N)) * glm::two_pi<float>();
+        const float t1 = (float(i + 1) / float(N)) * glm::two_pi<float>();
+        push(m_spruePathStart + m_sprueRadius * (std::cos(t0) * axisX + std::sin(t0) * axisY));
+        push(m_spruePathStart + m_sprueRadius * (std::cos(t1) * axisX + std::sin(t1) * axisY));
+    }
+
+    m_sprueXsecVertexCount = (GLsizei)verts.size() / 3;
+    glBufferData(GL_ARRAY_BUFFER,
+        (GLsizeiptr)(verts.size() * sizeof(float)),
+        verts.data(), GL_DYNAMIC_DRAW);
+    glBindVertexArray(0);
+}
+
+// ---------------------------------------------------------------------------
+// BuildSprueSolid — sweeps a circular cross-section from start to end to
+// produce a closed cylinder mesh.
+//
+// Vertex layout: [px, py, pz, nx, ny, nz]  (identical to BuildVentSolid,
+// compatible with the vsLit shader).
+//
+// The cylinder has three parts:
+//   - Start cap  : triangle fan, normal facing away from end
+//   - End cap    : triangle fan, normal facing away from start
+//   - Side quads : one quad per segment connecting the two rings
+// ---------------------------------------------------------------------------
+VentSolid GLCanvas::BuildSprueSolid(const glm::vec3& start, const glm::vec3& end,
+    float radius, int segments)
+{
+    VentSolid solid;
+    solid.valid = false;
+
+    const glm::vec3 axis = end - start;
+    const float     axisLen = glm::length(axis);
+    if (axisLen < 1e-6f || radius < 1e-6f) return solid;
+
+    // Sweep direction and two perpendicular axes (Gram-Schmidt)
+    const glm::vec3 axisZ = axis / axisLen;
+    glm::vec3 axisX = glm::abs(axisZ.x) < 0.9f
+        ? glm::vec3(1.0f, 0.0f, 0.0f)
+        : glm::vec3(0.0f, 1.0f, 0.0f);
+    axisX = glm::normalize(axisX - glm::dot(axisX, axisZ) * axisZ);
+    const glm::vec3 axisY = glm::cross(axisZ, axisX);
+
+    std::vector<float>    verts;
+    std::vector<uint32_t> idx;
+
+    // Helper: push one interleaved vertex
+    auto pushVert = [&](const glm::vec3& pos, const glm::vec3& norm)
+        {
+            verts.push_back(pos.x);  verts.push_back(pos.y);  verts.push_back(pos.z);
+            verts.push_back(norm.x); verts.push_back(norm.y); verts.push_back(norm.z);
+        };
+
+    // ---- Side surface ------------------------------------------------------
+    // Two rings of vertices — start ring then end ring, normals point outward
+    for (int cap = 0; cap < 2; ++cap)
+    {
+        const glm::vec3 centre = (cap == 0) ? start : end;
+        for (int i = 0; i < segments; ++i)
+        {
+            const float theta = (float(i) / float(segments)) * glm::two_pi<float>();
+            const glm::vec3 radial = std::cos(theta) * axisX + std::sin(theta) * axisY;
+            pushVert(centre + radius * radial, radial);
+        }
+    }
+    // Quads: startRing[i]→startRing[i+1]→endRing[i+1]→endRing[i]
+    for (int i = 0; i < segments; ++i)
+    {
+        const uint32_t s0 = (uint32_t)i;
+        const uint32_t s1 = (uint32_t)((i + 1) % segments);
+        const uint32_t e0 = (uint32_t)(segments + i);
+        const uint32_t e1 = (uint32_t)(segments + (i + 1) % segments);
+        idx.push_back(s0); idx.push_back(e0); idx.push_back(e1);
+        idx.push_back(s0); idx.push_back(e1); idx.push_back(s1);
+    }
+
+    // ---- Caps --------------------------------------------------------------
+    // Each cap: one centre vertex + segments rim vertices, assembled as a fan
+    auto addCap = [&](const glm::vec3& centre, const glm::vec3& capNorm)
+        {
+            const uint32_t centreIdx = (uint32_t)(verts.size() / 6);
+            pushVert(centre, capNorm);
+
+            const uint32_t rimBase = (uint32_t)(verts.size() / 6);
+            for (int i = 0; i < segments; ++i)
+            {
+                const float theta = (float(i) / float(segments)) * glm::two_pi<float>();
+                const glm::vec3 radial = std::cos(theta) * axisX + std::sin(theta) * axisY;
+                pushVert(centre + radius * radial, capNorm);
+            }
+            for (int i = 0; i < segments; ++i)
+            {
+                const uint32_t r0 = rimBase + (uint32_t)i;
+                const uint32_t r1 = rimBase + (uint32_t)((i + 1) % segments);
+                // Winding matches the cap normal direction
+                if (glm::dot(capNorm, axisZ) < 0.0f)
+                {
+                    idx.push_back(centreIdx); idx.push_back(r1); idx.push_back(r0);
+                }
+                else
+                {
+                    idx.push_back(centreIdx); idx.push_back(r0); idx.push_back(r1);
+                }
+            }
+        };
+
+    addCap(start, -axisZ);   // start cap faces away from end
+    addCap(end, +axisZ);   // end cap faces away from start
+
+    // ---- Upload to GPU ----
+    glGenVertexArrays(1, &solid.vao);
+    glGenBuffers(1, &solid.vbo);
+    glGenBuffers(1, &solid.ebo);
+
+    glBindVertexArray(solid.vao);
+    glBindBuffer(GL_ARRAY_BUFFER, solid.vbo);
+    glBufferData(GL_ARRAY_BUFFER,
+        (GLsizeiptr)(verts.size() * sizeof(float)),
+        verts.data(), GL_STATIC_DRAW);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, solid.ebo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+        (GLsizeiptr)(idx.size() * sizeof(uint32_t)),
+        idx.data(), GL_STATIC_DRAW);
+
+    // position  (location 0)
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    // normal (location 1)
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float),
+        (void*)(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+
+    glBindVertexArray(0);
+
+    solid.indexCount = (GLsizei)idx.size();
+    solid.valid = true;
+    return solid;
+}
+
 void GLCanvas::SetActiveInjectionPoint(const InjectionPoint& ip)
 {
     m_activeInjectionPoint = ip;
@@ -257,7 +441,9 @@ void GLCanvas::SetActiveInjectionPoint(const InjectionPoint& ip)
     // after a fixture change.
     m_isDirectInjection = false;
     m_hasSpruePoint = false;
+    m_sprueSolid.Destroy();
     RebuildSpruePathVBO();
+    RebuildSprueXsecVBO();
     Refresh(false);
 }
 
@@ -297,7 +483,16 @@ void GLCanvas::PlaceSprue()
         m_isDirectInjection = false;
     }
 
+    // Read sprue diameter from the left-panel UI
+    if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+        m_sprueRadius = frame->GetSprueDiameter() * 0.5f;
+
+    // Build the swept cylinder preview mesh
+    m_sprueSolid.Destroy();
+    m_sprueSolid = BuildSprueSolid(m_spruePathStart, m_spruePathEnd, m_sprueRadius);
+
     RebuildSpruePathVBO();
+    RebuildSprueXsecVBO();
     Refresh(false);
 }
 
@@ -305,7 +500,9 @@ void GLCanvas::ClearSprue()
 {
     m_hasSpruePoint = false;
     m_isDirectInjection = false;
+    m_sprueSolid.Destroy();
     RebuildSpruePathVBO();
+    RebuildSprueXsecVBO();
     Refresh(false);
 }
 
@@ -1436,6 +1633,15 @@ void GLCanvas::InitGLOnce()
     glEnableVertexAttribArray(0);
     glBindVertexArray(0);
 
+    // Sprue cross-section circle VBO (dynamic, N-segment line-loop)
+    glGenVertexArrays(1, &m_sprueXsecVAO);
+    glGenBuffers(1, &m_sprueXsecVBO);
+    glBindVertexArray(m_sprueXsecVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, m_sprueXsecVBO);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glBindVertexArray(0);
+
     m_inited = true;
 }
 
@@ -1447,6 +1653,7 @@ void GLCanvas::DestroyGL()
     m_objects.clear();
     for (auto& s : m_ventSolids) s.Destroy();
     m_ventSolids.clear();
+    m_sprueSolid.Destroy();
 
     if (m_outlineProgram) { glDeleteProgram(m_outlineProgram);        m_outlineProgram = 0; }
     if (m_flatProgram) { glDeleteProgram(m_flatProgram);           m_flatProgram = 0; }
@@ -1457,6 +1664,8 @@ void GLCanvas::DestroyGL()
     if (m_xsecVAO) { glDeleteVertexArrays(1, &m_xsecVAO);         m_xsecVAO = 0; }
     if (m_spruePathVBO) { glDeleteBuffers(1, &m_spruePathVBO);         m_spruePathVBO = 0; }
     if (m_spruePathVAO) { glDeleteVertexArrays(1, &m_spruePathVAO);    m_spruePathVAO = 0; }
+    if (m_sprueXsecVBO) { glDeleteBuffers(1, &m_sprueXsecVBO);         m_sprueXsecVBO = 0; }
+    if (m_sprueXsecVAO) { glDeleteVertexArrays(1, &m_sprueXsecVAO);    m_sprueXsecVAO = 0; }
     if (m_sphereEBO) { glDeleteBuffers(1, &m_sphereEBO);          m_sphereEBO = 0; }
     if (m_sphereVBO) { glDeleteBuffers(1, &m_sphereVBO);          m_sphereVBO = 0; }
     if (m_sphereVAO) { glDeleteVertexArrays(1, &m_sphereVAO);     m_sphereVAO = 0; }
@@ -1956,6 +2165,27 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         glUseProgram(0);
     }
 
+    // ---- Sprue cross-section circle (purple) -------------------------------
+    if (m_flatProgram && m_sprueXsecVAO && m_sprueXsecVertexCount > 0)
+    {
+        glEnable(GL_DEPTH_TEST);
+        glLineWidth(2.0f);
+        glUseProgram(m_flatProgram);
+
+        const glm::mat4 VP = proj * view;
+        glUniformMatrix4fv(m_flat_uVP, 1, GL_FALSE, &VP[0][0]);
+
+        const glm::vec4 sprueCircleColor(0.65f, 0.10f, 0.90f, 1.0f);   // purple
+        glUniform4fv(m_flat_uColor, 1, &sprueCircleColor[0]);
+
+        glBindVertexArray(m_sprueXsecVAO);
+        glDrawArrays(GL_LINES, 0, m_sprueXsecVertexCount);
+        glBindVertexArray(0);
+
+        glLineWidth(1.0f);
+        glUseProgram(0);
+    }
+
     // ---- Vent path lines ---------------------------------------------------
     if (m_flatProgram && m_pathVAO && m_pathVertexCount > 0)
     {
@@ -2030,6 +2260,40 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         }
 
         glBindVertexArray(0);
+        glUseProgram(0);
+        glDepthMask(GL_TRUE);
+        glDisable(GL_BLEND);
+    }
+
+    // ---- Sprue solid (lit, semi-transparent purple) ------------------------
+    if (m_program && m_sprueSolid.valid && m_sprueSolid.vao != 0)
+    {
+        glEnable(GL_DEPTH_TEST);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glDepthMask(GL_FALSE);
+
+        glUseProgram(m_program);
+
+        const glm::mat4 identity(1.0f);
+        const glm::vec3 sprueSolidColor(0.65f, 0.10f, 0.90f);   // purple
+        glUniform3fv(glGetUniformLocation(m_program, "uCameraPos"), 1, &camPos[0]);
+        glUniform3fv(glGetUniformLocation(m_program, "uLightDir"), 1, &lightDir[0]);
+        glUniform3fv(glGetUniformLocation(m_program, "uLightColor"), 1, &lightColor[0]);
+        glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &sprueSolidColor[0]);
+        glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 0.55f);
+        glUniform1f(glGetUniformLocation(m_program, "uAmbient"), 0.30f);
+        glUniform1f(glGetUniformLocation(m_program, "uDiffuse"), 0.80f);
+        glUniform1f(glGetUniformLocation(m_program, "uSpecular"), 0.40f);
+        glUniform1f(glGetUniformLocation(m_program, "uShininess"), 32.0f);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uView"), 1, GL_FALSE, &view[0][0]);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uProj"), 1, GL_FALSE, &proj[0][0]);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &identity[0][0]);
+
+        glBindVertexArray(m_sprueSolid.vao);
+        glDrawElements(GL_TRIANGLES, m_sprueSolid.indexCount, GL_UNSIGNED_INT, 0);
+        glBindVertexArray(0);
+
         glUseProgram(0);
         glDepthMask(GL_TRUE);
         glDisable(GL_BLEND);

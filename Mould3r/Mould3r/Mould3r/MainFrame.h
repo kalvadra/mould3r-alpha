@@ -26,6 +26,9 @@ public:
     void GetVentDimensions(float& outLength, float& outWidth,
         float& outOverrunStart, float& outOverrunEnd) const;
 
+    // Read current sprue dimensions from the left-panel UI fields
+    float GetSprueDiameter() const;
+
 private:
     // Menu handlers
     void OnImport(wxCommandEvent& evt);
