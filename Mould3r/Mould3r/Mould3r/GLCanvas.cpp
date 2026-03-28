@@ -24,12 +24,19 @@
 #include <opencascade/BRepBuilderAPI_MakeWire.hxx>
 #include <opencascade/BRepBuilderAPI_MakeFace.hxx>
 #include <opencascade/BRepPrimAPI_MakePrism.hxx>
+#include <opencascade/BRepPrimAPI_MakeCylinder.hxx>
+#include <opencascade/BRepPrimAPI_MakeCone.hxx>
+#include <opencascade/gp_Ax2.hxx>
+#include <opencascade/gp_Dir.hxx>
 #include <opencascade/gp_Vec.hxx>
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <string>
 #include <vector>
+
+#include <glm/gtc/constants.hpp>
 
 #include "camera.h"
 #include "FileImporter.h"
@@ -220,6 +227,358 @@ void GLCanvas::ClearVentPoints()
 }
 
 // ---------------------------------------------------------------------------
+// Sprue placement
+// ---------------------------------------------------------------------------
+
+// RebuildSpruePathVBO — uploads the two path endpoints as a single GL_LINES pair.
+void GLCanvas::RebuildSpruePathVBO()
+{
+    if (!m_spruePathVAO) return;
+
+    glBindVertexArray(m_spruePathVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, m_spruePathVBO);
+
+    if (m_hasSpruePoint)
+    {
+        const float verts[6] = {
+            m_spruePathStart.x, m_spruePathStart.y, m_spruePathStart.z,
+            m_spruePathEnd.x,   m_spruePathEnd.y,   m_spruePathEnd.z
+        };
+        glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_DYNAMIC_DRAW);
+        m_spruePathVertexCount = 2;
+    }
+    else
+    {
+        glBufferData(GL_ARRAY_BUFFER, 0, nullptr, GL_DYNAMIC_DRAW);
+        m_spruePathVertexCount = 0;
+    }
+
+    glBindVertexArray(0);
+}
+
+// RebuildSprueXsecVBO — builds a circle of kSprueCircleSegments line pairs
+// centred at m_spruePathStart, lying in the plane perpendicular to the sprue
+// path direction, with radius m_sprueRadius.
+void GLCanvas::RebuildSprueXsecVBO()
+{
+    if (!m_sprueXsecVAO) return;
+
+    glBindVertexArray(m_sprueXsecVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, m_sprueXsecVBO);
+
+    if (!m_hasSpruePoint)
+    {
+        glBufferData(GL_ARRAY_BUFFER, 0, nullptr, GL_DYNAMIC_DRAW);
+        m_sprueXsecVertexCount = 0;
+        glBindVertexArray(0);
+        return;
+    }
+
+    // Path direction — normalise; fall back to world-Y if degenerate
+    glm::vec3 axisZ = m_spruePathEnd - m_spruePathStart;
+    const float axisLen = glm::length(axisZ);
+    axisZ = (axisLen > 1e-6f) ? axisZ / axisLen : glm::vec3(0.0f, -1.0f, 0.0f);
+
+    // Build two axes perpendicular to axisZ using Gram-Schmidt
+    glm::vec3 axisX = glm::abs(axisZ.x) < 0.9f
+        ? glm::vec3(1.0f, 0.0f, 0.0f)
+        : glm::vec3(0.0f, 1.0f, 0.0f);
+    axisX = glm::normalize(axisX - glm::dot(axisX, axisZ) * axisZ);
+    const glm::vec3 axisY = glm::cross(axisZ, axisX);
+
+    // Generate N evenly-spaced points around the circle, packed as GL_LINES pairs
+    constexpr int N = 32;
+    std::vector<float> verts;
+    verts.reserve(N * 6);   // 2 verts per segment × 3 floats
+
+    auto push = [&](const glm::vec3& v)
+        {
+            verts.push_back(v.x); verts.push_back(v.y); verts.push_back(v.z);
+        };
+
+    for (int i = 0; i < N; ++i)
+    {
+        const float t0 = (float(i) / float(N)) * glm::two_pi<float>();
+        const float t1 = (float(i + 1) / float(N)) * glm::two_pi<float>();
+        push(m_spruePathStart + m_sprueRadius * (std::cos(t0) * axisX + std::sin(t0) * axisY));
+        push(m_spruePathStart + m_sprueRadius * (std::cos(t1) * axisX + std::sin(t1) * axisY));
+    }
+
+    m_sprueXsecVertexCount = (GLsizei)verts.size() / 3;
+    glBufferData(GL_ARRAY_BUFFER,
+        (GLsizeiptr)(verts.size() * sizeof(float)),
+        verts.data(), GL_DYNAMIC_DRAW);
+    glBindVertexArray(0);
+}
+
+// ---------------------------------------------------------------------------
+// BuildSprueSolid — sweeps a circular cross-section from start to end to
+// produce a closed frustum (tapered cylinder) mesh.
+//
+// draftAngleDeg controls the taper: the radius at 'start' equals 'radius',
+// and the radius at 'end' equals radius + axisLen * tan(draftAngleDeg).
+// When draftAngleDeg == 0 the result is a straight cylinder.
+//
+// Vertex layout: [px, py, pz, nx, ny, nz]  (identical to BuildVentSolid,
+// compatible with the vsLit shader).
+//
+// The solid has three parts:
+//   - Start cap  : triangle fan, normal facing away from end
+//   - End cap    : triangle fan, normal facing away from start
+//   - Side quads : one quad per segment connecting the two rings
+// ---------------------------------------------------------------------------
+VentSolid GLCanvas::BuildSprueSolid(const glm::vec3& start, const glm::vec3& end,
+    float radius, float draftAngleDeg, int segments)
+{
+    VentSolid solid;
+    solid.valid = false;
+
+    const glm::vec3 axis = end - start;
+    const float     axisLen = glm::length(axis);
+    if (axisLen < 1e-6f || radius < 1e-6f) return solid;
+
+    // Sweep direction and two perpendicular axes (Gram-Schmidt)
+    const glm::vec3 axisZ = axis / axisLen;
+    glm::vec3 axisX = glm::abs(axisZ.x) < 0.9f
+        ? glm::vec3(1.0f, 0.0f, 0.0f)
+        : glm::vec3(0.0f, 1.0f, 0.0f);
+    axisX = glm::normalize(axisX - glm::dot(axisX, axisZ) * axisZ);
+    const glm::vec3 axisY = glm::cross(axisZ, axisX);
+
+    // Draft taper: start ring has 'radius', end ring grows by the draft angle
+    const float draftRad = glm::radians(glm::clamp(draftAngleDeg, 0.0f, 45.0f));
+    const float startRadius = radius;
+    const float endRadius = radius + axisLen * std::tan(draftRad);
+
+    // Side-surface normal tilt: for a frustum the outward normal is
+    //   normalize(radial - tan(draftAngle) * axisZ)
+    const float tanDraft = std::tan(draftRad);
+
+    std::vector<float>    verts;
+    std::vector<uint32_t> idx;
+
+    // Helper: push one interleaved vertex
+    auto pushVert = [&](const glm::vec3& pos, const glm::vec3& norm)
+        {
+            verts.push_back(pos.x);  verts.push_back(pos.y);  verts.push_back(pos.z);
+            verts.push_back(norm.x); verts.push_back(norm.y); verts.push_back(norm.z);
+        };
+
+    // ---- Side surface ------------------------------------------------------
+    // Two rings of vertices — start ring then end ring
+    for (int cap = 0; cap < 2; ++cap)
+    {
+        const glm::vec3 centre = (cap == 0) ? start : end;
+        const float     r = (cap == 0) ? startRadius : endRadius;
+        for (int i = 0; i < segments; ++i)
+        {
+            const float theta = (float(i) / float(segments)) * glm::two_pi<float>();
+            const glm::vec3 radial = std::cos(theta) * axisX + std::sin(theta) * axisY;
+            const glm::vec3 sideNorm = glm::normalize(radial - tanDraft * axisZ);
+            pushVert(centre + r * radial, sideNorm);
+        }
+    }
+    // Quads: startRing[i]→startRing[i+1]→endRing[i+1]→endRing[i]
+    for (int i = 0; i < segments; ++i)
+    {
+        const uint32_t s0 = (uint32_t)i;
+        const uint32_t s1 = (uint32_t)((i + 1) % segments);
+        const uint32_t e0 = (uint32_t)(segments + i);
+        const uint32_t e1 = (uint32_t)(segments + (i + 1) % segments);
+        idx.push_back(s0); idx.push_back(e0); idx.push_back(e1);
+        idx.push_back(s0); idx.push_back(e1); idx.push_back(s1);
+    }
+
+    // ---- Caps --------------------------------------------------------------
+    // Each cap: one centre vertex + segments rim vertices, assembled as a fan
+    auto addCap = [&](const glm::vec3& centre, const glm::vec3& capNorm, float capRadius)
+        {
+            const uint32_t centreIdx = (uint32_t)(verts.size() / 6);
+            pushVert(centre, capNorm);
+
+            const uint32_t rimBase = (uint32_t)(verts.size() / 6);
+            for (int i = 0; i < segments; ++i)
+            {
+                const float theta = (float(i) / float(segments)) * glm::two_pi<float>();
+                const glm::vec3 radial = std::cos(theta) * axisX + std::sin(theta) * axisY;
+                pushVert(centre + capRadius * radial, capNorm);
+            }
+            for (int i = 0; i < segments; ++i)
+            {
+                const uint32_t r0 = rimBase + (uint32_t)i;
+                const uint32_t r1 = rimBase + (uint32_t)((i + 1) % segments);
+                // Winding matches the cap normal direction
+                if (glm::dot(capNorm, axisZ) < 0.0f)
+                {
+                    idx.push_back(centreIdx); idx.push_back(r1); idx.push_back(r0);
+                }
+                else
+                {
+                    idx.push_back(centreIdx); idx.push_back(r0); idx.push_back(r1);
+                }
+            }
+        };
+
+    addCap(start, -axisZ, startRadius);   // start cap faces away from end
+    addCap(end, +axisZ, endRadius);      // end cap faces away from start
+
+    // ---- Upload to GPU ----
+    glGenVertexArrays(1, &solid.vao);
+    glGenBuffers(1, &solid.vbo);
+    glGenBuffers(1, &solid.ebo);
+
+    glBindVertexArray(solid.vao);
+    glBindBuffer(GL_ARRAY_BUFFER, solid.vbo);
+    glBufferData(GL_ARRAY_BUFFER,
+        (GLsizeiptr)(verts.size() * sizeof(float)),
+        verts.data(), GL_STATIC_DRAW);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, solid.ebo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+        (GLsizeiptr)(idx.size() * sizeof(uint32_t)),
+        idx.data(), GL_STATIC_DRAW);
+
+    // position  (location 0)
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    // normal (location 1)
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float),
+        (void*)(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+
+    glBindVertexArray(0);
+
+    solid.indexCount = (GLsizei)idx.size();
+    solid.valid = true;
+    return solid;
+}
+
+void GLCanvas::SetActiveInjectionPoint(const InjectionPoint& ip)
+{
+    m_activeInjectionPoint = ip;
+    m_hasActiveInjectionPoint = true;
+    // Clear any previously placed sphere so stale geometry isn't shown
+    // after a fixture change.
+    m_isDirectInjection = false;
+    m_hasSpruePoint = false;
+    m_sprueSolid.Destroy();
+    m_sprueColdSlugSolid.Destroy();
+    RebuildSpruePathVBO();
+    RebuildSprueXsecVBO();
+    Refresh(false);
+}
+
+void GLCanvas::PlaceSprue()
+{
+    if (!m_hasActiveInjectionPoint) return;
+
+    // Transform the injection point from fixture-local space to world space.
+    glm::vec4 localPos(m_activeInjectionPoint.x,
+        m_activeInjectionPoint.y,
+        m_activeInjectionPoint.z,
+        1.0f);
+
+    glm::mat4 fixtureMatrix(1.0f);
+    if (!m_fixtures.empty())
+        fixtureMatrix = m_fixtures[0].BuildModelMatrix();
+
+    m_sprueWorldPos = glm::vec3(fixtureMatrix * localPos);
+    m_hasSpruePoint = true;
+    m_spruePathStart = m_sprueWorldPos;
+
+    // Fire a ray straight down toward y=0, max 1000mm (1m).
+    constexpr float kMaxDist = 1000.0f;
+    const glm::vec3 rayDir(0.0f, -1.0f, 0.0f);
+
+    glm::vec3 hitPos;
+    if (RayCastWorldRay(m_sprueWorldPos, rayDir, kMaxDist, hitPos))
+    {
+        // Ray hit an object — this is a direct-injection mould
+        m_spruePathEnd = hitPos;
+        m_isDirectInjection = true;
+    }
+    else
+    {
+        // No object hit — path terminates at the y=0 parting plane
+        m_spruePathEnd = glm::vec3(m_sprueWorldPos.x, 0.0f, m_sprueWorldPos.z);
+        m_isDirectInjection = false;
+    }
+
+    // Read sprue dimensions from the left-panel UI
+    if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+    {
+        m_sprueRadius = frame->GetSprueDiameter() * 0.5f;
+        m_sprueDraftAngleDeg = frame->GetSprueDraftAngle();
+        m_sprueColdSlugDepth = frame->GetSprueColdSlugDepth();
+    }
+
+    // Compute the point where the sprue path crosses the y=0 parting plane
+    {
+        const glm::vec3& S = m_spruePathStart;
+        const glm::vec3& E = m_spruePathEnd;
+        float dy = E.y - S.y;
+        if (std::abs(dy) > 1e-6f)
+        {
+            float t = -S.y / dy;               // parametric t where y == 0
+            if (t >= 0.0f && t <= 1.0f)
+            {
+                m_spruePartingPos = S + t * (E - S);
+                m_hasSpruePartingPoint = true;
+            }
+            else
+            {
+                // Path doesn't cross y=0 within the segment
+                m_hasSpruePartingPoint = false;
+            }
+        }
+        else if (std::abs(S.y) < 1e-6f)
+        {
+            // Both endpoints are already on the parting plane; use the end
+            m_spruePartingPos = E;
+            m_hasSpruePartingPoint = true;
+        }
+        else
+        {
+            m_hasSpruePartingPoint = false;
+        }
+    }
+
+    // Build the swept cylinder preview mesh
+    m_sprueSolid.Destroy();
+    m_sprueSolid = BuildSprueSolid(m_spruePathStart, m_spruePathEnd, m_sprueRadius, m_sprueDraftAngleDeg);
+
+    // Build cold slug well — a straight cylinder extending beyond the sprue end,
+    // using the end radius of the drafted sprue.  Skipped for direct injection.
+    m_sprueColdSlugSolid.Destroy();
+    if (!m_isDirectInjection && m_sprueColdSlugDepth > 1e-6f)
+    {
+        const glm::vec3 sprueDir = glm::normalize(m_spruePathEnd - m_spruePathStart);
+        const float sprueLen = glm::length(m_spruePathEnd - m_spruePathStart);
+        const float draftRad = glm::radians(glm::clamp(m_sprueDraftAngleDeg, 0.0f, 45.0f));
+        const float endRadius = m_sprueRadius + sprueLen * std::tan(draftRad);
+
+        const glm::vec3 slugStart = m_spruePathEnd;
+        const glm::vec3 slugEnd = m_spruePathEnd + sprueDir * m_sprueColdSlugDepth;
+        m_sprueColdSlugSolid = BuildSprueSolid(slugStart, slugEnd, endRadius, 0.0f);
+    }
+
+    RebuildSpruePathVBO();
+    RebuildSprueXsecVBO();
+    Refresh(false);
+}
+
+void GLCanvas::ClearSprue()
+{
+    m_hasSpruePoint = false;
+    m_isDirectInjection = false;
+    m_hasSpruePartingPoint = false;
+    m_sprueSolid.Destroy();
+    m_sprueColdSlugSolid.Destroy();
+    RebuildSpruePathVBO();
+    RebuildSprueXsecVBO();
+    Refresh(false);
+}
+
+// ---------------------------------------------------------------------------
 // Generate Mould Operation — Cuts objects, vents, runners, and sprues from blank mold halves
 // ---------------------------------------------------------------------------
 void GLCanvas::GenerateMould()
@@ -237,8 +596,8 @@ void GLCanvas::GenerateMould()
         return;
     }
 
-    // Steps per fixture: 1 read + 1 transform + (1 per object subtract) + (1 per vent subtract) + 1 tessellate + 1 upload
-    const int stepsPerFixture = 3 + (int)m_objects.size() + (int)m_ventCrossSections.size();
+    // Steps per fixture: 1 read + 1 transform + (1 per object subtract) + (1 per vent subtract) + 1 sprue + 1 tessellate + 1 upload
+    const int stepsPerFixture = 4 + (int)m_objects.size() + (int)m_ventCrossSections.size();
     const int totalSteps = stepsPerFixture * (int)m_fixtures.size();
 
     wxProgressDialog progress(
@@ -367,11 +726,30 @@ void GLCanvas::GenerateMould()
             BRepBuilderAPI_MakeFace face(wire.Wire(), /*onlyPlane=*/true);
             if (!face.IsDone()) continue;
 
-            // Extrude face along the vent path vector
-            const glm::vec3 sweep = vp.end - vp.start;
-            const gp_Vec    sweepVec(sweep.x, sweep.y, sweep.z);
+            // Extrude face along the vent path vector, extended by the stored overruns.
+            // The cross-section sits at path.start; shift it back by overrunStart,
+            // then extend the sweep by overrunStart + overrunEnd so both ends clear
+            // any surface co-planarity artifacts.
+            const glm::vec3 rawSweep = vp.end - vp.start;
+            const float     rawLen = glm::length(rawSweep);
+            if (rawLen < 1e-6f) continue;
+            const glm::vec3 sweepDir = rawSweep / rawLen;
 
-            BRepPrimAPI_MakePrism prism(face.Face(), sweepVec);
+            // Translate the face back by overrunStart before extruding
+            const glm::vec3 originOffset = -sweepDir * vp.overrunStart;
+            const gp_Trsf   offsetTrsf = [&]() {
+                gp_Trsf t;
+                t.SetTranslation(gp_Vec(originOffset.x, originOffset.y, originOffset.z));
+                return t;
+                }();
+            const TopoDS_Shape offsetFace =
+                BRepBuilderAPI_Transform(face.Face(), offsetTrsf, /*copy=*/true).Shape();
+
+            const float     totalLen = rawLen + vp.overrunStart + vp.overrunEnd;
+            const glm::vec3 totalSweep = sweepDir * totalLen;
+            const gp_Vec    sweepVec(totalSweep.x, totalSweep.y, totalSweep.z);
+
+            BRepPrimAPI_MakePrism prism(offsetFace, sweepVec);
             if (!prism.IsDone() || prism.Shape().IsNull()) continue;
 
             BRepAlgoAPI_Cut ventCut(result, prism.Shape());
@@ -383,6 +761,87 @@ void GLCanvas::GenerateMould()
                 continue;
             }
             result = ventCut.Shape();
+        }
+
+        // Step: subtract sprue (frustum + cold slug)
+        progress.Update(step++, fixLabel + ": cutting sprue...");
+
+        if (m_hasSpruePoint)
+        {
+            const glm::vec3 sprueAxis = m_spruePathEnd - m_spruePathStart;
+            const float     sprueLen = glm::length(sprueAxis);
+
+            if (sprueLen > 1e-6f)
+            {
+                const glm::vec3 dir = sprueAxis / sprueLen;
+
+                // OCC axis at sprue start, pointing toward sprue end
+                gp_Ax2 sprueAx(
+                    gp_Pnt(m_spruePathStart.x, m_spruePathStart.y, m_spruePathStart.z),
+                    gp_Dir(dir.x, dir.y, dir.z)
+                );
+
+                const float draftRad = glm::radians(glm::clamp(m_sprueDraftAngleDeg, 0.0f, 45.0f));
+                const float startR = m_sprueRadius;
+                const float endR = m_sprueRadius + sprueLen * std::tan(draftRad);
+
+                // Build the drafted sprue solid (frustum or cylinder)
+                TopoDS_Shape sprueCutShape;
+                bool sprueShapeOK = false;
+
+                if (std::abs(endR - startR) > 1e-6f)
+                {
+                    // Tapered — use a cone
+                    BRepPrimAPI_MakeCone cone(sprueAx, startR, endR, sprueLen);
+                    if (cone.IsDone() && !cone.Shape().IsNull())
+                    {
+                        sprueCutShape = cone.Shape();
+                        sprueShapeOK = true;
+                    }
+                }
+                else
+                {
+                    // No taper — straight cylinder
+                    BRepPrimAPI_MakeCylinder cyl(sprueAx, startR, sprueLen);
+                    if (cyl.IsDone() && !cyl.Shape().IsNull())
+                    {
+                        sprueCutShape = cyl.Shape();
+                        sprueShapeOK = true;
+                    }
+                }
+
+                if (sprueShapeOK)
+                {
+                    BRepAlgoAPI_Cut sprueCut(result, sprueCutShape);
+                    sprueCut.Build();
+                    if (sprueCut.IsDone() && !sprueCut.Shape().IsNull())
+                        result = sprueCut.Shape();
+                    else
+                        wxMessageBox("Sprue boolean cut failed.",
+                            "Generate Mould", wxOK | wxICON_WARNING, this);
+                }
+
+                // Cold slug well — straight cylinder extending past the sprue end
+                if (!m_isDirectInjection && m_sprueColdSlugDepth > 1e-6f)
+                {
+                    gp_Ax2 slugAx(
+                        gp_Pnt(m_spruePathEnd.x, m_spruePathEnd.y, m_spruePathEnd.z),
+                        gp_Dir(dir.x, dir.y, dir.z)
+                    );
+
+                    BRepPrimAPI_MakeCylinder slugCyl(slugAx, endR, m_sprueColdSlugDepth);
+                    if (slugCyl.IsDone() && !slugCyl.Shape().IsNull())
+                    {
+                        BRepAlgoAPI_Cut slugCut(result, slugCyl.Shape());
+                        slugCut.Build();
+                        if (slugCut.IsDone() && !slugCut.Shape().IsNull())
+                            result = slugCut.Shape();
+                        else
+                            wxMessageBox("Cold slug boolean cut failed.",
+                                "Generate Mould", wxOK | wxICON_WARNING, this);
+                    }
+                }
+            }
         }
 
         // Step: tessellate + upload
@@ -605,6 +1064,56 @@ bool GLCanvas::RayCastObjects(int mouseX, int mouseY,
                 if (glm::dot(outNormal, rayDir) > 0.0f)
                     outNormal = -outNormal;
 
+                hit = true;
+            }
+        }
+    }
+
+    return hit;
+}
+
+// ---------------------------------------------------------------------------
+// RayCastWorldRay — fires a pre-built world-space ray against all imported
+// objects (Möller–Trumbore, front-faces only).  Returns the closest hit.
+// Unlike RayCastObjects this takes an explicit origin + direction rather than
+// unprojecting mouse coordinates, so it can be called without a mouse event.
+// ---------------------------------------------------------------------------
+bool GLCanvas::RayCastWorldRay(const glm::vec3& origin, const glm::vec3& dir,
+    float maxDist, glm::vec3& outPos)
+{
+    float bestT = maxDist;
+    bool  hit = false;
+
+    for (const auto& obj : m_objects)
+    {
+        if (obj.cpuVerts.empty() || obj.cpuIndices.empty()) continue;
+
+        const glm::mat4 model = obj.BuildModelMatrix();
+        const glm::mat4 invModel = glm::inverse(model);
+
+        const glm::vec3 localOrig = glm::vec3(invModel * glm::vec4(origin, 1.0f));
+        const glm::vec3 localDir = glm::normalize(glm::vec3(invModel * glm::vec4(dir, 0.0f)));
+
+        for (size_t i = 0; i + 2 < obj.cpuIndices.size(); i += 3)
+        {
+            const uint32_t i0 = obj.cpuIndices[i];
+            const uint32_t i1 = obj.cpuIndices[i + 1];
+            const uint32_t i2 = obj.cpuIndices[i + 2];
+
+            const glm::vec3 v0(obj.cpuVerts[i0 * 3], obj.cpuVerts[i0 * 3 + 1], obj.cpuVerts[i0 * 3 + 2]);
+            const glm::vec3 v1(obj.cpuVerts[i1 * 3], obj.cpuVerts[i1 * 3 + 1], obj.cpuVerts[i1 * 3 + 2]);
+            const glm::vec3 v2(obj.cpuVerts[i2 * 3], obj.cpuVerts[i2 * 3 + 1], obj.cpuVerts[i2 * 3 + 2]);
+
+            float localT = 0.0f;
+            if (!RayTriangle(localOrig, localDir, v0, v1, v2, localT)) continue;
+
+            const glm::vec3 worldHit = glm::vec3(model * glm::vec4(localOrig + localDir * localT, 1.0f));
+            const float     worldT = glm::length(worldHit - origin);
+
+            if (worldT < bestT)
+            {
+                bestT = worldT;
+                outPos = worldHit;
                 hit = true;
             }
         }
@@ -1041,14 +1550,19 @@ void GLCanvas::RebuildCrossSectionVBO()
 // BuildVentSolid — sweeps the rectangular cross-section along the vent path
 // to produce a closed prismatic mesh.
 //
+// overrunStart / overrunEnd extend the solid beyond path.start and path.end
+// respectively (along the path direction) so the cut geometry clears any
+// surface artifacts at both terminations.
+//
 // The prism has 6 faces:
-//   - Start cap  (at path.start, facing -pathDir)
-//   - End cap    (at path.end,   facing +pathDir)
+//   - Start cap  (at extended start, facing -pathDir)
+//   - End cap    (at extended end,   facing +pathDir)
 //   - 4 side quads connecting corresponding edges of start and end caps
 //
 // Vertex layout per vertex: [px, py, pz, nx, ny, nz]  (compatible with vsLit)
 // ---------------------------------------------------------------------------
-VentSolid GLCanvas::BuildVentSolid(const VentPath& path, float width, float depth)
+VentSolid GLCanvas::BuildVentSolid(const VentPath& path, float width, float depth,
+    float overrunStart, float overrunEnd)
 {
     VentSolid solid;
     solid.valid = false;
@@ -1067,6 +1581,15 @@ VentSolid GLCanvas::BuildVentSolid(const VentPath& path, float width, float dept
     const float hw = width * 0.5f;
     const float hd = depth * 0.5f;
 
+    // Sweep direction (start → end).  pathDir was built reversed, so sweep = -pathDir.
+    const glm::vec3 sweepDir = -pathDir;
+
+    // Extend the cap positions outward by the requested overrun amounts.
+    // overrunStart pushes the start cap back (opposite sweepDir).
+    // overrunEnd   pushes the end   cap forward (along sweepDir).
+    const glm::vec3 extendedStart = path.start - sweepDir * overrunStart;
+    const glm::vec3 extendedEnd = path.end + sweepDir * overrunEnd;
+
     // Build start and end corner sets (BL, BR, TR, TL)
     auto makeCorners = [&](const glm::vec3& centre) -> std::array<glm::vec3, 4>
         {
@@ -1078,11 +1601,10 @@ VentSolid GLCanvas::BuildVentSolid(const VentPath& path, float width, float dept
             } };
         };
 
-    const auto startC = makeCorners(path.start);
-    const auto endC = makeCorners(path.end);
+    const auto startC = makeCorners(extendedStart);
+    const auto endC = makeCorners(extendedEnd);
 
     // pathDir currently points start←end; sweep direction is start→end
-    const glm::vec3 sweepDir = -pathDir;
 
     // ---- Accumulate interleaved [pos(3) norm(3)] verts and indices ----
     std::vector<float>    verts;
@@ -1255,6 +1777,24 @@ void GLCanvas::InitGLOnce()
     glEnableVertexAttribArray(0);
     glBindVertexArray(0);
 
+    // Sprue path line VBO (dynamic, holds a single start→end segment)
+    glGenVertexArrays(1, &m_spruePathVAO);
+    glGenBuffers(1, &m_spruePathVBO);
+    glBindVertexArray(m_spruePathVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, m_spruePathVBO);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glBindVertexArray(0);
+
+    // Sprue cross-section circle VBO (dynamic, N-segment line-loop)
+    glGenVertexArrays(1, &m_sprueXsecVAO);
+    glGenBuffers(1, &m_sprueXsecVBO);
+    glBindVertexArray(m_sprueXsecVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, m_sprueXsecVBO);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glBindVertexArray(0);
+
     m_inited = true;
 }
 
@@ -1266,6 +1806,8 @@ void GLCanvas::DestroyGL()
     m_objects.clear();
     for (auto& s : m_ventSolids) s.Destroy();
     m_ventSolids.clear();
+    m_sprueSolid.Destroy();
+    m_sprueColdSlugSolid.Destroy();
 
     if (m_outlineProgram) { glDeleteProgram(m_outlineProgram);        m_outlineProgram = 0; }
     if (m_flatProgram) { glDeleteProgram(m_flatProgram);           m_flatProgram = 0; }
@@ -1274,6 +1816,10 @@ void GLCanvas::DestroyGL()
     if (m_pathVAO) { glDeleteVertexArrays(1, &m_pathVAO);         m_pathVAO = 0; }
     if (m_xsecVBO) { glDeleteBuffers(1, &m_xsecVBO);              m_xsecVBO = 0; }
     if (m_xsecVAO) { glDeleteVertexArrays(1, &m_xsecVAO);         m_xsecVAO = 0; }
+    if (m_spruePathVBO) { glDeleteBuffers(1, &m_spruePathVBO);         m_spruePathVBO = 0; }
+    if (m_spruePathVAO) { glDeleteVertexArrays(1, &m_spruePathVAO);    m_spruePathVAO = 0; }
+    if (m_sprueXsecVBO) { glDeleteBuffers(1, &m_sprueXsecVBO);         m_sprueXsecVBO = 0; }
+    if (m_sprueXsecVAO) { glDeleteVertexArrays(1, &m_sprueXsecVAO);    m_sprueXsecVAO = 0; }
     if (m_sphereEBO) { glDeleteBuffers(1, &m_sphereEBO);          m_sphereEBO = 0; }
     if (m_sphereVBO) { glDeleteBuffers(1, &m_sphereVBO);          m_sphereVBO = 0; }
     if (m_sphereVAO) { glDeleteVertexArrays(1, &m_sphereVAO);     m_sphereVAO = 0; }
@@ -1722,6 +2268,108 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         glUseProgram(0);
     }
 
+    // ---- Sprue sphere (purple) ---------------------------------------------
+    if (m_program && m_sphereVAO && m_sphereIndexCount > 0 && m_hasSpruePoint)
+    {
+        glEnable(GL_DEPTH_TEST);
+        glUseProgram(m_program);
+
+        glUniform3fv(glGetUniformLocation(m_program, "uCameraPos"), 1, &camPos[0]);
+        glUniform3fv(glGetUniformLocation(m_program, "uLightDir"), 1, &lightDir[0]);
+        glUniform3fv(glGetUniformLocation(m_program, "uLightColor"), 1, &lightColor[0]);
+        glUniform1f(glGetUniformLocation(m_program, "uAmbient"), 0.35f);
+        glUniform1f(glGetUniformLocation(m_program, "uDiffuse"), 0.75f);
+        glUniform1f(glGetUniformLocation(m_program, "uSpecular"), 0.60f);
+        glUniform1f(glGetUniformLocation(m_program, "uShininess"), 48.0f);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uView"), 1, GL_FALSE, &view[0][0]);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uProj"), 1, GL_FALSE, &proj[0][0]);
+
+        const glm::vec3 sprueColor(0.65f, 0.10f, 0.90f);   // purple
+        glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &sprueColor[0]);
+        glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 1.0f);
+
+        glBindVertexArray(m_sphereVAO);
+        glm::mat4 model = glm::translate(glm::mat4(1.0f), m_sprueWorldPos);
+        model = glm::scale(model, glm::vec3(kVentMarkerRadius * 1.5f));  // slightly larger than vent spheres
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &model[0][0]);
+        glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
+        glBindVertexArray(0);
+
+        glUseProgram(0);
+    }
+
+    // ---- Sprue parting-plane intersection sphere (blue) ---------------------
+    if (m_program && m_sphereVAO && m_sphereIndexCount > 0 && m_hasSpruePartingPoint)
+    {
+        glEnable(GL_DEPTH_TEST);
+        glUseProgram(m_program);
+
+        glUniform3fv(glGetUniformLocation(m_program, "uCameraPos"), 1, &camPos[0]);
+        glUniform3fv(glGetUniformLocation(m_program, "uLightDir"), 1, &lightDir[0]);
+        glUniform3fv(glGetUniformLocation(m_program, "uLightColor"), 1, &lightColor[0]);
+        glUniform1f(glGetUniformLocation(m_program, "uAmbient"), 0.35f);
+        glUniform1f(glGetUniformLocation(m_program, "uDiffuse"), 0.75f);
+        glUniform1f(glGetUniformLocation(m_program, "uSpecular"), 0.60f);
+        glUniform1f(glGetUniformLocation(m_program, "uShininess"), 48.0f);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uView"), 1, GL_FALSE, &view[0][0]);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uProj"), 1, GL_FALSE, &proj[0][0]);
+
+        const glm::vec3 partingColor(0.10f, 0.40f, 0.95f);   // blue
+        glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &partingColor[0]);
+        glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 1.0f);
+
+        glBindVertexArray(m_sphereVAO);
+        glm::mat4 model = glm::translate(glm::mat4(1.0f), m_spruePartingPos);
+        model = glm::scale(model, glm::vec3(kVentMarkerRadius * 1.5f));
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &model[0][0]);
+        glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
+        glBindVertexArray(0);
+
+        glUseProgram(0);
+    }
+
+    // ---- Sprue path line (purple) ------------------------------------------
+    if (m_flatProgram && m_spruePathVAO && m_spruePathVertexCount > 0)
+    {
+        glEnable(GL_DEPTH_TEST);
+        glLineWidth(2.5f);
+        glUseProgram(m_flatProgram);
+
+        const glm::mat4 VP = proj * view;
+        glUniformMatrix4fv(m_flat_uVP, 1, GL_FALSE, &VP[0][0]);
+
+        const glm::vec4 sprueLineColor(0.65f, 0.10f, 0.90f, 1.0f);   // purple
+        glUniform4fv(m_flat_uColor, 1, &sprueLineColor[0]);
+
+        glBindVertexArray(m_spruePathVAO);
+        glDrawArrays(GL_LINES, 0, m_spruePathVertexCount);
+        glBindVertexArray(0);
+
+        glLineWidth(1.0f);
+        glUseProgram(0);
+    }
+
+    // ---- Sprue cross-section circle (purple) -------------------------------
+    if (m_flatProgram && m_sprueXsecVAO && m_sprueXsecVertexCount > 0)
+    {
+        glEnable(GL_DEPTH_TEST);
+        glLineWidth(2.0f);
+        glUseProgram(m_flatProgram);
+
+        const glm::mat4 VP = proj * view;
+        glUniformMatrix4fv(m_flat_uVP, 1, GL_FALSE, &VP[0][0]);
+
+        const glm::vec4 sprueCircleColor(0.65f, 0.10f, 0.90f, 1.0f);   // purple
+        glUniform4fv(m_flat_uColor, 1, &sprueCircleColor[0]);
+
+        glBindVertexArray(m_sprueXsecVAO);
+        glDrawArrays(GL_LINES, 0, m_sprueXsecVertexCount);
+        glBindVertexArray(0);
+
+        glLineWidth(1.0f);
+        glUseProgram(0);
+    }
+
     // ---- Vent path lines ---------------------------------------------------
     if (m_flatProgram && m_pathVAO && m_pathVertexCount > 0)
     {
@@ -1801,6 +2449,74 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         glDisable(GL_BLEND);
     }
 
+    // ---- Sprue solid (lit, semi-transparent purple) ------------------------
+    if (m_program && m_sprueSolid.valid && m_sprueSolid.vao != 0)
+    {
+        glEnable(GL_DEPTH_TEST);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glDepthMask(GL_FALSE);
+
+        glUseProgram(m_program);
+
+        const glm::mat4 identity(1.0f);
+        const glm::vec3 sprueSolidColor(0.65f, 0.10f, 0.90f);   // purple
+        glUniform3fv(glGetUniformLocation(m_program, "uCameraPos"), 1, &camPos[0]);
+        glUniform3fv(glGetUniformLocation(m_program, "uLightDir"), 1, &lightDir[0]);
+        glUniform3fv(glGetUniformLocation(m_program, "uLightColor"), 1, &lightColor[0]);
+        glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &sprueSolidColor[0]);
+        glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 0.55f);
+        glUniform1f(glGetUniformLocation(m_program, "uAmbient"), 0.30f);
+        glUniform1f(glGetUniformLocation(m_program, "uDiffuse"), 0.80f);
+        glUniform1f(glGetUniformLocation(m_program, "uSpecular"), 0.40f);
+        glUniform1f(glGetUniformLocation(m_program, "uShininess"), 32.0f);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uView"), 1, GL_FALSE, &view[0][0]);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uProj"), 1, GL_FALSE, &proj[0][0]);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &identity[0][0]);
+
+        glBindVertexArray(m_sprueSolid.vao);
+        glDrawElements(GL_TRIANGLES, m_sprueSolid.indexCount, GL_UNSIGNED_INT, 0);
+        glBindVertexArray(0);
+
+        glUseProgram(0);
+        glDepthMask(GL_TRUE);
+        glDisable(GL_BLEND);
+    }
+
+    // ---- Cold slug solid (lit, semi-transparent purple) ---------------------
+    if (m_program && m_sprueColdSlugSolid.valid && m_sprueColdSlugSolid.vao != 0)
+    {
+        glEnable(GL_DEPTH_TEST);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glDepthMask(GL_FALSE);
+
+        glUseProgram(m_program);
+
+        const glm::mat4 identity(1.0f);
+        const glm::vec3 coldSlugColor(0.65f, 0.10f, 0.90f);   // purple, same as sprue
+        glUniform3fv(glGetUniformLocation(m_program, "uCameraPos"), 1, &camPos[0]);
+        glUniform3fv(glGetUniformLocation(m_program, "uLightDir"), 1, &lightDir[0]);
+        glUniform3fv(glGetUniformLocation(m_program, "uLightColor"), 1, &lightColor[0]);
+        glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &coldSlugColor[0]);
+        glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 0.55f);
+        glUniform1f(glGetUniformLocation(m_program, "uAmbient"), 0.30f);
+        glUniform1f(glGetUniformLocation(m_program, "uDiffuse"), 0.80f);
+        glUniform1f(glGetUniformLocation(m_program, "uSpecular"), 0.40f);
+        glUniform1f(glGetUniformLocation(m_program, "uShininess"), 32.0f);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uView"), 1, GL_FALSE, &view[0][0]);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uProj"), 1, GL_FALSE, &proj[0][0]);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &identity[0][0]);
+
+        glBindVertexArray(m_sprueColdSlugSolid.vao);
+        glDrawElements(GL_TRIANGLES, m_sprueColdSlugSolid.indexCount, GL_UNSIGNED_INT, 0);
+        glBindVertexArray(0);
+
+        glUseProgram(0);
+        glDepthMask(GL_TRUE);
+        glDisable(GL_BLEND);
+    }
+
     // ---- DEBUG: fixture perimeter hull -------------------------------------
     if (m_flatProgram && !m_fixturePerimeter.empty())
     {
@@ -1875,19 +2591,24 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
                 const VentPoint vp{ hitPos, hitNormal };
                 m_ventPoints.push_back(vp);
 
-                const VentPath path = ComputeVentPath(vp);
-                m_ventPaths.push_back(path);
-
                 // Read dimensions from the left-panel UI
-                float ventLength = 5.0f, ventWidth = 2.0f;
+                float ventLength = 5.0f, ventWidth = 2.0f,
+                    ventOverrunStart = 0.5f, ventOverrunEnd = 0.5f;
                 if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
-                    frame->GetVentDimensions(ventLength, ventWidth);
+                    frame->GetVentDimensions(ventLength, ventWidth,
+                        ventOverrunStart, ventOverrunEnd);
+
+                VentPath path = ComputeVentPath(vp);
+                path.overrunStart = ventOverrunStart;
+                path.overrunEnd = ventOverrunEnd;
+                m_ventPaths.push_back(path);
 
                 m_ventCrossSections.push_back(
                     BuildVentCrossSection(path, ventWidth, ventLength));
 
                 m_ventSolids.push_back(
-                    BuildVentSolid(path, ventWidth, ventLength));
+                    BuildVentSolid(path, ventWidth, ventLength,
+                        ventOverrunStart, ventOverrunEnd));
 
                 RebuildPathVBO();
                 RebuildCrossSectionVBO();

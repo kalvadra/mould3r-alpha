@@ -92,6 +92,10 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
         m_canvas->ImportStepFileAsFixture(fixture.modelAPath);
     if (!fixture.modelBPath.empty())
         m_canvas->ImportStepFileAsFixture(fixture.modelBPath);
+
+    // Set the active injection point (first in the list for now)
+    if (!fixture.injectionPoints.empty())
+        m_canvas->SetActiveInjectionPoint(fixture.injectionPoints[0]);
 }
 
 // ---------------------------------------------------------------------------
@@ -211,6 +215,40 @@ wxPanel* MainFrame::CreateRibbon(wxWindow* parent)
     hSizer->Add(divider2, 0, wxALIGN_CENTER_VERTICAL);
     hSizer->AddSpacer(16);
 
+    // ---- SPRUES group ------------------------------------------------------
+    auto* spruesSizer = new wxBoxSizer(wxVERTICAL);
+    auto* spruesRow = new wxBoxSizer(wxHORIZONTAL);
+
+    m_btnPlaceSprue = new wxButton(panel, ID_PlaceSprue, "Place Sprue",
+        wxDefaultPosition, wxSize(90, 32));
+    m_btnPlaceSprue->SetToolTip("Place a sprue sphere at the active injection point");
+    m_btnPlaceSprue->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
+    m_btnPlaceSprue->SetForegroundColour(kTextDefault);
+    m_btnPlaceSprue->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
+    spruesRow->Add(m_btnPlaceSprue, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
+
+    auto* btnClearSprue = new wxButton(panel, ID_ClearSprue, "Clear",
+        wxDefaultPosition, wxSize(50, 32));
+    btnClearSprue->SetToolTip("Remove the placed sprue sphere");
+    btnClearSprue->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
+    btnClearSprue->SetForegroundColour(kTextDefault);
+    btnClearSprue->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
+    spruesRow->Add(btnClearSprue, 0, wxALIGN_CENTER_VERTICAL);
+
+    spruesSizer->Add(spruesRow, 0, wxALIGN_CENTER_HORIZONTAL);
+    spruesSizer->Add(addLabel("SPRUES"), 0, wxALIGN_CENTER_HORIZONTAL | wxTOP, 2);
+
+    hSizer->Add(spruesSizer, 0, wxALIGN_CENTER_VERTICAL | wxTOP | wxBOTTOM, 6);
+
+    // Vertical divider
+    hSizer->AddSpacer(16);
+    auto* divider3 = new wxPanel(panel, wxID_ANY, wxDefaultPosition, wxSize(1, 36));
+    divider3->SetBackgroundColour(wxColour(0x38, 0x44, 0x55));
+    hSizer->Add(divider3, 0, wxALIGN_CENTER_VERTICAL);
+    hSizer->AddSpacer(16);
+
     // ---- Hint label --------------------------------------------------------
     auto* hint = new wxStaticText(panel, wxID_ANY,
         "LMB: orbit / transform    MMB: pan    Scroll: zoom    Shift+LMB: pan");
@@ -230,6 +268,8 @@ wxPanel* MainFrame::CreateRibbon(wxWindow* parent)
     Bind(wxEVT_BUTTON, &MainFrame::OnToolCenter, this, ID_ToolCenter);
     Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolPlaceVent, this, ID_ToolPlaceVent);
     Bind(wxEVT_BUTTON, &MainFrame::OnClearVentPoints, this, ID_ClearVentPoints);
+    Bind(wxEVT_BUTTON, &MainFrame::OnPlaceSprue, this, ID_PlaceSprue);
+    Bind(wxEVT_BUTTON, &MainFrame::OnClearSprue, this, ID_ClearSprue);
 
     return panel;
 }
@@ -449,7 +489,20 @@ void MainFrame::OnClearVentPoints(wxCommandEvent&)
         m_canvas->ClearVentPoints();
 }
 
-void MainFrame::GetVentDimensions(float& outLength, float& outWidth) const
+void MainFrame::OnPlaceSprue(wxCommandEvent&)
+{
+    if (m_canvas)
+        m_canvas->PlaceSprue();
+}
+
+void MainFrame::OnClearSprue(wxCommandEvent&)
+{
+    if (m_canvas)
+        m_canvas->ClearSprue();
+}
+
+void MainFrame::GetVentDimensions(float& outLength, float& outWidth,
+    float& outOverrunStart, float& outOverrunEnd) const
 {
     // Safe parse helper — returns defaultVal if text is empty or non-numeric
     auto parseField = [](wxTextCtrl* ctrl, float defaultVal) -> float
@@ -462,6 +515,35 @@ void MainFrame::GetVentDimensions(float& outLength, float& outWidth) const
 
     outLength = parseField(m_ventLength, 5.0f);
     outWidth = parseField(m_ventWidth, 2.0f);
+    outOverrunStart = parseField(m_ventOverrunStart, 0.5f);
+    outOverrunEnd = parseField(m_ventOverrunEnd, 0.5f);
+}
+
+float MainFrame::GetSprueDiameter() const
+{
+    if (!m_sprueDiameter) return 5.0f;
+    double v = 5.0;
+    if (!m_sprueDiameter->GetValue().ToDouble(&v)) return 5.0f;
+    return (v > 0.0) ? static_cast<float>(v) : 5.0f;
+}
+
+float MainFrame::GetSprueDraftAngle() const
+{
+    if (!m_sprueDraftAngle) return 1.0f;
+    double v = 1.0;
+    if (!m_sprueDraftAngle->GetValue().ToDouble(&v)) return 1.0f;
+    if (v < 0.0) v = 0.0;
+    if (v > 45.0) v = 45.0;
+    return static_cast<float>(v);
+}
+
+float MainFrame::GetSprueColdSlugDepth() const
+{
+    if (!m_sprueColdSlugDepth) return 5.0f;
+    double v = 5.0;
+    if (!m_sprueColdSlugDepth->GetValue().ToDouble(&v)) return 5.0f;
+    if (v < 0.0) v = 0.0;
+    return static_cast<float>(v);
 }
 
 // ---------------------------------------------------------------------------
@@ -618,17 +700,18 @@ wxPanel* MainFrame::CreateVentsContent(wxWindow* parent)
     auto* dimsSizer = new wxBoxSizer(wxVERTICAL);
 
     // Helper: labelled mm field
-    auto addDimRow = [&](const wxString& label, wxTextCtrl*& ctrl)
+    auto addDimRow = [&](const wxString& label, wxTextCtrl*& ctrl,
+        const wxString& defaultVal)
         {
             auto* row = new wxBoxSizer(wxHORIZONTAL);
 
             auto* lbl = new wxStaticText(m_ventDimsPanel, wxID_ANY, label,
-                wxDefaultPosition, wxSize(52, -1));
+                wxDefaultPosition, wxSize(90, -1));
             lbl->SetForegroundColour(kTextDefault);
             lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
                 wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
 
-            ctrl = new wxTextCtrl(m_ventDimsPanel, wxID_ANY, "0.0",
+            ctrl = new wxTextCtrl(m_ventDimsPanel, wxID_ANY, defaultVal,
                 wxDefaultPosition, wxSize(70, 22));
             ctrl->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
             ctrl->SetForegroundColour(kTextDefault);
@@ -645,8 +728,10 @@ wxPanel* MainFrame::CreateVentsContent(wxWindow* parent)
             dimsSizer->Add(row, 0, wxLEFT | wxTOP, 10);
         };
 
-    addDimRow("Length:", m_ventLength);
-    addDimRow("Width:", m_ventWidth);
+    addDimRow("Length:", m_ventLength, "5.0");
+    addDimRow("Width:", m_ventWidth, "2.0");
+    addDimRow("Overrun (start):", m_ventOverrunStart, "0.5");
+    addDimRow("Overrun (end):", m_ventOverrunEnd, "0.5");
 
     m_ventDimsPanel->SetSizer(dimsSizer);
     sizer->Add(m_ventDimsPanel, 0, wxEXPAND | wxBOTTOM, 10);
@@ -659,6 +744,127 @@ wxPanel* MainFrame::CreateVentsContent(wxWindow* parent)
             m_ventDimsPanel->Show(m_ventTypeChoice->GetStringSelection() == "Rectangular");
             m_ventDimsPanel->GetParent()->Layout();
             m_ventDimsPanel->GetParent()->GetParent()->Layout();
+        });
+
+    return panel;
+}
+
+wxPanel* MainFrame::CreateSpruesContent(wxWindow* parent)
+{
+    auto* panel = new wxPanel(parent, wxID_ANY);
+    panel->SetBackgroundColour(kRibbonBg);
+
+    auto* sizer = new wxBoxSizer(wxVERTICAL);
+
+    // ---- Sprue type dropdown -----------------------------------------------
+    auto* typeLabel = new wxStaticText(panel, wxID_ANY, "Sprue type:");
+    typeLabel->SetForegroundColour(kTextDefault);
+    typeLabel->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+    sizer->Add(typeLabel, 0, wxLEFT | wxTOP, 10);
+
+    m_sprueTypeChoice = new wxChoice(panel, wxID_ANY);
+    m_sprueTypeChoice->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
+    m_sprueTypeChoice->SetForegroundColour(kTextDefault);
+    m_sprueTypeChoice->Append("Cylinder");
+    m_sprueTypeChoice->SetSelection(0);
+    sizer->Add(m_sprueTypeChoice, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
+
+    // ---- Dimensions panel (shown for Cylinder) -----------------------------
+    auto* dimsPanel = new wxPanel(panel, wxID_ANY);
+    dimsPanel->SetBackgroundColour(kRibbonBg);
+
+    auto* dimsSizer = new wxBoxSizer(wxVERTICAL);
+
+    // Diameter row
+    {
+        auto* row = new wxBoxSizer(wxHORIZONTAL);
+
+        auto* lbl = new wxStaticText(dimsPanel, wxID_ANY, "Diameter:",
+            wxDefaultPosition, wxSize(60, -1));
+        lbl->SetForegroundColour(kTextDefault);
+        lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+
+        m_sprueDiameter = new wxTextCtrl(dimsPanel, wxID_ANY, "5.0",
+            wxDefaultPosition, wxSize(70, 22));
+        m_sprueDiameter->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
+        m_sprueDiameter->SetForegroundColour(kTextDefault);
+
+        auto* unit = new wxStaticText(dimsPanel, wxID_ANY, "mm");
+        unit->SetForegroundColour(wxColour(0x55, 0x6A, 0x85));
+        unit->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+
+        row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
+        row->Add(m_sprueDiameter, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
+        row->Add(unit, 0, wxALIGN_CENTER_VERTICAL);
+        dimsSizer->Add(row, 0, wxLEFT | wxTOP, 10);
+    }
+
+    // Draft angle row
+    {
+        auto* row = new wxBoxSizer(wxHORIZONTAL);
+
+        auto* lbl = new wxStaticText(dimsPanel, wxID_ANY, "Draft angle:",
+            wxDefaultPosition, wxSize(60, -1));
+        lbl->SetForegroundColour(kTextDefault);
+        lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+
+        m_sprueDraftAngle = new wxTextCtrl(dimsPanel, wxID_ANY, "1.0",
+            wxDefaultPosition, wxSize(70, 22));
+        m_sprueDraftAngle->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
+        m_sprueDraftAngle->SetForegroundColour(kTextDefault);
+
+        auto* unit = new wxStaticText(dimsPanel, wxID_ANY, "\xC2\xB0");
+        unit->SetForegroundColour(wxColour(0x55, 0x6A, 0x85));
+        unit->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+
+        row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
+        row->Add(m_sprueDraftAngle, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
+        row->Add(unit, 0, wxALIGN_CENTER_VERTICAL);
+        dimsSizer->Add(row, 0, wxLEFT | wxTOP, 10);
+    }
+
+    // Cold slug depth row
+    {
+        auto* row = new wxBoxSizer(wxHORIZONTAL);
+
+        auto* lbl = new wxStaticText(dimsPanel, wxID_ANY, "Cold slug:",
+            wxDefaultPosition, wxSize(60, -1));
+        lbl->SetForegroundColour(kTextDefault);
+        lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+
+        m_sprueColdSlugDepth = new wxTextCtrl(dimsPanel, wxID_ANY, "5.0",
+            wxDefaultPosition, wxSize(70, 22));
+        m_sprueColdSlugDepth->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
+        m_sprueColdSlugDepth->SetForegroundColour(kTextDefault);
+
+        auto* unit = new wxStaticText(dimsPanel, wxID_ANY, "mm");
+        unit->SetForegroundColour(wxColour(0x55, 0x6A, 0x85));
+        unit->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+
+        row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
+        row->Add(m_sprueColdSlugDepth, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
+        row->Add(unit, 0, wxALIGN_CENTER_VERTICAL);
+        dimsSizer->Add(row, 0, wxLEFT | wxTOP, 10);
+    }
+
+    dimsPanel->SetSizer(dimsSizer);
+    sizer->Add(dimsPanel, 0, wxEXPAND | wxBOTTOM, 10);
+
+    panel->SetSizer(sizer);
+
+    // Show/hide dims based on type selection (future-proofed for more types)
+    m_sprueTypeChoice->Bind(wxEVT_CHOICE, [dimsPanel, this](wxCommandEvent&)
+        {
+            dimsPanel->Show(m_sprueTypeChoice->GetStringSelection() == "Cylinder");
+            dimsPanel->GetParent()->Layout();
+            dimsPanel->GetParent()->GetParent()->Layout();
         });
 
     return panel;
@@ -687,7 +893,9 @@ wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
     sizer->AddSpacer(4);
 
     // ---- Collapsible sections ----------------------------------------------
-    CreateCollapsibleSection(panel, sizer, "Sprues");
+    // Sprues — custom content
+    wxPanel* spruesContent = CreateSpruesContent(panel);
+    CreateCollapsibleSection(panel, sizer, "Sprues", &spruesContent);
     CreateCollapsibleSection(panel, sizer, "Runners");
     CreateCollapsibleSection(panel, sizer, "Gates");
     // Vents — custom content

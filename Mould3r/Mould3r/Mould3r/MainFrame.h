@@ -23,7 +23,13 @@ public:
     void SetActiveTool(TransformMode mode);
 
     // Read current vent dimensions from the left-panel UI fields
-    void GetVentDimensions(float& outLength, float& outWidth) const;
+    void GetVentDimensions(float& outLength, float& outWidth,
+        float& outOverrunStart, float& outOverrunEnd) const;
+
+    // Read current sprue dimensions from the left-panel UI fields
+    float GetSprueDiameter() const;
+    float GetSprueDraftAngle() const;
+    float GetSprueColdSlugDepth() const;
 
 private:
     // Menu handlers
@@ -39,6 +45,9 @@ private:
     void OnToolCenter(wxCommandEvent& evt);
     void OnToolPlaceVent(wxCommandEvent& evt);
 
+    void OnPlaceSprue(wxCommandEvent&);
+    void OnClearSprue(wxCommandEvent&);
+
     // Activates a tool button and deactivates the others (also called by GLCanvas on Escape)
 
     //Creates the left panel
@@ -49,12 +58,21 @@ private:
     wxPanel* CreateCollapsibleSection(wxWindow* parent, wxSizer* parentSizer,
         const wxString& title, wxPanel** contentOut = nullptr);
     wxPanel* CreateVentsContent(wxWindow* parent);
+    wxPanel* CreateSpruesContent(wxWindow* parent);
 
     // Vent field members
     wxChoice* m_ventTypeChoice = nullptr;
     wxPanel* m_ventDimsPanel = nullptr;
     wxTextCtrl* m_ventLength = nullptr;
     wxTextCtrl* m_ventWidth = nullptr;
+    wxTextCtrl* m_ventOverrunStart = nullptr;
+    wxTextCtrl* m_ventOverrunEnd = nullptr;
+
+    // Sprue field members
+    wxChoice* m_sprueTypeChoice = nullptr;
+    wxTextCtrl* m_sprueDiameter = nullptr;
+    wxTextCtrl* m_sprueDraftAngle = nullptr;
+    wxTextCtrl* m_sprueColdSlugDepth = nullptr;
 
     // Creates the top ribbon panel
     wxPanel* CreateRibbon(wxWindow* parent);
@@ -69,6 +87,9 @@ private:
 
     // Vent tool button (ribbon — Vents group)
     wxToggleButton* m_btnPlaceVent = nullptr;
+
+    // Sprue tool buttons (ribbon — Sprues group)
+    wxButton* m_btnPlaceSprue = nullptr;
 
     wxPanel* m_sidePanel = nullptr;
     wxTextCtrl* m_exportPath = nullptr;
@@ -92,6 +113,8 @@ private:
         ID_Export,
         ID_GenerateMould,
         ID_ChangeFixture,
-        ID_ClearVentPoints
+        ID_ClearVentPoints,
+        ID_PlaceSprue,
+        ID_ClearSprue
     };
 };
