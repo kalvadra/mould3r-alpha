@@ -28,6 +28,8 @@ public:
 
     // Read current sprue dimensions from the left-panel UI fields
     float GetSprueDiameter() const;
+    float GetSprueDraftAngle() const;
+    float GetSprueColdSlugDepth() const;
 
 private:
     // Menu handlers
@@ -69,6 +71,8 @@ private:
     // Sprue field members
     wxChoice* m_sprueTypeChoice = nullptr;
     wxTextCtrl* m_sprueDiameter = nullptr;
+    wxTextCtrl* m_sprueDraftAngle = nullptr;
+    wxTextCtrl* m_sprueColdSlugDepth = nullptr;
 
     // Creates the top ribbon panel
     wxPanel* CreateRibbon(wxWindow* parent);

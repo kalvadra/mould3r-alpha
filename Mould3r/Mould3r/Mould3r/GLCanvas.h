@@ -111,6 +111,10 @@ public:
     void ClearSprue();
     bool IsDirectInjection() const { return m_isDirectInjection; }
 
+    // Point where the sprue path crosses the y=0 parting plane
+    bool              HasSpruePartingPoint() const { return m_hasSpruePartingPoint; }
+    const glm::vec3& GetSpruePartingPoint() const { return m_spruePartingPos; }
+
 private:
     void OnPaint(wxPaintEvent& evt);
     void OnResize(wxSizeEvent& evt);
@@ -164,7 +168,7 @@ private:
 
     // Sprue solid — swept cylinder mesh (same GPU layout as VentSolid)
     VentSolid BuildSprueSolid(const glm::vec3& start, const glm::vec3& end,
-        float radius, int segments = 32);
+        float radius, float draftAngleDeg = 0.0f, int segments = 32);
 
     // Fixture outer perimeter on the parting plane (convex hull in XZ)
     void                   BuildFixturePerimeter();
@@ -197,11 +201,18 @@ private:
     bool           m_hasActiveInjectionPoint = false;
     bool           m_isDirectInjection = false;    // true when sprue ray hits a body directly
     float          m_sprueRadius = 2.5f;           // radius of the sprue cylinder (mm)
+    float          m_sprueDraftAngleDeg = 1.0f;    // draft angle in degrees
+    float          m_sprueColdSlugDepth = 5.0f;    // cold slug well depth (mm)
     glm::vec3      m_sprueWorldPos{ 0.0f };        // world-space position of placed sphere
     bool           m_hasSpruePoint = false;
     glm::vec3      m_spruePathStart{ 0.0f };       // injection point (= m_sprueWorldPos)
     glm::vec3      m_spruePathEnd{ 0.0f };         // object hit or y=0 projection
     VentSolid      m_sprueSolid;                   // swept cylinder mesh for preview
+    VentSolid      m_sprueColdSlugSolid;           // cold slug well cylinder
+
+    // Sprue–parting-plane intersection
+    glm::vec3      m_spruePartingPos{ 0.0f };       // where the sprue path crosses y=0
+    bool           m_hasSpruePartingPoint = false;
 
     // Ghost preview for vent placement (follows mouse in PlaceVent mode)
     VentPoint m_ventGhost;

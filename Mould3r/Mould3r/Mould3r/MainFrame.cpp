@@ -527,6 +527,25 @@ float MainFrame::GetSprueDiameter() const
     return (v > 0.0) ? static_cast<float>(v) : 5.0f;
 }
 
+float MainFrame::GetSprueDraftAngle() const
+{
+    if (!m_sprueDraftAngle) return 1.0f;
+    double v = 1.0;
+    if (!m_sprueDraftAngle->GetValue().ToDouble(&v)) return 1.0f;
+    if (v < 0.0) v = 0.0;
+    if (v > 45.0) v = 45.0;
+    return static_cast<float>(v);
+}
+
+float MainFrame::GetSprueColdSlugDepth() const
+{
+    if (!m_sprueColdSlugDepth) return 5.0f;
+    double v = 5.0;
+    if (!m_sprueColdSlugDepth->GetValue().ToDouble(&v)) return 5.0f;
+    if (v < 0.0) v = 0.0;
+    return static_cast<float>(v);
+}
+
 // ---------------------------------------------------------------------------
 // Menu handlers
 // ---------------------------------------------------------------------------
@@ -779,6 +798,58 @@ wxPanel* MainFrame::CreateSpruesContent(wxWindow* parent)
 
         row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
         row->Add(m_sprueDiameter, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
+        row->Add(unit, 0, wxALIGN_CENTER_VERTICAL);
+        dimsSizer->Add(row, 0, wxLEFT | wxTOP, 10);
+    }
+
+    // Draft angle row
+    {
+        auto* row = new wxBoxSizer(wxHORIZONTAL);
+
+        auto* lbl = new wxStaticText(dimsPanel, wxID_ANY, "Draft angle:",
+            wxDefaultPosition, wxSize(60, -1));
+        lbl->SetForegroundColour(kTextDefault);
+        lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+
+        m_sprueDraftAngle = new wxTextCtrl(dimsPanel, wxID_ANY, "1.0",
+            wxDefaultPosition, wxSize(70, 22));
+        m_sprueDraftAngle->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
+        m_sprueDraftAngle->SetForegroundColour(kTextDefault);
+
+        auto* unit = new wxStaticText(dimsPanel, wxID_ANY, "\xC2\xB0");
+        unit->SetForegroundColour(wxColour(0x55, 0x6A, 0x85));
+        unit->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+
+        row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
+        row->Add(m_sprueDraftAngle, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
+        row->Add(unit, 0, wxALIGN_CENTER_VERTICAL);
+        dimsSizer->Add(row, 0, wxLEFT | wxTOP, 10);
+    }
+
+    // Cold slug depth row
+    {
+        auto* row = new wxBoxSizer(wxHORIZONTAL);
+
+        auto* lbl = new wxStaticText(dimsPanel, wxID_ANY, "Cold slug:",
+            wxDefaultPosition, wxSize(60, -1));
+        lbl->SetForegroundColour(kTextDefault);
+        lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+
+        m_sprueColdSlugDepth = new wxTextCtrl(dimsPanel, wxID_ANY, "5.0",
+            wxDefaultPosition, wxSize(70, 22));
+        m_sprueColdSlugDepth->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
+        m_sprueColdSlugDepth->SetForegroundColour(kTextDefault);
+
+        auto* unit = new wxStaticText(dimsPanel, wxID_ANY, "mm");
+        unit->SetForegroundColour(wxColour(0x55, 0x6A, 0x85));
+        unit->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+
+        row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
+        row->Add(m_sprueColdSlugDepth, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
         row->Add(unit, 0, wxALIGN_CENTER_VERTICAL);
         dimsSizer->Add(row, 0, wxLEFT | wxTOP, 10);
     }
