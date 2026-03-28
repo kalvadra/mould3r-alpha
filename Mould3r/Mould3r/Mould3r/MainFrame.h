@@ -12,7 +12,7 @@
 
 class GLCanvas;
 
-enum class TransformMode { Select, Translate, Rotate, Scale, PlaceVent };
+enum class TransformMode { Select, Translate, Rotate, Scale, PlaceVent, PlaceRunner };
 
 class MainFrame : public wxFrame
 {
@@ -31,6 +31,8 @@ public:
     float GetSprueDraftAngle() const;
     float GetSprueColdSlugDepth() const;
 
+    float GetRunnerDiameter() const;
+
 private:
     // Menu handlers
     void OnImport(wxCommandEvent& evt);
@@ -48,6 +50,9 @@ private:
     void OnPlaceSprue(wxCommandEvent&);
     void OnClearSprue(wxCommandEvent&);
 
+    void OnPlaceRunner(wxCommandEvent& evt);
+    void OnClearRunners(wxCommandEvent&);
+
     // Activates a tool button and deactivates the others (also called by GLCanvas on Escape)
 
     //Creates the left panel
@@ -59,6 +64,7 @@ private:
         const wxString& title, wxPanel** contentOut = nullptr);
     wxPanel* CreateVentsContent(wxWindow* parent);
     wxPanel* CreateSpruesContent(wxWindow* parent);
+    wxPanel* CreateRunnersContent(wxWindow* parent);
 
     // Vent field members
     wxChoice* m_ventTypeChoice = nullptr;
@@ -73,6 +79,10 @@ private:
     wxTextCtrl* m_sprueDiameter = nullptr;
     wxTextCtrl* m_sprueDraftAngle = nullptr;
     wxTextCtrl* m_sprueColdSlugDepth = nullptr;
+
+    // Runner field members
+    wxChoice* m_runnerTypeChoice = nullptr;
+    wxTextCtrl* m_runnerDiameter = nullptr;
 
     // Creates the top ribbon panel
     wxPanel* CreateRibbon(wxWindow* parent);
@@ -90,6 +100,9 @@ private:
 
     // Sprue tool buttons (ribbon — Sprues group)
     wxButton* m_btnPlaceSprue = nullptr;
+
+    // Runner tool button (ribbon — Runners group)
+    wxToggleButton* m_btnPlaceRunner = nullptr;
 
     wxPanel* m_sidePanel = nullptr;
     wxTextCtrl* m_exportPath = nullptr;
@@ -115,6 +128,8 @@ private:
         ID_ChangeFixture,
         ID_ClearVentPoints,
         ID_PlaceSprue,
-        ID_ClearSprue
+        ID_ClearSprue,
+        ID_PlaceRunner,
+        ID_ClearRunners
     };
 };

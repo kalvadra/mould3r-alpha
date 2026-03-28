@@ -115,6 +115,10 @@ public:
     bool              HasSpruePartingPoint() const { return m_hasSpruePartingPoint; }
     const glm::vec3& GetSpruePartingPoint() const { return m_spruePartingPos; }
 
+    // Runner placement
+    const std::vector<glm::vec3>& GetRunnerPoints() const { return m_runnerPoints; }
+    void ClearRunnerPoints();
+
 private:
     void OnPaint(wxPaintEvent& evt);
     void OnResize(wxSizeEvent& evt);
@@ -141,6 +145,9 @@ private:
     bool RayCastParting(int mouseX, int mouseY,
         glm::vec3& outPos, glm::vec3& outNormal);
 
+    // Simple ray–plane intersection with y=0 (no mesh snapping)
+    bool RayCastToPartingPlane(int mouseX, int mouseY, glm::vec3& outPos);
+
     // Vent path computation and GPU upload
     VentPath         ComputeVentPath(const VentPoint& vp);
     void             RebuildPathVBO();
@@ -165,6 +172,9 @@ private:
 
     // Sprue cross-section circle GPU upload (N-segment line-loop approximation)
     void RebuildSprueXsecVBO();
+
+    // Runner path lines GPU upload (sprue parting point → each runner point)
+    void RebuildRunnerPathVBO();
 
     // Sprue solid — swept cylinder mesh (same GPU layout as VentSolid)
     VentSolid BuildSprueSolid(const glm::vec3& start, const glm::vec3& end,
@@ -219,6 +229,14 @@ private:
     bool      m_ventGhostActive = false;
     wxPoint   m_ghostMousePos;          // last known cursor pos, ray cast deferred to OnPaint
 
+    // Runner placement points (on the y=0 parting plane)
+    std::vector<glm::vec3> m_runnerPoints;
+
+    // Ghost preview for runner placement (follows mouse in PlaceRunner mode)
+    glm::vec3 m_runnerGhostPos{ 0.0f };
+    bool      m_runnerGhostActive = false;
+    wxPoint   m_runnerGhostMousePos;
+
     // Fallback test geometry (pyramid)
     unsigned int m_vao = 0;
     unsigned int m_vbo = 0;
@@ -249,6 +267,11 @@ private:
     GLuint  m_sprueXsecVAO = 0;
     GLuint  m_sprueXsecVBO = 0;
     GLsizei m_sprueXsecVertexCount = 0;
+
+    // Runner path line GPU resources (sprue parting point → each runner point)
+    GLuint  m_runnerPathVAO = 0;
+    GLuint  m_runnerPathVBO = 0;
+    GLsizei m_runnerPathVertexCount = 0;
 
     // Vent cross-section GPU resources
     GLuint  m_xsecVAO = 0;

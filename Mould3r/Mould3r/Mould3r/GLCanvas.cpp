@@ -173,6 +173,8 @@ void GLCanvas::SetTransformMode(TransformMode mode)
         SetCursor(wxCursor(wxCURSOR_SIZENS));   break;
     case TransformMode::PlaceVent:
         SetCursor(wxCursor(wxCURSOR_CROSS));    break;
+    case TransformMode::PlaceRunner:
+        SetCursor(wxCursor(wxCURSOR_CROSS));    break;
     }
 }
 
@@ -308,6 +310,45 @@ void GLCanvas::RebuildSprueXsecVBO()
     glBufferData(GL_ARRAY_BUFFER,
         (GLsizeiptr)(verts.size() * sizeof(float)),
         verts.data(), GL_DYNAMIC_DRAW);
+    glBindVertexArray(0);
+}
+
+// ---------------------------------------------------------------------------
+// RebuildRunnerPathVBO — uploads line segments from the sprue parting point
+// to each runner point as GL_LINES pairs.
+// ---------------------------------------------------------------------------
+void GLCanvas::RebuildRunnerPathVBO()
+{
+    if (!m_runnerPathVAO) return;
+
+    glBindVertexArray(m_runnerPathVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, m_runnerPathVBO);
+
+    if (m_hasSpruePartingPoint && !m_runnerPoints.empty())
+    {
+        std::vector<float> verts;
+        verts.reserve(m_runnerPoints.size() * 6);  // 2 endpoints × 3 floats per line
+
+        for (const glm::vec3& rp : m_runnerPoints)
+        {
+            verts.push_back(m_spruePartingPos.x);
+            verts.push_back(m_spruePartingPos.y);
+            verts.push_back(m_spruePartingPos.z);
+            verts.push_back(rp.x);
+            verts.push_back(rp.y);
+            verts.push_back(rp.z);
+        }
+
+        m_runnerPathVertexCount = (GLsizei)(verts.size() / 3);
+        glBufferData(GL_ARRAY_BUFFER,
+            (GLsizeiptr)(verts.size() * sizeof(float)),
+            verts.data(), GL_DYNAMIC_DRAW);
+    }
+    else
+    {
+        m_runnerPathVertexCount = 0;
+    }
+
     glBindVertexArray(0);
 }
 
@@ -464,6 +505,7 @@ void GLCanvas::SetActiveInjectionPoint(const InjectionPoint& ip)
     m_sprueColdSlugSolid.Destroy();
     RebuildSpruePathVBO();
     RebuildSprueXsecVBO();
+    RebuildRunnerPathVBO();
     Refresh(false);
 }
 
@@ -563,6 +605,7 @@ void GLCanvas::PlaceSprue()
 
     RebuildSpruePathVBO();
     RebuildSprueXsecVBO();
+    RebuildRunnerPathVBO();
     Refresh(false);
 }
 
@@ -575,6 +618,7 @@ void GLCanvas::ClearSprue()
     m_sprueColdSlugSolid.Destroy();
     RebuildSpruePathVBO();
     RebuildSprueXsecVBO();
+    RebuildRunnerPathVBO();
     Refresh(false);
 }
 
@@ -1262,6 +1306,48 @@ bool GLCanvas::RayCastParting(int mouseX, int mouseY,
 }
 
 // ---------------------------------------------------------------------------
+// RayCastToPartingPlane — simple ray–plane intersection with world y=0.
+// Returns the hit point on the plane; no mesh snapping.
+// ---------------------------------------------------------------------------
+bool GLCanvas::RayCastToPartingPlane(int mouseX, int mouseY, glm::vec3& outPos)
+{
+    const wxSize sz = GetClientSize();
+    const int    w = std::max(1, sz.x);
+    const int    h = std::max(1, sz.y);
+
+    const float ndcX = (2.0f * float(mouseX)) / float(w) - 1.0f;
+    const float ndcY = 1.0f - (2.0f * float(mouseY)) / float(h);
+
+    m_camera.SetAspect(float(w) / float(h));
+    const glm::mat4 invVP = glm::inverse(m_camera.Projection() * m_camera.View());
+
+    glm::vec4 nearH = invVP * glm::vec4(ndcX, ndcY, -1.0f, 1.0f);
+    glm::vec4 farH = invVP * glm::vec4(ndcX, ndcY, 1.0f, 1.0f);
+    nearH /= nearH.w;
+    farH /= farH.w;
+
+    const glm::vec3 rayOrig = glm::vec3(nearH);
+    const glm::vec3 rayDir = glm::normalize(glm::vec3(farH) - glm::vec3(nearH));
+
+    if (std::abs(rayDir.y) < 1e-6f) return false;   // ray parallel to plane
+    const float t = -rayOrig.y / rayDir.y;
+    if (t < 0.0f) return false;                       // plane behind camera
+
+    outPos = rayOrig + rayDir * t;                    // y == 0
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// ClearRunnerPoints
+// ---------------------------------------------------------------------------
+void GLCanvas::ClearRunnerPoints()
+{
+    m_runnerPoints.clear();
+    RebuildRunnerPathVBO();
+    Refresh(false);
+}
+
+// ---------------------------------------------------------------------------
 // BuildFixturePerimeter — collects all y=0 XZ crossing points from every
 // fixture triangle, then computes their 2D convex hull (Graham scan).
 // Result is cached in m_fixturePerimeter and is only rebuilt when fixtures
@@ -1795,6 +1881,15 @@ void GLCanvas::InitGLOnce()
     glEnableVertexAttribArray(0);
     glBindVertexArray(0);
 
+    // Runner path line VBO (dynamic, sprue parting point → runner points)
+    glGenVertexArrays(1, &m_runnerPathVAO);
+    glGenBuffers(1, &m_runnerPathVBO);
+    glBindVertexArray(m_runnerPathVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, m_runnerPathVBO);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glBindVertexArray(0);
+
     m_inited = true;
 }
 
@@ -1820,6 +1915,8 @@ void GLCanvas::DestroyGL()
     if (m_spruePathVAO) { glDeleteVertexArrays(1, &m_spruePathVAO);    m_spruePathVAO = 0; }
     if (m_sprueXsecVBO) { glDeleteBuffers(1, &m_sprueXsecVBO);         m_sprueXsecVBO = 0; }
     if (m_sprueXsecVAO) { glDeleteVertexArrays(1, &m_sprueXsecVAO);    m_sprueXsecVAO = 0; }
+    if (m_runnerPathVBO) { glDeleteBuffers(1, &m_runnerPathVBO);         m_runnerPathVBO = 0; }
+    if (m_runnerPathVAO) { glDeleteVertexArrays(1, &m_runnerPathVAO);    m_runnerPathVAO = 0; }
     if (m_sphereEBO) { glDeleteBuffers(1, &m_sphereEBO);          m_sphereEBO = 0; }
     if (m_sphereVBO) { glDeleteBuffers(1, &m_sphereVBO);          m_sphereVBO = 0; }
     if (m_sphereVAO) { glDeleteVertexArrays(1, &m_sphereVAO);     m_sphereVAO = 0; }
@@ -2268,6 +2365,71 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         glUseProgram(0);
     }
 
+    // ---- Runner point markers (blue spheres) --------------------------------
+    if (m_transformMode == TransformMode::PlaceRunner)
+    {
+        glm::vec3 hitPos;
+        m_runnerGhostActive = RayCastToPartingPlane(
+            m_runnerGhostMousePos.x, m_runnerGhostMousePos.y, hitPos);
+        m_runnerGhostPos = hitPos;
+    }
+    if (m_program && m_sphereVAO && m_sphereIndexCount > 0 &&
+        (!m_runnerPoints.empty() || m_runnerGhostActive))
+    {
+        glEnable(GL_DEPTH_TEST);
+        glUseProgram(m_program);
+
+        glUniform3fv(glGetUniformLocation(m_program, "uCameraPos"), 1, &camPos[0]);
+        glUniform3fv(glGetUniformLocation(m_program, "uLightDir"), 1, &lightDir[0]);
+        glUniform3fv(glGetUniformLocation(m_program, "uLightColor"), 1, &lightColor[0]);
+        glUniform1f(glGetUniformLocation(m_program, "uAmbient"), 0.35f);
+        glUniform1f(glGetUniformLocation(m_program, "uDiffuse"), 0.75f);
+        glUniform1f(glGetUniformLocation(m_program, "uSpecular"), 0.60f);
+        glUniform1f(glGetUniformLocation(m_program, "uShininess"), 48.0f);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uView"), 1, GL_FALSE, &view[0][0]);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uProj"), 1, GL_FALSE, &proj[0][0]);
+
+        glBindVertexArray(m_sphereVAO);
+
+        // Ghost preview — translucent
+        if (m_runnerGhostActive)
+        {
+            const glm::vec3 ghostColor(0.10f, 0.40f, 0.95f);   // blue
+            glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &ghostColor[0]);
+            glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 0.45f);
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glDepthMask(GL_FALSE);
+
+            glm::mat4 model = glm::translate(glm::mat4(1.0f), m_runnerGhostPos);
+            model = glm::scale(model, glm::vec3(kVentMarkerRadius * 1.15f));
+            glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &model[0][0]);
+            glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
+
+            glDepthMask(GL_TRUE);
+            glDisable(GL_BLEND);
+        }
+
+        // Confirmed runner points — fully opaque blue
+        if (!m_runnerPoints.empty())
+        {
+            const glm::vec3 runnerColor(0.10f, 0.40f, 0.95f);   // blue
+            glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &runnerColor[0]);
+            glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 1.0f);
+
+            for (const glm::vec3& rp : m_runnerPoints)
+            {
+                glm::mat4 model = glm::translate(glm::mat4(1.0f), rp);
+                model = glm::scale(model, glm::vec3(kVentMarkerRadius));
+                glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &model[0][0]);
+                glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
+            }
+        }
+
+        glBindVertexArray(0);
+        glUseProgram(0);
+    }
+
     // ---- Sprue sphere (purple) ---------------------------------------------
     if (m_program && m_sphereVAO && m_sphereIndexCount > 0 && m_hasSpruePoint)
     {
@@ -2364,6 +2526,27 @@ void GLCanvas::OnPaint(wxPaintEvent&)
 
         glBindVertexArray(m_sprueXsecVAO);
         glDrawArrays(GL_LINES, 0, m_sprueXsecVertexCount);
+        glBindVertexArray(0);
+
+        glLineWidth(1.0f);
+        glUseProgram(0);
+    }
+
+    // ---- Runner path lines (blue) ------------------------------------------
+    if (m_flatProgram && m_runnerPathVAO && m_runnerPathVertexCount > 0)
+    {
+        glEnable(GL_DEPTH_TEST);
+        glLineWidth(2.5f);
+        glUseProgram(m_flatProgram);
+
+        const glm::mat4 VP = proj * view;
+        glUniformMatrix4fv(m_flat_uVP, 1, GL_FALSE, &VP[0][0]);
+
+        const glm::vec4 runnerLineColor(0.10f, 0.40f, 0.95f, 1.0f);   // blue
+        glUniform4fv(m_flat_uColor, 1, &runnerLineColor[0]);
+
+        glBindVertexArray(m_runnerPathVAO);
+        glDrawArrays(GL_LINES, 0, m_runnerPathVertexCount);
         glBindVertexArray(0);
 
         glLineWidth(1.0f);
@@ -2615,6 +2798,17 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
                 Refresh(false);
             }
         }
+        else if (m_transformMode == TransformMode::PlaceRunner)
+        {
+            const wxPoint p = evt.GetPosition();
+            glm::vec3 hitPos;
+            if (RayCastToPartingPlane(p.x, p.y, hitPos))
+            {
+                m_runnerPoints.push_back(hitPos);
+                RebuildRunnerPathVBO();
+                Refresh(false);
+            }
+        }
     }
 
     if (evt.LeftUp()) { m_lmb = false; if (HasCapture()) ReleaseMouse(); }
@@ -2636,6 +2830,11 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
         if (m_transformMode == TransformMode::PlaceVent)
         {
             m_ghostMousePos = pos;
+            Refresh(false);
+        }
+        if (m_transformMode == TransformMode::PlaceRunner)
+        {
+            m_runnerGhostMousePos = pos;
             Refresh(false);
         }
         evt.Skip();
@@ -2704,6 +2903,17 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
             m_camera.Orbit(dx, dy);
         Refresh(false);
     }
+    else if (m_lmb && m_transformMode == TransformMode::PlaceRunner)
+    {
+        // Orbit while holding LMB in PlaceRunner mode
+        if (shift)
+            m_camera.Pan(dx, -dy);
+        else if (ctrl)
+            m_camera.Dolly(dy * 0.05f);
+        else
+            m_camera.Orbit(dx, dy);
+        Refresh(false);
+    }
 
     // Update ghost preview whenever the mouse moves in PlaceVent mode.
     // The actual ray cast is deferred to OnPaint so only one cast runs per
@@ -2713,9 +2923,15 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
         m_ghostMousePos = evt.GetPosition();
         Refresh(false);
     }
-    else if (m_ventGhostActive)
+    else if (m_transformMode == TransformMode::PlaceRunner)
+    {
+        m_runnerGhostMousePos = evt.GetPosition();
+        Refresh(false);
+    }
+    else if (m_ventGhostActive || m_runnerGhostActive)
     {
         m_ventGhostActive = false;
+        m_runnerGhostActive = false;
         Refresh(false);
     }
 
@@ -2738,6 +2954,7 @@ void GLCanvas::OnKeyDown(wxKeyEvent& evt)
         if (m_transformMode != TransformMode::Select)
         {
             m_ventGhostActive = false;
+            m_runnerGhostActive = false;
             SetTransformMode(TransformMode::Select);
             if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
                 frame->SetActiveTool(TransformMode::Select);
