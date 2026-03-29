@@ -102,18 +102,22 @@ public:
     void ClearFixtures();
 
     // Vent point placement
-    const std::vector<VentPoint>& GetVentPoints() const { return m_ventPoints; }
+    const std::vector<VentInstance>& GetVents() const { return m_vents; }
     void ClearVentPoints();
 
     // Sprue placement
     void SetActiveInjectionPoint(const InjectionPoint& ip);
     void PlaceSprue();
     void ClearSprue();
-    bool IsDirectInjection() const { return m_isDirectInjection; }
+    bool IsDirectInjection() const { return m_sprue.isDirectInjection; }
 
     // Point where the sprue path crosses the y=0 parting plane
-    bool              HasSpruePartingPoint() const { return m_hasSpruePartingPoint; }
-    const glm::vec3& GetSpruePartingPoint() const { return m_spruePartingPos; }
+    bool              HasSpruePartingPoint() const { return m_sprue.hasPartingPoint; }
+    const glm::vec3& GetSpruePartingPoint() const { return m_sprue.partingPos; }
+
+    // Runner placement
+    const std::vector<RunnerFeature>& GetRunners() const { return m_runners; }
+    void ClearRunnerPoints();
 
 private:
     void OnPaint(wxPaintEvent& evt);
@@ -141,6 +145,9 @@ private:
     bool RayCastParting(int mouseX, int mouseY,
         glm::vec3& outPos, glm::vec3& outNormal);
 
+    // Simple ray–plane intersection with y=0 (no mesh snapping)
+    bool RayCastToPartingPlane(int mouseX, int mouseY, glm::vec3& outPos);
+
     // Vent path computation and GPU upload
     VentPath         ComputeVentPath(const VentPoint& vp);
     void             RebuildPathVBO();
@@ -150,9 +157,7 @@ private:
         float width, float depth);
     void             RebuildCrossSectionVBO();
 
-    // Vent solid (swept mesh)
-    VentSolid BuildVentSolid(const VentPath& path, float width, float depth,
-        float overrunStart = 0.0f, float overrunEnd = 0.0f);
+    // Vent solid is now built via free function BuildBoxSweepMesh() in MouldFeature.h
 
     // World-space ray cast against imported objects (no mouse unprojection).
     // Fires from 'origin' along 'dir' up to 'maxDist' world units.
@@ -166,9 +171,13 @@ private:
     // Sprue cross-section circle GPU upload (N-segment line-loop approximation)
     void RebuildSprueXsecVBO();
 
-    // Sprue solid — swept cylinder mesh (same GPU layout as VentSolid)
-    VentSolid BuildSprueSolid(const glm::vec3& start, const glm::vec3& end,
-        float radius, float draftAngleDeg = 0.0f, int segments = 32);
+    // Runner path lines GPU upload (sprue parting point → each runner point)
+    void RebuildRunnerPathVBO();
+
+    // Runner solid geometry — swept cylinders from sprue parting point to each runner point
+    void RebuildRunnerSolids();
+
+    // Cylinder/frustum mesh is now built via free function BuildCylinderMesh() in MouldFeature.h
 
     // Fixture outer perimeter on the parting plane (convex hull in XZ)
     void                   BuildFixturePerimeter();
@@ -190,34 +199,26 @@ private:
     std::vector<SceneObject> m_objects;
     int                      m_selectedIndex = -1;
 
-    // Vent placement points
-    std::vector<VentPoint>        m_ventPoints;
-    std::vector<VentPath>         m_ventPaths;          // parallel to m_ventPoints
-    std::vector<VentCrossSection> m_ventCrossSections;  // parallel to m_ventPoints
-    std::vector<VentSolid>        m_ventSolids;         // parallel to m_ventPoints
+    // Vent features (consolidated: point + path + cross-section + solid)
+    std::vector<VentInstance> m_vents;
 
-    // Sprue state
+    // Sprue state (consolidated)
     InjectionPoint m_activeInjectionPoint;         // set from fixture on load
     bool           m_hasActiveInjectionPoint = false;
-    bool           m_isDirectInjection = false;    // true when sprue ray hits a body directly
-    float          m_sprueRadius = 2.5f;           // radius of the sprue cylinder (mm)
-    float          m_sprueDraftAngleDeg = 1.0f;    // draft angle in degrees
-    float          m_sprueColdSlugDepth = 5.0f;    // cold slug well depth (mm)
-    glm::vec3      m_sprueWorldPos{ 0.0f };        // world-space position of placed sphere
-    bool           m_hasSpruePoint = false;
-    glm::vec3      m_spruePathStart{ 0.0f };       // injection point (= m_sprueWorldPos)
-    glm::vec3      m_spruePathEnd{ 0.0f };         // object hit or y=0 projection
-    VentSolid      m_sprueSolid;                   // swept cylinder mesh for preview
-    VentSolid      m_sprueColdSlugSolid;           // cold slug well cylinder
-
-    // Sprue–parting-plane intersection
-    glm::vec3      m_spruePartingPos{ 0.0f };       // where the sprue path crosses y=0
-    bool           m_hasSpruePartingPoint = false;
+    SprueFeature   m_sprue;
 
     // Ghost preview for vent placement (follows mouse in PlaceVent mode)
     VentPoint m_ventGhost;
     bool      m_ventGhostActive = false;
     wxPoint   m_ghostMousePos;          // last known cursor pos, ray cast deferred to OnPaint
+
+    // Runner features (consolidated: point + solid + cold plug solid)
+    std::vector<RunnerFeature> m_runners;
+
+    // Ghost preview for runner placement (follows mouse in PlaceRunner mode)
+    glm::vec3 m_runnerGhostPos{ 0.0f };
+    bool      m_runnerGhostActive = false;
+    wxPoint   m_runnerGhostMousePos;
 
     // Fallback test geometry (pyramid)
     unsigned int m_vao = 0;
@@ -240,15 +241,12 @@ private:
     GLuint  m_pathVBO = 0;
     GLsizei m_pathVertexCount = 0;
 
-    // Sprue path line GPU resources
-    GLuint  m_spruePathVAO = 0;
-    GLuint  m_spruePathVBO = 0;
-    GLsizei m_spruePathVertexCount = 0;
+    // Sprue path/xsec GPU resources now live inside m_sprue (SprueFeature)
 
-    // Sprue cross-section circle GPU resources
-    GLuint  m_sprueXsecVAO = 0;
-    GLuint  m_sprueXsecVBO = 0;
-    GLsizei m_sprueXsecVertexCount = 0;
+    // Runner path line GPU resources (sprue parting point → each runner point)
+    GLuint  m_runnerPathVAO = 0;
+    GLuint  m_runnerPathVBO = 0;
+    GLsizei m_runnerPathVertexCount = 0;
 
     // Vent cross-section GPU resources
     GLuint  m_xsecVAO = 0;

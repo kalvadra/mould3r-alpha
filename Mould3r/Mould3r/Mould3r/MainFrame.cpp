@@ -249,6 +249,35 @@ wxPanel* MainFrame::CreateRibbon(wxWindow* parent)
     hSizer->Add(divider3, 0, wxALIGN_CENTER_VERTICAL);
     hSizer->AddSpacer(16);
 
+    // ---- RUNNERS group -----------------------------------------------------
+    auto* runnersSizer = new wxBoxSizer(wxVERTICAL);
+    auto* runnersRow = new wxBoxSizer(wxHORIZONTAL);
+
+    m_btnPlaceRunner = addTool(ID_PlaceRunner, "Place Runner", "Click the parting plane to place a runner point");
+
+    runnersRow->Add(m_btnPlaceRunner, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
+
+    auto* btnClearRunners = new wxButton(panel, ID_ClearRunners, "Clear",
+        wxDefaultPosition, wxSize(50, 32));
+    btnClearRunners->SetToolTip("Remove all runner placement points");
+    btnClearRunners->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
+    btnClearRunners->SetForegroundColour(kTextDefault);
+    btnClearRunners->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
+    runnersRow->Add(btnClearRunners, 0, wxALIGN_CENTER_VERTICAL);
+
+    runnersSizer->Add(runnersRow, 0, wxALIGN_CENTER_HORIZONTAL);
+    runnersSizer->Add(addLabel("RUNNERS"), 0, wxALIGN_CENTER_HORIZONTAL | wxTOP, 2);
+
+    hSizer->Add(runnersSizer, 0, wxALIGN_CENTER_VERTICAL | wxTOP | wxBOTTOM, 6);
+
+    // Vertical divider
+    hSizer->AddSpacer(16);
+    auto* divider4 = new wxPanel(panel, wxID_ANY, wxDefaultPosition, wxSize(1, 36));
+    divider4->SetBackgroundColour(wxColour(0x38, 0x44, 0x55));
+    hSizer->Add(divider4, 0, wxALIGN_CENTER_VERTICAL);
+    hSizer->AddSpacer(16);
+
     // ---- Hint label --------------------------------------------------------
     auto* hint = new wxStaticText(panel, wxID_ANY,
         "LMB: orbit / transform    MMB: pan    Scroll: zoom    Shift+LMB: pan");
@@ -270,6 +299,8 @@ wxPanel* MainFrame::CreateRibbon(wxWindow* parent)
     Bind(wxEVT_BUTTON, &MainFrame::OnClearVentPoints, this, ID_ClearVentPoints);
     Bind(wxEVT_BUTTON, &MainFrame::OnPlaceSprue, this, ID_PlaceSprue);
     Bind(wxEVT_BUTTON, &MainFrame::OnClearSprue, this, ID_ClearSprue);
+    Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnPlaceRunner, this, ID_PlaceRunner);
+    Bind(wxEVT_BUTTON, &MainFrame::OnClearRunners, this, ID_ClearRunners);
 
     return panel;
 }
@@ -375,6 +406,11 @@ void MainFrame::SetActiveTool(TransformMode mode)
         StyleRibbonBtn(m_btnPlaceVent, false);
         m_btnPlaceVent->SetValue(false);
     }
+    if (m_btnPlaceRunner)
+    {
+        StyleRibbonBtn(m_btnPlaceRunner, false);
+        m_btnPlaceRunner->SetValue(false);
+    }
 
     // Activate selected
     switch (mode)
@@ -390,6 +426,13 @@ void MainFrame::SetActiveTool(TransformMode mode)
         {
             StyleRibbonBtn(m_btnPlaceVent, true);
             m_btnPlaceVent->SetValue(true);
+        }
+        break;
+    case TransformMode::PlaceRunner:
+        if (m_btnPlaceRunner)
+        {
+            StyleRibbonBtn(m_btnPlaceRunner, true);
+            m_btnPlaceRunner->SetValue(true);
         }
         break;
     }
@@ -501,6 +544,21 @@ void MainFrame::OnClearSprue(wxCommandEvent&)
         m_canvas->ClearSprue();
 }
 
+void MainFrame::OnPlaceRunner(wxCommandEvent&)
+{
+    // Toggle: if already in PlaceRunner mode, return to Select
+    if (m_canvas && m_canvas->GetTransformMode() == TransformMode::PlaceRunner)
+        SetActiveTool(TransformMode::Select);
+    else
+        SetActiveTool(TransformMode::PlaceRunner);
+}
+
+void MainFrame::OnClearRunners(wxCommandEvent&)
+{
+    if (m_canvas)
+        m_canvas->ClearRunnerPoints();
+}
+
 void MainFrame::GetVentDimensions(float& outLength, float& outWidth,
     float& outOverrunStart, float& outOverrunEnd) const
 {
@@ -542,6 +600,23 @@ float MainFrame::GetSprueColdSlugDepth() const
     if (!m_sprueColdSlugDepth) return 5.0f;
     double v = 5.0;
     if (!m_sprueColdSlugDepth->GetValue().ToDouble(&v)) return 5.0f;
+    if (v < 0.0) v = 0.0;
+    return static_cast<float>(v);
+}
+
+float MainFrame::GetRunnerDiameter() const
+{
+    if (!m_runnerDiameter) return 5.0f;
+    double v = 5.0;
+    if (!m_runnerDiameter->GetValue().ToDouble(&v)) return 5.0f;
+    return (v > 0.0) ? static_cast<float>(v) : 5.0f;
+}
+
+float MainFrame::GetRunnerColdPlugDist() const
+{
+    if (!m_runnerColdSlugDepth) return 5.0f;
+    double v = 5.0;
+    if (!m_runnerColdSlugDepth->GetValue().ToDouble(&v)) return 5.0f;
     if (v < 0.0) v = 0.0;
     return static_cast<float>(v);
 }
@@ -870,6 +945,103 @@ wxPanel* MainFrame::CreateSpruesContent(wxWindow* parent)
     return panel;
 }
 
+wxPanel* MainFrame::CreateRunnersContent(wxWindow* parent)
+{
+    auto* panel = new wxPanel(parent, wxID_ANY);
+    panel->SetBackgroundColour(kRibbonBg);
+
+    auto* sizer = new wxBoxSizer(wxVERTICAL);
+
+    // ---- Runner type dropdown -----------------------------------------------
+    auto* typeLabel = new wxStaticText(panel, wxID_ANY, "Runner type:");
+    typeLabel->SetForegroundColour(kTextDefault);
+    typeLabel->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+    sizer->Add(typeLabel, 0, wxLEFT | wxTOP, 10);
+
+    m_runnerTypeChoice = new wxChoice(panel, wxID_ANY);
+    m_runnerTypeChoice->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
+    m_runnerTypeChoice->SetForegroundColour(kTextDefault);
+    m_runnerTypeChoice->Append("Cylindrical");
+    m_runnerTypeChoice->SetSelection(0);
+    sizer->Add(m_runnerTypeChoice, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
+
+    // ---- Dimensions panel (shown for Cylindrical) ---------------------------
+    auto* dimsPanel = new wxPanel(panel, wxID_ANY);
+    dimsPanel->SetBackgroundColour(kRibbonBg);
+
+    auto* dimsSizer = new wxBoxSizer(wxVERTICAL);
+
+    // Diameter row
+    {
+        auto* row = new wxBoxSizer(wxHORIZONTAL);
+
+        auto* lbl = new wxStaticText(dimsPanel, wxID_ANY, "Diameter:",
+            wxDefaultPosition, wxSize(60, -1));
+        lbl->SetForegroundColour(kTextDefault);
+        lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+
+        m_runnerDiameter = new wxTextCtrl(dimsPanel, wxID_ANY, "4.0",
+            wxDefaultPosition, wxSize(70, 22));
+        m_runnerDiameter->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
+        m_runnerDiameter->SetForegroundColour(kTextDefault);
+
+
+        auto* unit = new wxStaticText(dimsPanel, wxID_ANY, "mm");
+        unit->SetForegroundColour(wxColour(0x55, 0x6A, 0x85));
+        unit->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+
+        row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
+        row->Add(m_runnerDiameter, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
+        row->Add(unit, 0, wxALIGN_CENTER_VERTICAL);
+        dimsSizer->Add(row, 0, wxLEFT | wxTOP, 10);
+    }
+
+    //Cold Slug Well Row
+    {
+        auto* row = new wxBoxSizer(wxHORIZONTAL);
+
+        auto* lbl = new wxStaticText(dimsPanel, wxID_ANY, "Cold slug length:",
+            wxDefaultPosition, wxSize(60, -1));
+        lbl->SetForegroundColour(kTextDefault);
+        lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+
+        m_runnerColdSlugDepth = new wxTextCtrl(dimsPanel, wxID_ANY, "5.0",
+            wxDefaultPosition, wxSize(70, 22));
+        m_runnerColdSlugDepth->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
+        m_runnerColdSlugDepth->SetForegroundColour(kTextDefault);
+
+
+        auto* unit = new wxStaticText(dimsPanel, wxID_ANY, "mm");
+        unit->SetForegroundColour(wxColour(0x55, 0x6A, 0x85));
+        unit->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+
+        row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
+        row->Add(m_runnerColdSlugDepth, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
+        row->Add(unit, 0, wxALIGN_CENTER_VERTICAL);
+        dimsSizer->Add(row, 0, wxLEFT | wxTOP, 10);
+    }
+
+    dimsPanel->SetSizer(dimsSizer);
+    sizer->Add(dimsPanel, 0, wxEXPAND | wxBOTTOM, 10);
+
+    panel->SetSizer(sizer);
+
+    // Show/hide dims based on type selection (future-proofed for more types)
+    m_runnerTypeChoice->Bind(wxEVT_CHOICE, [dimsPanel, this](wxCommandEvent&)
+        {
+            dimsPanel->Show(m_runnerTypeChoice->GetStringSelection() == "Cylindrical");
+            dimsPanel->GetParent()->Layout();
+            dimsPanel->GetParent()->GetParent()->Layout();
+        });
+
+    return panel;
+}
+
 wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
 {
     auto* panel = new wxPanel(parent, wxID_ANY,
@@ -896,7 +1068,9 @@ wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
     // Sprues — custom content
     wxPanel* spruesContent = CreateSpruesContent(panel);
     CreateCollapsibleSection(panel, sizer, "Sprues", &spruesContent);
-    CreateCollapsibleSection(panel, sizer, "Runners");
+    // Runners — custom content
+    wxPanel* runnersContent = CreateRunnersContent(panel);
+    CreateCollapsibleSection(panel, sizer, "Runners", &runnersContent);
     CreateCollapsibleSection(panel, sizer, "Gates");
     // Vents — custom content
     wxPanel* ventsContent = CreateVentsContent(panel);
