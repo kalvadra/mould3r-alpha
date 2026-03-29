@@ -353,6 +353,37 @@ void GLCanvas::RebuildRunnerPathVBO()
 }
 
 // ---------------------------------------------------------------------------
+// RebuildRunnerSolids — destroys existing runner solid meshes and rebuilds
+// one swept cylinder per runner point, running from the sprue parting point
+// to the runner point along the y=0 parting plane.  Uses the runner diameter
+// from the left-panel UI.
+// ---------------------------------------------------------------------------
+void GLCanvas::RebuildRunnerSolids()
+{
+    for (auto& s : m_runnerSolids) s.Destroy();
+    m_runnerSolids.clear();
+
+    if (!m_hasSpruePartingPoint || m_runnerPoints.empty()) return;
+
+    // Read the current runner diameter from the UI
+    float runnerRadius = 2.5f;   // default: 5 mm diameter → 2.5 mm radius
+    if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+        runnerRadius = frame->GetRunnerDiameter() * 0.5f;
+
+    m_runnerSolids.reserve(m_runnerPoints.size());
+
+    for (const glm::vec3& rp : m_runnerPoints)
+    {
+        // Runner runs from the sprue parting point to the placed runner point,
+        // both on the y=0 plane.  Use BuildSprueSolid with 0 draft angle for
+        // a straight cylinder.
+        VentSolid solid = BuildSprueSolid(m_spruePartingPos, rp, runnerRadius,
+                                          /*draftAngleDeg=*/0.0f);
+        m_runnerSolids.push_back(std::move(solid));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // BuildSprueSolid — sweeps a circular cross-section from start to end to
 // produce a closed frustum (tapered cylinder) mesh.
 //
@@ -501,11 +532,13 @@ void GLCanvas::SetActiveInjectionPoint(const InjectionPoint& ip)
     // after a fixture change.
     m_isDirectInjection = false;
     m_hasSpruePoint = false;
+    m_hasSpruePartingPoint = false;
     m_sprueSolid.Destroy();
     m_sprueColdSlugSolid.Destroy();
     RebuildSpruePathVBO();
     RebuildSprueXsecVBO();
     RebuildRunnerPathVBO();
+    RebuildRunnerSolids();
     Refresh(false);
 }
 
@@ -606,6 +639,7 @@ void GLCanvas::PlaceSprue()
     RebuildSpruePathVBO();
     RebuildSprueXsecVBO();
     RebuildRunnerPathVBO();
+    RebuildRunnerSolids();
     Refresh(false);
 }
 
@@ -619,6 +653,7 @@ void GLCanvas::ClearSprue()
     RebuildSpruePathVBO();
     RebuildSprueXsecVBO();
     RebuildRunnerPathVBO();
+    RebuildRunnerSolids();
     Refresh(false);
 }
 
@@ -640,8 +675,8 @@ void GLCanvas::GenerateMould()
         return;
     }
 
-    // Steps per fixture: 1 read + 1 transform + (1 per object subtract) + (1 per vent subtract) + 1 sprue + 1 tessellate + 1 upload
-    const int stepsPerFixture = 4 + (int)m_objects.size() + (int)m_ventCrossSections.size();
+    // Steps per fixture: 1 read + 1 transform + (1 per object subtract) + (1 per vent subtract) + (1 per runner subtract) + 1 sprue + 1 tessellate + 1 upload
+    const int stepsPerFixture = 4 + (int)m_objects.size() + (int)m_ventCrossSections.size() + (int)m_runnerPoints.size();
     const int totalSteps = stepsPerFixture * (int)m_fixtures.size();
 
     wxProgressDialog progress(
@@ -805,6 +840,53 @@ void GLCanvas::GenerateMould()
                 continue;
             }
             result = ventCut.Shape();
+        }
+
+        // Steps: subtract each runner (cylinder from sprue parting point to runner point)
+        if (m_hasSpruePartingPoint)
+        {
+            // Read runner radius from UI (same source as the preview solids)
+            float runnerRadius = 2.5f;
+            if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+                runnerRadius = frame->GetRunnerDiameter() * 0.5f;
+
+            for (int ri = 0; ri < (int)m_runnerPoints.size(); ++ri)
+            {
+                progress.Update(step++,
+                    fixLabel + ": cutting runner " +
+                    std::to_string(ri + 1) + " of " +
+                    std::to_string((int)m_runnerPoints.size()) + "...");
+
+                const glm::vec3& rp = m_runnerPoints[ri];
+                const glm::vec3 runnerAxis = rp - m_spruePartingPos;
+                const float runnerLen = glm::length(runnerAxis);
+                if (runnerLen < 1e-6f || runnerRadius < 1e-6f) continue;
+
+                const glm::vec3 runnerDir = runnerAxis / runnerLen;
+
+                gp_Ax2 runnerAx(
+                    gp_Pnt(m_spruePartingPos.x, m_spruePartingPos.y, m_spruePartingPos.z),
+                    gp_Dir(runnerDir.x, runnerDir.y, runnerDir.z)
+                );
+
+                BRepPrimAPI_MakeCylinder runnerCyl(runnerAx, runnerRadius, runnerLen);
+                if (!runnerCyl.IsDone() || runnerCyl.Shape().IsNull()) continue;
+
+                BRepAlgoAPI_Cut runnerCut(result, runnerCyl.Shape());
+                runnerCut.Build();
+                if (!runnerCut.IsDone() || runnerCut.Shape().IsNull())
+                {
+                    wxMessageBox("Runner cut failed for runner " + std::to_string(ri + 1),
+                        "Generate Mould", wxOK | wxICON_WARNING, this);
+                    continue;
+                }
+                result = runnerCut.Shape();
+            }
+        }
+        else
+        {
+            // No sprue parting point — skip runner steps but still advance progress
+            step += (int)m_runnerPoints.size();
         }
 
         // Step: subtract sprue (frustum + cold slug)
@@ -1343,6 +1425,8 @@ bool GLCanvas::RayCastToPartingPlane(int mouseX, int mouseY, glm::vec3& outPos)
 void GLCanvas::ClearRunnerPoints()
 {
     m_runnerPoints.clear();
+    for (auto& s : m_runnerSolids) s.Destroy();
+    m_runnerSolids.clear();
     RebuildRunnerPathVBO();
     Refresh(false);
 }
@@ -1901,6 +1985,8 @@ void GLCanvas::DestroyGL()
     m_objects.clear();
     for (auto& s : m_ventSolids) s.Destroy();
     m_ventSolids.clear();
+    for (auto& s : m_runnerSolids) s.Destroy();
+    m_runnerSolids.clear();
     m_sprueSolid.Destroy();
     m_sprueColdSlugSolid.Destroy();
 
@@ -2632,6 +2718,44 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         glDisable(GL_BLEND);
     }
 
+    // ---- Runner solids (lit, semi-transparent blue) -------------------------
+    if (m_program && !m_runnerSolids.empty())
+    {
+        glEnable(GL_DEPTH_TEST);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glDepthMask(GL_FALSE);
+
+        glUseProgram(m_program);
+
+        const glm::mat4 identity(1.0f);
+        const glm::vec3 runnerSolidColor(0.10f, 0.40f, 0.95f);   // blue, matches runner markers
+        glUniform3fv(glGetUniformLocation(m_program, "uCameraPos"), 1, &camPos[0]);
+        glUniform3fv(glGetUniformLocation(m_program, "uLightDir"), 1, &lightDir[0]);
+        glUniform3fv(glGetUniformLocation(m_program, "uLightColor"), 1, &lightColor[0]);
+        glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &runnerSolidColor[0]);
+        glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 0.55f);
+        glUniform1f(glGetUniformLocation(m_program, "uAmbient"), 0.30f);
+        glUniform1f(glGetUniformLocation(m_program, "uDiffuse"), 0.80f);
+        glUniform1f(glGetUniformLocation(m_program, "uSpecular"), 0.40f);
+        glUniform1f(glGetUniformLocation(m_program, "uShininess"), 32.0f);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uView"), 1, GL_FALSE, &view[0][0]);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uProj"), 1, GL_FALSE, &proj[0][0]);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &identity[0][0]);
+
+        for (const VentSolid& rs : m_runnerSolids)
+        {
+            if (!rs.valid || rs.vao == 0) continue;
+            glBindVertexArray(rs.vao);
+            glDrawElements(GL_TRIANGLES, rs.indexCount, GL_UNSIGNED_INT, 0);
+        }
+
+        glBindVertexArray(0);
+        glUseProgram(0);
+        glDepthMask(GL_TRUE);
+        glDisable(GL_BLEND);
+    }
+
     // ---- Sprue solid (lit, semi-transparent purple) ------------------------
     if (m_program && m_sprueSolid.valid && m_sprueSolid.vao != 0)
     {
@@ -2806,6 +2930,7 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
             {
                 m_runnerPoints.push_back(hitPos);
                 RebuildRunnerPathVBO();
+                RebuildRunnerSolids();
                 Refresh(false);
             }
         }

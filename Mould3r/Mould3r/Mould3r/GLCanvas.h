@@ -176,6 +176,9 @@ private:
     // Runner path lines GPU upload (sprue parting point → each runner point)
     void RebuildRunnerPathVBO();
 
+    // Runner solid geometry — swept cylinders from sprue parting point to each runner point
+    void RebuildRunnerSolids();
+
     // Sprue solid — swept cylinder mesh (same GPU layout as VentSolid)
     VentSolid BuildSprueSolid(const glm::vec3& start, const glm::vec3& end,
         float radius, float draftAngleDeg = 0.0f, int segments = 32);
@@ -231,6 +234,9 @@ private:
 
     // Runner placement points (on the y=0 parting plane)
     std::vector<glm::vec3> m_runnerPoints;
+
+    // Runner solid geometry — parallel to m_runnerPoints
+    std::vector<VentSolid> m_runnerSolids;
 
     // Ghost preview for runner placement (follows mouse in PlaceRunner mode)
     glm::vec3 m_runnerGhostPos{ 0.0f };
