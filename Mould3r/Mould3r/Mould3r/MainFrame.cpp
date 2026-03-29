@@ -612,6 +612,15 @@ float MainFrame::GetRunnerDiameter() const
     return (v > 0.0) ? static_cast<float>(v) : 5.0f;
 }
 
+float MainFrame::GetRunnerColdPlugDist() const
+{
+    if (!m_runnerColdSlugDepth) return 5.0f;
+    double v = 5.0;
+    if (!m_runnerColdSlugDepth->GetValue().ToDouble(&v)) return 5.0f;
+    if (v < 0.0) v = 0.0;
+    return static_cast<float>(v);
+}
+
 // ---------------------------------------------------------------------------
 // Menu handlers
 // ---------------------------------------------------------------------------
@@ -973,10 +982,11 @@ wxPanel* MainFrame::CreateRunnersContent(wxWindow* parent)
         lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
             wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
 
-        m_runnerDiameter = new wxTextCtrl(dimsPanel, wxID_ANY, "5.0",
+        m_runnerDiameter = new wxTextCtrl(dimsPanel, wxID_ANY, "4.0",
             wxDefaultPosition, wxSize(70, 22));
         m_runnerDiameter->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
         m_runnerDiameter->SetForegroundColour(kTextDefault);
+
 
         auto* unit = new wxStaticText(dimsPanel, wxID_ANY, "mm");
         unit->SetForegroundColour(wxColour(0x55, 0x6A, 0x85));
@@ -985,6 +995,33 @@ wxPanel* MainFrame::CreateRunnersContent(wxWindow* parent)
 
         row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
         row->Add(m_runnerDiameter, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
+        row->Add(unit, 0, wxALIGN_CENTER_VERTICAL);
+        dimsSizer->Add(row, 0, wxLEFT | wxTOP, 10);
+    }
+
+    //Cold Slug Well Row
+    {
+        auto* row = new wxBoxSizer(wxHORIZONTAL);
+
+        auto* lbl = new wxStaticText(dimsPanel, wxID_ANY, "Cold slug length:",
+            wxDefaultPosition, wxSize(60, -1));
+        lbl->SetForegroundColour(kTextDefault);
+        lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+
+        m_runnerColdSlugDepth = new wxTextCtrl(dimsPanel, wxID_ANY, "5.0",
+            wxDefaultPosition, wxSize(70, 22));
+        m_runnerColdSlugDepth->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
+        m_runnerColdSlugDepth->SetForegroundColour(kTextDefault);
+
+
+        auto* unit = new wxStaticText(dimsPanel, wxID_ANY, "mm");
+        unit->SetForegroundColour(wxColour(0x55, 0x6A, 0x85));
+        unit->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+
+        row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
+        row->Add(m_runnerColdSlugDepth, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
         row->Add(unit, 0, wxALIGN_CENTER_VERTICAL);
         dimsSizer->Add(row, 0, wxLEFT | wxTOP, 10);
     }

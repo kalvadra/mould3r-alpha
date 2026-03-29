@@ -30,6 +30,7 @@ public:
     float GetSprueDiameter() const;
     float GetSprueDraftAngle() const;
     float GetSprueColdSlugDepth() const;
+    float GetRunnerColdPlugDist() const;
 
     float GetRunnerDiameter() const;
 
@@ -83,6 +84,7 @@ private:
     // Runner field members
     wxChoice* m_runnerTypeChoice = nullptr;
     wxTextCtrl* m_runnerDiameter = nullptr;
+    wxTextCtrl* m_runnerColdSlugDepth = nullptr;
 
     // Creates the top ribbon panel
     wxPanel* CreateRibbon(wxWindow* parent);
