@@ -175,6 +175,8 @@ void GLCanvas::SetTransformMode(TransformMode mode)
         SetCursor(wxCursor(wxCURSOR_CROSS));    break;
     case TransformMode::PlaceRunner:
         SetCursor(wxCursor(wxCURSOR_CROSS));    break;
+    case TransformMode::PlaceGate:
+        SetCursor(wxCursor(wxCURSOR_CROSS));    break;
     }
 }
 
@@ -385,6 +387,93 @@ void GLCanvas::RebuildRunnerSolids()
     }
 }
 
+// ---------------------------------------------------------------------------
+// RebuildGatePathVBO — for each placed gate, finds the nearest point on any
+// feed-network segment (sprue parting point, or any point along a runner path)
+// in XZ, stores the result on the GateFeature, then uploads one GL_LINES pair
+// per gate.  Runner paths are treated as full segments (sprue parting pt →
+// runner pt), not just their endpoints.
+// ---------------------------------------------------------------------------
+void GLCanvas::RebuildGatePathVBO()
+{
+    if (!m_gatePathVAO) return;
+
+    std::vector<float> verts;
+    verts.reserve(m_gates.size() * 6);
+
+    for (GateFeature& gf : m_gates)
+    {
+        gf.hasPath = false;
+
+        const glm::vec2 gateXZ(gf.point.worldPos.x, gf.point.worldPos.z);
+        float     bestDist = std::numeric_limits<float>::max();
+        glm::vec3 bestPt(0.0f);
+
+        // Candidate 1: sprue parting-plane intersection point (a degenerate
+        // segment of length zero — also serves as the shared segment origin).
+        if (m_sprue.hasPartingPoint)
+        {
+            const glm::vec2 d(m_sprue.partingPos.x - gateXZ.x,
+                m_sprue.partingPos.z - gateXZ.y);
+            const float dist = glm::length(d);
+            if (dist < bestDist) { bestDist = dist; bestPt = m_sprue.partingPos; }
+
+            // Candidate 2: closest point along each runner segment
+            // (segment runs from sprue parting pt → runner pt, all on y=0)
+            for (const RunnerFeature& rf : m_runners)
+            {
+                const glm::vec2 A(m_sprue.partingPos.x, m_sprue.partingPos.z);
+                const glm::vec2 B(rf.point.x, rf.point.z);
+                const glm::vec2 AB = B - A;
+                const float     len2 = glm::dot(AB, AB);
+
+                glm::vec2 closest;
+                if (len2 < 1e-10f)
+                {
+                    // Degenerate segment — just the sprue parting point
+                    closest = A;
+                }
+                else
+                {
+                    const float t = glm::clamp(glm::dot(gateXZ - A, AB) / len2,
+                        0.0f, 1.0f);
+                    closest = A + t * AB;
+                }
+
+                const float dist2 = glm::length(closest - gateXZ);
+                if (dist2 < bestDist)
+                {
+                    bestDist = dist2;
+                    bestPt = glm::vec3(closest.x, 0.0f, closest.y);
+                }
+            }
+        }
+
+        if (bestDist < std::numeric_limits<float>::max())
+        {
+            gf.pathEnd = bestPt;
+            gf.hasPath = true;
+
+            verts.push_back(gf.point.worldPos.x);
+            verts.push_back(gf.point.worldPos.y);
+            verts.push_back(gf.point.worldPos.z);
+            verts.push_back(bestPt.x);
+            verts.push_back(bestPt.y);
+            verts.push_back(bestPt.z);
+        }
+    }
+
+    m_gatePathVertexCount = (GLsizei)(verts.size() / 3);
+
+    glBindVertexArray(m_gatePathVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, m_gatePathVBO);
+    glBufferData(GL_ARRAY_BUFFER,
+        (GLsizeiptr)(verts.size() * sizeof(float)),
+        verts.empty() ? nullptr : verts.data(),
+        GL_DYNAMIC_DRAW);
+    glBindVertexArray(0);
+}
+
 void GLCanvas::SetActiveInjectionPoint(const InjectionPoint& ip)
 {
     m_activeInjectionPoint = ip;
@@ -400,6 +489,7 @@ void GLCanvas::SetActiveInjectionPoint(const InjectionPoint& ip)
     RebuildSprueXsecVBO();
     RebuildRunnerPathVBO();
     RebuildRunnerSolids();
+    RebuildGatePathVBO();
     Refresh(false);
 }
 
@@ -501,6 +591,7 @@ void GLCanvas::PlaceSprue()
     RebuildSprueXsecVBO();
     RebuildRunnerPathVBO();
     RebuildRunnerSolids();
+    RebuildGatePathVBO();
     Refresh(false);
 }
 
@@ -515,6 +606,7 @@ void GLCanvas::ClearSprue()
     RebuildSprueXsecVBO();
     RebuildRunnerPathVBO();
     RebuildRunnerSolids();
+    RebuildGatePathVBO();
     Refresh(false);
 }
 
@@ -1317,6 +1409,16 @@ void GLCanvas::ClearRunnerPoints()
     for (auto& rf : m_runners) rf.Destroy();
     m_runners.clear();
     RebuildRunnerPathVBO();
+    RebuildGatePathVBO();
+    Refresh(false);
+}
+
+void GLCanvas::ClearGatePoints()
+{
+    for (auto& gf : m_gates) gf.Destroy();
+    m_gates.clear();
+    m_gateGhostActive = false;
+    RebuildGatePathVBO();
     Refresh(false);
 }
 
@@ -1740,6 +1842,15 @@ void GLCanvas::InitGLOnce()
     glEnableVertexAttribArray(0);
     glBindVertexArray(0);
 
+    // Gate path line VBO (dynamic, gate point → nearest feed point)
+    glGenVertexArrays(1, &m_gatePathVAO);
+    glGenBuffers(1, &m_gatePathVBO);
+    glBindVertexArray(m_gatePathVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, m_gatePathVBO);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glBindVertexArray(0);
+
     m_inited = true;
 }
 
@@ -1753,6 +1864,8 @@ void GLCanvas::DestroyGL()
     m_vents.clear();
     for (auto& rf : m_runners) rf.Destroy();
     m_runners.clear();
+    for (auto& gf : m_gates) gf.Destroy();
+    m_gates.clear();
     m_sprue.DestroyGL();
 
     if (m_outlineProgram) { glDeleteProgram(m_outlineProgram);        m_outlineProgram = 0; }
@@ -1764,6 +1877,8 @@ void GLCanvas::DestroyGL()
     if (m_xsecVAO) { glDeleteVertexArrays(1, &m_xsecVAO);         m_xsecVAO = 0; }
     if (m_runnerPathVBO) { glDeleteBuffers(1, &m_runnerPathVBO);         m_runnerPathVBO = 0; }
     if (m_runnerPathVAO) { glDeleteVertexArrays(1, &m_runnerPathVAO);    m_runnerPathVAO = 0; }
+    if (m_gatePathVBO) { glDeleteBuffers(1, &m_gatePathVBO);           m_gatePathVBO = 0; }
+    if (m_gatePathVAO) { glDeleteVertexArrays(1, &m_gatePathVAO);      m_gatePathVAO = 0; }
     if (m_sphereEBO) { glDeleteBuffers(1, &m_sphereEBO);          m_sphereEBO = 0; }
     if (m_sphereVBO) { glDeleteBuffers(1, &m_sphereVBO);          m_sphereVBO = 0; }
     if (m_sphereVAO) { glDeleteVertexArrays(1, &m_sphereVAO);     m_sphereVAO = 0; }
@@ -2277,6 +2392,72 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         glUseProgram(0);
     }
 
+    // ---- Gate point markers (yellow spheres) --------------------------------
+    if (m_transformMode == TransformMode::PlaceGate)
+    {
+        glm::vec3 hitPos, hitNormal;
+        m_gateGhostActive = RayCastParting(m_gateGhostMousePos.x, m_gateGhostMousePos.y,
+            hitPos, hitNormal);
+        m_gateGhost.worldPos = hitPos;
+        m_gateGhost.worldNormal = hitNormal;
+    }
+    if (m_program && m_sphereVAO && m_sphereIndexCount > 0 &&
+        (!m_gates.empty() || m_gateGhostActive))
+    {
+        glEnable(GL_DEPTH_TEST);
+        glUseProgram(m_program);
+
+        glUniform3fv(glGetUniformLocation(m_program, "uCameraPos"), 1, &camPos[0]);
+        glUniform3fv(glGetUniformLocation(m_program, "uLightDir"), 1, &lightDir[0]);
+        glUniform3fv(glGetUniformLocation(m_program, "uLightColor"), 1, &lightColor[0]);
+        glUniform1f(glGetUniformLocation(m_program, "uAmbient"), 0.35f);
+        glUniform1f(glGetUniformLocation(m_program, "uDiffuse"), 0.75f);
+        glUniform1f(glGetUniformLocation(m_program, "uSpecular"), 0.60f);
+        glUniform1f(glGetUniformLocation(m_program, "uShininess"), 48.0f);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uView"), 1, GL_FALSE, &view[0][0]);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uProj"), 1, GL_FALSE, &proj[0][0]);
+
+        glBindVertexArray(m_sphereVAO);
+
+        // Ghost preview — translucent yellow
+        if (m_gateGhostActive)
+        {
+            const glm::vec3 ghostColor(1.0f, 0.85f, 0.10f);   // yellow
+            glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &ghostColor[0]);
+            glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 0.45f);
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glDepthMask(GL_FALSE);
+
+            glm::mat4 model = glm::translate(glm::mat4(1.0f), m_gateGhost.worldPos);
+            model = glm::scale(model, glm::vec3(kVentMarkerRadius * 1.15f));
+            glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &model[0][0]);
+            glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
+
+            glDepthMask(GL_TRUE);
+            glDisable(GL_BLEND);
+        }
+
+        // Confirmed gate points — fully opaque yellow
+        if (!m_gates.empty())
+        {
+            const glm::vec3 gateColor(1.0f, 0.85f, 0.10f);   // yellow
+            glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &gateColor[0]);
+            glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 1.0f);
+
+            for (const GateFeature& gf : m_gates)
+            {
+                glm::mat4 model = glm::translate(glm::mat4(1.0f), gf.point.worldPos);
+                model = glm::scale(model, glm::vec3(kVentMarkerRadius));
+                glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &model[0][0]);
+                glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
+            }
+        }
+
+        glBindVertexArray(0);
+        glUseProgram(0);
+    }
+
     // ---- Sprue sphere (purple) ---------------------------------------------
     if (m_program && m_sphereVAO && m_sphereIndexCount > 0 && m_sprue.hasPoint)
     {
@@ -2394,6 +2575,27 @@ void GLCanvas::OnPaint(wxPaintEvent&)
 
         glBindVertexArray(m_runnerPathVAO);
         glDrawArrays(GL_LINES, 0, m_runnerPathVertexCount);
+        glBindVertexArray(0);
+
+        glLineWidth(1.0f);
+        glUseProgram(0);
+    }
+
+    // ---- Gate path lines (yellow) -----------------------------------------
+    if (m_flatProgram && m_gatePathVAO && m_gatePathVertexCount > 0)
+    {
+        glEnable(GL_DEPTH_TEST);
+        glLineWidth(2.5f);
+        glUseProgram(m_flatProgram);
+
+        const glm::mat4 VP = proj * view;
+        glUniformMatrix4fv(m_flat_uVP, 1, GL_FALSE, &VP[0][0]);
+
+        const glm::vec4 gateLineColor(1.0f, 0.85f, 0.10f, 1.0f);   // yellow, matches gate spheres
+        glUniform4fv(m_flat_uColor, 1, &gateLineColor[0]);
+
+        glBindVertexArray(m_gatePathVAO);
+        glDrawArrays(GL_LINES, 0, m_gatePathVertexCount);
         glBindVertexArray(0);
 
         glLineWidth(1.0f);
@@ -2705,6 +2907,20 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
                 m_runners.push_back(RunnerFeature{ hitPos, {}, {} });
                 RebuildRunnerPathVBO();
                 RebuildRunnerSolids();
+                RebuildGatePathVBO();
+                Refresh(false);
+            }
+        }
+        else if (m_transformMode == TransformMode::PlaceGate)
+        {
+            const wxPoint p = evt.GetPosition();
+            glm::vec3 hitPos, hitNormal;
+            if (RayCastParting(p.x, p.y, hitPos, hitNormal))
+            {
+                GateFeature gf;
+                gf.point = VentPoint{ hitPos, hitNormal };
+                m_gates.push_back(std::move(gf));
+                RebuildGatePathVBO();
                 Refresh(false);
             }
         }
@@ -2734,6 +2950,11 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
         if (m_transformMode == TransformMode::PlaceRunner)
         {
             m_runnerGhostMousePos = pos;
+            Refresh(false);
+        }
+        if (m_transformMode == TransformMode::PlaceGate)
+        {
+            m_gateGhostMousePos = pos;
             Refresh(false);
         }
         evt.Skip();
@@ -2813,6 +3034,17 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
             m_camera.Orbit(dx, dy);
         Refresh(false);
     }
+    else if (m_lmb && m_transformMode == TransformMode::PlaceGate)
+    {
+        // Orbit while holding LMB in PlaceGate mode
+        if (shift)
+            m_camera.Pan(dx, -dy);
+        else if (ctrl)
+            m_camera.Dolly(dy * 0.05f);
+        else
+            m_camera.Orbit(dx, dy);
+        Refresh(false);
+    }
 
     // Update ghost preview whenever the mouse moves in PlaceVent mode.
     // The actual ray cast is deferred to OnPaint so only one cast runs per
@@ -2827,10 +3059,16 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
         m_runnerGhostMousePos = evt.GetPosition();
         Refresh(false);
     }
-    else if (m_ventGhostActive || m_runnerGhostActive)
+    else if (m_transformMode == TransformMode::PlaceGate)
+    {
+        m_gateGhostMousePos = evt.GetPosition();
+        Refresh(false);
+    }
+    else if (m_ventGhostActive || m_runnerGhostActive || m_gateGhostActive)
     {
         m_ventGhostActive = false;
         m_runnerGhostActive = false;
+        m_gateGhostActive = false;
         Refresh(false);
     }
 
@@ -2854,6 +3092,7 @@ void GLCanvas::OnKeyDown(wxKeyEvent& evt)
         {
             m_ventGhostActive = false;
             m_runnerGhostActive = false;
+            m_gateGhostActive = false;
             SetTransformMode(TransformMode::Select);
             if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
                 frame->SetActiveTool(TransformMode::Select);

@@ -111,6 +111,24 @@ struct RunnerFeature
 };
 
 // ---------------------------------------------------------------------------
+// GateFeature — one gate: a placement point on the parting surface plus a
+//               SolidMesh placeholder for future cut geometry.
+//               Gates are placed on the part perimeter at y=0, the same ray-
+//               cast method used for vents.
+// ---------------------------------------------------------------------------
+struct GateFeature
+{
+    VentPoint point;    // worldPos + worldNormal on the parting surface
+    SolidMesh solid;    // reserved for future tapered-cylinder cut geometry
+
+    // Path from the gate to the nearest feed point (sprue parting pt or runner pt)
+    glm::vec3 pathEnd{ 0.0f };
+    bool      hasPath = false;
+
+    void Destroy() { solid.Destroy(); }
+};
+
+// ---------------------------------------------------------------------------
 // SprueFeature — all sprue state consolidated into one struct.
 //                Replaces ~15 scattered m_sprue* members in GLCanvas.
 // ---------------------------------------------------------------------------
