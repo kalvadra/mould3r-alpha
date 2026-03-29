@@ -184,6 +184,9 @@ private:
     // Gate path lines GPU upload (gate point → nearest feed point)
     void RebuildGatePathVBO();
 
+    // Gate and sub-runner solid geometry
+    void RebuildGateSolids();
+
     // Cylinder/frustum mesh is now built via free function BuildCylinderMesh() in MouldFeature.h
 
     // Fixture outer perimeter on the parting plane (convex hull in XZ)

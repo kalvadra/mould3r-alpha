@@ -36,6 +36,7 @@ public:
 
     float GetGateDiameter() const;
     float GetGateDraftAngle() const;
+    float GetSubRunnerDiameter() const;
 
 private:
     // Menu handlers
@@ -97,6 +98,10 @@ private:
     wxChoice* m_gateTypeChoice = nullptr;
     wxTextCtrl* m_gateDiameter = nullptr;
     wxTextCtrl* m_gateDraftAngle = nullptr;
+
+    // Sub-runner field members (within the Gates section)
+    wxChoice* m_subRunnerTypeChoice = nullptr;
+    wxTextCtrl* m_subRunnerDiameter = nullptr;
 
     // Creates the top ribbon panel
     wxPanel* CreateRibbon(wxWindow* parent);

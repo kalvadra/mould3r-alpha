@@ -697,6 +697,15 @@ float MainFrame::GetGateDraftAngle() const
     return static_cast<float>(v);
 }
 
+float MainFrame::GetSubRunnerDiameter() const
+{
+    if (!m_subRunnerDiameter) return 5.0f;
+    double v = 5.0;
+    if (!m_subRunnerDiameter->GetValue().ToDouble(&v)) return 5.0f;
+    if (v <= 0.0) v = 5.0;
+    return static_cast<float>(v);
+}
+
 // ---------------------------------------------------------------------------
 // Menu handlers
 // ---------------------------------------------------------------------------
@@ -1198,11 +1207,61 @@ wxPanel* MainFrame::CreateGatesContent(wxWindow* parent)
     }
 
     dimsPanel->SetSizer(dimsSizer);
-    sizer->Add(dimsPanel, 0, wxEXPAND | wxBOTTOM, 10);
+    sizer->Add(dimsPanel, 0, wxEXPAND | wxBOTTOM, 6);
+
+    // ---- Sub-runner divider ------------------------------------------------
+    auto* subSep = new wxPanel(panel, wxID_ANY, wxDefaultPosition, wxSize(-1, 1));
+    subSep->SetBackgroundColour(wxColour(0x2A, 0x38, 0x4A));
+    sizer->Add(subSep, 0, wxEXPAND | wxLEFT | wxRIGHT, 10);
+
+    // ---- Sub-runner type dropdown ------------------------------------------
+    auto* subTypeLabel = new wxStaticText(panel, wxID_ANY, "Sub-runner type:");
+    subTypeLabel->SetForegroundColour(kTextDefault);
+    subTypeLabel->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+    sizer->Add(subTypeLabel, 0, wxLEFT | wxTOP, 10);
+
+    m_subRunnerTypeChoice = new wxChoice(panel, wxID_ANY);
+    m_subRunnerTypeChoice->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
+    m_subRunnerTypeChoice->SetForegroundColour(kTextDefault);
+    m_subRunnerTypeChoice->Append("Cylinder");
+    m_subRunnerTypeChoice->SetSelection(0);
+    sizer->Add(m_subRunnerTypeChoice, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
+
+    // ---- Sub-runner dimensions panel ---------------------------------------
+    auto* subDimsPanel = new wxPanel(panel, wxID_ANY);
+    subDimsPanel->SetBackgroundColour(kRibbonBg);
+    auto* subDimsSizer = new wxBoxSizer(wxVERTICAL);
+    {
+        auto* row = new wxBoxSizer(wxHORIZONTAL);
+
+        auto* lbl = new wxStaticText(subDimsPanel, wxID_ANY, "Diameter:",
+            wxDefaultPosition, wxSize(60, -1));
+        lbl->SetForegroundColour(kTextDefault);
+        lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+
+        m_subRunnerDiameter = new wxTextCtrl(subDimsPanel, wxID_ANY, "5.0",
+            wxDefaultPosition, wxSize(70, 22));
+        m_subRunnerDiameter->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
+        m_subRunnerDiameter->SetForegroundColour(kTextDefault);
+
+        auto* unit = new wxStaticText(subDimsPanel, wxID_ANY, "mm");
+        unit->SetForegroundColour(wxColour(0x55, 0x6A, 0x85));
+        unit->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+
+        row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
+        row->Add(m_subRunnerDiameter, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
+        row->Add(unit, 0, wxALIGN_CENTER_VERTICAL);
+        subDimsSizer->Add(row, 0, wxLEFT | wxTOP, 10);
+    }
+    subDimsPanel->SetSizer(subDimsSizer);
+    sizer->Add(subDimsPanel, 0, wxEXPAND | wxBOTTOM, 10);
 
     panel->SetSizer(sizer);
 
-    // Show/hide dims based on type selection (future-proofed for more types)
+    // Show/hide gate dims based on type selection
     m_gateTypeChoice->Bind(wxEVT_CHOICE, [dimsPanel, this](wxCommandEvent&)
         {
             dimsPanel->Show(m_gateTypeChoice->GetStringSelection() == "Tapered Cylinder");

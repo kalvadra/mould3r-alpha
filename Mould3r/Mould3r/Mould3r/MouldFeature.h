@@ -111,21 +111,21 @@ struct RunnerFeature
 };
 
 // ---------------------------------------------------------------------------
-// GateFeature — one gate: a placement point on the parting surface plus a
-//               SolidMesh placeholder for future cut geometry.
-//               Gates are placed on the part perimeter at y=0, the same ray-
-//               cast method used for vents.
+// GateFeature — one gate: a placement point on the parting surface, a tapered
+//               frustum (the gate itself), and a straight cylinder (the
+//               sub-runner) connecting it to the feed network.
 // ---------------------------------------------------------------------------
 struct GateFeature
 {
-    VentPoint point;    // worldPos + worldNormal on the parting surface
-    SolidMesh solid;    // reserved for future tapered-cylinder cut geometry
+    VentPoint point;          // worldPos + worldNormal on the parting surface
+    SolidMesh solid;          // tapered gate frustum
+    SolidMesh subRunnerSolid; // straight sub-runner cylinder
 
     // Path from the gate to the nearest feed point (sprue parting pt or runner pt)
     glm::vec3 pathEnd{ 0.0f };
     bool      hasPath = false;
 
-    void Destroy() { solid.Destroy(); }
+    void Destroy() { solid.Destroy(); subRunnerSolid.Destroy(); }
 };
 
 // ---------------------------------------------------------------------------
