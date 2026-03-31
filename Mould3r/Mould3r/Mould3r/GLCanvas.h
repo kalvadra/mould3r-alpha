@@ -119,6 +119,10 @@ public:
     const std::vector<RunnerFeature>& GetRunners() const { return m_runners; }
     void ClearRunnerPoints();
 
+    // Gate placement
+    const std::vector<GateFeature>& GetGates() const { return m_gates; }
+    void ClearGatePoints();
+
 private:
     void OnPaint(wxPaintEvent& evt);
     void OnResize(wxSizeEvent& evt);
@@ -177,6 +181,12 @@ private:
     // Runner solid geometry — swept cylinders from sprue parting point to each runner point
     void RebuildRunnerSolids();
 
+    // Gate path lines GPU upload (gate point → nearest feed point)
+    void RebuildGatePathVBO();
+
+    // Gate and sub-runner solid geometry
+    void RebuildGateSolids();
+
     // Cylinder/frustum mesh is now built via free function BuildCylinderMesh() in MouldFeature.h
 
     // Fixture outer perimeter on the parting plane (convex hull in XZ)
@@ -220,6 +230,14 @@ private:
     bool      m_runnerGhostActive = false;
     wxPoint   m_runnerGhostMousePos;
 
+    // Gate features
+    std::vector<GateFeature> m_gates;
+
+    // Ghost preview for gate placement (follows mouse in PlaceGate mode)
+    VentPoint m_gateGhost;
+    bool      m_gateGhostActive = false;
+    wxPoint   m_gateGhostMousePos;
+
     // Fallback test geometry (pyramid)
     unsigned int m_vao = 0;
     unsigned int m_vbo = 0;
@@ -247,6 +265,11 @@ private:
     GLuint  m_runnerPathVAO = 0;
     GLuint  m_runnerPathVBO = 0;
     GLsizei m_runnerPathVertexCount = 0;
+
+    // Gate path line GPU resources (gate point → nearest feed point)
+    GLuint  m_gatePathVAO = 0;
+    GLuint  m_gatePathVBO = 0;
+    GLsizei m_gatePathVertexCount = 0;
 
     // Vent cross-section GPU resources
     GLuint  m_xsecVAO = 0;

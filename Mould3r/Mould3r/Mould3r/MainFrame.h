@@ -12,7 +12,7 @@
 
 class GLCanvas;
 
-enum class TransformMode { Select, Translate, Rotate, Scale, PlaceVent, PlaceRunner };
+enum class TransformMode { Select, Translate, Rotate, Scale, PlaceVent, PlaceRunner, PlaceGate };
 
 class MainFrame : public wxFrame
 {
@@ -34,6 +34,10 @@ public:
 
     float GetRunnerDiameter() const;
 
+    float GetGateDiameter() const;
+    float GetGateDraftAngle() const;
+    float GetSubRunnerDiameter() const;
+
 private:
     // Menu handlers
     void OnImport(wxCommandEvent& evt);
@@ -54,6 +58,9 @@ private:
     void OnPlaceRunner(wxCommandEvent& evt);
     void OnClearRunners(wxCommandEvent&);
 
+    void OnPlaceGate(wxCommandEvent& evt);
+    void OnClearGates(wxCommandEvent&);
+
     // Activates a tool button and deactivates the others (also called by GLCanvas on Escape)
 
     //Creates the left panel
@@ -66,6 +73,7 @@ private:
     wxPanel* CreateVentsContent(wxWindow* parent);
     wxPanel* CreateSpruesContent(wxWindow* parent);
     wxPanel* CreateRunnersContent(wxWindow* parent);
+    wxPanel* CreateGatesContent(wxWindow* parent);
 
     // Vent field members
     wxChoice* m_ventTypeChoice = nullptr;
@@ -86,6 +94,15 @@ private:
     wxTextCtrl* m_runnerDiameter = nullptr;
     wxTextCtrl* m_runnerColdSlugDepth = nullptr;
 
+    // Gate field members
+    wxChoice* m_gateTypeChoice = nullptr;
+    wxTextCtrl* m_gateDiameter = nullptr;
+    wxTextCtrl* m_gateDraftAngle = nullptr;
+
+    // Sub-runner field members (within the Gates section)
+    wxChoice* m_subRunnerTypeChoice = nullptr;
+    wxTextCtrl* m_subRunnerDiameter = nullptr;
+
     // Creates the top ribbon panel
     wxPanel* CreateRibbon(wxWindow* parent);
 
@@ -105,6 +122,9 @@ private:
 
     // Runner tool button (ribbon — Runners group)
     wxToggleButton* m_btnPlaceRunner = nullptr;
+
+    // Gate tool button (ribbon — Gates group)
+    wxToggleButton* m_btnPlaceGate = nullptr;
 
     wxPanel* m_sidePanel = nullptr;
     wxTextCtrl* m_exportPath = nullptr;
@@ -132,6 +152,8 @@ private:
         ID_PlaceSprue,
         ID_ClearSprue,
         ID_PlaceRunner,
-        ID_ClearRunners
+        ID_ClearRunners,
+        ID_PlaceGate,
+        ID_ClearGates
     };
 };

@@ -111,6 +111,24 @@ struct RunnerFeature
 };
 
 // ---------------------------------------------------------------------------
+// GateFeature — one gate: a placement point on the parting surface, a tapered
+//               frustum (the gate itself), and a straight cylinder (the
+//               sub-runner) connecting it to the feed network.
+// ---------------------------------------------------------------------------
+struct GateFeature
+{
+    VentPoint point;          // worldPos + worldNormal on the parting surface
+    SolidMesh solid;          // tapered gate frustum
+    SolidMesh subRunnerSolid; // straight sub-runner cylinder
+
+    // Path from the gate to the nearest feed point (sprue parting pt or runner pt)
+    glm::vec3 pathEnd{ 0.0f };
+    bool      hasPath = false;
+
+    void Destroy() { solid.Destroy(); subRunnerSolid.Destroy(); }
+};
+
+// ---------------------------------------------------------------------------
 // SprueFeature — all sprue state consolidated into one struct.
 //                Replaces ~15 scattered m_sprue* members in GLCanvas.
 // ---------------------------------------------------------------------------

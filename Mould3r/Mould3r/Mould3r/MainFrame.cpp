@@ -181,7 +181,7 @@ wxPanel* MainFrame::CreateRibbon(wxWindow* parent)
 
     // Vertical divider
     hSizer->AddSpacer(16);
-    auto* divider = new wxPanel(panel, wxID_ANY, wxDefaultPosition, wxSize(1, 36));
+    wxPanel* divider = new wxPanel(panel, wxID_ANY, wxDefaultPosition, wxSize(1, 36));
     divider->SetBackgroundColour(wxColour(0x38, 0x44, 0x55));
     hSizer->Add(divider, 0, wxALIGN_CENTER_VERTICAL);
     hSizer->AddSpacer(16);
@@ -278,6 +278,35 @@ wxPanel* MainFrame::CreateRibbon(wxWindow* parent)
     hSizer->Add(divider4, 0, wxALIGN_CENTER_VERTICAL);
     hSizer->AddSpacer(16);
 
+    // ---- GATES group -------------------------------------------------------
+    auto* gatesSizer = new wxBoxSizer(wxVERTICAL);
+    auto* gatesRow = new wxBoxSizer(wxHORIZONTAL);
+
+    m_btnPlaceGate = addTool(ID_PlaceGate, "Place Gate", "Click the part perimeter at the parting plane to place a gate");
+
+    gatesRow->Add(m_btnPlaceGate, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
+
+    auto* btnClearGates = new wxButton(panel, ID_ClearGates, "Clear",
+        wxDefaultPosition, wxSize(50, 32));
+    btnClearGates->SetToolTip("Remove all gate placement points");
+    btnClearGates->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
+    btnClearGates->SetForegroundColour(kTextDefault);
+    btnClearGates->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
+    gatesRow->Add(btnClearGates, 0, wxALIGN_CENTER_VERTICAL);
+
+    gatesSizer->Add(gatesRow, 0, wxALIGN_CENTER_HORIZONTAL);
+    gatesSizer->Add(addLabel("GATES"), 0, wxALIGN_CENTER_HORIZONTAL | wxTOP, 2);
+
+    hSizer->Add(gatesSizer, 0, wxALIGN_CENTER_VERTICAL | wxTOP | wxBOTTOM, 6);
+
+    // Vertical divider
+    hSizer->AddSpacer(16);
+    auto* divider5 = new wxPanel(panel, wxID_ANY, wxDefaultPosition, wxSize(1, 36));
+    divider5->SetBackgroundColour(wxColour(0x38, 0x44, 0x55));
+    hSizer->Add(divider5, 0, wxALIGN_CENTER_VERTICAL);
+    hSizer->AddSpacer(16);
+
     // ---- Hint label --------------------------------------------------------
     auto* hint = new wxStaticText(panel, wxID_ANY,
         "LMB: orbit / transform    MMB: pan    Scroll: zoom    Shift+LMB: pan");
@@ -301,6 +330,8 @@ wxPanel* MainFrame::CreateRibbon(wxWindow* parent)
     Bind(wxEVT_BUTTON, &MainFrame::OnClearSprue, this, ID_ClearSprue);
     Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnPlaceRunner, this, ID_PlaceRunner);
     Bind(wxEVT_BUTTON, &MainFrame::OnClearRunners, this, ID_ClearRunners);
+    Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnPlaceGate, this, ID_PlaceGate);
+    Bind(wxEVT_BUTTON, &MainFrame::OnClearGates, this, ID_ClearGates);
 
     return panel;
 }
@@ -411,6 +442,11 @@ void MainFrame::SetActiveTool(TransformMode mode)
         StyleRibbonBtn(m_btnPlaceRunner, false);
         m_btnPlaceRunner->SetValue(false);
     }
+    if (m_btnPlaceGate)
+    {
+        StyleRibbonBtn(m_btnPlaceGate, false);
+        m_btnPlaceGate->SetValue(false);
+    }
 
     // Activate selected
     switch (mode)
@@ -433,6 +469,13 @@ void MainFrame::SetActiveTool(TransformMode mode)
         {
             StyleRibbonBtn(m_btnPlaceRunner, true);
             m_btnPlaceRunner->SetValue(true);
+        }
+        break;
+    case TransformMode::PlaceGate:
+        if (m_btnPlaceGate)
+        {
+            StyleRibbonBtn(m_btnPlaceGate, true);
+            m_btnPlaceGate->SetValue(true);
         }
         break;
     }
@@ -559,6 +602,21 @@ void MainFrame::OnClearRunners(wxCommandEvent&)
         m_canvas->ClearRunnerPoints();
 }
 
+void MainFrame::OnPlaceGate(wxCommandEvent&)
+{
+    // Toggle: if already in PlaceGate mode, return to Select
+    if (m_canvas && m_canvas->GetTransformMode() == TransformMode::PlaceGate)
+        SetActiveTool(TransformMode::Select);
+    else
+        SetActiveTool(TransformMode::PlaceGate);
+}
+
+void MainFrame::OnClearGates(wxCommandEvent&)
+{
+    if (m_canvas)
+        m_canvas->ClearGatePoints();
+}
+
 void MainFrame::GetVentDimensions(float& outLength, float& outWidth,
     float& outOverrunStart, float& outOverrunEnd) const
 {
@@ -618,6 +676,33 @@ float MainFrame::GetRunnerColdPlugDist() const
     double v = 5.0;
     if (!m_runnerColdSlugDepth->GetValue().ToDouble(&v)) return 5.0f;
     if (v < 0.0) v = 0.0;
+    return static_cast<float>(v);
+}
+
+float MainFrame::GetGateDiameter() const
+{
+    if (!m_gateDiameter) return 3.0f;
+    double v = 3.0;
+    if (!m_gateDiameter->GetValue().ToDouble(&v)) return 3.0f;
+    if (v < 0.0) v = 0.0;
+    return static_cast<float>(v);
+}
+
+float MainFrame::GetGateDraftAngle() const
+{
+    if (!m_gateDraftAngle) return 1.0f;
+    double v = 1.0;
+    if (!m_gateDraftAngle->GetValue().ToDouble(&v)) return 1.0f;
+    if (v < 0.0) v = 0.0;
+    return static_cast<float>(v);
+}
+
+float MainFrame::GetSubRunnerDiameter() const
+{
+    if (!m_subRunnerDiameter) return 5.0f;
+    double v = 5.0;
+    if (!m_subRunnerDiameter->GetValue().ToDouble(&v)) return 5.0f;
+    if (v <= 0.0) v = 5.0;
     return static_cast<float>(v);
 }
 
@@ -1042,6 +1127,151 @@ wxPanel* MainFrame::CreateRunnersContent(wxWindow* parent)
     return panel;
 }
 
+wxPanel* MainFrame::CreateGatesContent(wxWindow* parent)
+{
+    auto* panel = new wxPanel(parent, wxID_ANY);
+    panel->SetBackgroundColour(kRibbonBg);
+
+    auto* sizer = new wxBoxSizer(wxVERTICAL);
+
+    // ---- Gate type dropdown ------------------------------------------------
+    auto* typeLabel = new wxStaticText(panel, wxID_ANY, "Gate type:");
+    typeLabel->SetForegroundColour(kTextDefault);
+    typeLabel->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+    sizer->Add(typeLabel, 0, wxLEFT | wxTOP, 10);
+
+    m_gateTypeChoice = new wxChoice(panel, wxID_ANY);
+    m_gateTypeChoice->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
+    m_gateTypeChoice->SetForegroundColour(kTextDefault);
+    m_gateTypeChoice->Append("Tapered Cylinder");
+    m_gateTypeChoice->SetSelection(0);
+    sizer->Add(m_gateTypeChoice, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
+
+    // ---- Dimensions panel (shown for Tapered Cylinder) ---------------------
+    auto* dimsPanel = new wxPanel(panel, wxID_ANY);
+    dimsPanel->SetBackgroundColour(kRibbonBg);
+
+    auto* dimsSizer = new wxBoxSizer(wxVERTICAL);
+
+    // Diameter row
+    {
+        auto* row = new wxBoxSizer(wxHORIZONTAL);
+
+        auto* lbl = new wxStaticText(dimsPanel, wxID_ANY, "Diameter:",
+            wxDefaultPosition, wxSize(60, -1));
+        lbl->SetForegroundColour(kTextDefault);
+        lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+
+        m_gateDiameter = new wxTextCtrl(dimsPanel, wxID_ANY, "3.0",
+            wxDefaultPosition, wxSize(70, 22));
+        m_gateDiameter->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
+        m_gateDiameter->SetForegroundColour(kTextDefault);
+
+        auto* unit = new wxStaticText(dimsPanel, wxID_ANY, "mm");
+        unit->SetForegroundColour(wxColour(0x55, 0x6A, 0x85));
+        unit->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+
+        row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
+        row->Add(m_gateDiameter, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
+        row->Add(unit, 0, wxALIGN_CENTER_VERTICAL);
+        dimsSizer->Add(row, 0, wxLEFT | wxTOP, 10);
+    }
+
+    // Draft angle row
+    {
+        auto* row = new wxBoxSizer(wxHORIZONTAL);
+
+        auto* lbl = new wxStaticText(dimsPanel, wxID_ANY, "Draft angle:",
+            wxDefaultPosition, wxSize(60, -1));
+        lbl->SetForegroundColour(kTextDefault);
+        lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+
+        m_gateDraftAngle = new wxTextCtrl(dimsPanel, wxID_ANY, "1.0",
+            wxDefaultPosition, wxSize(70, 22));
+        m_gateDraftAngle->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
+        m_gateDraftAngle->SetForegroundColour(kTextDefault);
+
+        auto* unit = new wxStaticText(dimsPanel, wxID_ANY, "\xC2\xB0");
+        unit->SetForegroundColour(wxColour(0x55, 0x6A, 0x85));
+        unit->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+
+        row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
+        row->Add(m_gateDraftAngle, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
+        row->Add(unit, 0, wxALIGN_CENTER_VERTICAL);
+        dimsSizer->Add(row, 0, wxLEFT | wxTOP, 10);
+    }
+
+    dimsPanel->SetSizer(dimsSizer);
+    sizer->Add(dimsPanel, 0, wxEXPAND | wxBOTTOM, 6);
+
+    // ---- Sub-runner divider ------------------------------------------------
+    auto* subSep = new wxPanel(panel, wxID_ANY, wxDefaultPosition, wxSize(-1, 1));
+    subSep->SetBackgroundColour(wxColour(0x2A, 0x38, 0x4A));
+    sizer->Add(subSep, 0, wxEXPAND | wxLEFT | wxRIGHT, 10);
+
+    // ---- Sub-runner type dropdown ------------------------------------------
+    auto* subTypeLabel = new wxStaticText(panel, wxID_ANY, "Sub-runner type:");
+    subTypeLabel->SetForegroundColour(kTextDefault);
+    subTypeLabel->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+    sizer->Add(subTypeLabel, 0, wxLEFT | wxTOP, 10);
+
+    m_subRunnerTypeChoice = new wxChoice(panel, wxID_ANY);
+    m_subRunnerTypeChoice->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
+    m_subRunnerTypeChoice->SetForegroundColour(kTextDefault);
+    m_subRunnerTypeChoice->Append("Cylinder");
+    m_subRunnerTypeChoice->SetSelection(0);
+    sizer->Add(m_subRunnerTypeChoice, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
+
+    // ---- Sub-runner dimensions panel ---------------------------------------
+    auto* subDimsPanel = new wxPanel(panel, wxID_ANY);
+    subDimsPanel->SetBackgroundColour(kRibbonBg);
+    auto* subDimsSizer = new wxBoxSizer(wxVERTICAL);
+    {
+        auto* row = new wxBoxSizer(wxHORIZONTAL);
+
+        auto* lbl = new wxStaticText(subDimsPanel, wxID_ANY, "Diameter:",
+            wxDefaultPosition, wxSize(60, -1));
+        lbl->SetForegroundColour(kTextDefault);
+        lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+
+        m_subRunnerDiameter = new wxTextCtrl(subDimsPanel, wxID_ANY, "5.0",
+            wxDefaultPosition, wxSize(70, 22));
+        m_subRunnerDiameter->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
+        m_subRunnerDiameter->SetForegroundColour(kTextDefault);
+
+        auto* unit = new wxStaticText(subDimsPanel, wxID_ANY, "mm");
+        unit->SetForegroundColour(wxColour(0x55, 0x6A, 0x85));
+        unit->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+
+        row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
+        row->Add(m_subRunnerDiameter, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
+        row->Add(unit, 0, wxALIGN_CENTER_VERTICAL);
+        subDimsSizer->Add(row, 0, wxLEFT | wxTOP, 10);
+    }
+    subDimsPanel->SetSizer(subDimsSizer);
+    sizer->Add(subDimsPanel, 0, wxEXPAND | wxBOTTOM, 10);
+
+    panel->SetSizer(sizer);
+
+    // Show/hide gate dims based on type selection
+    m_gateTypeChoice->Bind(wxEVT_CHOICE, [dimsPanel, this](wxCommandEvent&)
+        {
+            dimsPanel->Show(m_gateTypeChoice->GetStringSelection() == "Tapered Cylinder");
+            dimsPanel->GetParent()->Layout();
+            dimsPanel->GetParent()->GetParent()->Layout();
+        });
+
+    return panel;
+}
+
 wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
 {
     auto* panel = new wxPanel(parent, wxID_ANY,
@@ -1051,7 +1281,7 @@ wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
     auto* sizer = new wxBoxSizer(wxVERTICAL);
 
     // ---- Panel title -------------------------------------------------------
-    auto* title = new wxStaticText(panel, wxID_ANY, "MOULD TOOLS");
+    auto* title = new wxStaticText(panel, wxID_ANY, "MOULD TOOL SETTINGS");
     title->SetForegroundColour(wxColour(0x44, 0x55, 0x66));
     title->SetFont(wxFont(7, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_BOLD, false, "Segoe UI"));
@@ -1071,7 +1301,9 @@ wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
     // Runners — custom content
     wxPanel* runnersContent = CreateRunnersContent(panel);
     CreateCollapsibleSection(panel, sizer, "Runners", &runnersContent);
-    CreateCollapsibleSection(panel, sizer, "Gates");
+    // Gates — custom content
+    wxPanel* gatesContent = CreateGatesContent(panel);
+    CreateCollapsibleSection(panel, sizer, "Gates", &gatesContent);
     // Vents — custom content
     wxPanel* ventsContent = CreateVentsContent(panel);
     CreateCollapsibleSection(panel, sizer, "Vents", &ventsContent);

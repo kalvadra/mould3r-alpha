@@ -175,6 +175,8 @@ void GLCanvas::SetTransformMode(TransformMode mode)
         SetCursor(wxCursor(wxCURSOR_CROSS));    break;
     case TransformMode::PlaceRunner:
         SetCursor(wxCursor(wxCURSOR_CROSS));    break;
+    case TransformMode::PlaceGate:
+        SetCursor(wxCursor(wxCURSOR_CROSS));    break;
     }
 }
 
@@ -385,6 +387,155 @@ void GLCanvas::RebuildRunnerSolids()
     }
 }
 
+// ---------------------------------------------------------------------------
+// RebuildGateSolids — builds a tapered frustum (gate) and a straight cylinder
+// (sub-runner) for every placed gate that has a valid path.
+//
+// The gate frustum starts at the gate point with gateRadius, expands at
+// draftAngle along the path direction until it reaches subRunnerRadius —
+// that transition point is (subRunnerRadius - gateRadius) / tan(draftAngle)
+// from the gate origin.  The sub-runner cylinder continues at subRunnerRadius
+// from the transition point to pathEnd.
+//
+// If the taper length >= total path length, the gate fills the whole path
+// and no sub-runner section is produced.
+// ---------------------------------------------------------------------------
+void GLCanvas::RebuildGateSolids()
+{
+    for (auto& gf : m_gates) { gf.solid.Destroy(); gf.subRunnerSolid.Destroy(); }
+    if (m_gates.empty()) return;
+
+    float gateRadius = 1.5f;
+    float draftAngle = 1.0f;
+    float subRunnerRadius = 2.5f;
+    if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+    {
+        gateRadius = frame->GetGateDiameter() * 0.5f;
+        draftAngle = frame->GetGateDraftAngle();
+        subRunnerRadius = frame->GetSubRunnerDiameter() * 0.5f;
+    }
+
+    const float draftRad = glm::radians(glm::clamp(draftAngle, 0.0f, 45.0f));
+    const float tanDraft = std::tan(draftRad);
+
+    for (GateFeature& gf : m_gates)
+    {
+        if (!gf.hasPath) continue;
+
+        const glm::vec3 origin = gf.point.worldPos;
+        const glm::vec3 pathVec = gf.pathEnd - origin;
+        const float     totalLen = glm::length(pathVec);
+        if (totalLen < 1e-6f) continue;
+        const glm::vec3 pathDir = pathVec / totalLen;
+
+        // Distance along path at which the draft expands gate to sub-runner radius
+        float taperLen = std::numeric_limits<float>::max();
+        if (tanDraft > 1e-6f && subRunnerRadius > gateRadius)
+            taperLen = (subRunnerRadius - gateRadius) / tanDraft;
+
+        if (taperLen >= totalLen)
+        {
+            // Gate fills the entire path — no sub-runner section
+            gf.solid = BuildCylinderMesh(origin, gf.pathEnd, gateRadius, draftAngle);
+        }
+        else
+        {
+            const glm::vec3 transitionPt = origin + pathDir * taperLen;
+            gf.solid = BuildCylinderMesh(origin, transitionPt,
+                gateRadius, draftAngle);
+            gf.subRunnerSolid = BuildCylinderMesh(transitionPt, gf.pathEnd,
+                subRunnerRadius, 0.0f);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RebuildGatePathVBO — for each placed gate, finds the nearest point on any
+// feed-network segment (sprue parting point, or any point along a runner path)
+// in XZ, stores the result on the GateFeature, then uploads one GL_LINES pair
+// per gate.  Runner paths are treated as full segments (sprue parting pt →
+// runner pt), not just their endpoints.
+// ---------------------------------------------------------------------------
+void GLCanvas::RebuildGatePathVBO()
+{
+    if (!m_gatePathVAO) return;
+
+    std::vector<float> verts;
+    verts.reserve(m_gates.size() * 6);
+
+    for (GateFeature& gf : m_gates)
+    {
+        gf.hasPath = false;
+
+        const glm::vec2 gateXZ(gf.point.worldPos.x, gf.point.worldPos.z);
+        float     bestDist = std::numeric_limits<float>::max();
+        glm::vec3 bestPt(0.0f);
+
+        // Candidate 1: sprue parting-plane intersection point (a degenerate
+        // segment of length zero — also serves as the shared segment origin).
+        if (m_sprue.hasPartingPoint)
+        {
+            const glm::vec2 d(m_sprue.partingPos.x - gateXZ.x,
+                m_sprue.partingPos.z - gateXZ.y);
+            const float dist = glm::length(d);
+            if (dist < bestDist) { bestDist = dist; bestPt = m_sprue.partingPos; }
+
+            // Candidate 2: closest point along each runner segment
+            // (segment runs from sprue parting pt → runner pt, all on y=0)
+            for (const RunnerFeature& rf : m_runners)
+            {
+                const glm::vec2 A(m_sprue.partingPos.x, m_sprue.partingPos.z);
+                const glm::vec2 B(rf.point.x, rf.point.z);
+                const glm::vec2 AB = B - A;
+                const float     len2 = glm::dot(AB, AB);
+
+                glm::vec2 closest;
+                if (len2 < 1e-10f)
+                {
+                    // Degenerate segment — just the sprue parting point
+                    closest = A;
+                }
+                else
+                {
+                    const float t = glm::clamp(glm::dot(gateXZ - A, AB) / len2,
+                        0.0f, 1.0f);
+                    closest = A + t * AB;
+                }
+
+                const float dist2 = glm::length(closest - gateXZ);
+                if (dist2 < bestDist)
+                {
+                    bestDist = dist2;
+                    bestPt = glm::vec3(closest.x, 0.0f, closest.y);
+                }
+            }
+        }
+
+        if (bestDist < std::numeric_limits<float>::max())
+        {
+            gf.pathEnd = bestPt;
+            gf.hasPath = true;
+
+            verts.push_back(gf.point.worldPos.x);
+            verts.push_back(gf.point.worldPos.y);
+            verts.push_back(gf.point.worldPos.z);
+            verts.push_back(bestPt.x);
+            verts.push_back(bestPt.y);
+            verts.push_back(bestPt.z);
+        }
+    }
+
+    m_gatePathVertexCount = (GLsizei)(verts.size() / 3);
+
+    glBindVertexArray(m_gatePathVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, m_gatePathVBO);
+    glBufferData(GL_ARRAY_BUFFER,
+        (GLsizeiptr)(verts.size() * sizeof(float)),
+        verts.empty() ? nullptr : verts.data(),
+        GL_DYNAMIC_DRAW);
+    glBindVertexArray(0);
+}
+
 void GLCanvas::SetActiveInjectionPoint(const InjectionPoint& ip)
 {
     m_activeInjectionPoint = ip;
@@ -400,6 +551,8 @@ void GLCanvas::SetActiveInjectionPoint(const InjectionPoint& ip)
     RebuildSprueXsecVBO();
     RebuildRunnerPathVBO();
     RebuildRunnerSolids();
+    RebuildGatePathVBO();
+    RebuildGateSolids();
     Refresh(false);
 }
 
@@ -501,6 +654,8 @@ void GLCanvas::PlaceSprue()
     RebuildSprueXsecVBO();
     RebuildRunnerPathVBO();
     RebuildRunnerSolids();
+    RebuildGatePathVBO();
+    RebuildGateSolids();
     Refresh(false);
 }
 
@@ -515,6 +670,8 @@ void GLCanvas::ClearSprue()
     RebuildSprueXsecVBO();
     RebuildRunnerPathVBO();
     RebuildRunnerSolids();
+    RebuildGatePathVBO();
+    RebuildGateSolids();
     Refresh(false);
 }
 
@@ -537,7 +694,7 @@ void GLCanvas::GenerateMould()
     }
 
     // Steps per fixture: 1 read + 1 transform + (1 per object subtract) + (1 per vent subtract) + (1 per runner subtract) + 1 sprue + 1 tessellate + 1 upload
-    const int stepsPerFixture = 4 + (int)m_objects.size() + (int)m_vents.size() + (int)m_runners.size();
+    const int stepsPerFixture = 4 + (int)m_objects.size() + (int)m_vents.size() + (int)m_runners.size() + (int)m_gates.size();
     const int totalSteps = stepsPerFixture * (int)m_fixtures.size();
 
     wxProgressDialog progress(
@@ -730,13 +887,17 @@ void GLCanvas::GenerateMould()
 
                 const glm::vec3 runnerDir = runnerAxis / runnerLen;
 
-                // Runner cylinder: from sprue parting point, length = runner path
+                // Runner cylinder: pulled back by kCutEps so it protrudes through
+                // both parting faces and avoids co-planar boundary failures.
+                static constexpr float kCutEps = 0.1f;
+                const glm::vec3 runnerOriginExt = m_sprue.partingPos - runnerDir * kCutEps;
                 gp_Ax2 runnerAx(
-                    gp_Pnt(m_sprue.partingPos.x, m_sprue.partingPos.y, m_sprue.partingPos.z),
+                    gp_Pnt(runnerOriginExt.x, runnerOriginExt.y, runnerOriginExt.z),
                     gp_Dir(runnerDir.x, runnerDir.y, runnerDir.z)
                 );
 
-                BRepPrimAPI_MakeCylinder runnerCyl(runnerAx, runnerRadius, runnerLen);
+                BRepPrimAPI_MakeCylinder runnerCyl(runnerAx, runnerRadius, runnerLen + 2.0f * kCutEps);
+                runnerCyl.Build();
                 if (!runnerCyl.IsDone() || runnerCyl.Shape().IsNull()) continue;
 
                 BRepAlgoAPI_Cut runnerCut(result, runnerCyl.Shape());
@@ -760,6 +921,7 @@ void GLCanvas::GenerateMould()
                     );
 
                     BRepPrimAPI_MakeCylinder plugCyl(plugAx, runnerRadius, coldPlugDist);
+                    plugCyl.Build();
                     if (plugCyl.IsDone() && !plugCyl.Shape().IsNull())
                     {
                         BRepAlgoAPI_Cut plugCut(result, plugCyl.Shape());
@@ -779,6 +941,130 @@ void GLCanvas::GenerateMould()
             step += (int)m_runners.size();
         }
 
+        // Steps: subtract each gate (tapered frustum) and its sub-runner cylinder
+        {
+            float gateRadius = 1.5f;
+            float draftAngle = 1.0f;
+            float subRunnerRadius = 2.5f;
+            if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+            {
+                gateRadius = frame->GetGateDiameter() * 0.5f;
+                draftAngle = frame->GetGateDraftAngle();
+                subRunnerRadius = frame->GetSubRunnerDiameter() * 0.5f;
+            }
+
+            const float draftRad = glm::radians(glm::clamp(draftAngle, 0.0f, 45.0f));
+            const float tanDraft = std::tan(draftRad);
+
+            for (int gi = 0; gi < (int)m_gates.size(); ++gi)
+            {
+                progress.Update(step++,
+                    fixLabel + ": cutting gate " +
+                    std::to_string(gi + 1) + " of " +
+                    std::to_string((int)m_gates.size()) + "...");
+
+                const GateFeature& gf = m_gates[gi];
+                if (!gf.hasPath) continue;
+
+                const glm::vec3 origin = gf.point.worldPos;
+                const glm::vec3 pathVec = gf.pathEnd - origin;
+                const float     totalLen = glm::length(pathVec);
+                if (totalLen < 1e-6f || gateRadius < 1e-6f) continue;
+                const glm::vec3 pathDir = pathVec / totalLen;
+
+                const gp_Pnt occOrigin(origin.x, origin.y, origin.z);
+                const gp_Dir occDir(pathDir.x, pathDir.y, pathDir.z);
+
+                // Pull the gate origin back by kCutEps so the primitive protrudes
+                // through the part surface and avoids co-planar boundary failures.
+                static constexpr float kCutEps = 0.1f;
+                const glm::vec3 originExt = origin - pathDir * kCutEps;
+                const float     totalLenExt = totalLen + kCutEps;  // extends into the feed network
+                const gp_Pnt    occOriginExt(originExt.x, originExt.y, originExt.z);
+                const gp_Ax2    gateAxExt(occOriginExt, occDir);
+
+                // Distance along path where draft expands to sub-runner radius
+                float taperLen = std::numeric_limits<float>::max();
+                if (tanDraft > 1e-6f && subRunnerRadius > gateRadius)
+                    taperLen = (subRunnerRadius - gateRadius) / tanDraft;
+
+                // Adjust taperLen relative to the extended origin
+                const float taperLenExt = taperLen + kCutEps;
+
+                if (taperLen >= totalLen)
+                {
+                    // Gate fills the whole path — single cone/cylinder cut
+                    const float endR = gateRadius + totalLenExt * tanDraft;
+                    TopoDS_Shape gateShape;
+                    if (std::abs(endR - gateRadius) > 1e-6f)
+                    {
+                        BRepPrimAPI_MakeCone cone(gateAxExt, gateRadius, endR, totalLenExt);
+                        cone.Build();
+                        if (cone.IsDone() && !cone.Shape().IsNull())
+                            gateShape = cone.Shape();
+                    }
+                    else
+                    {
+                        BRepPrimAPI_MakeCylinder cyl(gateAxExt, gateRadius, totalLenExt);
+                        cyl.Build();
+                        if (cyl.IsDone() && !cyl.Shape().IsNull())
+                            gateShape = cyl.Shape();
+                    }
+
+                    if (!gateShape.IsNull())
+                    {
+                        BRepAlgoAPI_Cut gateCut(result, gateShape);
+                        gateCut.Build();
+                        if (gateCut.IsDone() && !gateCut.Shape().IsNull())
+                            result = gateCut.Shape();
+                        else
+                            wxMessageBox("Gate cut failed for gate " + std::to_string(gi + 1),
+                                "Generate Mould", wxOK | wxICON_WARNING, this);
+                    }
+                }
+                else
+                {
+                    // --- Gate frustum (extended origin → transition point) ---
+                    {
+                        BRepPrimAPI_MakeCone cone(gateAxExt, gateRadius, subRunnerRadius, taperLenExt);
+                        cone.Build();
+                        if (cone.IsDone() && !cone.Shape().IsNull())
+                        {
+                            BRepAlgoAPI_Cut gateCut(result, cone.Shape());
+                            gateCut.Build();
+                            if (gateCut.IsDone() && !gateCut.Shape().IsNull())
+                                result = gateCut.Shape();
+                            else
+                                wxMessageBox("Gate frustum cut failed for gate " + std::to_string(gi + 1),
+                                    "Generate Mould", wxOK | wxICON_WARNING, this);
+                        }
+                    }
+
+                    // --- Sub-runner cylinder (transition point → pathEnd) ---
+                    {
+                        const glm::vec3 transitionPt = originExt + pathDir * taperLenExt;
+                        const float     subLen = totalLenExt - taperLenExt;
+                        const gp_Ax2    subAx(
+                            gp_Pnt(transitionPt.x, transitionPt.y, transitionPt.z),
+                            occDir);
+
+                        BRepPrimAPI_MakeCylinder subCyl(subAx, subRunnerRadius, subLen);
+                        subCyl.Build();
+                        if (subCyl.IsDone() && !subCyl.Shape().IsNull())
+                        {
+                            BRepAlgoAPI_Cut subCut(result, subCyl.Shape());
+                            subCut.Build();
+                            if (subCut.IsDone() && !subCut.Shape().IsNull())
+                                result = subCut.Shape();
+                            else
+                                wxMessageBox("Sub-runner cut failed for gate " + std::to_string(gi + 1),
+                                    "Generate Mould", wxOK | wxICON_WARNING, this);
+                        }
+                    }
+                }
+            }
+        }
+
         // Step: subtract sprue (frustum + cold slug)
         progress.Update(step++, fixLabel + ": cutting sprue...");
 
@@ -792,14 +1078,20 @@ void GLCanvas::GenerateMould()
                 const glm::vec3 dir = sprueAxis / sprueLen;
 
                 // OCC axis at sprue start, pointing toward sprue end
+                // Pull the sprue start back by kCutEps so it protrudes through
+                // the top face of the fixture and avoids co-planar failures.
+                static constexpr float kCutEps = 0.1f;
+                const glm::vec3 sprueStartExt = m_sprue.pathStart - dir * kCutEps;
+                const float     sprueExtLen = sprueLen + kCutEps;  // extra only at entry
+
                 gp_Ax2 sprueAx(
-                    gp_Pnt(m_sprue.pathStart.x, m_sprue.pathStart.y, m_sprue.pathStart.z),
+                    gp_Pnt(sprueStartExt.x, sprueStartExt.y, sprueStartExt.z),
                     gp_Dir(dir.x, dir.y, dir.z)
                 );
 
                 const float draftRad = glm::radians(glm::clamp(m_sprue.draftAngleDeg, 0.0f, 45.0f));
                 const float startR = m_sprue.radius;
-                const float endR = m_sprue.radius + sprueLen * std::tan(draftRad);
+                const float endR = m_sprue.radius + sprueExtLen * std::tan(draftRad);
 
                 // Build the drafted sprue solid (frustum or cylinder)
                 TopoDS_Shape sprueCutShape;
@@ -808,7 +1100,8 @@ void GLCanvas::GenerateMould()
                 if (std::abs(endR - startR) > 1e-6f)
                 {
                     // Tapered — use a cone
-                    BRepPrimAPI_MakeCone cone(sprueAx, startR, endR, sprueLen);
+                    BRepPrimAPI_MakeCone cone(sprueAx, startR, endR, sprueExtLen);
+                    cone.Build();
                     if (cone.IsDone() && !cone.Shape().IsNull())
                     {
                         sprueCutShape = cone.Shape();
@@ -818,7 +1111,8 @@ void GLCanvas::GenerateMould()
                 else
                 {
                     // No taper — straight cylinder
-                    BRepPrimAPI_MakeCylinder cyl(sprueAx, startR, sprueLen);
+                    BRepPrimAPI_MakeCylinder cyl(sprueAx, startR, sprueExtLen);
+                    cyl.Build();
                     if (cyl.IsDone() && !cyl.Shape().IsNull())
                     {
                         sprueCutShape = cyl.Shape();
@@ -846,6 +1140,7 @@ void GLCanvas::GenerateMould()
                     );
 
                     BRepPrimAPI_MakeCylinder slugCyl(slugAx, endR, m_sprue.coldSlugDepth);
+                    slugCyl.Build();
                     if (slugCyl.IsDone() && !slugCyl.Shape().IsNull())
                     {
                         BRepAlgoAPI_Cut slugCut(result, slugCyl.Shape());
@@ -1317,6 +1612,18 @@ void GLCanvas::ClearRunnerPoints()
     for (auto& rf : m_runners) rf.Destroy();
     m_runners.clear();
     RebuildRunnerPathVBO();
+    RebuildGatePathVBO();
+    RebuildGateSolids();
+    Refresh(false);
+}
+
+void GLCanvas::ClearGatePoints()
+{
+    for (auto& gf : m_gates) gf.Destroy();
+    m_gates.clear();
+    m_gateGhostActive = false;
+    RebuildGatePathVBO();
+    RebuildGateSolids();
     Refresh(false);
 }
 
@@ -1331,6 +1638,20 @@ void GLCanvas::ClearRunnerPoints()
 static float Cross2D(const glm::vec2& O, const glm::vec2& A, const glm::vec2& B)
 {
     return (A.x - O.x) * (B.y - O.y) - (A.y - O.y) * (B.x - O.x);
+}
+
+// Returns true when pt is inside (or on the boundary of) a convex hull stored
+// in CCW order — the winding produced by the ConvexHull function below.
+static bool IsInsideConvexHull(const std::vector<glm::vec2>& hull, const glm::vec2& pt)
+{
+    const int n = (int)hull.size();
+    if (n < 3) return false;
+    for (int i = 0; i < n; ++i)
+    {
+        if (Cross2D(hull[i], hull[(i + 1) % n], pt) < 0.0f)
+            return false;
+    }
+    return true;
 }
 
 static std::vector<glm::vec2> ConvexHull(std::vector<glm::vec2> pts)
@@ -1740,6 +2061,15 @@ void GLCanvas::InitGLOnce()
     glEnableVertexAttribArray(0);
     glBindVertexArray(0);
 
+    // Gate path line VBO (dynamic, gate point → nearest feed point)
+    glGenVertexArrays(1, &m_gatePathVAO);
+    glGenBuffers(1, &m_gatePathVBO);
+    glBindVertexArray(m_gatePathVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, m_gatePathVBO);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glBindVertexArray(0);
+
     m_inited = true;
 }
 
@@ -1753,6 +2083,8 @@ void GLCanvas::DestroyGL()
     m_vents.clear();
     for (auto& rf : m_runners) rf.Destroy();
     m_runners.clear();
+    for (auto& gf : m_gates) gf.Destroy();
+    m_gates.clear();
     m_sprue.DestroyGL();
 
     if (m_outlineProgram) { glDeleteProgram(m_outlineProgram);        m_outlineProgram = 0; }
@@ -1764,6 +2096,8 @@ void GLCanvas::DestroyGL()
     if (m_xsecVAO) { glDeleteVertexArrays(1, &m_xsecVAO);         m_xsecVAO = 0; }
     if (m_runnerPathVBO) { glDeleteBuffers(1, &m_runnerPathVBO);         m_runnerPathVBO = 0; }
     if (m_runnerPathVAO) { glDeleteVertexArrays(1, &m_runnerPathVAO);    m_runnerPathVAO = 0; }
+    if (m_gatePathVBO) { glDeleteBuffers(1, &m_gatePathVBO);           m_gatePathVBO = 0; }
+    if (m_gatePathVAO) { glDeleteVertexArrays(1, &m_gatePathVAO);      m_gatePathVAO = 0; }
     if (m_sphereEBO) { glDeleteBuffers(1, &m_sphereEBO);          m_sphereEBO = 0; }
     if (m_sphereVBO) { glDeleteBuffers(1, &m_sphereVBO);          m_sphereVBO = 0; }
     if (m_sphereVAO) { glDeleteVertexArrays(1, &m_sphereVAO);     m_sphereVAO = 0; }
@@ -2216,8 +2550,10 @@ void GLCanvas::OnPaint(wxPaintEvent&)
     if (m_transformMode == TransformMode::PlaceRunner)
     {
         glm::vec3 hitPos;
-        m_runnerGhostActive = RayCastToPartingPlane(
+        const bool hit = RayCastToPartingPlane(
             m_runnerGhostMousePos.x, m_runnerGhostMousePos.y, hitPos);
+        const glm::vec2 hitXZ(hitPos.x, hitPos.z);
+        m_runnerGhostActive = hit && IsInsideConvexHull(m_fixturePerimeter, hitXZ);
         m_runnerGhostPos = hitPos;
     }
     if (m_program && m_sphereVAO && m_sphereIndexCount > 0 &&
@@ -2267,6 +2603,72 @@ void GLCanvas::OnPaint(wxPaintEvent&)
             for (const RunnerFeature& rf : m_runners)
             {
                 glm::mat4 model = glm::translate(glm::mat4(1.0f), rf.point);
+                model = glm::scale(model, glm::vec3(kVentMarkerRadius));
+                glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &model[0][0]);
+                glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
+            }
+        }
+
+        glBindVertexArray(0);
+        glUseProgram(0);
+    }
+
+    // ---- Gate point markers (yellow spheres) --------------------------------
+    if (m_transformMode == TransformMode::PlaceGate)
+    {
+        glm::vec3 hitPos, hitNormal;
+        m_gateGhostActive = RayCastParting(m_gateGhostMousePos.x, m_gateGhostMousePos.y,
+            hitPos, hitNormal);
+        m_gateGhost.worldPos = hitPos;
+        m_gateGhost.worldNormal = hitNormal;
+    }
+    if (m_program && m_sphereVAO && m_sphereIndexCount > 0 &&
+        (!m_gates.empty() || m_gateGhostActive))
+    {
+        glEnable(GL_DEPTH_TEST);
+        glUseProgram(m_program);
+
+        glUniform3fv(glGetUniformLocation(m_program, "uCameraPos"), 1, &camPos[0]);
+        glUniform3fv(glGetUniformLocation(m_program, "uLightDir"), 1, &lightDir[0]);
+        glUniform3fv(glGetUniformLocation(m_program, "uLightColor"), 1, &lightColor[0]);
+        glUniform1f(glGetUniformLocation(m_program, "uAmbient"), 0.35f);
+        glUniform1f(glGetUniformLocation(m_program, "uDiffuse"), 0.75f);
+        glUniform1f(glGetUniformLocation(m_program, "uSpecular"), 0.60f);
+        glUniform1f(glGetUniformLocation(m_program, "uShininess"), 48.0f);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uView"), 1, GL_FALSE, &view[0][0]);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uProj"), 1, GL_FALSE, &proj[0][0]);
+
+        glBindVertexArray(m_sphereVAO);
+
+        // Ghost preview — translucent yellow
+        if (m_gateGhostActive)
+        {
+            const glm::vec3 ghostColor(1.0f, 0.85f, 0.10f);   // yellow
+            glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &ghostColor[0]);
+            glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 0.45f);
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glDepthMask(GL_FALSE);
+
+            glm::mat4 model = glm::translate(glm::mat4(1.0f), m_gateGhost.worldPos);
+            model = glm::scale(model, glm::vec3(kVentMarkerRadius * 1.15f));
+            glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &model[0][0]);
+            glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
+
+            glDepthMask(GL_TRUE);
+            glDisable(GL_BLEND);
+        }
+
+        // Confirmed gate points — fully opaque yellow
+        if (!m_gates.empty())
+        {
+            const glm::vec3 gateColor(1.0f, 0.85f, 0.10f);   // yellow
+            glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &gateColor[0]);
+            glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 1.0f);
+
+            for (const GateFeature& gf : m_gates)
+            {
+                glm::mat4 model = glm::translate(glm::mat4(1.0f), gf.point.worldPos);
                 model = glm::scale(model, glm::vec3(kVentMarkerRadius));
                 glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &model[0][0]);
                 glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
@@ -2400,6 +2802,27 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         glUseProgram(0);
     }
 
+    // ---- Gate path lines (yellow) -----------------------------------------
+    if (m_flatProgram && m_gatePathVAO && m_gatePathVertexCount > 0)
+    {
+        glEnable(GL_DEPTH_TEST);
+        glLineWidth(2.5f);
+        glUseProgram(m_flatProgram);
+
+        const glm::mat4 VP = proj * view;
+        glUniformMatrix4fv(m_flat_uVP, 1, GL_FALSE, &VP[0][0]);
+
+        const glm::vec4 gateLineColor(1.0f, 0.85f, 0.10f, 1.0f);   // yellow, matches gate spheres
+        glUniform4fv(m_flat_uColor, 1, &gateLineColor[0]);
+
+        glBindVertexArray(m_gatePathVAO);
+        glDrawArrays(GL_LINES, 0, m_gatePathVertexCount);
+        glBindVertexArray(0);
+
+        glLineWidth(1.0f);
+        glUseProgram(0);
+    }
+
     // ---- Vent path lines ---------------------------------------------------
     if (m_flatProgram && m_pathVAO && m_pathVertexCount > 0)
     {
@@ -2521,6 +2944,55 @@ void GLCanvas::OnPaint(wxPaintEvent&)
             if (!rf.coldPlugSolid.valid || rf.coldPlugSolid.vao == 0) continue;
             glBindVertexArray(rf.coldPlugSolid.vao);
             glDrawElements(GL_TRIANGLES, rf.coldPlugSolid.indexCount, GL_UNSIGNED_INT, 0);
+        }
+
+        glBindVertexArray(0);
+        glUseProgram(0);
+        glDepthMask(GL_TRUE);
+        glDisable(GL_BLEND);
+    }
+
+    // ---- Gate solids (lit, semi-transparent yellow) ------------------------
+    if (m_program && !m_gates.empty())
+    {
+        glEnable(GL_DEPTH_TEST);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glDepthMask(GL_FALSE);
+        glUseProgram(m_program);
+
+        const glm::mat4 identity(1.0f);
+        glUniform3fv(glGetUniformLocation(m_program, "uCameraPos"), 1, &camPos[0]);
+        glUniform3fv(glGetUniformLocation(m_program, "uLightDir"), 1, &lightDir[0]);
+        glUniform3fv(glGetUniformLocation(m_program, "uLightColor"), 1, &lightColor[0]);
+        glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 0.55f);
+        glUniform1f(glGetUniformLocation(m_program, "uAmbient"), 0.30f);
+        glUniform1f(glGetUniformLocation(m_program, "uDiffuse"), 0.80f);
+        glUniform1f(glGetUniformLocation(m_program, "uSpecular"), 0.40f);
+        glUniform1f(glGetUniformLocation(m_program, "uShininess"), 32.0f);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uView"), 1, GL_FALSE, &view[0][0]);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uProj"), 1, GL_FALSE, &proj[0][0]);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &identity[0][0]);
+
+        // Gate frustums — bright yellow, matches gate sphere colour
+        const glm::vec3 gateColor(1.0f, 0.85f, 0.10f);
+        glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &gateColor[0]);
+        for (const GateFeature& gf : m_gates)
+        {
+            if (!gf.solid.valid || gf.solid.vao == 0) continue;
+            glBindVertexArray(gf.solid.vao);
+            glDrawElements(GL_TRIANGLES, gf.solid.indexCount, GL_UNSIGNED_INT, 0);
+        }
+
+        // Sub-runner cylinders — slightly dimmer yellow, more transparent
+        const glm::vec3 subRunnerColor(0.80f, 0.65f, 0.05f);
+        glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &subRunnerColor[0]);
+        glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 0.45f);
+        for (const GateFeature& gf : m_gates)
+        {
+            if (!gf.subRunnerSolid.valid || gf.subRunnerSolid.vao == 0) continue;
+            glBindVertexArray(gf.subRunnerSolid.vao);
+            glDrawElements(GL_TRIANGLES, gf.subRunnerSolid.indexCount, GL_UNSIGNED_INT, 0);
         }
 
         glBindVertexArray(0);
@@ -2702,9 +3174,29 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
             glm::vec3 hitPos;
             if (RayCastToPartingPlane(p.x, p.y, hitPos))
             {
-                m_runners.push_back(RunnerFeature{ hitPos, {}, {} });
-                RebuildRunnerPathVBO();
-                RebuildRunnerSolids();
+                const glm::vec2 hitXZ(hitPos.x, hitPos.z);
+                if (IsInsideConvexHull(m_fixturePerimeter, hitXZ))
+                {
+                    m_runners.push_back(RunnerFeature{ hitPos, {}, {} });
+                    RebuildRunnerPathVBO();
+                    RebuildRunnerSolids();
+                    RebuildGatePathVBO();
+                    RebuildGateSolids();
+                    Refresh(false);
+                }
+            }
+        }
+        else if (m_transformMode == TransformMode::PlaceGate)
+        {
+            const wxPoint p = evt.GetPosition();
+            glm::vec3 hitPos, hitNormal;
+            if (RayCastParting(p.x, p.y, hitPos, hitNormal))
+            {
+                GateFeature gf;
+                gf.point = VentPoint{ hitPos, hitNormal };
+                m_gates.push_back(std::move(gf));
+                RebuildGatePathVBO();
+                RebuildGateSolids();
                 Refresh(false);
             }
         }
@@ -2734,6 +3226,11 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
         if (m_transformMode == TransformMode::PlaceRunner)
         {
             m_runnerGhostMousePos = pos;
+            Refresh(false);
+        }
+        if (m_transformMode == TransformMode::PlaceGate)
+        {
+            m_gateGhostMousePos = pos;
             Refresh(false);
         }
         evt.Skip();
@@ -2777,6 +3274,7 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
             m_objects[m_selectedIndex].pos += right * (dx * unitsPerPx);
             m_objects[m_selectedIndex].pos += forward * (-dyAdjusted * unitsPerPx);
             for (auto& v : m_vents) v.Destroy(); m_vents.clear(); RebuildPathVBO(); RebuildCrossSectionVBO();
+            for (auto& gf : m_gates) gf.Destroy(); m_gates.clear(); RebuildGatePathVBO();
             Refresh(false);
         }
         else
@@ -2813,6 +3311,17 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
             m_camera.Orbit(dx, dy);
         Refresh(false);
     }
+    else if (m_lmb && m_transformMode == TransformMode::PlaceGate)
+    {
+        // Orbit while holding LMB in PlaceGate mode
+        if (shift)
+            m_camera.Pan(dx, -dy);
+        else if (ctrl)
+            m_camera.Dolly(dy * 0.05f);
+        else
+            m_camera.Orbit(dx, dy);
+        Refresh(false);
+    }
 
     // Update ghost preview whenever the mouse moves in PlaceVent mode.
     // The actual ray cast is deferred to OnPaint so only one cast runs per
@@ -2827,10 +3336,16 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
         m_runnerGhostMousePos = evt.GetPosition();
         Refresh(false);
     }
-    else if (m_ventGhostActive || m_runnerGhostActive)
+    else if (m_transformMode == TransformMode::PlaceGate)
+    {
+        m_gateGhostMousePos = evt.GetPosition();
+        Refresh(false);
+    }
+    else if (m_ventGhostActive || m_runnerGhostActive || m_gateGhostActive)
     {
         m_ventGhostActive = false;
         m_runnerGhostActive = false;
+        m_gateGhostActive = false;
         Refresh(false);
     }
 
@@ -2854,6 +3369,7 @@ void GLCanvas::OnKeyDown(wxKeyEvent& evt)
         {
             m_ventGhostActive = false;
             m_runnerGhostActive = false;
+            m_gateGhostActive = false;
             SetTransformMode(TransformMode::Select);
             if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
                 frame->SetActiveTool(TransformMode::Select);
