@@ -694,7 +694,7 @@ void GLCanvas::GenerateMould()
     }
 
     // Steps per fixture: 1 read + 1 transform + (1 per object subtract) + (1 per vent subtract) + (1 per runner subtract) + 1 sprue + 1 tessellate + 1 upload
-    const int stepsPerFixture = 4 + (int)m_objects.size() + (int)m_vents.size() + (int)m_runners.size();
+    const int stepsPerFixture = 4 + (int)m_objects.size() + (int)m_vents.size() + (int)m_runners.size() + (int)m_gates.size();
     const int totalSteps = stepsPerFixture * (int)m_fixtures.size();
 
     wxProgressDialog progress(
@@ -887,13 +887,17 @@ void GLCanvas::GenerateMould()
 
                 const glm::vec3 runnerDir = runnerAxis / runnerLen;
 
-                // Runner cylinder: from sprue parting point, length = runner path
+                // Runner cylinder: pulled back by kCutEps so it protrudes through
+                // both parting faces and avoids co-planar boundary failures.
+                static constexpr float kCutEps = 0.1f;
+                const glm::vec3 runnerOriginExt = m_sprue.partingPos - runnerDir * kCutEps;
                 gp_Ax2 runnerAx(
-                    gp_Pnt(m_sprue.partingPos.x, m_sprue.partingPos.y, m_sprue.partingPos.z),
+                    gp_Pnt(runnerOriginExt.x, runnerOriginExt.y, runnerOriginExt.z),
                     gp_Dir(runnerDir.x, runnerDir.y, runnerDir.z)
                 );
 
-                BRepPrimAPI_MakeCylinder runnerCyl(runnerAx, runnerRadius, runnerLen);
+                BRepPrimAPI_MakeCylinder runnerCyl(runnerAx, runnerRadius, runnerLen + 2.0f * kCutEps);
+                runnerCyl.Build();
                 if (!runnerCyl.IsDone() || runnerCyl.Shape().IsNull()) continue;
 
                 BRepAlgoAPI_Cut runnerCut(result, runnerCyl.Shape());
@@ -917,6 +921,7 @@ void GLCanvas::GenerateMould()
                     );
 
                     BRepPrimAPI_MakeCylinder plugCyl(plugAx, runnerRadius, coldPlugDist);
+                    plugCyl.Build();
                     if (plugCyl.IsDone() && !plugCyl.Shape().IsNull())
                     {
                         BRepAlgoAPI_Cut plugCut(result, plugCyl.Shape());
@@ -936,6 +941,130 @@ void GLCanvas::GenerateMould()
             step += (int)m_runners.size();
         }
 
+        // Steps: subtract each gate (tapered frustum) and its sub-runner cylinder
+        {
+            float gateRadius = 1.5f;
+            float draftAngle = 1.0f;
+            float subRunnerRadius = 2.5f;
+            if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+            {
+                gateRadius = frame->GetGateDiameter() * 0.5f;
+                draftAngle = frame->GetGateDraftAngle();
+                subRunnerRadius = frame->GetSubRunnerDiameter() * 0.5f;
+            }
+
+            const float draftRad = glm::radians(glm::clamp(draftAngle, 0.0f, 45.0f));
+            const float tanDraft = std::tan(draftRad);
+
+            for (int gi = 0; gi < (int)m_gates.size(); ++gi)
+            {
+                progress.Update(step++,
+                    fixLabel + ": cutting gate " +
+                    std::to_string(gi + 1) + " of " +
+                    std::to_string((int)m_gates.size()) + "...");
+
+                const GateFeature& gf = m_gates[gi];
+                if (!gf.hasPath) continue;
+
+                const glm::vec3 origin = gf.point.worldPos;
+                const glm::vec3 pathVec = gf.pathEnd - origin;
+                const float     totalLen = glm::length(pathVec);
+                if (totalLen < 1e-6f || gateRadius < 1e-6f) continue;
+                const glm::vec3 pathDir = pathVec / totalLen;
+
+                const gp_Pnt occOrigin(origin.x, origin.y, origin.z);
+                const gp_Dir occDir(pathDir.x, pathDir.y, pathDir.z);
+
+                // Pull the gate origin back by kCutEps so the primitive protrudes
+                // through the part surface and avoids co-planar boundary failures.
+                static constexpr float kCutEps = 0.1f;
+                const glm::vec3 originExt = origin - pathDir * kCutEps;
+                const float     totalLenExt = totalLen + kCutEps;  // extends into the feed network
+                const gp_Pnt    occOriginExt(originExt.x, originExt.y, originExt.z);
+                const gp_Ax2    gateAxExt(occOriginExt, occDir);
+
+                // Distance along path where draft expands to sub-runner radius
+                float taperLen = std::numeric_limits<float>::max();
+                if (tanDraft > 1e-6f && subRunnerRadius > gateRadius)
+                    taperLen = (subRunnerRadius - gateRadius) / tanDraft;
+
+                // Adjust taperLen relative to the extended origin
+                const float taperLenExt = taperLen + kCutEps;
+
+                if (taperLen >= totalLen)
+                {
+                    // Gate fills the whole path — single cone/cylinder cut
+                    const float endR = gateRadius + totalLenExt * tanDraft;
+                    TopoDS_Shape gateShape;
+                    if (std::abs(endR - gateRadius) > 1e-6f)
+                    {
+                        BRepPrimAPI_MakeCone cone(gateAxExt, gateRadius, endR, totalLenExt);
+                        cone.Build();
+                        if (cone.IsDone() && !cone.Shape().IsNull())
+                            gateShape = cone.Shape();
+                    }
+                    else
+                    {
+                        BRepPrimAPI_MakeCylinder cyl(gateAxExt, gateRadius, totalLenExt);
+                        cyl.Build();
+                        if (cyl.IsDone() && !cyl.Shape().IsNull())
+                            gateShape = cyl.Shape();
+                    }
+
+                    if (!gateShape.IsNull())
+                    {
+                        BRepAlgoAPI_Cut gateCut(result, gateShape);
+                        gateCut.Build();
+                        if (gateCut.IsDone() && !gateCut.Shape().IsNull())
+                            result = gateCut.Shape();
+                        else
+                            wxMessageBox("Gate cut failed for gate " + std::to_string(gi + 1),
+                                "Generate Mould", wxOK | wxICON_WARNING, this);
+                    }
+                }
+                else
+                {
+                    // --- Gate frustum (extended origin → transition point) ---
+                    {
+                        BRepPrimAPI_MakeCone cone(gateAxExt, gateRadius, subRunnerRadius, taperLenExt);
+                        cone.Build();
+                        if (cone.IsDone() && !cone.Shape().IsNull())
+                        {
+                            BRepAlgoAPI_Cut gateCut(result, cone.Shape());
+                            gateCut.Build();
+                            if (gateCut.IsDone() && !gateCut.Shape().IsNull())
+                                result = gateCut.Shape();
+                            else
+                                wxMessageBox("Gate frustum cut failed for gate " + std::to_string(gi + 1),
+                                    "Generate Mould", wxOK | wxICON_WARNING, this);
+                        }
+                    }
+
+                    // --- Sub-runner cylinder (transition point → pathEnd) ---
+                    {
+                        const glm::vec3 transitionPt = originExt + pathDir * taperLenExt;
+                        const float     subLen = totalLenExt - taperLenExt;
+                        const gp_Ax2    subAx(
+                            gp_Pnt(transitionPt.x, transitionPt.y, transitionPt.z),
+                            occDir);
+
+                        BRepPrimAPI_MakeCylinder subCyl(subAx, subRunnerRadius, subLen);
+                        subCyl.Build();
+                        if (subCyl.IsDone() && !subCyl.Shape().IsNull())
+                        {
+                            BRepAlgoAPI_Cut subCut(result, subCyl.Shape());
+                            subCut.Build();
+                            if (subCut.IsDone() && !subCut.Shape().IsNull())
+                                result = subCut.Shape();
+                            else
+                                wxMessageBox("Sub-runner cut failed for gate " + std::to_string(gi + 1),
+                                    "Generate Mould", wxOK | wxICON_WARNING, this);
+                        }
+                    }
+                }
+            }
+        }
+
         // Step: subtract sprue (frustum + cold slug)
         progress.Update(step++, fixLabel + ": cutting sprue...");
 
@@ -949,14 +1078,20 @@ void GLCanvas::GenerateMould()
                 const glm::vec3 dir = sprueAxis / sprueLen;
 
                 // OCC axis at sprue start, pointing toward sprue end
+                // Pull the sprue start back by kCutEps so it protrudes through
+                // the top face of the fixture and avoids co-planar failures.
+                static constexpr float kCutEps = 0.1f;
+                const glm::vec3 sprueStartExt = m_sprue.pathStart - dir * kCutEps;
+                const float     sprueExtLen = sprueLen + kCutEps;  // extra only at entry
+
                 gp_Ax2 sprueAx(
-                    gp_Pnt(m_sprue.pathStart.x, m_sprue.pathStart.y, m_sprue.pathStart.z),
+                    gp_Pnt(sprueStartExt.x, sprueStartExt.y, sprueStartExt.z),
                     gp_Dir(dir.x, dir.y, dir.z)
                 );
 
                 const float draftRad = glm::radians(glm::clamp(m_sprue.draftAngleDeg, 0.0f, 45.0f));
                 const float startR = m_sprue.radius;
-                const float endR = m_sprue.radius + sprueLen * std::tan(draftRad);
+                const float endR = m_sprue.radius + sprueExtLen * std::tan(draftRad);
 
                 // Build the drafted sprue solid (frustum or cylinder)
                 TopoDS_Shape sprueCutShape;
@@ -965,7 +1100,8 @@ void GLCanvas::GenerateMould()
                 if (std::abs(endR - startR) > 1e-6f)
                 {
                     // Tapered — use a cone
-                    BRepPrimAPI_MakeCone cone(sprueAx, startR, endR, sprueLen);
+                    BRepPrimAPI_MakeCone cone(sprueAx, startR, endR, sprueExtLen);
+                    cone.Build();
                     if (cone.IsDone() && !cone.Shape().IsNull())
                     {
                         sprueCutShape = cone.Shape();
@@ -975,7 +1111,8 @@ void GLCanvas::GenerateMould()
                 else
                 {
                     // No taper — straight cylinder
-                    BRepPrimAPI_MakeCylinder cyl(sprueAx, startR, sprueLen);
+                    BRepPrimAPI_MakeCylinder cyl(sprueAx, startR, sprueExtLen);
+                    cyl.Build();
                     if (cyl.IsDone() && !cyl.Shape().IsNull())
                     {
                         sprueCutShape = cyl.Shape();
@@ -1003,6 +1140,7 @@ void GLCanvas::GenerateMould()
                     );
 
                     BRepPrimAPI_MakeCylinder slugCyl(slugAx, endR, m_sprue.coldSlugDepth);
+                    slugCyl.Build();
                     if (slugCyl.IsDone() && !slugCyl.Shape().IsNull())
                     {
                         BRepAlgoAPI_Cut slugCut(result, slugCyl.Shape());
@@ -3136,6 +3274,7 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
             m_objects[m_selectedIndex].pos += right * (dx * unitsPerPx);
             m_objects[m_selectedIndex].pos += forward * (-dyAdjusted * unitsPerPx);
             for (auto& v : m_vents) v.Destroy(); m_vents.clear(); RebuildPathVBO(); RebuildCrossSectionVBO();
+            for (auto& gf : m_gates) gf.Destroy(); m_gates.clear(); RebuildGatePathVBO();
             Refresh(false);
         }
         else

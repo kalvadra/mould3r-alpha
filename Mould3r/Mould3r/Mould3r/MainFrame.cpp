@@ -181,7 +181,7 @@ wxPanel* MainFrame::CreateRibbon(wxWindow* parent)
 
     // Vertical divider
     hSizer->AddSpacer(16);
-    auto* divider = new wxPanel(panel, wxID_ANY, wxDefaultPosition, wxSize(1, 36));
+    wxPanel* divider = new wxPanel(panel, wxID_ANY, wxDefaultPosition, wxSize(1, 36));
     divider->SetBackgroundColour(wxColour(0x38, 0x44, 0x55));
     hSizer->Add(divider, 0, wxALIGN_CENTER_VERTICAL);
     hSizer->AddSpacer(16);
@@ -1281,7 +1281,7 @@ wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
     auto* sizer = new wxBoxSizer(wxVERTICAL);
 
     // ---- Panel title -------------------------------------------------------
-    auto* title = new wxStaticText(panel, wxID_ANY, "MOULD TOOLS");
+    auto* title = new wxStaticText(panel, wxID_ANY, "MOULD TOOL SETTINGS");
     title->SetForegroundColour(wxColour(0x44, 0x55, 0x66));
     title->SetFont(wxFont(7, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_BOLD, false, "Segoe UI"));
