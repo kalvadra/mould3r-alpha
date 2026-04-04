@@ -171,6 +171,7 @@
     <ClInclude Include="ScaleDialog.h" />
     <ClInclude Include="shaders.h" />
     <ClInclude Include="StartupDialog.h" />
+    <ClInclude Include="style.h" />
     <ClInclude Include="TranslateDialog.h" />
     <ClInclude Include="VentFeature.h" />
   </ItemGroup>

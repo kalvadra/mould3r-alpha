@@ -128,6 +128,9 @@
     <ClInclude Include="VentFeature.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="style.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <None Include="vcpkg.json" />

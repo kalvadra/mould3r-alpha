@@ -13,7 +13,7 @@ static const wxColour kText(0xC8, 0xD0, 0xDC);
 static const wxColour kSubtext(0x66, 0x77, 0x88);
 
 StartupDialog::StartupDialog(wxWindow* parent)
-    : wxDialog(parent, wxID_ANY, "Mould3r — Select Fixture",
+    : wxDialog(parent, wxID_ANY, "Mould3r - Select Fixture",
         wxDefaultPosition, wxSize(560, 480),
         wxDEFAULT_DIALOG_STYLE)
 {
@@ -37,7 +37,7 @@ StartupDialog::StartupDialog(wxWindow* parent)
         wxFONTWEIGHT_BOLD, false, "Segoe UI"));
 
     auto* subtitle = new wxStaticText(titlePanel, wxID_ANY,
-        "Choose a fixture to load, or create a new one.");
+        "Choose a fixture to load, or create a new one.\nA fixture is a set of blank mould halves that the design features will be cut from.\nIt may also include ejector information.");
     subtitle->SetForegroundColour(kSubtext);
     subtitle->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
