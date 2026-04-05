@@ -1,4 +1,9 @@
 #include <wx/filedlg.h>
+#include <wx/bmpbndl.h>
+#include <wx/stdpaths.h>
+#include <wx/filename.h>
+#include <wx/file.h>
+#include <memory>
 
 #include "MainFrame.h"
 #include "GLCanvas.h"
@@ -1296,34 +1301,147 @@ wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
 
         auto* grid = new wxGridSizer(2, 2, 4, 4);
 
-        auto makeToolBtn = [&](int id, const wxString& label, bool toggle) -> wxWindow*
+        // ---- SVG icon paths for model tool buttons --------------------------------
+        // Fill in the path to each SVG file (relative to the executable, or absolute).
+        // Leave a string empty ("") to show the text label only.
+        static const wxString kIconMove = "res/icons/arrows-move.svg";
+        static const wxString kIconRotate = "rotate-2.svg";
+        static const wxString kIconScale = "resize.svg";
+        static const wxString kIconCenter = "focus-centered.svg";
+
+        // Helper: load an SVG, recolor all strokes and fills to white, and return a
+        // wxBitmapBundle.  Relative paths are anchored to the executable directory.
+        // Returns an invalid bundle (IsOk() == false) if the path is empty or missing.
+        auto LoadToolIcon = [](const wxString& svgPath) -> wxBitmapBundle
             {
-                if (toggle)
+                if (svgPath.IsEmpty())
+                    return wxBitmapBundle();
+
+                wxFileName fn(svgPath);
+                if (fn.IsRelative())
                 {
-                    auto* btn = new wxToggleButton(toolsPanel, id, label,
-                        wxDefaultPosition, wxSize(-1, 34), wxBORDER_NONE);
-                    btn->SetBackgroundColour(kToolBtnBg);
-                    btn->SetForegroundColour(kToolBtnText);
-                    btn->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
-                        wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
-                    return btn;
+                    wxFileName exeDir(wxStandardPaths::Get().GetExecutablePath());
+                    fn.MakeAbsolute(exeDir.GetPath());
                 }
-                else
-                {
-                    auto* btn = new wxButton(toolsPanel, id, label,
-                        wxDefaultPosition, wxSize(-1, 34), wxBORDER_NONE);
-                    btn->SetBackgroundColour(kToolBtnBg);
-                    btn->SetForegroundColour(kToolBtnText);
-                    btn->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
-                        wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
-                    return btn;
-                }
+
+                // Read raw SVG text so we can override its colors before rendering.
+                wxFile file(fn.GetFullPath());
+                if (!file.IsOpened())
+                    return wxBitmapBundle();
+                wxString svg;
+                file.ReadAll(&svg);
+
+                // Replace the most common color tokens used by icon sets (e.g. Lucide)
+                // with plain white so the icon matches the button text color.
+                svg.Replace("currentColor", "white");
+                svg.Replace("\"black\"", "\"white\"");
+                svg.Replace("\"#000000\"", "\"white\"");
+                svg.Replace("\"#000\"", "\"white\"");
+
+                const wxScopedCharBuffer utf8 = svg.utf8_str();
+                return wxBitmapBundle::FromSVG(utf8.data(), wxSize(18, 18));
             };
 
-        grid->Add(makeToolBtn(ID_ToolTranslate, "Move", true), 0, wxEXPAND);
-        grid->Add(makeToolBtn(ID_ToolRotate, "Rotate", true), 0, wxEXPAND);
-        grid->Add(makeToolBtn(ID_ToolScale, "Scale", true), 0, wxEXPAND);
-        grid->Add(makeToolBtn(ID_ToolCenter, "Center", false), 0, wxEXPAND);
+        static const wxFont kToolBtnFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_NORMAL, false, "Segoe UI");
+
+        auto makeToolBtn = [&](int id, const wxString& label, bool toggle,
+            const wxString& svgPath = "") -> wxWindow*
+            {
+                // Use a plain wxPanel so we can freely position the icon+text
+                // with a sizer, giving true centred layout that native buttons
+                // won't provide once a bitmap is attached.
+                auto* panel = new wxPanel(toolsPanel, wxID_ANY,
+                    wxDefaultPosition, wxSize(-1, 34), wxBORDER_NONE);
+                panel->SetBackgroundColour(kToolBtnBg);
+
+                // Inner horizontal sizer: [icon] [gap] [label]
+                auto* hSizer = new wxBoxSizer(wxHORIZONTAL);
+
+                wxStaticBitmap* bmpCtrl = nullptr;
+                wxBitmapBundle icon = LoadToolIcon(svgPath);
+                if (icon.IsOk())
+                {
+                    bmpCtrl = new wxStaticBitmap(panel, wxID_ANY,
+                        icon.GetBitmapFor(panel));
+                    hSizer->Add(bmpCtrl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 5);
+                }
+
+                auto* txt = new wxStaticText(panel, wxID_ANY, label);
+                txt->SetForegroundColour(kToolBtnText);
+                txt->SetBackgroundColour(kToolBtnBg);
+                txt->SetFont(kToolBtnFont);
+                hSizer->Add(txt, 0, wxALIGN_CENTER_VERTICAL);
+
+                // Wrap in a centering sizer using stretch spacers
+                auto* outer = new wxBoxSizer(wxHORIZONTAL);
+                outer->AddStretchSpacer(1);
+                outer->Add(hSizer, 0, wxALIGN_CENTER_VERTICAL);
+                outer->AddStretchSpacer(1);
+                panel->SetSizer(outer);
+
+                // Shared toggle state (avoids raw-pointer lifetime issues)
+                auto toggled = std::make_shared<bool>(false);
+
+                // Helpers to apply normal / hover / active colours
+                auto applyColours = [=](const wxColour& bg, const wxColour& fg) {
+                    panel->SetBackgroundColour(bg);
+                    txt->SetBackgroundColour(bg);
+                    txt->SetForegroundColour(fg);
+                    panel->Refresh();
+                    txt->Refresh();
+                    };
+
+                // Left-click: fire the appropriate command event and update visuals
+                auto onClick = [=](wxMouseEvent& e) {
+                    if (toggle)
+                    {
+                        *toggled = !*toggled;
+                        applyColours(*toggled ? kBtnActive : kToolBtnBg,
+                            *toggled ? kTextActive : kToolBtnText);
+                        wxCommandEvent evt(wxEVT_TOGGLEBUTTON, id);
+                        evt.SetEventObject(panel);
+                        evt.SetInt(*toggled ? 1 : 0);
+                        panel->GetEventHandler()->ProcessEvent(evt);
+                    }
+                    else
+                    {
+                        wxCommandEvent evt(wxEVT_BUTTON, id);
+                        evt.SetEventObject(panel);
+                        panel->GetEventHandler()->ProcessEvent(evt);
+                    }
+                    e.Skip();
+                    };
+
+                // Hover colours (only when not toggled-on)
+                auto onEnter = [=](wxMouseEvent& e) {
+                    if (!*toggled)
+                        applyColours(kBtnHover, kToolBtnText);
+                    e.Skip();
+                    };
+                auto onLeave = [=](wxMouseEvent& e) {
+                    if (!*toggled)
+                        applyColours(kToolBtnBg, kToolBtnText);
+                    e.Skip();
+                    };
+
+                // Bind events to the panel and every child so the full hit-area works
+                for (wxWindow* w : { (wxWindow*)panel, (wxWindow*)txt,
+                                     (wxWindow*)bmpCtrl })
+                {
+                    if (!w) continue;
+                    w->Bind(wxEVT_LEFT_UP, onClick);
+                    w->Bind(wxEVT_ENTER_WINDOW, onEnter);
+                    w->Bind(wxEVT_LEAVE_WINDOW, onLeave);
+                }
+
+                return panel;
+            };
+
+        grid->Add(makeToolBtn(ID_ToolTranslate, "Move", true, kIconMove), 0, wxEXPAND);
+        grid->Add(makeToolBtn(ID_ToolRotate, "Rotate", true, kIconRotate), 0, wxEXPAND);
+        grid->Add(makeToolBtn(ID_ToolScale, "Scale", true, kIconScale), 0, wxEXPAND);
+        grid->Add(makeToolBtn(ID_ToolCenter, "Center", false, kIconCenter), 0, wxEXPAND);
 
         toolsSizer->Add(grid, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
         toolsSizer->AddSpacer(10);
