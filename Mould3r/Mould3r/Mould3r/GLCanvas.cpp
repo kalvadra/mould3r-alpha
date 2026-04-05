@@ -160,6 +160,13 @@ GLCanvas::~GLCanvas()
 // ---------------------------------------------------------------------------
 void GLCanvas::SetTransformMode(TransformMode mode)
 {
+    // Clear edit selection when leaving an edit mode
+    if (m_transformMode != mode)
+    {
+        m_editFeatureIndex = -1;
+        m_editNeedsUpdate = false;
+    }
+
     m_transformMode = mode;
     switch (mode)
     {
@@ -177,6 +184,15 @@ void GLCanvas::SetTransformMode(TransformMode mode)
         SetCursor(wxCursor(wxCURSOR_CROSS));    break;
     case TransformMode::PlaceGate:
         SetCursor(wxCursor(wxCURSOR_CROSS));    break;
+    case TransformMode::RemoveVent:
+    case TransformMode::RemoveRunner:
+    case TransformMode::RemoveGate:
+    case TransformMode::RemoveSprue:
+        SetCursor(wxCursor(wxCURSOR_HAND));     break;
+    case TransformMode::EditVent:
+    case TransformMode::EditRunner:
+    case TransformMode::EditGate:
+        SetCursor(wxCursor(wxCURSOR_HAND));     break;
     }
 }
 
@@ -1628,6 +1644,169 @@ void GLCanvas::ClearGatePoints()
 }
 
 // ---------------------------------------------------------------------------
+// BuildMouseRay — unprojects mouse coordinates into a world-space ray.
+// ---------------------------------------------------------------------------
+void GLCanvas::BuildMouseRay(int mouseX, int mouseY,
+    glm::vec3& outOrigin, glm::vec3& outDir)
+{
+    const wxSize sz = GetClientSize();
+    const int    w = std::max(1, sz.x);
+    const int    h = std::max(1, sz.y);
+
+    const float ndcX = (2.0f * float(mouseX)) / float(w) - 1.0f;
+    const float ndcY = 1.0f - (2.0f * float(mouseY)) / float(h);
+
+    m_camera.SetAspect(float(w) / float(h));
+    const glm::mat4 view = m_camera.View();
+    const glm::mat4 proj = m_camera.Projection();
+    const glm::mat4 invVP = glm::inverse(proj * view);
+
+    glm::vec4 nearH = invVP * glm::vec4(ndcX, ndcY, -1.0f, 1.0f);
+    glm::vec4 farH = invVP * glm::vec4(ndcX, ndcY, 1.0f, 1.0f);
+    nearH /= nearH.w;
+    farH /= farH.w;
+
+    outOrigin = glm::vec3(nearH);
+    outDir = glm::normalize(glm::vec3(farH) - glm::vec3(nearH));
+}
+
+// ---------------------------------------------------------------------------
+// Helper: point-to-ray distance (used for feature marker hit-testing).
+// Returns the perpendicular distance from 'point' to the ray (origin, dir).
+// ---------------------------------------------------------------------------
+static float PointRayDistance(const glm::vec3& point,
+    const glm::vec3& origin, const glm::vec3& dir)
+{
+    const glm::vec3 v = point - origin;
+    const float t = glm::dot(v, dir);
+    if (t < 0.0f) return glm::length(v);          // behind the camera
+    const glm::vec3 closest = origin + dir * t;
+    return glm::length(point - closest);
+}
+
+// ---------------------------------------------------------------------------
+// RemoveVentAtMouse — removes the vent whose marker is closest to the ray.
+// ---------------------------------------------------------------------------
+void GLCanvas::RemoveVentAtMouse(int mouseX, int mouseY)
+{
+    if (m_vents.empty()) return;
+
+    glm::vec3 rayOrig, rayDir;
+    BuildMouseRay(mouseX, mouseY, rayOrig, rayDir);
+
+    const float hitRadius = kVentMarkerRadius * 2.0f;   // generous pick radius
+    float bestDist = hitRadius;
+    int   bestIdx = -1;
+
+    for (int i = 0; i < (int)m_vents.size(); ++i)
+    {
+        const float d = PointRayDistance(m_vents[i].point.worldPos, rayOrig, rayDir);
+        if (d < bestDist)
+        {
+            bestDist = d;
+            bestIdx = i;
+        }
+    }
+
+    if (bestIdx < 0) return;
+
+    m_vents[bestIdx].Destroy();
+    m_vents.erase(m_vents.begin() + bestIdx);
+
+    RebuildPathVBO();
+    RebuildCrossSectionVBO();
+    Refresh(false);
+}
+
+// ---------------------------------------------------------------------------
+// RemoveRunnerAtMouse — removes the runner whose marker is closest to the ray.
+// ---------------------------------------------------------------------------
+void GLCanvas::RemoveRunnerAtMouse(int mouseX, int mouseY)
+{
+    if (m_runners.empty()) return;
+
+    glm::vec3 rayOrig, rayDir;
+    BuildMouseRay(mouseX, mouseY, rayOrig, rayDir);
+
+    const float hitRadius = kVentMarkerRadius * 2.0f;
+    float bestDist = hitRadius;
+    int   bestIdx = -1;
+
+    for (int i = 0; i < (int)m_runners.size(); ++i)
+    {
+        const float d = PointRayDistance(m_runners[i].point, rayOrig, rayDir);
+        if (d < bestDist)
+        {
+            bestDist = d;
+            bestIdx = i;
+        }
+    }
+
+    if (bestIdx < 0) return;
+
+    m_runners[bestIdx].Destroy();
+    m_runners.erase(m_runners.begin() + bestIdx);
+
+    RebuildRunnerPathVBO();
+    RebuildRunnerSolids();
+    RebuildGatePathVBO();
+    RebuildGateSolids();
+    Refresh(false);
+}
+
+// ---------------------------------------------------------------------------
+// RemoveGateAtMouse — removes the gate whose marker is closest to the ray.
+// ---------------------------------------------------------------------------
+void GLCanvas::RemoveGateAtMouse(int mouseX, int mouseY)
+{
+    if (m_gates.empty()) return;
+
+    glm::vec3 rayOrig, rayDir;
+    BuildMouseRay(mouseX, mouseY, rayOrig, rayDir);
+
+    const float hitRadius = kVentMarkerRadius * 2.0f;
+    float bestDist = hitRadius;
+    int   bestIdx = -1;
+
+    for (int i = 0; i < (int)m_gates.size(); ++i)
+    {
+        const float d = PointRayDistance(m_gates[i].point.worldPos, rayOrig, rayDir);
+        if (d < bestDist)
+        {
+            bestDist = d;
+            bestIdx = i;
+        }
+    }
+
+    if (bestIdx < 0) return;
+
+    m_gates[bestIdx].Destroy();
+    m_gates.erase(m_gates.begin() + bestIdx);
+
+    RebuildGatePathVBO();
+    RebuildGateSolids();
+    Refresh(false);
+}
+
+// ---------------------------------------------------------------------------
+// RemoveSprueAtMouse — removes the sprue if the click hits its marker.
+// ---------------------------------------------------------------------------
+void GLCanvas::RemoveSprueAtMouse(int mouseX, int mouseY)
+{
+    if (!m_sprue.hasPoint) return;
+
+    glm::vec3 rayOrig, rayDir;
+    BuildMouseRay(mouseX, mouseY, rayOrig, rayDir);
+
+    const float hitRadius = kVentMarkerRadius * 3.0f;   // sprue markers are 1.5× bigger
+    const float d = PointRayDistance(m_sprue.worldPos, rayOrig, rayDir);
+
+    if (d > hitRadius) return;
+
+    ClearSprue();     // reuses existing full-cleanup logic
+}
+
+// ---------------------------------------------------------------------------
 // BuildFixturePerimeter — collects all y=0 XZ crossing points from every
 // fixture triangle, then computes their 2D convex hull (Graham scan).
 // Result is cached in m_fixturePerimeter and is only rebuilt when fixtures
@@ -2479,6 +2658,76 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         }
     }
 
+    // ---- Deferred edit-drag processing ----------------------------------------
+    // Ray cast + geometry rebuild deferred from OnMouse so only one update
+    // runs per rendered frame, regardless of how many motion events queued up.
+    if (m_editNeedsUpdate)
+    {
+        m_editNeedsUpdate = false;
+
+        if (m_transformMode == TransformMode::EditVent &&
+            m_editFeatureIndex >= 0 && m_editFeatureIndex < (int)m_vents.size())
+        {
+            glm::vec3 hitPos, hitNormal;
+            if (RayCastParting(m_editMousePos.x, m_editMousePos.y, hitPos, hitNormal))
+            {
+                VentInstance& vi = m_vents[m_editFeatureIndex];
+                vi.Destroy();
+                vi.point = VentPoint{ hitPos, hitNormal };
+
+                float ventLength = 5.0f, ventWidth = 2.0f,
+                    ventOverrunStart = 0.5f, ventOverrunEnd = 0.5f;
+                if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+                    frame->GetVentDimensions(ventLength, ventWidth,
+                        ventOverrunStart, ventOverrunEnd);
+
+                vi.path = ComputeVentPath(vi.point);
+                vi.path.overrunStart = ventOverrunStart;
+                vi.path.overrunEnd = ventOverrunEnd;
+                vi.crossSection = BuildVentCrossSection(vi.path, ventWidth, ventLength);
+                vi.solid = BuildBoxSweepMesh(vi.path, ventWidth, ventLength,
+                    ventOverrunStart, ventOverrunEnd);
+
+                RebuildPathVBO();
+                RebuildCrossSectionVBO();
+            }
+        }
+        else if (m_transformMode == TransformMode::EditRunner &&
+            m_editFeatureIndex >= 0 && m_editFeatureIndex < (int)m_runners.size())
+        {
+            glm::vec3 hitPos;
+            if (RayCastToPartingPlane(m_editMousePos.x, m_editMousePos.y, hitPos))
+            {
+                const glm::vec2 hitXZ(hitPos.x, hitPos.z);
+                if (IsInsideConvexHull(m_fixturePerimeter, hitXZ))
+                {
+                    RunnerFeature& rf = m_runners[m_editFeatureIndex];
+                    rf.Destroy();
+                    rf.point = hitPos;
+
+                    RebuildRunnerPathVBO();
+                    RebuildRunnerSolids();
+                    RebuildGatePathVBO();
+                    RebuildGateSolids();
+                }
+            }
+        }
+        else if (m_transformMode == TransformMode::EditGate &&
+            m_editFeatureIndex >= 0 && m_editFeatureIndex < (int)m_gates.size())
+        {
+            glm::vec3 hitPos, hitNormal;
+            if (RayCastParting(m_editMousePos.x, m_editMousePos.y, hitPos, hitNormal))
+            {
+                GateFeature& gf = m_gates[m_editFeatureIndex];
+                gf.Destroy();
+                gf.point = VentPoint{ hitPos, hitNormal };
+
+                RebuildGatePathVBO();
+                RebuildGateSolids();
+            }
+        }
+    }
+
     // ---- Vent point markers (green spheres) --------------------------------
     // Resolve ghost position here — one ray cast per rendered frame regardless
     // of how many motion events queued up since the last paint.
@@ -2526,16 +2775,38 @@ void GLCanvas::OnPaint(wxPaintEvent&)
             glDisable(GL_BLEND);
         }
 
-        // Confirmed vent points — fully opaque
+        // Confirmed vent points — highlight halo behind, then normal markers
         if (!m_vents.empty())
         {
+            // Pass 1: draw highlight halo for the selected marker (behind)
+            if (m_transformMode == TransformMode::EditVent &&
+                m_editFeatureIndex >= 0 && m_editFeatureIndex < (int)m_vents.size())
+            {
+                const glm::vec3 haloColor(1.0f, 0.55f, 0.0f);   // orange
+                glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &haloColor[0]);
+                glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 0.55f);
+                glEnable(GL_BLEND);
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                glDepthMask(GL_FALSE);
+
+                glm::mat4 model = glm::translate(glm::mat4(1.0f),
+                    m_vents[m_editFeatureIndex].point.worldPos);
+                model = glm::scale(model, glm::vec3(kVentMarkerRadius * 1.8f));
+                glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &model[0][0]);
+                glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
+
+                glDepthMask(GL_TRUE);
+                glDisable(GL_BLEND);
+            }
+
+            // Pass 2: normal markers on top
             const glm::vec3 ventColor(0.10f, 0.92f, 0.25f);
             glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &ventColor[0]);
             glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 1.0f);
 
-            for (const VentInstance& vi : m_vents)
+            for (int i = 0; i < (int)m_vents.size(); ++i)
             {
-                glm::mat4 model = glm::translate(glm::mat4(1.0f), vi.point.worldPos);
+                glm::mat4 model = glm::translate(glm::mat4(1.0f), m_vents[i].point.worldPos);
                 model = glm::scale(model, glm::vec3(kVentMarkerRadius));
                 glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &model[0][0]);
                 glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
@@ -2593,16 +2864,38 @@ void GLCanvas::OnPaint(wxPaintEvent&)
             glDisable(GL_BLEND);
         }
 
-        // Confirmed runner points — fully opaque blue
+        // Confirmed runner points — highlight halo behind, then normal markers
         if (!m_runners.empty())
         {
-            const glm::vec3 runnerColor(0.10f, 0.40f, 0.95f);   // blue
+            // Pass 1: draw highlight halo for the selected marker (behind)
+            if (m_transformMode == TransformMode::EditRunner &&
+                m_editFeatureIndex >= 0 && m_editFeatureIndex < (int)m_runners.size())
+            {
+                const glm::vec3 haloColor(1.0f, 0.55f, 0.0f);
+                glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &haloColor[0]);
+                glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 0.55f);
+                glEnable(GL_BLEND);
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                glDepthMask(GL_FALSE);
+
+                glm::mat4 model = glm::translate(glm::mat4(1.0f),
+                    m_runners[m_editFeatureIndex].point);
+                model = glm::scale(model, glm::vec3(kVentMarkerRadius * 1.8f));
+                glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &model[0][0]);
+                glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
+
+                glDepthMask(GL_TRUE);
+                glDisable(GL_BLEND);
+            }
+
+            // Pass 2: normal markers on top
+            const glm::vec3 runnerColor(0.10f, 0.40f, 0.95f);
             glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &runnerColor[0]);
             glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 1.0f);
 
-            for (const RunnerFeature& rf : m_runners)
+            for (int i = 0; i < (int)m_runners.size(); ++i)
             {
-                glm::mat4 model = glm::translate(glm::mat4(1.0f), rf.point);
+                glm::mat4 model = glm::translate(glm::mat4(1.0f), m_runners[i].point);
                 model = glm::scale(model, glm::vec3(kVentMarkerRadius));
                 glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &model[0][0]);
                 glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
@@ -2659,16 +2952,38 @@ void GLCanvas::OnPaint(wxPaintEvent&)
             glDisable(GL_BLEND);
         }
 
-        // Confirmed gate points — fully opaque yellow
+        // Confirmed gate points — highlight halo behind, then normal markers
         if (!m_gates.empty())
         {
-            const glm::vec3 gateColor(1.0f, 0.85f, 0.10f);   // yellow
+            // Pass 1: draw highlight halo for the selected marker (behind)
+            if (m_transformMode == TransformMode::EditGate &&
+                m_editFeatureIndex >= 0 && m_editFeatureIndex < (int)m_gates.size())
+            {
+                const glm::vec3 haloColor(1.0f, 0.55f, 0.0f);
+                glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &haloColor[0]);
+                glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 0.55f);
+                glEnable(GL_BLEND);
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                glDepthMask(GL_FALSE);
+
+                glm::mat4 model = glm::translate(glm::mat4(1.0f),
+                    m_gates[m_editFeatureIndex].point.worldPos);
+                model = glm::scale(model, glm::vec3(kVentMarkerRadius * 1.8f));
+                glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &model[0][0]);
+                glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
+
+                glDepthMask(GL_TRUE);
+                glDisable(GL_BLEND);
+            }
+
+            // Pass 2: normal markers on top
+            const glm::vec3 gateColor(1.0f, 0.85f, 0.10f);
             glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &gateColor[0]);
             glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 1.0f);
 
-            for (const GateFeature& gf : m_gates)
+            for (int i = 0; i < (int)m_gates.size(); ++i)
             {
-                glm::mat4 model = glm::translate(glm::mat4(1.0f), gf.point.worldPos);
+                glm::mat4 model = glm::translate(glm::mat4(1.0f), m_gates[i].point.worldPos);
                 model = glm::scale(model, glm::vec3(kVentMarkerRadius));
                 glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &model[0][0]);
                 glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
@@ -3200,6 +3515,77 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
                 Refresh(false);
             }
         }
+        else if (m_transformMode == TransformMode::RemoveVent)
+        {
+            const wxPoint p = evt.GetPosition();
+            RemoveVentAtMouse(p.x, p.y);
+        }
+        else if (m_transformMode == TransformMode::RemoveRunner)
+        {
+            const wxPoint p = evt.GetPosition();
+            RemoveRunnerAtMouse(p.x, p.y);
+        }
+        else if (m_transformMode == TransformMode::RemoveGate)
+        {
+            const wxPoint p = evt.GetPosition();
+            RemoveGateAtMouse(p.x, p.y);
+        }
+        else if (m_transformMode == TransformMode::RemoveSprue)
+        {
+            const wxPoint p = evt.GetPosition();
+            RemoveSprueAtMouse(p.x, p.y);
+        }
+        else if (m_transformMode == TransformMode::EditVent)
+        {
+            const wxPoint p = evt.GetPosition();
+            glm::vec3 rayOrig, rayDir;
+            BuildMouseRay(p.x, p.y, rayOrig, rayDir);
+
+            const float hitRadius = kVentMarkerRadius * 2.0f;
+            float bestDist = hitRadius;
+            int   bestIdx = -1;
+            for (int i = 0; i < (int)m_vents.size(); ++i)
+            {
+                const float d = PointRayDistance(m_vents[i].point.worldPos, rayOrig, rayDir);
+                if (d < bestDist) { bestDist = d; bestIdx = i; }
+            }
+            m_editFeatureIndex = bestIdx;
+            Refresh(false);
+        }
+        else if (m_transformMode == TransformMode::EditRunner)
+        {
+            const wxPoint p = evt.GetPosition();
+            glm::vec3 rayOrig, rayDir;
+            BuildMouseRay(p.x, p.y, rayOrig, rayDir);
+
+            const float hitRadius = kVentMarkerRadius * 2.0f;
+            float bestDist = hitRadius;
+            int   bestIdx = -1;
+            for (int i = 0; i < (int)m_runners.size(); ++i)
+            {
+                const float d = PointRayDistance(m_runners[i].point, rayOrig, rayDir);
+                if (d < bestDist) { bestDist = d; bestIdx = i; }
+            }
+            m_editFeatureIndex = bestIdx;
+            Refresh(false);
+        }
+        else if (m_transformMode == TransformMode::EditGate)
+        {
+            const wxPoint p = evt.GetPosition();
+            glm::vec3 rayOrig, rayDir;
+            BuildMouseRay(p.x, p.y, rayOrig, rayDir);
+
+            const float hitRadius = kVentMarkerRadius * 2.0f;
+            float bestDist = hitRadius;
+            int   bestIdx = -1;
+            for (int i = 0; i < (int)m_gates.size(); ++i)
+            {
+                const float d = PointRayDistance(m_gates[i].point.worldPos, rayOrig, rayDir);
+                if (d < bestDist) { bestDist = d; bestIdx = i; }
+            }
+            m_editFeatureIndex = bestIdx;
+            Refresh(false);
+        }
     }
 
     if (evt.LeftUp()) { m_lmb = false; if (HasCapture()) ReleaseMouse(); }
@@ -3321,6 +3707,41 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
         else
             m_camera.Orbit(dx, dy);
         Refresh(false);
+    }
+    else if (m_lmb && (m_transformMode == TransformMode::RemoveVent ||
+        m_transformMode == TransformMode::RemoveRunner ||
+        m_transformMode == TransformMode::RemoveGate ||
+        m_transformMode == TransformMode::RemoveSprue))
+    {
+        // Orbit while holding LMB in Remove modes
+        if (shift)
+            m_camera.Pan(dx, -dy);
+        else if (ctrl)
+            m_camera.Dolly(dy * 0.05f);
+        else
+            m_camera.Orbit(dx, dy);
+        Refresh(false);
+    }
+    else if (m_lmb && (m_transformMode == TransformMode::EditVent ||
+        m_transformMode == TransformMode::EditRunner ||
+        m_transformMode == TransformMode::EditGate))
+    {
+        if (m_editFeatureIndex >= 0)
+        {
+            // Defer ray cast + geometry rebuild to OnPaint so only one
+            // update runs per rendered frame regardless of queued events.
+            m_editMousePos = pos;
+            m_editNeedsUpdate = true;
+            Refresh(false);
+        }
+        else
+        {
+            // No feature selected — orbit
+            if (shift) m_camera.Pan(dx, -dy);
+            else if (ctrl) m_camera.Dolly(dy * 0.05f);
+            else m_camera.Orbit(dx, dy);
+            Refresh(false);
+        }
     }
 
     // Update ghost preview whenever the mouse moves in PlaceVent mode.

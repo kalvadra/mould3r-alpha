@@ -12,7 +12,7 @@
 
 class GLCanvas;
 
-enum class TransformMode { Select, Translate, Rotate, Scale, PlaceVent, PlaceRunner, PlaceGate };
+enum class TransformMode { Select, Translate, Rotate, Scale, PlaceVent, PlaceRunner, PlaceGate, RemoveVent, RemoveRunner, RemoveGate, RemoveSprue, EditVent, EditRunner, EditGate };
 
 class MainFrame : public wxFrame
 {
@@ -60,6 +60,15 @@ private:
 
     void OnPlaceGate(wxCommandEvent& evt);
     void OnClearGates(wxCommandEvent&);
+
+    void OnRemoveVent(wxCommandEvent&);
+    void OnRemoveSprue(wxCommandEvent&);
+    void OnRemoveRunner(wxCommandEvent&);
+    void OnRemoveGate(wxCommandEvent&);
+
+    void OnEditVent(wxCommandEvent&);
+    void OnEditRunner(wxCommandEvent&);
+    void OnEditGate(wxCommandEvent&);
 
     // Activates a tool button and deactivates the others (also called by GLCanvas on Escape)
 
@@ -154,6 +163,13 @@ private:
         ID_PlaceRunner,
         ID_ClearRunners,
         ID_PlaceGate,
-        ID_ClearGates
+        ID_ClearGates,
+        ID_RemoveVent,
+        ID_RemoveSprue,
+        ID_RemoveRunner,
+        ID_RemoveGate,
+        ID_EditVent,
+        ID_EditRunner,
+        ID_EditGate
     };
 };
