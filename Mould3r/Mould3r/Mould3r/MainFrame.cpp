@@ -23,6 +23,51 @@ static const wxColour kTextDefault(0xC8, 0xD0, 0xDC);
 static const wxColour kTextActive(0xFF, 0xFF, 0xFF);
 
 // ---------------------------------------------------------------------------
+// SVG asset paths (relative to the executable directory)
+// ---------------------------------------------------------------------------
+static const wxString kAppIconSvg = "res/logos/logo-icon.svg";   
+static const wxString kRibbonLogoSvg = ""; 
+
+// ---------------------------------------------------------------------------
+// LoadSvgBundle — loads an SVG file and returns a wxBitmapBundle at the
+// requested size.  Relative paths are anchored to the executable directory.
+// If recolorWhite is true, common fill/stroke colours are replaced with white.
+// Returns an invalid bundle if the path is empty or the file can't be read.
+// ---------------------------------------------------------------------------
+static wxBitmapBundle LoadSvgBundle(const wxString& svgPath,
+    const wxSize& size,
+    bool recolorWhite = false)
+{
+    if (svgPath.IsEmpty())
+        return wxBitmapBundle();
+
+    wxFileName fn(svgPath);
+    if (fn.IsRelative())
+    {
+        wxFileName exeDir(wxStandardPaths::Get().GetExecutablePath());
+        fn.MakeAbsolute(exeDir.GetPath());
+    }
+
+    wxFile file(fn.GetFullPath());
+    if (!file.IsOpened())
+        return wxBitmapBundle();
+
+    wxString svg;
+    file.ReadAll(&svg);
+
+    if (recolorWhite)
+    {
+        svg.Replace("currentColor", "white");
+        svg.Replace("\"black\"", "\"white\"");
+        svg.Replace("\"#000000\"", "\"white\"");
+        svg.Replace("\"#000\"", "\"white\"");
+    }
+
+    const wxScopedCharBuffer utf8 = svg.utf8_str();
+    return wxBitmapBundle::FromSVG(utf8.data(), size);
+}
+
+// ---------------------------------------------------------------------------
 // Helper: style a single toggle button
 // ---------------------------------------------------------------------------
 static void StyleRibbonBtn(wxToggleButton* btn, bool active = false)
@@ -41,6 +86,17 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
     : wxFrame(nullptr, wxID_ANY, "Mould3r",
         wxDefaultPosition, wxSize(1200, 800))
 {
+    // ---- Window icon from SVG -----------------------------------------------
+    {
+        wxBitmapBundle iconBundle = LoadSvgBundle(kAppIconSvg, wxSize(32, 32));
+        if (iconBundle.IsOk())
+        {
+            wxIcon icon;
+            icon.CopyFromBitmap(iconBundle.GetBitmapFor(this));
+            SetIcon(icon);
+        }
+    }
+
     // ---- Menu bar ----------------------------------------------------------
     auto* fileMenu = new wxMenu();
     fileMenu->Append(ID_Import, "Import...\tCtrl+I");
@@ -112,6 +168,17 @@ wxPanel* MainFrame::CreateRibbon(wxWindow* parent)
     auto* hSizer = new wxBoxSizer(wxHORIZONTAL);
 
     hSizer->AddSpacer(12);
+
+    // ---- App logo (SVG, replaces text title) --------------------------------
+    {
+        wxBitmapBundle logoBndle = LoadSvgBundle(kRibbonLogoSvg, wxSize(120, 28));
+        if (logoBndle.IsOk())
+        {
+            auto* logo = new wxStaticBitmap(panel, wxID_ANY,
+                logoBndle.GetBitmapFor(panel));
+            hSizer->Add(logo, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 16);
+        }
+    }
 
     // Import button (accent blue, left-aligned)
     auto* btnImport = new wxButton(panel, ID_Import, "Import Model",
