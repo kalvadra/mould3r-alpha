@@ -3,21 +3,16 @@
 #include <wx/dirdlg.h>
 #include <wx/stdpaths.h>
 #include <filesystem>
+#include "style.h"
 
 namespace fs = std::filesystem;
-
-static const wxColour kBg(0x1E, 0x22, 0x2A);
-static const wxColour kPanel(0x25, 0x2B, 0x36);
-static const wxColour kAccent(0x00, 0x7A, 0xCC);
-static const wxColour kText(0xC8, 0xD0, 0xDC);
-static const wxColour kSubtext(0x66, 0x77, 0x88);
 
 StartupDialog::StartupDialog(wxWindow* parent)
     : wxDialog(parent, wxID_ANY, "Mould3r - Select Fixture",
         wxDefaultPosition, wxSize(560, 480),
         wxDEFAULT_DIALOG_STYLE)
 {
-    SetBackgroundColour(kBg);
+    SetBackgroundColour(Style::AppBg);
 
     // Default fixtures folder: 'fixtures/' next to the executable
     m_fixturesFolder = (fs::path(wxStandardPaths::Get()
@@ -28,17 +23,17 @@ StartupDialog::StartupDialog(wxWindow* parent)
 
     // ---- Title area --------------------------------------------------------
     auto* titlePanel = new wxPanel(this, wxID_ANY);
-    titlePanel->SetBackgroundColour(kPanel);
+    titlePanel->SetBackgroundColour(Style::SectionHeaderBg);
     auto* titleSizer = new wxBoxSizer(wxVERTICAL);
 
     auto* title = new wxStaticText(titlePanel, wxID_ANY, "Select Fixture");
-    title->SetForegroundColour(kText);
+    title->SetForegroundColour(Style::TextPrimary);
     title->SetFont(wxFont(16, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_BOLD, false, "Segoe UI"));
 
     auto* subtitle = new wxStaticText(titlePanel, wxID_ANY,
         "Choose a fixture to load, or create a new one.\nA fixture is a set of blank mould halves that the design features will be cut from.\nIt may also include ejector information.");
-    subtitle->SetForegroundColour(kSubtext);
+    subtitle->SetForegroundColour(Style::TextSubtext);
     subtitle->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
 
@@ -48,7 +43,7 @@ StartupDialog::StartupDialog(wxWindow* parent)
     main->Add(titlePanel, 0, wxEXPAND);
 
     auto* sep = new wxPanel(this, wxID_ANY, wxDefaultPosition, wxSize(-1, 1));
-    sep->SetBackgroundColour(kAccent);
+    sep->SetBackgroundColour(Style::Accent);
     main->Add(sep, 0, wxEXPAND);
 
     // ---- Folder row --------------------------------------------------------
@@ -57,14 +52,14 @@ StartupDialog::StartupDialog(wxWindow* parent)
     m_lblFolder = new wxStaticText(this, wxID_ANY, m_fixturesFolder,
         wxDefaultPosition, wxDefaultSize,
         wxST_ELLIPSIZE_START);
-    m_lblFolder->SetForegroundColour(kSubtext);
+    m_lblFolder->SetForegroundColour(Style::TextSubtext);
     m_lblFolder->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
 
     auto* btnBrowse = new wxButton(this, ID_BrowseFolder, "Browse...",
         wxDefaultPosition, wxSize(80, 26));
-    btnBrowse->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
-    btnBrowse->SetForegroundColour(kText);
+    btnBrowse->SetBackgroundColour(Style::InputBg);
+    btnBrowse->SetForegroundColour(Style::TextPrimary);
 
     folderRow->Add(m_lblFolder, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
     folderRow->Add(btnBrowse, 0, wxALIGN_CENTER_VERTICAL);
@@ -73,8 +68,8 @@ StartupDialog::StartupDialog(wxWindow* parent)
     // ---- Fixture list ------------------------------------------------------
     m_list = new wxListCtrl(this, wxID_ANY, wxDefaultPosition, wxDefaultSize,
         wxLC_REPORT | wxLC_SINGLE_SEL | wxBORDER_NONE);
-    m_list->SetBackgroundColour(kPanel);
-    m_list->SetForegroundColour(kText);
+    m_list->SetBackgroundColour(Style::SectionHeaderBg);
+    m_list->SetForegroundColour(Style::TextPrimary);
     m_list->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
 
@@ -86,8 +81,8 @@ StartupDialog::StartupDialog(wxWindow* parent)
 
     // ---- Preview box -------------------------------------------------------
     auto* previewBox = new wxStaticBoxSizer(wxVERTICAL, this, "Selected Fixture");
-    previewBox->GetStaticBox()->SetForegroundColour(kSubtext);
-    previewBox->GetStaticBox()->SetBackgroundColour(kBg);
+    previewBox->GetStaticBox()->SetForegroundColour(Style::TextSubtext);
+    previewBox->GetStaticBox()->SetBackgroundColour(Style::AppBg);
 
     m_lblModelA = new wxStaticText(this, wxID_ANY, "Model A: —",
         wxDefaultPosition, wxDefaultSize,
@@ -98,7 +93,7 @@ StartupDialog::StartupDialog(wxWindow* parent)
 
     for (auto* lbl : { m_lblModelA, m_lblModelB })
     {
-        lbl->SetForegroundColour(kText);
+        lbl->SetForegroundColour(Style::TextPrimary);
         lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
             wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
         previewBox->Add(lbl, 0, wxEXPAND | wxALL, 4);
@@ -111,8 +106,8 @@ StartupDialog::StartupDialog(wxWindow* parent)
 
     auto* btnNew = new wxButton(this, ID_NewFixture, "New Fixture...",
         wxDefaultPosition, wxSize(110, 30));
-    btnNew->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
-    btnNew->SetForegroundColour(kText);
+    btnNew->SetBackgroundColour(Style::InputBg);
+    btnNew->SetForegroundColour(Style::TextPrimary);
 
     btnSizer->Add(btnNew, 0);
     btnSizer->AddStretchSpacer();
@@ -122,12 +117,12 @@ StartupDialog::StartupDialog(wxWindow* parent)
     auto* btnOK = new wxButton(this, wxID_OK, "Open",
         wxDefaultPosition, wxSize(90, 30));
 
-    btnOK->SetBackgroundColour(kAccent);
+    btnOK->SetBackgroundColour(Style::Accent);
     btnOK->SetForegroundColour(*wxWHITE);
     btnOK->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
-    btnCancel->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
-    btnCancel->SetForegroundColour(kText);
+    btnCancel->SetBackgroundColour(Style::InputBg);
+    btnCancel->SetForegroundColour(Style::TextPrimary);
 
     btnSizer->Add(btnCancel, 0, wxRIGHT, 8);
     btnSizer->Add(btnOK, 0);
