@@ -26,8 +26,14 @@ static const wxColour& kTextActive = Style::TextActive;
 // ---------------------------------------------------------------------------
 // SVG asset paths (relative to the executable directory)
 // ---------------------------------------------------------------------------
-static const wxString kAppIconSvg = "res/logos/logo-icon-nobackground.svg";  
+static const wxString kAppIconSvg = "res/logos/logo-icon-nobackground.svg";
 static const wxString kRibbonLogoSvg = "";
+
+// ---------------------------------------------------------------------------
+// Chevron SVG icons (relative to the executable directory)
+// ---------------------------------------------------------------------------
+static const wxString kChevronDownSvg = "res/icons/chevron-down.svg";
+static const wxString kChevronRightSvg = "res/icons/chevron-right.svg";
 
 // ---------------------------------------------------------------------------
 // LoadSvgBundle — loads an SVG file and returns a wxBitmapBundle at the
@@ -728,7 +734,7 @@ wxPanel* MainFrame::CreateCollapsibleSection(wxWindow* parent,
     const wxString& title,
     wxPanel** contentOut)
 {
-    auto* headerBtn = new wxToggleButton(parent, wxID_ANY, "v  " + title,
+    auto* headerBtn = new wxToggleButton(parent, wxID_ANY, title,
         wxDefaultPosition, wxSize(-1, 28),
         wxBU_LEFT);
     headerBtn->SetValue(true);
@@ -736,6 +742,8 @@ wxPanel* MainFrame::CreateCollapsibleSection(wxWindow* parent,
     headerBtn->SetForegroundColour(Style::Accent);
     headerBtn->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_BOLD, false, "Segoe UI"));
+    headerBtn->SetBitmap(LoadSvgBundle(kChevronDownSvg, wxSize(14, 14), true));
+    headerBtn->SetBitmapPosition(wxLEFT);
     parentSizer->Add(headerBtn, 0, wxEXPAND | wxTOP, 4);
 
     // Use custom content if provided, otherwise build placeholder
@@ -768,7 +776,9 @@ wxPanel* MainFrame::CreateCollapsibleSection(wxWindow* parent,
         parent, title](wxCommandEvent&)
         {
             const bool expanded = headerBtn->GetValue();
-            headerBtn->SetLabel((expanded ? "v  " : ">  ") + title);
+            headerBtn->SetBitmap(LoadSvgBundle(
+                expanded ? kChevronDownSvg : kChevronRightSvg,
+                wxSize(14, 14), true));
             contentRef->Show(expanded);
             parent->Layout();
             parent->GetParent()->Layout();
@@ -810,7 +820,7 @@ wxPanel* MainFrame::CreateVentsContent(wxWindow* parent)
             auto* btn = new wxButton(panel, wxID_ANY, label,
                 wxDefaultPosition, wxSize(-1, 26), wxBORDER_NONE);
             btn->SetBackgroundColour(Style::BtnSmall);
-            btn->SetForegroundColour(Style::TextMuted);
+            btn->SetForegroundColour(Style::TextPrimary);
             btn->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
                 wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
             return btn;
@@ -829,13 +839,15 @@ wxPanel* MainFrame::CreateVentsContent(wxWindow* parent)
 
     // ---- Collapsible "Settings" sub-section ---------------------------------
     auto* settingsBtn = new wxToggleButton(panel, wxID_ANY,
-        wxString::FromUTF8("Settings      \xe2\x96\xb8"),
+        "Settings",
         wxDefaultPosition, wxSize(-1, 22), wxBU_LEFT | wxBORDER_NONE);
     settingsBtn->SetValue(false);
     settingsBtn->SetBackgroundColour(Style::CardBg);
     settingsBtn->SetForegroundColour(Style::TextSubtle);
     settingsBtn->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+    settingsBtn->SetBitmap(LoadSvgBundle(kChevronRightSvg, wxSize(12, 12), true));
+    settingsBtn->SetBitmapPosition(wxRIGHT);
     sizer->Add(settingsBtn, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
 
     // Settings content
@@ -914,7 +926,10 @@ wxPanel* MainFrame::CreateVentsContent(wxWindow* parent)
             if ((now - lastToggleMs).GetValue() < 200) { settingsBtn->SetValue(!settingsBtn->GetValue()); return; }
             lastToggleMs = now;
             const bool expanded = settingsBtn->GetValue();
-            settingsBtn->SetLabel(expanded ? wxString::FromUTF8("Settings      \xe2\x96\xbe") : wxString::FromUTF8("Settings      \xe2\x96\xb8"));
+            settingsBtn->SetBitmap(LoadSvgBundle(
+                expanded ? kChevronDownSvg : kChevronRightSvg,
+                wxSize(12, 12), true));
+            settingsBtn->SetBitmapPosition(wxRIGHT);
             settingsPanel->Show(expanded);
             panel->Layout(); panel->GetParent()->Layout(); panel->GetParent()->GetParent()->Layout();
         });
@@ -970,13 +985,15 @@ wxPanel* MainFrame::CreateSpruesContent(wxWindow* parent)
 
     // Collapsible Settings
     auto* settingsBtn = new wxToggleButton(panel, wxID_ANY,
-        wxString::FromUTF8("Settings      \xe2\x96\xb8"),
+        "Settings",
         wxDefaultPosition, wxSize(-1, 22), wxBU_LEFT | wxBORDER_NONE);
     settingsBtn->SetValue(false);
     settingsBtn->SetBackgroundColour(Style::CardBg);
     settingsBtn->SetForegroundColour(Style::TextSubtle);
     settingsBtn->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+    settingsBtn->SetBitmap(LoadSvgBundle(kChevronRightSvg, wxSize(12, 12), true));
+    settingsBtn->SetBitmapPosition(wxRIGHT);
     sizer->Add(settingsBtn, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
 
     auto* settingsPanel = new wxPanel(panel, wxID_ANY);
@@ -1041,7 +1058,10 @@ wxPanel* MainFrame::CreateSpruesContent(wxWindow* parent)
         if ((now - lastToggleMs).GetValue() < 200) { settingsBtn->SetValue(!settingsBtn->GetValue()); return; }
         lastToggleMs = now;
         const bool expanded = settingsBtn->GetValue();
-        settingsBtn->SetLabel(expanded ? wxString::FromUTF8("Settings      \xe2\x96\xbe") : wxString::FromUTF8("Settings      \xe2\x96\xb8"));
+        settingsBtn->SetBitmap(LoadSvgBundle(
+            expanded ? kChevronDownSvg : kChevronRightSvg,
+            wxSize(12, 12), true));
+        settingsBtn->SetBitmapPosition(wxRIGHT);
         settingsPanel->Show(expanded);
         panel->Layout(); panel->GetParent()->Layout(); panel->GetParent()->GetParent()->Layout();
         });
@@ -1087,7 +1107,7 @@ wxPanel* MainFrame::CreateRunnersContent(wxWindow* parent)
             auto* btn = new wxButton(panel, wxID_ANY, label,
                 wxDefaultPosition, wxSize(-1, 26), wxBORDER_NONE);
             btn->SetBackgroundColour(Style::BtnSmall);
-            btn->SetForegroundColour(Style::TextMuted);
+            btn->SetForegroundColour(Style::TextPrimary);
             btn->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
                 wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
             return btn;
@@ -1109,13 +1129,15 @@ wxPanel* MainFrame::CreateRunnersContent(wxWindow* parent)
 
     // ---- Collapsible "Settings" sub-section ---------------------------------
     auto* settingsBtn = new wxToggleButton(panel, wxID_ANY,
-        wxString::FromUTF8("Settings      \xe2\x96\xb8"),   // ▾ chevron
+        "Settings",
         wxDefaultPosition, wxSize(-1, 22), wxBU_LEFT | wxBORDER_NONE);
     settingsBtn->SetValue(false);
     settingsBtn->SetBackgroundColour(Style::CardBg);
     settingsBtn->SetForegroundColour(Style::TextSubtle);
     settingsBtn->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+    settingsBtn->SetBitmap(LoadSvgBundle(kChevronRightSvg, wxSize(12, 12), true));
+    settingsBtn->SetBitmapPosition(wxRIGHT);
     sizer->Add(settingsBtn, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
 
     // Settings content panel (contains the existing type/dimension fields)
@@ -1227,10 +1249,10 @@ wxPanel* MainFrame::CreateRunnersContent(wxWindow* parent)
             lastToggleMs = now;
 
             const bool expanded = settingsBtn->GetValue();
-            wxString lbl = expanded
-                ? wxString::FromUTF8("Settings      \xe2\x96\xb8")    // ▾
-                : wxString::FromUTF8("Settings      \xe2\x96\xb8");   // ▸
-            settingsBtn->SetLabel(lbl);
+            settingsBtn->SetBitmap(LoadSvgBundle(
+                expanded ? kChevronDownSvg : kChevronRightSvg,
+                wxSize(12, 12), true));
+            settingsBtn->SetBitmapPosition(wxRIGHT);
             settingsPanel->Show(expanded);
             panel->Layout();
             panel->GetParent()->Layout();
@@ -1288,13 +1310,15 @@ wxPanel* MainFrame::CreateGatesContent(wxWindow* parent)
 
     // Collapsible Settings
     auto* settingsBtn = new wxToggleButton(panel, wxID_ANY,
-        wxString::FromUTF8("Settings      \xe2\x96\xb8"),
+        "Settings",
         wxDefaultPosition, wxSize(-1, 22), wxBU_LEFT | wxBORDER_NONE);
     settingsBtn->SetValue(false);
     settingsBtn->SetBackgroundColour(Style::CardBg);
     settingsBtn->SetForegroundColour(Style::TextSubtle);
     settingsBtn->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+    settingsBtn->SetBitmap(LoadSvgBundle(kChevronRightSvg, wxSize(12, 12), true));
+    settingsBtn->SetBitmapPosition(wxRIGHT);
     sizer->Add(settingsBtn, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
 
     auto* settingsPanel = new wxPanel(panel, wxID_ANY);
@@ -1392,7 +1416,10 @@ wxPanel* MainFrame::CreateGatesContent(wxWindow* parent)
         if ((now - lastToggleMs).GetValue() < 200) { settingsBtn->SetValue(!settingsBtn->GetValue()); return; }
         lastToggleMs = now;
         const bool expanded = settingsBtn->GetValue();
-        settingsBtn->SetLabel(expanded ? wxString::FromUTF8("Settings      \xe2\x96\xbe") : wxString::FromUTF8("Settings      \xe2\x96\xb8"));
+        settingsBtn->SetBitmap(LoadSvgBundle(
+            expanded ? kChevronDownSvg : kChevronRightSvg,
+            wxSize(12, 12), true));
+        settingsBtn->SetBitmapPosition(wxRIGHT);
         settingsPanel->Show(expanded);
         panel->Layout(); panel->GetParent()->Layout(); panel->GetParent()->GetParent()->Layout();
         });
@@ -1479,7 +1506,7 @@ wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
             };
 
         static const wxFont kToolBtnFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
-            wxFONTWEIGHT_NORMAL, false, "Segoe UI");
+            wxFONTWEIGHT_BOLD, false, "Segoe UI");
 
         auto makeToolBtn = [&](int id, const wxString& label, bool toggle,
             const wxString& svgPath = "") -> wxWindow*
