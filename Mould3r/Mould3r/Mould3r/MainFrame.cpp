@@ -36,6 +36,15 @@ static const wxString kChevronDownSvg = "res/icons/chevron-down.svg";
 static const wxString kChevronRightSvg = "res/icons/chevron-right.svg";
 
 // ---------------------------------------------------------------------------
+// Settings-panel layout constants — keep dimension fields and type dropdowns
+// aligned in a consistent right-hand control column.
+// ---------------------------------------------------------------------------
+static const int kFieldWidth = 90;     // text-entry width (px)
+static const int kUnitWidth = 28;     // fixed unit-label column (px)
+static const int kFieldGap = 4;      // gap between field and unit label
+static const int kCtrlColWidth = kFieldWidth + kFieldGap + kUnitWidth;  // total
+
+// ---------------------------------------------------------------------------
 // LoadSvgBundle — loads an SVG file and returns a wxBitmapBundle at the
 // requested size.  Relative paths are anchored to the executable directory.
 // If recolorWhite is true, common fill/stroke colours are replaced with white.
@@ -862,13 +871,15 @@ wxPanel* MainFrame::CreateVentsContent(wxWindow* parent)
     typeLabel->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
 
-    m_ventTypeChoice = new wxChoice(settingsPanel, wxID_ANY);
+    m_ventTypeChoice = new wxChoice(settingsPanel, wxID_ANY,
+        wxDefaultPosition, wxSize(kCtrlColWidth, -1));
     m_ventTypeChoice->SetBackgroundColour(Style::BtnSmall);
     m_ventTypeChoice->SetForegroundColour(Style::TextMuted);
     m_ventTypeChoice->Append("Rectangular");
     m_ventTypeChoice->SetSelection(0);
-    typeRow->Add(typeLabel, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
-    typeRow->Add(m_ventTypeChoice, 1, wxALIGN_CENTER_VERTICAL);
+    typeRow->Add(typeLabel, 0, wxALIGN_CENTER_VERTICAL);
+    typeRow->AddStretchSpacer(1);
+    typeRow->Add(m_ventTypeChoice, 0, wxALIGN_CENTER_VERTICAL);
     settingsSizer->Add(typeRow, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
 
     // ---- Dimensions panel --------------------------------------------------
@@ -885,21 +896,22 @@ wxPanel* MainFrame::CreateVentsContent(wxWindow* parent)
             lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
                 wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
             ctrl = new wxTextCtrl(m_ventDimsPanel, wxID_ANY, defaultVal,
-                wxDefaultPosition, wxSize(70, 22));
+                wxDefaultPosition, wxSize(kFieldWidth, 22));
             ctrl->SetBackgroundColour(Style::BtnSmall);
             ctrl->SetForegroundColour(kTextDefault);
             auto* unit = new wxStaticText(m_ventDimsPanel, wxID_ANY, "mm");
             unit->SetForegroundColour(Style::TextSubtle);
             unit->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
                 wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+            unit->SetMinSize(wxSize(kUnitWidth, -1));
             row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL);
             row->AddStretchSpacer(1);
-            row->Add(ctrl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
+            row->Add(ctrl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, kFieldGap);
             row->Add(unit, 0, wxALIGN_CENTER_VERTICAL);
             dimsSizer->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
         };
 
-    addDimRow("Length:", m_ventLength, "5.0");
+    addDimRow("Length:", m_ventLength, "1.0");
     addDimRow("Width:", m_ventWidth, "2.0");
     addDimRow("Overrun (start):", m_ventOverrunStart, "0.5");
     addDimRow("Overrun (end):", m_ventOverrunEnd, "0.5");
@@ -1006,13 +1018,15 @@ wxPanel* MainFrame::CreateSpruesContent(wxWindow* parent)
     typeLabel->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
 
-    m_sprueTypeChoice = new wxChoice(settingsPanel, wxID_ANY);
+    m_sprueTypeChoice = new wxChoice(settingsPanel, wxID_ANY,
+        wxDefaultPosition, wxSize(kCtrlColWidth, -1));
     m_sprueTypeChoice->SetBackgroundColour(Style::BtnSmall);
     m_sprueTypeChoice->SetForegroundColour(Style::TextMuted);
     m_sprueTypeChoice->Append("Cylinder");
     m_sprueTypeChoice->SetSelection(0);
-    typeRow->Add(typeLabel, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
-    typeRow->Add(m_sprueTypeChoice, 1, wxALIGN_CENTER_VERTICAL);
+    typeRow->Add(typeLabel, 0, wxALIGN_CENTER_VERTICAL);
+    typeRow->AddStretchSpacer(1);
+    typeRow->Add(m_sprueTypeChoice, 0, wxALIGN_CENTER_VERTICAL);
     settingsSizer->Add(typeRow, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
 
     auto* dimsPanel = new wxPanel(settingsPanel, wxID_ANY);
@@ -1024,14 +1038,15 @@ wxPanel* MainFrame::CreateSpruesContent(wxWindow* parent)
         auto* lbl = new wxStaticText(dimsPanel, wxID_ANY, label);
         lbl->SetForegroundColour(Style::TextMuted);
         lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
-        ctrl = new wxTextCtrl(dimsPanel, wxID_ANY, defVal, wxDefaultPosition, wxSize(70, 22));
+        ctrl = new wxTextCtrl(dimsPanel, wxID_ANY, defVal, wxDefaultPosition, wxSize(kFieldWidth, 22));
         ctrl->SetBackgroundColour(Style::BtnSmall); ctrl->SetForegroundColour(kTextDefault);
         auto* u = new wxStaticText(dimsPanel, wxID_ANY, unitStr);
         u->SetForegroundColour(Style::TextSubtle);
         u->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+        u->SetMinSize(wxSize(kUnitWidth, -1));
         row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL);
         row->AddStretchSpacer(1);
-        row->Add(ctrl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
+        row->Add(ctrl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, kFieldGap);
         row->Add(u, 0, wxALIGN_CENTER_VERTICAL);
         dimsSizer->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
         };
@@ -1152,13 +1167,15 @@ wxPanel* MainFrame::CreateRunnersContent(wxWindow* parent)
     typeLabel->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
 
-    m_runnerTypeChoice = new wxChoice(settingsPanel, wxID_ANY);
+    m_runnerTypeChoice = new wxChoice(settingsPanel, wxID_ANY,
+        wxDefaultPosition, wxSize(kCtrlColWidth, -1));
     m_runnerTypeChoice->SetBackgroundColour(Style::BtnSmall);
     m_runnerTypeChoice->SetForegroundColour(Style::TextMuted);
     m_runnerTypeChoice->Append("Cylindrical");
     m_runnerTypeChoice->SetSelection(0);
-    typeRow->Add(typeLabel, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
-    typeRow->Add(m_runnerTypeChoice, 1, wxALIGN_CENTER_VERTICAL);
+    typeRow->Add(typeLabel, 0, wxALIGN_CENTER_VERTICAL);
+    typeRow->AddStretchSpacer(1);
+    typeRow->Add(m_runnerTypeChoice, 0, wxALIGN_CENTER_VERTICAL);
     settingsSizer->Add(typeRow, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
 
     // ---- Dimensions panel (shown for Cylindrical) ---------------------------
@@ -1177,7 +1194,7 @@ wxPanel* MainFrame::CreateRunnersContent(wxWindow* parent)
             wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
 
         m_runnerDiameter = new wxTextCtrl(dimsPanel, wxID_ANY, "4.0",
-            wxDefaultPosition, wxSize(70, 22));
+            wxDefaultPosition, wxSize(kFieldWidth, 22));
         m_runnerDiameter->SetBackgroundColour(Style::BtnSmall);
         m_runnerDiameter->SetForegroundColour(kTextDefault);
 
@@ -1185,10 +1202,11 @@ wxPanel* MainFrame::CreateRunnersContent(wxWindow* parent)
         unit->SetForegroundColour(Style::TextSubtle);
         unit->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
             wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+        unit->SetMinSize(wxSize(kUnitWidth, -1));
 
         row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL);
         row->AddStretchSpacer(1);
-        row->Add(m_runnerDiameter, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
+        row->Add(m_runnerDiameter, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, kFieldGap);
         row->Add(unit, 0, wxALIGN_CENTER_VERTICAL);
         dimsSizer->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
     }
@@ -1203,7 +1221,7 @@ wxPanel* MainFrame::CreateRunnersContent(wxWindow* parent)
             wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
 
         m_runnerColdSlugDepth = new wxTextCtrl(dimsPanel, wxID_ANY, "5.0",
-            wxDefaultPosition, wxSize(70, 22));
+            wxDefaultPosition, wxSize(kFieldWidth, 22));
         m_runnerColdSlugDepth->SetBackgroundColour(Style::BtnSmall);
         m_runnerColdSlugDepth->SetForegroundColour(kTextDefault);
 
@@ -1211,10 +1229,11 @@ wxPanel* MainFrame::CreateRunnersContent(wxWindow* parent)
         unit->SetForegroundColour(Style::TextSubtle);
         unit->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
             wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+        unit->SetMinSize(wxSize(kUnitWidth, -1));
 
         row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL);
         row->AddStretchSpacer(1);
-        row->Add(m_runnerColdSlugDepth, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
+        row->Add(m_runnerColdSlugDepth, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, kFieldGap);
         row->Add(unit, 0, wxALIGN_CENTER_VERTICAL);
         dimsSizer->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
     }
@@ -1334,14 +1353,15 @@ wxPanel* MainFrame::CreateGatesContent(wxWindow* parent)
             auto* lbl = new wxStaticText(parent_, wxID_ANY, label);
             lbl->SetForegroundColour(Style::TextMuted);
             lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
-            ctrl = new wxTextCtrl(parent_, wxID_ANY, defVal, wxDefaultPosition, wxSize(70, 22));
+            ctrl = new wxTextCtrl(parent_, wxID_ANY, defVal, wxDefaultPosition, wxSize(kFieldWidth, 22));
             ctrl->SetBackgroundColour(Style::BtnSmall); ctrl->SetForegroundColour(kTextDefault);
             auto* u = new wxStaticText(parent_, wxID_ANY, unitStr);
             u->SetForegroundColour(Style::TextSubtle);
             u->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+            u->SetMinSize(wxSize(kUnitWidth, -1));
             row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL);
             row->AddStretchSpacer(1);
-            row->Add(ctrl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
+            row->Add(ctrl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, kFieldGap);
             row->Add(u, 0, wxALIGN_CENTER_VERTICAL);
             parentSz->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
         };
@@ -1353,13 +1373,15 @@ wxPanel* MainFrame::CreateGatesContent(wxWindow* parent)
     typeLabel->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
 
-    m_gateTypeChoice = new wxChoice(settingsPanel, wxID_ANY);
+    m_gateTypeChoice = new wxChoice(settingsPanel, wxID_ANY,
+        wxDefaultPosition, wxSize(kCtrlColWidth, -1));
     m_gateTypeChoice->SetBackgroundColour(Style::BtnSmall);
     m_gateTypeChoice->SetForegroundColour(Style::TextMuted);
     m_gateTypeChoice->Append("Tapered Cylinder");
     m_gateTypeChoice->SetSelection(0);
-    typeRow->Add(typeLabel, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
-    typeRow->Add(m_gateTypeChoice, 1, wxALIGN_CENTER_VERTICAL);
+    typeRow->Add(typeLabel, 0, wxALIGN_CENTER_VERTICAL);
+    typeRow->AddStretchSpacer(1);
+    typeRow->Add(m_gateTypeChoice, 0, wxALIGN_CENTER_VERTICAL);
     settingsSizer->Add(typeRow, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
 
     // Gate dimensions
@@ -1383,13 +1405,15 @@ wxPanel* MainFrame::CreateGatesContent(wxWindow* parent)
     subTypeLabel->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
 
-    m_subRunnerTypeChoice = new wxChoice(settingsPanel, wxID_ANY);
+    m_subRunnerTypeChoice = new wxChoice(settingsPanel, wxID_ANY,
+        wxDefaultPosition, wxSize(kCtrlColWidth, -1));
     m_subRunnerTypeChoice->SetBackgroundColour(Style::BtnSmall);
     m_subRunnerTypeChoice->SetForegroundColour(Style::TextMuted);
     m_subRunnerTypeChoice->Append("Cylinder");
     m_subRunnerTypeChoice->SetSelection(0);
-    subTypeRow->Add(subTypeLabel, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
-    subTypeRow->Add(m_subRunnerTypeChoice, 1, wxALIGN_CENTER_VERTICAL);
+    subTypeRow->Add(subTypeLabel, 0, wxALIGN_CENTER_VERTICAL);
+    subTypeRow->AddStretchSpacer(1);
+    subTypeRow->Add(m_subRunnerTypeChoice, 0, wxALIGN_CENTER_VERTICAL);
     settingsSizer->Add(subTypeRow, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
 
     // Sub-runner dimensions
