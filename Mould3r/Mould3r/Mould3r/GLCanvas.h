@@ -123,6 +123,12 @@ public:
     const std::vector<GateFeature>& GetGates() const { return m_gates; }
     void ClearGatePoints();
 
+    // Remove individual features by clicking their marker
+    void RemoveVentAtMouse(int mouseX, int mouseY);
+    void RemoveRunnerAtMouse(int mouseX, int mouseY);
+    void RemoveGateAtMouse(int mouseX, int mouseY);
+    void RemoveSprueAtMouse(int mouseX, int mouseY);
+
 private:
     void OnPaint(wxPaintEvent& evt);
     void OnResize(wxSizeEvent& evt);
@@ -188,6 +194,10 @@ private:
     void RebuildGateSolids();
 
     // Cylinder/frustum mesh is now built via free function BuildCylinderMesh() in MouldFeature.h
+
+    // Build a world-space ray from mouse coordinates (shared by remove modes)
+    void BuildMouseRay(int mouseX, int mouseY,
+        glm::vec3& outOrigin, glm::vec3& outDir);
 
     // Fixture outer perimeter on the parting plane (convex hull in XZ)
     void                   BuildFixturePerimeter();
@@ -303,6 +313,11 @@ private:
 
     // Transform mode
     TransformMode m_transformMode = TransformMode::Select;
+
+    // Edit mode state — index of the currently selected feature (-1 = none)
+    int     m_editFeatureIndex = -1;
+    wxPoint m_editMousePos;              // deferred mouse position for edit drag
+    bool    m_editNeedsUpdate = false;   // true when edit drag needs processing in OnPaint
 
     // Picking FBO
     GLuint m_pickFBO = 0;

@@ -1,4 +1,9 @@
 #include <wx/filedlg.h>
+#include <wx/bmpbndl.h>
+#include <wx/stdpaths.h>
+#include <wx/filename.h>
+#include <wx/file.h>
+#include <memory>
 
 #include "MainFrame.h"
 #include "GLCanvas.h"
@@ -6,16 +11,77 @@
 #include "TranslateDialog.h"
 #include "ScaleDialog.h"
 #include "AppConfig.h"
+#include "style.h"
 
 // ---------------------------------------------------------------------------
-// Ribbon colours
+// Ribbon colour aliases (shorthand into the Style namespace)
 // ---------------------------------------------------------------------------
-static const wxColour kRibbonBg(0x1E, 0x22, 0x2A);   // dark navy
-static const wxColour kBtnDefault(0x2A, 0x30, 0x3C);   // muted blue-grey
-static const wxColour kBtnActive(0x00, 0x7A, 0xCC);   // accent blue
-static const wxColour kBtnHover(0x38, 0x42, 0x52);
-static const wxColour kTextDefault(0xC8, 0xD0, 0xDC);
-static const wxColour kTextActive(0xFF, 0xFF, 0xFF);
+static const wxColour& kRibbonBg = Style::AppBg;
+static const wxColour& kBtnDefault = Style::BtnDefault;
+static const wxColour& kBtnActive = Style::BtnActive;
+static const wxColour& kBtnHover = Style::BtnHover;
+static const wxColour& kTextDefault = Style::TextPrimary;
+static const wxColour& kTextActive = Style::TextActive;
+
+// ---------------------------------------------------------------------------
+// SVG asset paths (relative to the executable directory)
+// ---------------------------------------------------------------------------
+static const wxString kAppIconSvg = "res/logos/logo-icon-nobackground.svg";
+static const wxString kRibbonLogoSvg = "";
+
+// ---------------------------------------------------------------------------
+// Chevron SVG icons (relative to the executable directory)
+// ---------------------------------------------------------------------------
+static const wxString kChevronDownSvg = "res/icons/chevron-down.svg";
+static const wxString kChevronRightSvg = "res/icons/chevron-right.svg";
+
+// ---------------------------------------------------------------------------
+// Settings-panel layout constants — keep dimension fields and type dropdowns
+// aligned in a consistent right-hand control column.
+// ---------------------------------------------------------------------------
+static const int kFieldWidth = 90;     // text-entry width (px)
+static const int kUnitWidth = 28;     // fixed unit-label column (px)
+static const int kFieldGap = 4;      // gap between field and unit label
+static const int kCtrlColWidth = kFieldWidth + kFieldGap + kUnitWidth;  // total
+
+// ---------------------------------------------------------------------------
+// LoadSvgBundle — loads an SVG file and returns a wxBitmapBundle at the
+// requested size.  Relative paths are anchored to the executable directory.
+// If recolorWhite is true, common fill/stroke colours are replaced with white.
+// Returns an invalid bundle if the path is empty or the file can't be read.
+// ---------------------------------------------------------------------------
+static wxBitmapBundle LoadSvgBundle(const wxString& svgPath,
+    const wxSize& size,
+    bool recolorWhite = false)
+{
+    if (svgPath.IsEmpty())
+        return wxBitmapBundle();
+
+    wxFileName fn(svgPath);
+    if (fn.IsRelative())
+    {
+        wxFileName exeDir(wxStandardPaths::Get().GetExecutablePath());
+        fn.MakeAbsolute(exeDir.GetPath());
+    }
+
+    wxFile file(fn.GetFullPath());
+    if (!file.IsOpened())
+        return wxBitmapBundle();
+
+    wxString svg;
+    file.ReadAll(&svg);
+
+    if (recolorWhite)
+    {
+        svg.Replace("currentColor", "white");
+        svg.Replace("\"black\"", "\"white\"");
+        svg.Replace("\"#000000\"", "\"white\"");
+        svg.Replace("\"#000\"", "\"white\"");
+    }
+
+    const wxScopedCharBuffer utf8 = svg.utf8_str();
+    return wxBitmapBundle::FromSVG(utf8.data(), size);
+}
 
 // ---------------------------------------------------------------------------
 // Helper: style a single toggle button
@@ -36,6 +102,17 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
     : wxFrame(nullptr, wxID_ANY, "Mould3r",
         wxDefaultPosition, wxSize(1200, 800))
 {
+    // ---- Window icon from SVG -----------------------------------------------
+    {
+        wxBitmapBundle iconBundle = LoadSvgBundle(kAppIconSvg, wxSize(32, 32));
+        if (iconBundle.IsOk())
+        {
+            wxIcon icon;
+            icon.CopyFromBitmap(iconBundle.GetBitmapFor(this));
+            SetIcon(icon);
+        }
+    }
+
     // ---- Menu bar ----------------------------------------------------------
     auto* fileMenu = new wxMenu();
     fileMenu->Append(ID_Import, "Import...\tCtrl+I");
@@ -61,17 +138,15 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
 
     // 1-px separator line
     auto* sep = new wxPanel(root, wxID_ANY, wxDefaultPosition, wxSize(-1, 1));
-    sep->SetBackgroundColour(wxColour(0x00, 0x7A, 0xCC));
+    sep->SetBackgroundColour(Style::Accent);
 
     // In MainFrame constructor, replace the vSizer canvas Add with:
     auto* contentSizer = new wxBoxSizer(wxHORIZONTAL);
     m_canvas = new GLCanvas(root);
     m_leftPanel = CreateLeftPanel(root);
-    m_sidePanel = CreateSidePanel(root);
 
     contentSizer->Add(m_leftPanel, 0, wxEXPAND);
     contentSizer->Add(m_canvas, 1, wxEXPAND);
-    contentSizer->Add(m_sidePanel, 0, wxEXPAND);
 
     vSizer->Add(ribbon, 0, wxEXPAND);
     vSizer->Add(sep, 0, wxEXPAND);
@@ -110,215 +185,49 @@ wxPanel* MainFrame::CreateRibbon(wxWindow* parent)
 
     hSizer->AddSpacer(12);
 
-    // Import button
+    // ---- App logo (SVG, replaces text title) --------------------------------
+    {
+        wxBitmapBundle logoBndle = LoadSvgBundle(kRibbonLogoSvg, wxSize(120, 28));
+        if (logoBndle.IsOk())
+        {
+            auto* logo = new wxStaticBitmap(panel, wxID_ANY,
+                logoBndle.GetBitmapFor(panel));
+            hSizer->Add(logo, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 16);
+        }
+    }
+
+    // Import button (accent blue, left-aligned)
     auto* btnImport = new wxButton(panel, ID_Import, "Import Model",
-        wxDefaultPosition, wxSize(110, 32));
-    btnImport->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
-    btnImport->SetForegroundColour(kTextDefault);
+        wxDefaultPosition, wxSize(120, 32), wxBORDER_NONE);
+    btnImport->SetBackgroundColour(Style::BtnSecondary);
+    btnImport->SetForegroundColour(*wxWHITE);
     btnImport->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
-    hSizer->Add(btnImport, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 12);
-
-    // Vertical divider
-    auto* importDivider = new wxPanel(panel, wxID_ANY, wxDefaultPosition, wxSize(1, 36));
-    importDivider->SetBackgroundColour(wxColour(0x38, 0x44, 0x55));
-    hSizer->Add(importDivider, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 16);
-
-    // ----- Group label helper -----------------------------------------------
-    auto addLabel = [&](const wxString& text)
-        {
-            auto* lbl = new wxStaticText(panel, wxID_ANY, text);
-            lbl->SetForegroundColour(wxColour(0x55, 0x6A, 0x85));
-            lbl->SetFont(wxFont(7, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
-                wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
-            return lbl;
-        };
-
-    // ----- Toggle button helper ---------------------------------------------
-    auto addTool = [&](int id, const wxString& label, const wxString& tooltip)
-        -> wxToggleButton*
-        {
-            auto* btn = new wxToggleButton(panel, id, label,
-                wxDefaultPosition, wxSize(90, 32));
-            btn->SetToolTip(tooltip);
-            StyleRibbonBtn(btn, false);
-            return btn;
-        };
-
-    // Change addTool lambda return type and add a regular button helper
-    auto addAction = [&](int id, const wxString& label, const wxString& tooltip)
-        -> wxButton*
-        {
-            auto* btn = new wxButton(panel, id, label,
-                wxDefaultPosition, wxSize(90, 32));
-            btn->SetToolTip(tooltip);
-            btn->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
-            btn->SetForegroundColour(kTextDefault);
-            btn->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
-                wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
-            return btn;
-        };
-
-    // ---- TRANSFORM group ---------------------------------------------------
-    auto* transformSizer = new wxBoxSizer(wxVERTICAL);
-
-    auto* toolRow = new wxBoxSizer(wxHORIZONTAL);
-
-    m_btnTranslate = addTool(ID_ToolTranslate, "+    Translate", "Drag to translate  (LMB)");
-    m_btnRotate = addTool(ID_ToolRotate, "O    Rotate", "Drag to rotate  (LMB)");
-    m_btnScale = addTool(ID_ToolScale, "<>   Scale", "Drag up/down to scale  (LMB)");
-    m_btnCenter = addAction(ID_ToolCenter, "[ ] Center", "Move selected object to origin");
-
-    toolRow->Add(m_btnTranslate, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
-    toolRow->Add(m_btnRotate, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
-    toolRow->Add(m_btnScale, 0, wxALIGN_CENTER_VERTICAL);
-    toolRow->Add(m_btnCenter, 0, wxALIGN_CENTER_VERTICAL);
-
-    transformSizer->Add(toolRow, 0, wxALIGN_CENTER_HORIZONTAL);
-    transformSizer->Add(addLabel("TRANSFORM"), 0, wxALIGN_CENTER_HORIZONTAL | wxTOP, 2);
-
-    hSizer->Add(transformSizer, 0, wxALIGN_CENTER_VERTICAL | wxTOP | wxBOTTOM, 6);
-
-    // Vertical divider
-    hSizer->AddSpacer(16);
-    wxPanel* divider = new wxPanel(panel, wxID_ANY, wxDefaultPosition, wxSize(1, 36));
-    divider->SetBackgroundColour(wxColour(0x38, 0x44, 0x55));
-    hSizer->Add(divider, 0, wxALIGN_CENTER_VERTICAL);
-    hSizer->AddSpacer(16);
-
-    // ---- VENTS group -------------------------------------------------------
-    auto* ventsSizer = new wxBoxSizer(wxVERTICAL);
-    auto* ventsRow = new wxBoxSizer(wxHORIZONTAL);
-
-    m_btnPlaceVent = addTool(ID_ToolPlaceVent, "Place Vent", "Click a surface to place a vent point");
-
-    ventsRow->Add(m_btnPlaceVent, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
-
-    auto* btnClearVents = new wxButton(panel, ID_ClearVentPoints, "Clear",
-        wxDefaultPosition, wxSize(50, 32));
-    btnClearVents->SetToolTip("Remove all vent placement points");
-    btnClearVents->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
-    btnClearVents->SetForegroundColour(kTextDefault);
-    btnClearVents->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
-        wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
-    ventsRow->Add(btnClearVents, 0, wxALIGN_CENTER_VERTICAL);
-
-    ventsSizer->Add(ventsRow, 0, wxALIGN_CENTER_HORIZONTAL);
-    ventsSizer->Add(addLabel("VENTS"), 0, wxALIGN_CENTER_HORIZONTAL | wxTOP, 2);
-
-    hSizer->Add(ventsSizer, 0, wxALIGN_CENTER_VERTICAL | wxTOP | wxBOTTOM, 6);
-
-    // Vertical divider
-    hSizer->AddSpacer(16);
-    auto* divider2 = new wxPanel(panel, wxID_ANY, wxDefaultPosition, wxSize(1, 36));
-    divider2->SetBackgroundColour(wxColour(0x38, 0x44, 0x55));
-    hSizer->Add(divider2, 0, wxALIGN_CENTER_VERTICAL);
-    hSizer->AddSpacer(16);
-
-    // ---- SPRUES group ------------------------------------------------------
-    auto* spruesSizer = new wxBoxSizer(wxVERTICAL);
-    auto* spruesRow = new wxBoxSizer(wxHORIZONTAL);
-
-    m_btnPlaceSprue = new wxButton(panel, ID_PlaceSprue, "Place Sprue",
-        wxDefaultPosition, wxSize(90, 32));
-    m_btnPlaceSprue->SetToolTip("Place a sprue sphere at the active injection point");
-    m_btnPlaceSprue->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
-    m_btnPlaceSprue->SetForegroundColour(kTextDefault);
-    m_btnPlaceSprue->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
-        wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
-    spruesRow->Add(m_btnPlaceSprue, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
-
-    auto* btnClearSprue = new wxButton(panel, ID_ClearSprue, "Clear",
-        wxDefaultPosition, wxSize(50, 32));
-    btnClearSprue->SetToolTip("Remove the placed sprue sphere");
-    btnClearSprue->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
-    btnClearSprue->SetForegroundColour(kTextDefault);
-    btnClearSprue->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
-        wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
-    spruesRow->Add(btnClearSprue, 0, wxALIGN_CENTER_VERTICAL);
-
-    spruesSizer->Add(spruesRow, 0, wxALIGN_CENTER_HORIZONTAL);
-    spruesSizer->Add(addLabel("SPRUES"), 0, wxALIGN_CENTER_HORIZONTAL | wxTOP, 2);
-
-    hSizer->Add(spruesSizer, 0, wxALIGN_CENTER_VERTICAL | wxTOP | wxBOTTOM, 6);
-
-    // Vertical divider
-    hSizer->AddSpacer(16);
-    auto* divider3 = new wxPanel(panel, wxID_ANY, wxDefaultPosition, wxSize(1, 36));
-    divider3->SetBackgroundColour(wxColour(0x38, 0x44, 0x55));
-    hSizer->Add(divider3, 0, wxALIGN_CENTER_VERTICAL);
-    hSizer->AddSpacer(16);
-
-    // ---- RUNNERS group -----------------------------------------------------
-    auto* runnersSizer = new wxBoxSizer(wxVERTICAL);
-    auto* runnersRow = new wxBoxSizer(wxHORIZONTAL);
-
-    m_btnPlaceRunner = addTool(ID_PlaceRunner, "Place Runner", "Click the parting plane to place a runner point");
-
-    runnersRow->Add(m_btnPlaceRunner, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
-
-    auto* btnClearRunners = new wxButton(panel, ID_ClearRunners, "Clear",
-        wxDefaultPosition, wxSize(50, 32));
-    btnClearRunners->SetToolTip("Remove all runner placement points");
-    btnClearRunners->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
-    btnClearRunners->SetForegroundColour(kTextDefault);
-    btnClearRunners->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
-        wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
-    runnersRow->Add(btnClearRunners, 0, wxALIGN_CENTER_VERTICAL);
-
-    runnersSizer->Add(runnersRow, 0, wxALIGN_CENTER_HORIZONTAL);
-    runnersSizer->Add(addLabel("RUNNERS"), 0, wxALIGN_CENTER_HORIZONTAL | wxTOP, 2);
-
-    hSizer->Add(runnersSizer, 0, wxALIGN_CENTER_VERTICAL | wxTOP | wxBOTTOM, 6);
-
-    // Vertical divider
-    hSizer->AddSpacer(16);
-    auto* divider4 = new wxPanel(panel, wxID_ANY, wxDefaultPosition, wxSize(1, 36));
-    divider4->SetBackgroundColour(wxColour(0x38, 0x44, 0x55));
-    hSizer->Add(divider4, 0, wxALIGN_CENTER_VERTICAL);
-    hSizer->AddSpacer(16);
-
-    // ---- GATES group -------------------------------------------------------
-    auto* gatesSizer = new wxBoxSizer(wxVERTICAL);
-    auto* gatesRow = new wxBoxSizer(wxHORIZONTAL);
-
-    m_btnPlaceGate = addTool(ID_PlaceGate, "Place Gate", "Click the part perimeter at the parting plane to place a gate");
-
-    gatesRow->Add(m_btnPlaceGate, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
-
-    auto* btnClearGates = new wxButton(panel, ID_ClearGates, "Clear",
-        wxDefaultPosition, wxSize(50, 32));
-    btnClearGates->SetToolTip("Remove all gate placement points");
-    btnClearGates->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
-    btnClearGates->SetForegroundColour(kTextDefault);
-    btnClearGates->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
-        wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
-    gatesRow->Add(btnClearGates, 0, wxALIGN_CENTER_VERTICAL);
-
-    gatesSizer->Add(gatesRow, 0, wxALIGN_CENTER_HORIZONTAL);
-    gatesSizer->Add(addLabel("GATES"), 0, wxALIGN_CENTER_HORIZONTAL | wxTOP, 2);
-
-    hSizer->Add(gatesSizer, 0, wxALIGN_CENTER_VERTICAL | wxTOP | wxBOTTOM, 6);
-
-    // Vertical divider
-    hSizer->AddSpacer(16);
-    auto* divider5 = new wxPanel(panel, wxID_ANY, wxDefaultPosition, wxSize(1, 36));
-    divider5->SetBackgroundColour(wxColour(0x38, 0x44, 0x55));
-    hSizer->Add(divider5, 0, wxALIGN_CENTER_VERTICAL);
-    hSizer->AddSpacer(16);
-
-    // ---- Hint label --------------------------------------------------------
-    auto* hint = new wxStaticText(panel, wxID_ANY,
-        "LMB: orbit / transform    MMB: pan    Scroll: zoom    Shift+LMB: pan");
-    hint->SetForegroundColour(wxColour(0x44, 0x55, 0x66));
-    hint->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_ITALIC,
-        wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
-    hSizer->Add(hint, 0, wxALIGN_CENTER_VERTICAL);
+    hSizer->Add(btnImport, 0, wxALIGN_CENTER_VERTICAL);
 
     hSizer->AddStretchSpacer();
+
+    // ---- Export (right-aligned) ---------------------------------------------
+    auto* btnExport = new wxButton(panel, ID_Export, "Export",
+        wxDefaultPosition, wxSize(90, 32), wxBORDER_NONE);
+    btnExport->SetBackgroundColour(Style::InputBg);
+    btnExport->SetForegroundColour(*wxWHITE);
+    btnExport->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
+    hSizer->Add(btnExport, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
+
+    // ---- Generate Mould (green, right-aligned) --------------------------------
+    auto* btnGenerate = new wxButton(panel, ID_GenerateMould, "Generate Mould",
+        wxDefaultPosition, wxSize(130, 32), wxBORDER_NONE);
+    btnGenerate->SetBackgroundColour(Style::BtnGenerate);
+    btnGenerate->SetForegroundColour(*wxWHITE);
+    btnGenerate->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
+    hSizer->Add(btnGenerate, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 12);
+
     panel->SetSizer(hSizer);
 
-    // ---- Bind toggle events ------------------------------------------------
+    // ---- Bind events -------------------------------------------------------
     Bind(wxEVT_BUTTON, &MainFrame::OnImport, this, ID_Import);
     Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolTranslate, this, ID_ToolTranslate);
     Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolRotate, this, ID_ToolRotate);
@@ -332,6 +241,15 @@ wxPanel* MainFrame::CreateRibbon(wxWindow* parent)
     Bind(wxEVT_BUTTON, &MainFrame::OnClearRunners, this, ID_ClearRunners);
     Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnPlaceGate, this, ID_PlaceGate);
     Bind(wxEVT_BUTTON, &MainFrame::OnClearGates, this, ID_ClearGates);
+    Bind(wxEVT_BUTTON, &MainFrame::OnRemoveVent, this, ID_RemoveVent);
+    Bind(wxEVT_BUTTON, &MainFrame::OnRemoveSprue, this, ID_RemoveSprue);
+    Bind(wxEVT_BUTTON, &MainFrame::OnRemoveRunner, this, ID_RemoveRunner);
+    Bind(wxEVT_BUTTON, &MainFrame::OnRemoveGate, this, ID_RemoveGate);
+    Bind(wxEVT_BUTTON, &MainFrame::OnEditVent, this, ID_EditVent);
+    Bind(wxEVT_BUTTON, &MainFrame::OnEditRunner, this, ID_EditRunner);
+    Bind(wxEVT_BUTTON, &MainFrame::OnEditGate, this, ID_EditGate);
+    Bind(wxEVT_BUTTON, &MainFrame::OnGenerateMould, this, ID_GenerateMould);
+    Bind(wxEVT_BUTTON, &MainFrame::OnExport, this, ID_Export);
 
     return panel;
 }
@@ -347,13 +265,13 @@ wxPanel* MainFrame::CreateSidePanel(wxWindow* parent)
     auto addSection = [&](const wxString& text)
         {
             auto* lbl = new wxStaticText(panel, wxID_ANY, text);
-            lbl->SetForegroundColour(wxColour(0x00, 0x7A, 0xCC));
+            lbl->SetForegroundColour(Style::Accent);
             lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
                 wxFONTWEIGHT_BOLD, false, "Segoe UI"));
             sizer->Add(lbl, 0, wxLEFT | wxTOP, 12);
 
             auto* line = new wxPanel(panel, wxID_ANY, wxDefaultPosition, wxSize(-1, 1));
-            line->SetBackgroundColour(wxColour(0x2A, 0x38, 0x4A));
+            line->SetBackgroundColour(Style::Divider);
             sizer->Add(line, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 12);
         };
 
@@ -369,12 +287,12 @@ wxPanel* MainFrame::CreateSidePanel(wxWindow* parent)
             auto* row = new wxBoxSizer(wxHORIZONTAL);
             ctrl = new wxTextCtrl(panel, wxID_ANY, "",
                 wxDefaultPosition, wxSize(140, 24), wxTE_READONLY);
-            ctrl->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
+            ctrl->SetBackgroundColour(Style::InputBg);
             ctrl->SetForegroundColour(kTextDefault);
 
             auto* browse = new wxButton(panel, browseId, "...",
                 wxDefaultPosition, wxSize(28, 24));
-            browse->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
+            browse->SetBackgroundColour(Style::InputBg);
             browse->SetForegroundColour(kTextDefault);
 
             row->Add(ctrl, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
@@ -382,44 +300,16 @@ wxPanel* MainFrame::CreateSidePanel(wxWindow* parent)
             sizer->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 12);
         };
 
-    // ---- Generate section ----------------------------------------------------
-    addSection("MOULD");
-
-    auto* btnGenerate = new wxButton(panel, ID_GenerateMould, "Generate Mould",
-        wxDefaultPosition, wxSize(-1, 36));
-    btnGenerate->SetBackgroundColour(wxColour(0x1A, 0x6B, 0x3A));   // dark green
-    btnGenerate->SetForegroundColour(*wxWHITE);
-    btnGenerate->SetFont(wxFont(10, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
-        wxFONTWEIGHT_BOLD, false, "Segoe UI"));
-    sizer->Add(btnGenerate, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 12);
-
-    Bind(wxEVT_BUTTON, &MainFrame::OnGenerateMould, this, ID_GenerateMould);
-
     // ---- Export section ----------------------------------------------------
     addSection("EXPORT");
     addPathRow("Output folder:", m_exportPath, ID_BrowseExport);
 
-    // ---- Spacer pushes export button to bottom -----------------------------
     sizer->AddStretchSpacer();
-
-    // 1px separator above button
-    auto* bottomLine = new wxPanel(panel, wxID_ANY, wxDefaultPosition, wxSize(-1, 1));
-    bottomLine->SetBackgroundColour(wxColour(0x00, 0x7A, 0xCC));
-    sizer->Add(bottomLine, 0, wxEXPAND);
-
-    auto* btnExport = new wxButton(panel, ID_Export, "Export",
-        wxDefaultPosition, wxSize(-1, 36));
-    btnExport->SetBackgroundColour(wxColour(0x00, 0x7A, 0xCC));
-    btnExport->SetForegroundColour(*wxWHITE);
-    btnExport->SetFont(wxFont(10, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
-        wxFONTWEIGHT_BOLD, false, "Segoe UI"));
-    sizer->Add(btnExport, 0, wxEXPAND);
 
     panel->SetSizer(sizer);
 
     // ---- Binds -------------------------------------------------------------
     Bind(wxEVT_BUTTON, &MainFrame::OnBrowseExport, this, ID_BrowseExport);
-    Bind(wxEVT_BUTTON, &MainFrame::OnExport, this, ID_Export);
 
     return panel;
 }
@@ -429,9 +319,9 @@ wxPanel* MainFrame::CreateSidePanel(wxWindow* parent)
 void MainFrame::SetActiveTool(TransformMode mode)
 {
     // Reset all buttons
-    StyleRibbonBtn(m_btnTranslate, false); m_btnTranslate->SetValue(false);
-    StyleRibbonBtn(m_btnRotate, false);    m_btnRotate->SetValue(false);
-    StyleRibbonBtn(m_btnScale, false);     m_btnScale->SetValue(false);
+    if (m_btnTranslate) { StyleRibbonBtn(m_btnTranslate, false); m_btnTranslate->SetValue(false); }
+    if (m_btnRotate) { StyleRibbonBtn(m_btnRotate, false);    m_btnRotate->SetValue(false); }
+    if (m_btnScale) { StyleRibbonBtn(m_btnScale, false);     m_btnScale->SetValue(false); }
     if (m_btnPlaceVent)
     {
         StyleRibbonBtn(m_btnPlaceVent, false);
@@ -452,11 +342,14 @@ void MainFrame::SetActiveTool(TransformMode mode)
     switch (mode)
     {
     case TransformMode::Translate:
-        StyleRibbonBtn(m_btnTranslate, true);  m_btnTranslate->SetValue(true);  break;
+        if (m_btnTranslate) { StyleRibbonBtn(m_btnTranslate, true); m_btnTranslate->SetValue(true); }
+        break;
     case TransformMode::Rotate:
-        StyleRibbonBtn(m_btnRotate, true);     m_btnRotate->SetValue(true);     break;
+        if (m_btnRotate) { StyleRibbonBtn(m_btnRotate, true); m_btnRotate->SetValue(true); }
+        break;
     case TransformMode::Scale:
-        StyleRibbonBtn(m_btnScale, true);      m_btnScale->SetValue(true);      break;
+        if (m_btnScale) { StyleRibbonBtn(m_btnScale, true); m_btnScale->SetValue(true); }
+        break;
     case TransformMode::PlaceVent:
         if (m_btnPlaceVent)
         {
@@ -477,6 +370,15 @@ void MainFrame::SetActiveTool(TransformMode mode)
             StyleRibbonBtn(m_btnPlaceGate, true);
             m_btnPlaceGate->SetValue(true);
         }
+        break;
+    case TransformMode::RemoveVent:
+    case TransformMode::RemoveRunner:
+    case TransformMode::RemoveGate:
+    case TransformMode::RemoveSprue:
+    case TransformMode::EditVent:
+    case TransformMode::EditRunner:
+    case TransformMode::EditGate:
+    case TransformMode::Select:
         break;
     }
 
@@ -615,6 +517,66 @@ void MainFrame::OnClearGates(wxCommandEvent&)
 {
     if (m_canvas)
         m_canvas->ClearGatePoints();
+}
+
+void MainFrame::OnRemoveVent(wxCommandEvent&)
+{
+    // Toggle: if already in RemoveVent mode, return to Select
+    if (m_canvas && m_canvas->GetTransformMode() == TransformMode::RemoveVent)
+        SetActiveTool(TransformMode::Select);
+    else
+        SetActiveTool(TransformMode::RemoveVent);
+}
+
+void MainFrame::OnRemoveSprue(wxCommandEvent&)
+{
+    // Toggle: if already in RemoveSprue mode, return to Select
+    if (m_canvas && m_canvas->GetTransformMode() == TransformMode::RemoveSprue)
+        SetActiveTool(TransformMode::Select);
+    else
+        SetActiveTool(TransformMode::RemoveSprue);
+}
+
+void MainFrame::OnRemoveRunner(wxCommandEvent&)
+{
+    // Toggle: if already in RemoveRunner mode, return to Select
+    if (m_canvas && m_canvas->GetTransformMode() == TransformMode::RemoveRunner)
+        SetActiveTool(TransformMode::Select);
+    else
+        SetActiveTool(TransformMode::RemoveRunner);
+}
+
+void MainFrame::OnRemoveGate(wxCommandEvent&)
+{
+    // Toggle: if already in RemoveGate mode, return to Select
+    if (m_canvas && m_canvas->GetTransformMode() == TransformMode::RemoveGate)
+        SetActiveTool(TransformMode::Select);
+    else
+        SetActiveTool(TransformMode::RemoveGate);
+}
+
+void MainFrame::OnEditVent(wxCommandEvent&)
+{
+    if (m_canvas && m_canvas->GetTransformMode() == TransformMode::EditVent)
+        SetActiveTool(TransformMode::Select);
+    else
+        SetActiveTool(TransformMode::EditVent);
+}
+
+void MainFrame::OnEditRunner(wxCommandEvent&)
+{
+    if (m_canvas && m_canvas->GetTransformMode() == TransformMode::EditRunner)
+        SetActiveTool(TransformMode::Select);
+    else
+        SetActiveTool(TransformMode::EditRunner);
+}
+
+void MainFrame::OnEditGate(wxCommandEvent&)
+{
+    if (m_canvas && m_canvas->GetTransformMode() == TransformMode::EditGate)
+        SetActiveTool(TransformMode::Select);
+    else
+        SetActiveTool(TransformMode::EditGate);
 }
 
 void MainFrame::GetVentDimensions(float& outLength, float& outWidth,
@@ -760,14 +722,12 @@ void MainFrame::OnBrowseExport(wxCommandEvent&)
 
 void MainFrame::OnExport(wxCommandEvent&)
 {
-    if (m_exportPath->GetValue().IsEmpty())
-    {
-        wxMessageBox("Please set an export folder before exporting.",
-            "Missing Path", wxOK | wxICON_WARNING, this);
+    wxDirDialog dlg(this, "Select export folder", "",
+        wxDD_DEFAULT_STYLE | wxDD_DIR_MUST_EXIST);
+    if (dlg.ShowModal() != wxID_OK)
         return;
-    }
 
-    const std::string folder = m_exportPath->GetValue().ToStdString();
+    const std::string folder = dlg.GetPath().ToStdString();
     m_canvas->ExportFixtures(folder + "/model_a.step",
         folder + "/model_b.step");
 }
@@ -783,14 +743,16 @@ wxPanel* MainFrame::CreateCollapsibleSection(wxWindow* parent,
     const wxString& title,
     wxPanel** contentOut)
 {
-    auto* headerBtn = new wxToggleButton(parent, wxID_ANY, "v  " + title,
+    auto* headerBtn = new wxToggleButton(parent, wxID_ANY, title,
         wxDefaultPosition, wxSize(-1, 28),
         wxBU_LEFT);
     headerBtn->SetValue(true);
-    headerBtn->SetBackgroundColour(wxColour(0x25, 0x2B, 0x36));
-    headerBtn->SetForegroundColour(wxColour(0x00, 0x7A, 0xCC));
+    headerBtn->SetBackgroundColour(Style::SectionHeaderBg);
+    headerBtn->SetForegroundColour(Style::Accent);
     headerBtn->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_BOLD, false, "Segoe UI"));
+    headerBtn->SetBitmap(LoadSvgBundle(kChevronDownSvg, wxSize(14, 14), true));
+    headerBtn->SetBitmapPosition(wxLEFT);
     parentSizer->Add(headerBtn, 0, wxEXPAND | wxTOP, 4);
 
     // Use custom content if provided, otherwise build placeholder
@@ -808,7 +770,7 @@ wxPanel* MainFrame::CreateCollapsibleSection(wxWindow* parent,
         auto* cs = new wxBoxSizer(wxVERTICAL);
         auto* placeholder = new wxStaticText(content, wxID_ANY,
             "Add options later");
-        placeholder->SetForegroundColour(wxColour(0x44, 0x55, 0x66));
+        placeholder->SetForegroundColour(Style::TextDim);
         placeholder->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_ITALIC,
             wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
         cs->Add(placeholder, 0, wxALL, 10);
@@ -823,7 +785,9 @@ wxPanel* MainFrame::CreateCollapsibleSection(wxWindow* parent,
         parent, title](wxCommandEvent&)
         {
             const bool expanded = headerBtn->GetValue();
-            headerBtn->SetLabel((expanded ? "v  " : ">  ") + title);
+            headerBtn->SetBitmap(LoadSvgBundle(
+                expanded ? kChevronDownSvg : kChevronRightSvg,
+                wxSize(14, 14), true));
             contentRef->Show(expanded);
             parent->Layout();
             parent->GetParent()->Layout();
@@ -834,226 +798,389 @@ wxPanel* MainFrame::CreateCollapsibleSection(wxWindow* parent,
 
 wxPanel* MainFrame::CreateVentsContent(wxWindow* parent)
 {
+
     auto* panel = new wxPanel(parent, wxID_ANY);
-    panel->SetBackgroundColour(kRibbonBg);
+    panel->SetBackgroundColour(Style::CardBg);
 
     auto* sizer = new wxBoxSizer(wxVERTICAL);
 
-    // ---- Vent type dropdown ------------------------------------------------
-    auto* typeLabel = new wxStaticText(panel, wxID_ANY, "Vent type:");
-    typeLabel->SetForegroundColour(kTextDefault);
+    // ---- Section title ------------------------------------------------------
+    auto* titleLabel = new wxStaticText(panel, wxID_ANY, "Vents");
+    titleLabel->SetForegroundColour(*wxWHITE);
+    titleLabel->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_BOLD, false, "Segoe UI"));
+    sizer->Add(titleLabel, 0, wxLEFT | wxTOP, 12);
+    sizer->AddSpacer(6);
+
+    // ---- "Place Vent" toggle button -----------------------------------------
+    auto* btnPlace = new wxToggleButton(panel, ID_ToolPlaceVent, "Place Vent",
+        wxDefaultPosition, wxSize(-1, 32), wxBORDER_NONE);
+    btnPlace->SetBackgroundColour(Style::BtnPlace);
+    btnPlace->SetForegroundColour(*wxWHITE);
+    btnPlace->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
+    sizer->Add(btnPlace, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
+    sizer->AddSpacer(6);
+
+    // ---- Edit / Remove / Clear all ------------------------------------------
+    auto* actionGrid = new wxGridSizer(1, 3, 0, 4);
+    auto makeSmallBtn = [&](const wxString& label) -> wxButton*
+        {
+            auto* btn = new wxButton(panel, wxID_ANY, label,
+                wxDefaultPosition, wxSize(-1, 26), wxBORDER_NONE);
+            btn->SetBackgroundColour(Style::BtnSmall);
+            btn->SetForegroundColour(Style::TextPrimary);
+            btn->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+                wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+            return btn;
+        };
+    auto* btnEdit = makeSmallBtn("Edit");
+    btnEdit->SetId(ID_EditVent);
+    auto* btnRemove = makeSmallBtn("Remove");
+    btnRemove->SetId(ID_RemoveVent);
+    auto* btnClearAll = makeSmallBtn("Clear all");
+    btnClearAll->SetId(ID_ClearVentPoints);
+    actionGrid->Add(btnEdit, 0, wxEXPAND);
+    actionGrid->Add(btnRemove, 0, wxEXPAND);
+    actionGrid->Add(btnClearAll, 0, wxEXPAND);
+    sizer->Add(actionGrid, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
+    sizer->AddSpacer(8);
+
+    // ---- Collapsible "Settings" sub-section ---------------------------------
+    auto* settingsBtn = new wxToggleButton(panel, wxID_ANY,
+        "Settings",
+        wxDefaultPosition, wxSize(-1, 22), wxBU_LEFT | wxBORDER_NONE);
+    settingsBtn->SetValue(false);
+    settingsBtn->SetBackgroundColour(Style::CardBg);
+    settingsBtn->SetForegroundColour(Style::TextSubtle);
+    settingsBtn->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+    settingsBtn->SetBitmap(LoadSvgBundle(kChevronRightSvg, wxSize(12, 12), true));
+    settingsBtn->SetBitmapPosition(wxRIGHT);
+    sizer->Add(settingsBtn, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
+
+    // Settings content
+    auto* settingsPanel = new wxPanel(panel, wxID_ANY);
+    settingsPanel->SetBackgroundColour(Style::CardBg);
+    auto* settingsSizer = new wxBoxSizer(wxVERTICAL);
+
+    // ---- Vent type dropdown (inline with label) -----------------------------
+    auto* typeRow = new wxBoxSizer(wxHORIZONTAL);
+    auto* typeLabel = new wxStaticText(settingsPanel, wxID_ANY, "Vent type:");
+    typeLabel->SetForegroundColour(Style::TextMuted);
     typeLabel->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
-    sizer->Add(typeLabel, 0, wxLEFT | wxTOP, 10);
 
-    m_ventTypeChoice = new wxChoice(panel, wxID_ANY);
-    m_ventTypeChoice->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
-    m_ventTypeChoice->SetForegroundColour(kTextDefault);
+    m_ventTypeChoice = new wxChoice(settingsPanel, wxID_ANY,
+        wxDefaultPosition, wxSize(kCtrlColWidth, -1));
+    m_ventTypeChoice->SetBackgroundColour(Style::BtnSmall);
+    m_ventTypeChoice->SetForegroundColour(Style::TextMuted);
     m_ventTypeChoice->Append("Rectangular");
     m_ventTypeChoice->SetSelection(0);
-    sizer->Add(m_ventTypeChoice, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
+    typeRow->Add(typeLabel, 0, wxALIGN_CENTER_VERTICAL);
+    typeRow->AddStretchSpacer(1);
+    typeRow->Add(m_ventTypeChoice, 0, wxALIGN_CENTER_VERTICAL);
+    settingsSizer->Add(typeRow, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
 
-    // ---- Dimensions panel (shown when Rectangular selected) ----------------
-    m_ventDimsPanel = new wxPanel(panel, wxID_ANY);
-    m_ventDimsPanel->SetBackgroundColour(kRibbonBg);
-
+    // ---- Dimensions panel --------------------------------------------------
+    m_ventDimsPanel = new wxPanel(settingsPanel, wxID_ANY);
+    m_ventDimsPanel->SetBackgroundColour(Style::CardBg);
     auto* dimsSizer = new wxBoxSizer(wxVERTICAL);
 
-    // Helper: labelled mm field
     auto addDimRow = [&](const wxString& label, wxTextCtrl*& ctrl,
         const wxString& defaultVal)
         {
             auto* row = new wxBoxSizer(wxHORIZONTAL);
-
-            auto* lbl = new wxStaticText(m_ventDimsPanel, wxID_ANY, label,
-                wxDefaultPosition, wxSize(90, -1));
-            lbl->SetForegroundColour(kTextDefault);
+            auto* lbl = new wxStaticText(m_ventDimsPanel, wxID_ANY, label);
+            lbl->SetForegroundColour(Style::TextMuted);
             lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
                 wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
-
             ctrl = new wxTextCtrl(m_ventDimsPanel, wxID_ANY, defaultVal,
-                wxDefaultPosition, wxSize(70, 22));
-            ctrl->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
+                wxDefaultPosition, wxSize(kFieldWidth, 22));
+            ctrl->SetBackgroundColour(Style::BtnSmall);
             ctrl->SetForegroundColour(kTextDefault);
-
             auto* unit = new wxStaticText(m_ventDimsPanel, wxID_ANY, "mm");
-            unit->SetForegroundColour(wxColour(0x55, 0x6A, 0x85));
+            unit->SetForegroundColour(Style::TextSubtle);
             unit->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
                 wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
-
-            row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
-            row->Add(ctrl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
+            unit->SetMinSize(wxSize(kUnitWidth, -1));
+            row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL);
+            row->AddStretchSpacer(1);
+            row->Add(ctrl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, kFieldGap);
             row->Add(unit, 0, wxALIGN_CENTER_VERTICAL);
-
-            dimsSizer->Add(row, 0, wxLEFT | wxTOP, 10);
+            dimsSizer->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
         };
 
-    addDimRow("Length:", m_ventLength, "5.0");
+    addDimRow("Length:", m_ventLength, "1.0");
     addDimRow("Width:", m_ventWidth, "2.0");
     addDimRow("Overrun (start):", m_ventOverrunStart, "0.5");
     addDimRow("Overrun (end):", m_ventOverrunEnd, "0.5");
 
     m_ventDimsPanel->SetSizer(dimsSizer);
-    sizer->Add(m_ventDimsPanel, 0, wxEXPAND | wxBOTTOM, 10);
+    settingsSizer->Add(m_ventDimsPanel, 0, wxEXPAND | wxBOTTOM, 10);
 
-    panel->SetSizer(sizer);
+    settingsPanel->SetSizer(settingsSizer);
+    settingsPanel->Show(false);
+    sizer->Add(settingsPanel, 0, wxEXPAND);
 
-    // Show/hide dims based on type selection
     m_ventTypeChoice->Bind(wxEVT_CHOICE, [this](wxCommandEvent&)
         {
             m_ventDimsPanel->Show(m_ventTypeChoice->GetStringSelection() == "Rectangular");
             m_ventDimsPanel->GetParent()->Layout();
             m_ventDimsPanel->GetParent()->GetParent()->Layout();
+            m_ventDimsPanel->GetParent()->GetParent()->GetParent()->Layout();
         });
 
+    settingsBtn->Bind(wxEVT_TOGGLEBUTTON, [settingsBtn, settingsPanel, panel](wxCommandEvent&)
+        {
+            static wxLongLong lastToggleMs = 0;
+            wxLongLong now = wxGetLocalTimeMillis();
+            if ((now - lastToggleMs).GetValue() < 200) { settingsBtn->SetValue(!settingsBtn->GetValue()); return; }
+            lastToggleMs = now;
+            const bool expanded = settingsBtn->GetValue();
+            settingsBtn->SetBitmap(LoadSvgBundle(
+                expanded ? kChevronDownSvg : kChevronRightSvg,
+                wxSize(12, 12), true));
+            settingsBtn->SetBitmapPosition(wxRIGHT);
+            settingsPanel->Show(expanded);
+            panel->Layout(); panel->GetParent()->Layout(); panel->GetParent()->GetParent()->Layout();
+        });
+
+    panel->SetSizer(sizer);
     return panel;
 }
 
 wxPanel* MainFrame::CreateSpruesContent(wxWindow* parent)
 {
-    auto* panel = new wxPanel(parent, wxID_ANY);
-    panel->SetBackgroundColour(kRibbonBg);
 
+    auto* panel = new wxPanel(parent, wxID_ANY);
+    panel->SetBackgroundColour(Style::CardBg);
     auto* sizer = new wxBoxSizer(wxVERTICAL);
 
-    // ---- Sprue type dropdown -----------------------------------------------
-    auto* typeLabel = new wxStaticText(panel, wxID_ANY, "Sprue type:");
-    typeLabel->SetForegroundColour(kTextDefault);
+    auto* titleLabel = new wxStaticText(panel, wxID_ANY, "Sprues");
+    titleLabel->SetForegroundColour(*wxWHITE);
+    titleLabel->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_BOLD, false, "Segoe UI"));
+    sizer->Add(titleLabel, 0, wxLEFT | wxTOP, 12);
+    sizer->AddSpacer(6);
+
+    // Place Sprue — regular button (one-shot action, not a toggle mode)
+    auto* btnPlace = new wxButton(panel, ID_PlaceSprue, "Place Sprue",
+        wxDefaultPosition, wxSize(-1, 32), wxBORDER_NONE);
+    btnPlace->SetBackgroundColour(Style::BtnPlace);
+    btnPlace->SetForegroundColour(*wxWHITE);
+    btnPlace->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
+    sizer->Add(btnPlace, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
+    sizer->AddSpacer(6);
+
+    auto* actionGrid = new wxGridSizer(1, 3, 0, 4);
+    auto makeSmallBtn = [&](const wxString& label) -> wxButton* {
+        auto* btn = new wxButton(panel, wxID_ANY, label,
+            wxDefaultPosition, wxSize(-1, 26), wxBORDER_NONE);
+        btn->SetBackgroundColour(Style::BtnSmall);
+        btn->SetForegroundColour(Style::TextPrimary);
+        btn->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+        return btn;
+        };
+    auto* btnEdit = makeSmallBtn("Edit");
+    auto* btnRemove = makeSmallBtn("Remove");
+    btnRemove->SetId(ID_RemoveSprue);
+    auto* btnClearAll = makeSmallBtn("Clear all");
+    btnClearAll->SetId(ID_ClearSprue);
+    actionGrid->Add(btnEdit, 0, wxEXPAND);
+    actionGrid->Add(btnRemove, 0, wxEXPAND);
+    actionGrid->Add(btnClearAll, 0, wxEXPAND);
+    sizer->Add(actionGrid, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
+    sizer->AddSpacer(8);
+
+    // Collapsible Settings
+    auto* settingsBtn = new wxToggleButton(panel, wxID_ANY,
+        "Settings",
+        wxDefaultPosition, wxSize(-1, 22), wxBU_LEFT | wxBORDER_NONE);
+    settingsBtn->SetValue(false);
+    settingsBtn->SetBackgroundColour(Style::CardBg);
+    settingsBtn->SetForegroundColour(Style::TextSubtle);
+    settingsBtn->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+    settingsBtn->SetBitmap(LoadSvgBundle(kChevronRightSvg, wxSize(12, 12), true));
+    settingsBtn->SetBitmapPosition(wxRIGHT);
+    sizer->Add(settingsBtn, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
+
+    auto* settingsPanel = new wxPanel(panel, wxID_ANY);
+    settingsPanel->SetBackgroundColour(Style::CardBg);
+    auto* settingsSizer = new wxBoxSizer(wxVERTICAL);
+
+    auto* typeRow = new wxBoxSizer(wxHORIZONTAL);
+    auto* typeLabel = new wxStaticText(settingsPanel, wxID_ANY, "Sprue type:");
+    typeLabel->SetForegroundColour(Style::TextMuted);
     typeLabel->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
-    sizer->Add(typeLabel, 0, wxLEFT | wxTOP, 10);
 
-    m_sprueTypeChoice = new wxChoice(panel, wxID_ANY);
-    m_sprueTypeChoice->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
-    m_sprueTypeChoice->SetForegroundColour(kTextDefault);
+    m_sprueTypeChoice = new wxChoice(settingsPanel, wxID_ANY,
+        wxDefaultPosition, wxSize(kCtrlColWidth, -1));
+    m_sprueTypeChoice->SetBackgroundColour(Style::BtnSmall);
+    m_sprueTypeChoice->SetForegroundColour(Style::TextMuted);
     m_sprueTypeChoice->Append("Cylinder");
     m_sprueTypeChoice->SetSelection(0);
-    sizer->Add(m_sprueTypeChoice, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
+    typeRow->Add(typeLabel, 0, wxALIGN_CENTER_VERTICAL);
+    typeRow->AddStretchSpacer(1);
+    typeRow->Add(m_sprueTypeChoice, 0, wxALIGN_CENTER_VERTICAL);
+    settingsSizer->Add(typeRow, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
 
-    // ---- Dimensions panel (shown for Cylinder) -----------------------------
-    auto* dimsPanel = new wxPanel(panel, wxID_ANY);
-    dimsPanel->SetBackgroundColour(kRibbonBg);
-
+    auto* dimsPanel = new wxPanel(settingsPanel, wxID_ANY);
+    dimsPanel->SetBackgroundColour(Style::CardBg);
     auto* dimsSizer = new wxBoxSizer(wxVERTICAL);
 
-    // Diameter row
-    {
+    auto addRow = [&](const wxString& label, wxTextCtrl*& ctrl, const wxString& defVal, const wxString& unitStr) {
         auto* row = new wxBoxSizer(wxHORIZONTAL);
+        auto* lbl = new wxStaticText(dimsPanel, wxID_ANY, label);
+        lbl->SetForegroundColour(Style::TextMuted);
+        lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+        ctrl = new wxTextCtrl(dimsPanel, wxID_ANY, defVal, wxDefaultPosition, wxSize(kFieldWidth, 22));
+        ctrl->SetBackgroundColour(Style::BtnSmall); ctrl->SetForegroundColour(kTextDefault);
+        auto* u = new wxStaticText(dimsPanel, wxID_ANY, unitStr);
+        u->SetForegroundColour(Style::TextSubtle);
+        u->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+        u->SetMinSize(wxSize(kUnitWidth, -1));
+        row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL);
+        row->AddStretchSpacer(1);
+        row->Add(ctrl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, kFieldGap);
+        row->Add(u, 0, wxALIGN_CENTER_VERTICAL);
+        dimsSizer->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
+        };
 
-        auto* lbl = new wxStaticText(dimsPanel, wxID_ANY, "Diameter:",
-            wxDefaultPosition, wxSize(60, -1));
-        lbl->SetForegroundColour(kTextDefault);
-        lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
-            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
-
-        m_sprueDiameter = new wxTextCtrl(dimsPanel, wxID_ANY, "5.0",
-            wxDefaultPosition, wxSize(70, 22));
-        m_sprueDiameter->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
-        m_sprueDiameter->SetForegroundColour(kTextDefault);
-
-        auto* unit = new wxStaticText(dimsPanel, wxID_ANY, "mm");
-        unit->SetForegroundColour(wxColour(0x55, 0x6A, 0x85));
-        unit->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
-            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
-
-        row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
-        row->Add(m_sprueDiameter, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
-        row->Add(unit, 0, wxALIGN_CENTER_VERTICAL);
-        dimsSizer->Add(row, 0, wxLEFT | wxTOP, 10);
-    }
-
-    // Draft angle row
-    {
-        auto* row = new wxBoxSizer(wxHORIZONTAL);
-
-        auto* lbl = new wxStaticText(dimsPanel, wxID_ANY, "Draft angle:",
-            wxDefaultPosition, wxSize(60, -1));
-        lbl->SetForegroundColour(kTextDefault);
-        lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
-            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
-
-        m_sprueDraftAngle = new wxTextCtrl(dimsPanel, wxID_ANY, "1.0",
-            wxDefaultPosition, wxSize(70, 22));
-        m_sprueDraftAngle->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
-        m_sprueDraftAngle->SetForegroundColour(kTextDefault);
-
-        auto* unit = new wxStaticText(dimsPanel, wxID_ANY, "\xC2\xB0");
-        unit->SetForegroundColour(wxColour(0x55, 0x6A, 0x85));
-        unit->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
-            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
-
-        row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
-        row->Add(m_sprueDraftAngle, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
-        row->Add(unit, 0, wxALIGN_CENTER_VERTICAL);
-        dimsSizer->Add(row, 0, wxLEFT | wxTOP, 10);
-    }
-
-    // Cold slug depth row
-    {
-        auto* row = new wxBoxSizer(wxHORIZONTAL);
-
-        auto* lbl = new wxStaticText(dimsPanel, wxID_ANY, "Cold slug:",
-            wxDefaultPosition, wxSize(60, -1));
-        lbl->SetForegroundColour(kTextDefault);
-        lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
-            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
-
-        m_sprueColdSlugDepth = new wxTextCtrl(dimsPanel, wxID_ANY, "5.0",
-            wxDefaultPosition, wxSize(70, 22));
-        m_sprueColdSlugDepth->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
-        m_sprueColdSlugDepth->SetForegroundColour(kTextDefault);
-
-        auto* unit = new wxStaticText(dimsPanel, wxID_ANY, "mm");
-        unit->SetForegroundColour(wxColour(0x55, 0x6A, 0x85));
-        unit->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
-            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
-
-        row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
-        row->Add(m_sprueColdSlugDepth, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
-        row->Add(unit, 0, wxALIGN_CENTER_VERTICAL);
-        dimsSizer->Add(row, 0, wxLEFT | wxTOP, 10);
-    }
+    addRow("Diameter:", m_sprueDiameter, "5.0", "mm");
+    addRow("Draft angle:", m_sprueDraftAngle, "1.0", wxString::FromUTF8("\xC2\xB0"));
+    addRow("Cold slug:", m_sprueColdSlugDepth, "5.0", "mm");
 
     dimsPanel->SetSizer(dimsSizer);
-    sizer->Add(dimsPanel, 0, wxEXPAND | wxBOTTOM, 10);
+    settingsSizer->Add(dimsPanel, 0, wxEXPAND | wxBOTTOM, 10);
+    settingsPanel->SetSizer(settingsSizer);
+    settingsPanel->Show(false);
+    sizer->Add(settingsPanel, 0, wxEXPAND);
 
-    panel->SetSizer(sizer);
-
-    // Show/hide dims based on type selection (future-proofed for more types)
-    m_sprueTypeChoice->Bind(wxEVT_CHOICE, [dimsPanel, this](wxCommandEvent&)
-        {
-            dimsPanel->Show(m_sprueTypeChoice->GetStringSelection() == "Cylinder");
-            dimsPanel->GetParent()->Layout();
-            dimsPanel->GetParent()->GetParent()->Layout();
+    m_sprueTypeChoice->Bind(wxEVT_CHOICE, [dimsPanel, this](wxCommandEvent&) {
+        dimsPanel->Show(m_sprueTypeChoice->GetStringSelection() == "Cylinder");
+        dimsPanel->GetParent()->Layout(); dimsPanel->GetParent()->GetParent()->Layout();
+        dimsPanel->GetParent()->GetParent()->GetParent()->Layout();
         });
 
+    settingsBtn->Bind(wxEVT_TOGGLEBUTTON, [settingsBtn, settingsPanel, panel](wxCommandEvent&) {
+        static wxLongLong lastToggleMs = 0;
+        wxLongLong now = wxGetLocalTimeMillis();
+        if ((now - lastToggleMs).GetValue() < 200) { settingsBtn->SetValue(!settingsBtn->GetValue()); return; }
+        lastToggleMs = now;
+        const bool expanded = settingsBtn->GetValue();
+        settingsBtn->SetBitmap(LoadSvgBundle(
+            expanded ? kChevronDownSvg : kChevronRightSvg,
+            wxSize(12, 12), true));
+        settingsBtn->SetBitmapPosition(wxRIGHT);
+        settingsPanel->Show(expanded);
+        panel->Layout(); panel->GetParent()->Layout(); panel->GetParent()->GetParent()->Layout();
+        });
+
+    panel->SetSizer(sizer);
     return panel;
 }
 
 wxPanel* MainFrame::CreateRunnersContent(wxWindow* parent)
 {
+    // Local colours sampled from the reference mockup
+
     auto* panel = new wxPanel(parent, wxID_ANY);
-    panel->SetBackgroundColour(kRibbonBg);
+    panel->SetBackgroundColour(Style::CardBg);
 
     auto* sizer = new wxBoxSizer(wxVERTICAL);
 
-    // ---- Runner type dropdown -----------------------------------------------
-    auto* typeLabel = new wxStaticText(panel, wxID_ANY, "Runner type:");
-    typeLabel->SetForegroundColour(kTextDefault);
+    // ---- "Runners" section title (inside the card) --------------------------
+    auto* runnersLabel = new wxStaticText(panel, wxID_ANY, "Runners");
+    runnersLabel->SetForegroundColour(*wxWHITE);
+    runnersLabel->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_BOLD, false, "Segoe UI"));
+    sizer->Add(runnersLabel, 0, wxLEFT | wxTOP, 12);
+
+    sizer->AddSpacer(6);
+
+    // ---- "Place Runner" toggle button (full-width, muted indigo) -------------
+    auto* btnPlace = new wxToggleButton(panel, ID_PlaceRunner, "Place Runner",
+        wxDefaultPosition, wxSize(-1, 32), wxBORDER_NONE);
+    btnPlace->SetBackgroundColour(Style::BtnPlace);
+    btnPlace->SetForegroundColour(*wxWHITE);
+    btnPlace->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
+    sizer->Add(btnPlace, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
+
+    sizer->AddSpacer(6);
+
+    // ---- Edit / Remove / Clear all — equal-width button row -----------------
+    auto* actionGrid = new wxGridSizer(1, 3, 0, 4);   // 1 row, 3 cols, 4px h-gap
+
+    auto makeSmallBtn = [&](const wxString& label) -> wxButton*
+        {
+            auto* btn = new wxButton(panel, wxID_ANY, label,
+                wxDefaultPosition, wxSize(-1, 26), wxBORDER_NONE);
+            btn->SetBackgroundColour(Style::BtnSmall);
+            btn->SetForegroundColour(Style::TextPrimary);
+            btn->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+                wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+            return btn;
+        };
+
+    auto* btnEdit = makeSmallBtn("Edit");
+    btnEdit->SetId(ID_EditRunner);
+    auto* btnRemove = makeSmallBtn("Remove");
+    btnRemove->SetId(ID_RemoveRunner);
+    auto* btnClearAll = makeSmallBtn("Clear all");
+    btnClearAll->SetId(ID_ClearRunners);
+
+    actionGrid->Add(btnEdit, 0, wxEXPAND);
+    actionGrid->Add(btnRemove, 0, wxEXPAND);
+    actionGrid->Add(btnClearAll, 0, wxEXPAND);
+    sizer->Add(actionGrid, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
+
+    sizer->AddSpacer(8);
+
+    // ---- Collapsible "Settings" sub-section ---------------------------------
+    auto* settingsBtn = new wxToggleButton(panel, wxID_ANY,
+        "Settings",
+        wxDefaultPosition, wxSize(-1, 22), wxBU_LEFT | wxBORDER_NONE);
+    settingsBtn->SetValue(false);
+    settingsBtn->SetBackgroundColour(Style::CardBg);
+    settingsBtn->SetForegroundColour(Style::TextSubtle);
+    settingsBtn->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+    settingsBtn->SetBitmap(LoadSvgBundle(kChevronRightSvg, wxSize(12, 12), true));
+    settingsBtn->SetBitmapPosition(wxRIGHT);
+    sizer->Add(settingsBtn, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
+
+    // Settings content panel (contains the existing type/dimension fields)
+    auto* settingsPanel = new wxPanel(panel, wxID_ANY);
+    settingsPanel->SetBackgroundColour(Style::CardBg);
+    auto* settingsSizer = new wxBoxSizer(wxVERTICAL);
+
+    // ---- Runner type dropdown (inline with label) ----------------------------
+    auto* typeRow = new wxBoxSizer(wxHORIZONTAL);
+    auto* typeLabel = new wxStaticText(settingsPanel, wxID_ANY, "Runner type:");
+    typeLabel->SetForegroundColour(Style::TextMuted);
     typeLabel->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
-    sizer->Add(typeLabel, 0, wxLEFT | wxTOP, 10);
 
-    m_runnerTypeChoice = new wxChoice(panel, wxID_ANY);
-    m_runnerTypeChoice->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
-    m_runnerTypeChoice->SetForegroundColour(kTextDefault);
+    m_runnerTypeChoice = new wxChoice(settingsPanel, wxID_ANY,
+        wxDefaultPosition, wxSize(kCtrlColWidth, -1));
+    m_runnerTypeChoice->SetBackgroundColour(Style::BtnSmall);
+    m_runnerTypeChoice->SetForegroundColour(Style::TextMuted);
     m_runnerTypeChoice->Append("Cylindrical");
     m_runnerTypeChoice->SetSelection(0);
-    sizer->Add(m_runnerTypeChoice, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
+    typeRow->Add(typeLabel, 0, wxALIGN_CENTER_VERTICAL);
+    typeRow->AddStretchSpacer(1);
+    typeRow->Add(m_runnerTypeChoice, 0, wxALIGN_CENTER_VERTICAL);
+    settingsSizer->Add(typeRow, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
 
     // ---- Dimensions panel (shown for Cylindrical) ---------------------------
-    auto* dimsPanel = new wxPanel(panel, wxID_ANY);
-    dimsPanel->SetBackgroundColour(kRibbonBg);
+    auto* dimsPanel = new wxPanel(settingsPanel, wxID_ANY);
+    dimsPanel->SetBackgroundColour(Style::CardBg);
 
     auto* dimsSizer = new wxBoxSizer(wxVERTICAL);
 
@@ -1061,60 +1188,62 @@ wxPanel* MainFrame::CreateRunnersContent(wxWindow* parent)
     {
         auto* row = new wxBoxSizer(wxHORIZONTAL);
 
-        auto* lbl = new wxStaticText(dimsPanel, wxID_ANY, "Diameter:",
-            wxDefaultPosition, wxSize(60, -1));
-        lbl->SetForegroundColour(kTextDefault);
+        auto* lbl = new wxStaticText(dimsPanel, wxID_ANY, "Diameter:");
+        lbl->SetForegroundColour(Style::TextMuted);
         lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
             wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
 
         m_runnerDiameter = new wxTextCtrl(dimsPanel, wxID_ANY, "4.0",
-            wxDefaultPosition, wxSize(70, 22));
-        m_runnerDiameter->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
+            wxDefaultPosition, wxSize(kFieldWidth, 22));
+        m_runnerDiameter->SetBackgroundColour(Style::BtnSmall);
         m_runnerDiameter->SetForegroundColour(kTextDefault);
 
-
         auto* unit = new wxStaticText(dimsPanel, wxID_ANY, "mm");
-        unit->SetForegroundColour(wxColour(0x55, 0x6A, 0x85));
+        unit->SetForegroundColour(Style::TextSubtle);
         unit->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
             wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+        unit->SetMinSize(wxSize(kUnitWidth, -1));
 
-        row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
-        row->Add(m_runnerDiameter, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
+        row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL);
+        row->AddStretchSpacer(1);
+        row->Add(m_runnerDiameter, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, kFieldGap);
         row->Add(unit, 0, wxALIGN_CENTER_VERTICAL);
-        dimsSizer->Add(row, 0, wxLEFT | wxTOP, 10);
+        dimsSizer->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
     }
 
-    //Cold Slug Well Row
+    // Cold Slug Well Row
     {
         auto* row = new wxBoxSizer(wxHORIZONTAL);
 
-        auto* lbl = new wxStaticText(dimsPanel, wxID_ANY, "Cold slug length:",
-            wxDefaultPosition, wxSize(60, -1));
-        lbl->SetForegroundColour(kTextDefault);
+        auto* lbl = new wxStaticText(dimsPanel, wxID_ANY, "Cold slug length:");
+        lbl->SetForegroundColour(Style::TextMuted);
         lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
             wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
 
         m_runnerColdSlugDepth = new wxTextCtrl(dimsPanel, wxID_ANY, "5.0",
-            wxDefaultPosition, wxSize(70, 22));
-        m_runnerColdSlugDepth->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
+            wxDefaultPosition, wxSize(kFieldWidth, 22));
+        m_runnerColdSlugDepth->SetBackgroundColour(Style::BtnSmall);
         m_runnerColdSlugDepth->SetForegroundColour(kTextDefault);
 
-
         auto* unit = new wxStaticText(dimsPanel, wxID_ANY, "mm");
-        unit->SetForegroundColour(wxColour(0x55, 0x6A, 0x85));
+        unit->SetForegroundColour(Style::TextSubtle);
         unit->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
             wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+        unit->SetMinSize(wxSize(kUnitWidth, -1));
 
-        row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
-        row->Add(m_runnerColdSlugDepth, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
+        row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL);
+        row->AddStretchSpacer(1);
+        row->Add(m_runnerColdSlugDepth, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, kFieldGap);
         row->Add(unit, 0, wxALIGN_CENTER_VERTICAL);
-        dimsSizer->Add(row, 0, wxLEFT | wxTOP, 10);
+        dimsSizer->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
     }
 
     dimsPanel->SetSizer(dimsSizer);
-    sizer->Add(dimsPanel, 0, wxEXPAND | wxBOTTOM, 10);
+    settingsSizer->Add(dimsPanel, 0, wxEXPAND | wxBOTTOM, 10);
 
-    panel->SetSizer(sizer);
+    settingsPanel->SetSizer(settingsSizer);
+    settingsPanel->Show(false);
+    sizer->Add(settingsPanel, 0, wxEXPAND);
 
     // Show/hide dims based on type selection (future-proofed for more types)
     m_runnerTypeChoice->Bind(wxEVT_CHOICE, [dimsPanel, this](wxCommandEvent&)
@@ -1122,200 +1251,446 @@ wxPanel* MainFrame::CreateRunnersContent(wxWindow* parent)
             dimsPanel->Show(m_runnerTypeChoice->GetStringSelection() == "Cylindrical");
             dimsPanel->GetParent()->Layout();
             dimsPanel->GetParent()->GetParent()->Layout();
+            dimsPanel->GetParent()->GetParent()->GetParent()->Layout();
         });
 
+    // Toggle the Settings sub-section (debounced — 200ms cooldown)
+    settingsBtn->Bind(wxEVT_TOGGLEBUTTON, [settingsBtn, settingsPanel, panel](wxCommandEvent&)
+        {
+            static wxLongLong lastToggleMs = 0;
+            wxLongLong now = wxGetLocalTimeMillis();
+            if ((now - lastToggleMs).GetValue() < 200)
+            {
+                // Too fast — revert the toggle state and ignore
+                settingsBtn->SetValue(!settingsBtn->GetValue());
+                return;
+            }
+            lastToggleMs = now;
+
+            const bool expanded = settingsBtn->GetValue();
+            settingsBtn->SetBitmap(LoadSvgBundle(
+                expanded ? kChevronDownSvg : kChevronRightSvg,
+                wxSize(12, 12), true));
+            settingsBtn->SetBitmapPosition(wxRIGHT);
+            settingsPanel->Show(expanded);
+            panel->Layout();
+            panel->GetParent()->Layout();
+            panel->GetParent()->GetParent()->Layout();
+        });
+
+    panel->SetSizer(sizer);
     return panel;
 }
 
 wxPanel* MainFrame::CreateGatesContent(wxWindow* parent)
 {
-    auto* panel = new wxPanel(parent, wxID_ANY);
-    panel->SetBackgroundColour(kRibbonBg);
 
+    auto* panel = new wxPanel(parent, wxID_ANY);
+    panel->SetBackgroundColour(Style::CardBg);
     auto* sizer = new wxBoxSizer(wxVERTICAL);
 
-    // ---- Gate type dropdown ------------------------------------------------
-    auto* typeLabel = new wxStaticText(panel, wxID_ANY, "Gate type:");
-    typeLabel->SetForegroundColour(kTextDefault);
+    auto* titleLabel = new wxStaticText(panel, wxID_ANY, "Gates");
+    titleLabel->SetForegroundColour(*wxWHITE);
+    titleLabel->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_BOLD, false, "Segoe UI"));
+    sizer->Add(titleLabel, 0, wxLEFT | wxTOP, 12);
+    sizer->AddSpacer(6);
+
+    auto* btnPlace = new wxToggleButton(panel, ID_PlaceGate, "Place Gate",
+        wxDefaultPosition, wxSize(-1, 32), wxBORDER_NONE);
+    btnPlace->SetBackgroundColour(Style::BtnPlace);
+    btnPlace->SetForegroundColour(*wxWHITE);
+    btnPlace->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
+    sizer->Add(btnPlace, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
+    sizer->AddSpacer(6);
+
+    auto* actionGrid = new wxGridSizer(1, 3, 0, 4);
+    auto makeSmallBtn = [&](const wxString& label) -> wxButton* {
+        auto* btn = new wxButton(panel, wxID_ANY, label,
+            wxDefaultPosition, wxSize(-1, 26), wxBORDER_NONE);
+        btn->SetBackgroundColour(Style::BtnSmall);
+        btn->SetForegroundColour(Style::TextPrimary);
+        btn->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+        return btn;
+        };
+    auto* btnEdit = makeSmallBtn("Edit");
+    btnEdit->SetId(ID_EditGate);
+    auto* btnRemove = makeSmallBtn("Remove");
+    btnRemove->SetId(ID_RemoveGate);
+    auto* btnClearAll = makeSmallBtn("Clear all");
+    btnClearAll->SetId(ID_ClearGates);
+    actionGrid->Add(btnEdit, 0, wxEXPAND);
+    actionGrid->Add(btnRemove, 0, wxEXPAND);
+    actionGrid->Add(btnClearAll, 0, wxEXPAND);
+    sizer->Add(actionGrid, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
+    sizer->AddSpacer(8);
+
+    // Collapsible Settings
+    auto* settingsBtn = new wxToggleButton(panel, wxID_ANY,
+        "Settings",
+        wxDefaultPosition, wxSize(-1, 22), wxBU_LEFT | wxBORDER_NONE);
+    settingsBtn->SetValue(false);
+    settingsBtn->SetBackgroundColour(Style::CardBg);
+    settingsBtn->SetForegroundColour(Style::TextSubtle);
+    settingsBtn->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+    settingsBtn->SetBitmap(LoadSvgBundle(kChevronRightSvg, wxSize(12, 12), true));
+    settingsBtn->SetBitmapPosition(wxRIGHT);
+    sizer->Add(settingsBtn, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
+
+    auto* settingsPanel = new wxPanel(panel, wxID_ANY);
+    settingsPanel->SetBackgroundColour(Style::CardBg);
+    auto* settingsSizer = new wxBoxSizer(wxVERTICAL);
+
+    // Helper for dimension rows
+    auto addRow = [&](wxWindow* parent_, wxSizer* parentSz,
+        const wxString& label, wxTextCtrl*& ctrl,
+        const wxString& defVal, const wxString& unitStr, int lblW = 60)
+        {
+            auto* row = new wxBoxSizer(wxHORIZONTAL);
+            auto* lbl = new wxStaticText(parent_, wxID_ANY, label);
+            lbl->SetForegroundColour(Style::TextMuted);
+            lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+            ctrl = new wxTextCtrl(parent_, wxID_ANY, defVal, wxDefaultPosition, wxSize(kFieldWidth, 22));
+            ctrl->SetBackgroundColour(Style::BtnSmall); ctrl->SetForegroundColour(kTextDefault);
+            auto* u = new wxStaticText(parent_, wxID_ANY, unitStr);
+            u->SetForegroundColour(Style::TextSubtle);
+            u->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+            u->SetMinSize(wxSize(kUnitWidth, -1));
+            row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL);
+            row->AddStretchSpacer(1);
+            row->Add(ctrl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, kFieldGap);
+            row->Add(u, 0, wxALIGN_CENTER_VERTICAL);
+            parentSz->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
+        };
+
+    // ---- Gate type dropdown (inline with label) ------------------------------
+    auto* typeRow = new wxBoxSizer(wxHORIZONTAL);
+    auto* typeLabel = new wxStaticText(settingsPanel, wxID_ANY, "Gate type:");
+    typeLabel->SetForegroundColour(Style::TextMuted);
     typeLabel->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
-    sizer->Add(typeLabel, 0, wxLEFT | wxTOP, 10);
 
-    m_gateTypeChoice = new wxChoice(panel, wxID_ANY);
-    m_gateTypeChoice->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
-    m_gateTypeChoice->SetForegroundColour(kTextDefault);
+    m_gateTypeChoice = new wxChoice(settingsPanel, wxID_ANY,
+        wxDefaultPosition, wxSize(kCtrlColWidth, -1));
+    m_gateTypeChoice->SetBackgroundColour(Style::BtnSmall);
+    m_gateTypeChoice->SetForegroundColour(Style::TextMuted);
     m_gateTypeChoice->Append("Tapered Cylinder");
     m_gateTypeChoice->SetSelection(0);
-    sizer->Add(m_gateTypeChoice, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
+    typeRow->Add(typeLabel, 0, wxALIGN_CENTER_VERTICAL);
+    typeRow->AddStretchSpacer(1);
+    typeRow->Add(m_gateTypeChoice, 0, wxALIGN_CENTER_VERTICAL);
+    settingsSizer->Add(typeRow, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
 
-    // ---- Dimensions panel (shown for Tapered Cylinder) ---------------------
-    auto* dimsPanel = new wxPanel(panel, wxID_ANY);
-    dimsPanel->SetBackgroundColour(kRibbonBg);
-
+    // Gate dimensions
+    auto* dimsPanel = new wxPanel(settingsPanel, wxID_ANY);
+    dimsPanel->SetBackgroundColour(Style::CardBg);
     auto* dimsSizer = new wxBoxSizer(wxVERTICAL);
-
-    // Diameter row
-    {
-        auto* row = new wxBoxSizer(wxHORIZONTAL);
-
-        auto* lbl = new wxStaticText(dimsPanel, wxID_ANY, "Diameter:",
-            wxDefaultPosition, wxSize(60, -1));
-        lbl->SetForegroundColour(kTextDefault);
-        lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
-            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
-
-        m_gateDiameter = new wxTextCtrl(dimsPanel, wxID_ANY, "3.0",
-            wxDefaultPosition, wxSize(70, 22));
-        m_gateDiameter->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
-        m_gateDiameter->SetForegroundColour(kTextDefault);
-
-        auto* unit = new wxStaticText(dimsPanel, wxID_ANY, "mm");
-        unit->SetForegroundColour(wxColour(0x55, 0x6A, 0x85));
-        unit->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
-            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
-
-        row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
-        row->Add(m_gateDiameter, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
-        row->Add(unit, 0, wxALIGN_CENTER_VERTICAL);
-        dimsSizer->Add(row, 0, wxLEFT | wxTOP, 10);
-    }
-
-    // Draft angle row
-    {
-        auto* row = new wxBoxSizer(wxHORIZONTAL);
-
-        auto* lbl = new wxStaticText(dimsPanel, wxID_ANY, "Draft angle:",
-            wxDefaultPosition, wxSize(60, -1));
-        lbl->SetForegroundColour(kTextDefault);
-        lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
-            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
-
-        m_gateDraftAngle = new wxTextCtrl(dimsPanel, wxID_ANY, "1.0",
-            wxDefaultPosition, wxSize(70, 22));
-        m_gateDraftAngle->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
-        m_gateDraftAngle->SetForegroundColour(kTextDefault);
-
-        auto* unit = new wxStaticText(dimsPanel, wxID_ANY, "\xC2\xB0");
-        unit->SetForegroundColour(wxColour(0x55, 0x6A, 0x85));
-        unit->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
-            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
-
-        row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
-        row->Add(m_gateDraftAngle, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
-        row->Add(unit, 0, wxALIGN_CENTER_VERTICAL);
-        dimsSizer->Add(row, 0, wxLEFT | wxTOP, 10);
-    }
-
+    addRow(dimsPanel, dimsSizer, "Diameter:", m_gateDiameter, "3.0", "mm");
+    addRow(dimsPanel, dimsSizer, "Draft angle:", m_gateDraftAngle, "1.0", wxString::FromUTF8("\xC2\xB0"));
     dimsPanel->SetSizer(dimsSizer);
-    sizer->Add(dimsPanel, 0, wxEXPAND | wxBOTTOM, 6);
+    settingsSizer->Add(dimsPanel, 0, wxEXPAND | wxBOTTOM, 6);
 
     // ---- Sub-runner divider ------------------------------------------------
-    auto* subSep = new wxPanel(panel, wxID_ANY, wxDefaultPosition, wxSize(-1, 1));
-    subSep->SetBackgroundColour(wxColour(0x2A, 0x38, 0x4A));
-    sizer->Add(subSep, 0, wxEXPAND | wxLEFT | wxRIGHT, 10);
+    auto* subSep = new wxPanel(settingsPanel, wxID_ANY, wxDefaultPosition, wxSize(-1, 1));
+    subSep->SetBackgroundColour(Style::Divider);
+    settingsSizer->Add(subSep, 0, wxEXPAND | wxLEFT | wxRIGHT, 10);
 
-    // ---- Sub-runner type dropdown ------------------------------------------
-    auto* subTypeLabel = new wxStaticText(panel, wxID_ANY, "Sub-runner type:");
-    subTypeLabel->SetForegroundColour(kTextDefault);
+    // ---- Sub-runner type dropdown (inline with label) ------------------------
+    auto* subTypeRow = new wxBoxSizer(wxHORIZONTAL);
+    auto* subTypeLabel = new wxStaticText(settingsPanel, wxID_ANY, "Sub-runner type:");
+    subTypeLabel->SetForegroundColour(Style::TextMuted);
     subTypeLabel->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
-    sizer->Add(subTypeLabel, 0, wxLEFT | wxTOP, 10);
 
-    m_subRunnerTypeChoice = new wxChoice(panel, wxID_ANY);
-    m_subRunnerTypeChoice->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
-    m_subRunnerTypeChoice->SetForegroundColour(kTextDefault);
+    m_subRunnerTypeChoice = new wxChoice(settingsPanel, wxID_ANY,
+        wxDefaultPosition, wxSize(kCtrlColWidth, -1));
+    m_subRunnerTypeChoice->SetBackgroundColour(Style::BtnSmall);
+    m_subRunnerTypeChoice->SetForegroundColour(Style::TextMuted);
     m_subRunnerTypeChoice->Append("Cylinder");
     m_subRunnerTypeChoice->SetSelection(0);
-    sizer->Add(m_subRunnerTypeChoice, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
+    subTypeRow->Add(subTypeLabel, 0, wxALIGN_CENTER_VERTICAL);
+    subTypeRow->AddStretchSpacer(1);
+    subTypeRow->Add(m_subRunnerTypeChoice, 0, wxALIGN_CENTER_VERTICAL);
+    settingsSizer->Add(subTypeRow, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
 
-    // ---- Sub-runner dimensions panel ---------------------------------------
-    auto* subDimsPanel = new wxPanel(panel, wxID_ANY);
-    subDimsPanel->SetBackgroundColour(kRibbonBg);
+    // Sub-runner dimensions
+    auto* subDimsPanel = new wxPanel(settingsPanel, wxID_ANY);
+    subDimsPanel->SetBackgroundColour(Style::CardBg);
     auto* subDimsSizer = new wxBoxSizer(wxVERTICAL);
-    {
-        auto* row = new wxBoxSizer(wxHORIZONTAL);
-
-        auto* lbl = new wxStaticText(subDimsPanel, wxID_ANY, "Diameter:",
-            wxDefaultPosition, wxSize(60, -1));
-        lbl->SetForegroundColour(kTextDefault);
-        lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
-            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
-
-        m_subRunnerDiameter = new wxTextCtrl(subDimsPanel, wxID_ANY, "5.0",
-            wxDefaultPosition, wxSize(70, 22));
-        m_subRunnerDiameter->SetBackgroundColour(wxColour(0x2A, 0x30, 0x3C));
-        m_subRunnerDiameter->SetForegroundColour(kTextDefault);
-
-        auto* unit = new wxStaticText(subDimsPanel, wxID_ANY, "mm");
-        unit->SetForegroundColour(wxColour(0x55, 0x6A, 0x85));
-        unit->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
-            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
-
-        row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
-        row->Add(m_subRunnerDiameter, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
-        row->Add(unit, 0, wxALIGN_CENTER_VERTICAL);
-        subDimsSizer->Add(row, 0, wxLEFT | wxTOP, 10);
-    }
+    addRow(subDimsPanel, subDimsSizer, "Diameter:", m_subRunnerDiameter, "5.0", "mm");
     subDimsPanel->SetSizer(subDimsSizer);
-    sizer->Add(subDimsPanel, 0, wxEXPAND | wxBOTTOM, 10);
+    settingsSizer->Add(subDimsPanel, 0, wxEXPAND | wxBOTTOM, 10);
 
-    panel->SetSizer(sizer);
+    settingsPanel->SetSizer(settingsSizer);
+    settingsPanel->Show(false);
+    sizer->Add(settingsPanel, 0, wxEXPAND);
 
-    // Show/hide gate dims based on type selection
-    m_gateTypeChoice->Bind(wxEVT_CHOICE, [dimsPanel, this](wxCommandEvent&)
-        {
-            dimsPanel->Show(m_gateTypeChoice->GetStringSelection() == "Tapered Cylinder");
-            dimsPanel->GetParent()->Layout();
-            dimsPanel->GetParent()->GetParent()->Layout();
+    m_gateTypeChoice->Bind(wxEVT_CHOICE, [dimsPanel, this](wxCommandEvent&) {
+        dimsPanel->Show(m_gateTypeChoice->GetStringSelection() == "Tapered Cylinder");
+        dimsPanel->GetParent()->Layout(); dimsPanel->GetParent()->GetParent()->Layout();
+        dimsPanel->GetParent()->GetParent()->GetParent()->Layout();
         });
 
+    settingsBtn->Bind(wxEVT_TOGGLEBUTTON, [settingsBtn, settingsPanel, panel](wxCommandEvent&) {
+        static wxLongLong lastToggleMs = 0;
+        wxLongLong now = wxGetLocalTimeMillis();
+        if ((now - lastToggleMs).GetValue() < 200) { settingsBtn->SetValue(!settingsBtn->GetValue()); return; }
+        lastToggleMs = now;
+        const bool expanded = settingsBtn->GetValue();
+        settingsBtn->SetBitmap(LoadSvgBundle(
+            expanded ? kChevronDownSvg : kChevronRightSvg,
+            wxSize(12, 12), true));
+        settingsBtn->SetBitmapPosition(wxRIGHT);
+        settingsPanel->Show(expanded);
+        panel->Layout(); panel->GetParent()->Layout(); panel->GetParent()->GetParent()->Layout();
+        });
+
+    panel->SetSizer(sizer);
     return panel;
 }
 
 wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
 {
-    auto* panel = new wxPanel(parent, wxID_ANY,
-        wxDefaultPosition, wxSize(180, -1));
-    panel->SetBackgroundColour(kRibbonBg);
+    // Outer container: content column + right border
+    auto* outer = new wxPanel(parent, wxID_ANY,
+        wxDefaultPosition, wxSize(300, -1));
+    outer->SetBackgroundColour(kRibbonBg);
+    auto* outerSizer = new wxBoxSizer(wxHORIZONTAL);
+
+    // Content column: fixed Model Tools on top, scrollable mould settings below
+    auto* column = new wxPanel(outer, wxID_ANY);
+    column->SetBackgroundColour(kRibbonBg);
+    auto* colSizer = new wxBoxSizer(wxVERTICAL);
+
+    // ---- Model Tools section (fixed, non-scrolling) -------------------------
+    {
+
+        auto* toolsPanel = new wxPanel(column, wxID_ANY);
+        toolsPanel->SetBackgroundColour(kRibbonBg);
+        auto* toolsSizer = new wxBoxSizer(wxVERTICAL);
+
+        // Header matching the MOULD TOOL SETTINGS style
+        auto* toolsLabel = new wxStaticText(toolsPanel, wxID_ANY, "MODEL TOOLS");
+        toolsLabel->SetForegroundColour(Style::TextPrimary);
+        toolsLabel->SetFont(wxFont(7, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_BOLD, false, "Segoe UI"));
+        toolsSizer->Add(toolsLabel, 0, wxLEFT | wxTOP, 12);
+
+        //auto* toolsLine = new wxPanel(toolsPanel, wxID_ANY,
+        //    wxDefaultPosition, wxSize(-1, 1));
+        //toolsLine->SetBackgroundColour(Style::TextPrimary);
+        //toolsSizer->Add(toolsLine, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
+
+        toolsSizer->AddSpacer(8);
+
+        auto* grid = new wxGridSizer(2, 2, 4, 4);
+
+        // ---- SVG icon paths for model tool buttons --------------------------------
+        // Fill in the path to each SVG file (relative to the executable, or absolute).
+        // Leave a string empty ("") to show the text label only.
+        static const wxString kIconMove = "res/icons/arrows-move.svg";
+        static const wxString kIconRotate = "rotate-2.svg";
+        static const wxString kIconScale = "resize.svg";
+        static const wxString kIconCenter = "focus-centered.svg";
+
+        // Helper: load an SVG, recolor all strokes and fills to white, and return a
+        // wxBitmapBundle.  Relative paths are anchored to the executable directory.
+        // Returns an invalid bundle (IsOk() == false) if the path is empty or missing.
+        auto LoadToolIcon = [](const wxString& svgPath) -> wxBitmapBundle
+            {
+                if (svgPath.IsEmpty())
+                    return wxBitmapBundle();
+
+                wxFileName fn(svgPath);
+                if (fn.IsRelative())
+                {
+                    wxFileName exeDir(wxStandardPaths::Get().GetExecutablePath());
+                    fn.MakeAbsolute(exeDir.GetPath());
+                }
+
+                // Read raw SVG text so we can override its colors before rendering.
+                wxFile file(fn.GetFullPath());
+                if (!file.IsOpened())
+                    return wxBitmapBundle();
+                wxString svg;
+                file.ReadAll(&svg);
+
+                // Replace the most common color tokens used by icon sets (e.g. Lucide)
+                // with plain white so the icon matches the button text color.
+                svg.Replace("currentColor", "white");
+                svg.Replace("\"black\"", "\"white\"");
+                svg.Replace("\"#000000\"", "\"white\"");
+                svg.Replace("\"#000\"", "\"white\"");
+
+                const wxScopedCharBuffer utf8 = svg.utf8_str();
+                return wxBitmapBundle::FromSVG(utf8.data(), wxSize(18, 18));
+            };
+
+        static const wxFont kToolBtnFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_BOLD, false, "Segoe UI");
+
+        auto makeToolBtn = [&](int id, const wxString& label, bool toggle,
+            const wxString& svgPath = "") -> wxWindow*
+            {
+                // Use a plain wxPanel so we can freely position the icon+text
+                // with a sizer, giving true centred layout that native buttons
+                // won't provide once a bitmap is attached.
+                auto* panel = new wxPanel(toolsPanel, wxID_ANY,
+                    wxDefaultPosition, wxSize(-1, 34), wxBORDER_NONE);
+                panel->SetBackgroundColour(Style::BtnSecondary);
+
+                // Inner horizontal sizer: [icon] [gap] [label]
+                auto* hSizer = new wxBoxSizer(wxHORIZONTAL);
+
+                wxStaticBitmap* bmpCtrl = nullptr;
+                wxBitmapBundle icon = LoadToolIcon(svgPath);
+                if (icon.IsOk())
+                {
+                    bmpCtrl = new wxStaticBitmap(panel, wxID_ANY,
+                        icon.GetBitmapFor(panel));
+                    hSizer->Add(bmpCtrl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 5);
+                }
+
+                auto* txt = new wxStaticText(panel, wxID_ANY, label);
+                txt->SetForegroundColour(Style::TextPrimary);
+                txt->SetBackgroundColour(Style::BtnSecondary);
+                txt->SetFont(kToolBtnFont);
+                hSizer->Add(txt, 0, wxALIGN_CENTER_VERTICAL);
+
+                // Wrap in a centering sizer using stretch spacers
+                auto* outer = new wxBoxSizer(wxHORIZONTAL);
+                outer->AddStretchSpacer(1);
+                outer->Add(hSizer, 0, wxALIGN_CENTER_VERTICAL);
+                outer->AddStretchSpacer(1);
+                panel->SetSizer(outer);
+
+                // Shared toggle state (avoids raw-pointer lifetime issues)
+                auto toggled = std::make_shared<bool>(false);
+
+                // Helpers to apply normal / hover / active colours
+                auto applyColours = [=](const wxColour& bg, const wxColour& fg) {
+                    panel->SetBackgroundColour(bg);
+                    txt->SetBackgroundColour(bg);
+                    txt->SetForegroundColour(fg);
+                    panel->Refresh();
+                    txt->Refresh();
+                    };
+
+                // Left-click: fire the appropriate command event and update visuals
+                auto onClick = [=](wxMouseEvent& e) {
+                    if (toggle)
+                    {
+                        *toggled = !*toggled;
+                        applyColours(*toggled ? Style::BtnSecondarySelected : Style::BtnSecondary,
+                            *toggled ? kTextActive : Style::TextPrimary);
+                        wxCommandEvent evt(wxEVT_TOGGLEBUTTON, id);
+                        evt.SetEventObject(panel);
+                        evt.SetInt(*toggled ? 1 : 0);
+                        panel->GetEventHandler()->ProcessEvent(evt);
+                    }
+                    else
+                    {
+                        wxCommandEvent evt(wxEVT_BUTTON, id);
+                        evt.SetEventObject(panel);
+                        panel->GetEventHandler()->ProcessEvent(evt);
+                    }
+                    e.Skip();
+                    };
+
+                // Hover colours (only when not toggled-on)
+                auto onEnter = [=](wxMouseEvent& e) {
+                    if (!*toggled)
+                        applyColours(Style::BtnSecondaryHover, Style::TextPrimary);
+                    e.Skip();
+                    };
+                auto onLeave = [=](wxMouseEvent& e) {
+                    if (!*toggled)
+                        applyColours(Style::BtnSecondary, Style::TextPrimary);
+                    e.Skip();
+                    };
+
+                // Bind events to the panel and every child so the full hit-area works
+                for (wxWindow* w : { (wxWindow*)panel, (wxWindow*)txt,
+                                     (wxWindow*)bmpCtrl })
+                {
+                    if (!w) continue;
+                    w->Bind(wxEVT_LEFT_UP, onClick);
+                    w->Bind(wxEVT_ENTER_WINDOW, onEnter);
+                    w->Bind(wxEVT_LEAVE_WINDOW, onLeave);
+                }
+
+                return panel;
+            };
+
+        grid->Add(makeToolBtn(ID_ToolTranslate, "Move", true, kIconMove), 0, wxEXPAND);
+        grid->Add(makeToolBtn(ID_ToolRotate, "Rotate", true, kIconRotate), 0, wxEXPAND);
+        grid->Add(makeToolBtn(ID_ToolScale, "Scale", true, kIconScale), 0, wxEXPAND);
+        grid->Add(makeToolBtn(ID_ToolCenter, "Center", false, kIconCenter), 0, wxEXPAND);
+
+        toolsSizer->Add(grid, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
+        toolsSizer->AddSpacer(10);
+
+        toolsPanel->SetSizer(toolsSizer);
+        colSizer->Add(toolsPanel, 0, wxEXPAND);
+    }
+
+    //Create dividing line
+    auto* titleLine = new wxPanel(column, wxID_ANY,
+        wxDefaultPosition, wxSize(-1, 1));
+    titleLine->SetBackgroundColour(Style::TextPrimary);
+    colSizer->Add(titleLine, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
+
+
+    // ---- Mould settings title (fixed, non-scrolling) ------------------------
+    auto* title = new wxStaticText(column, wxID_ANY, "MOULD TOOL SETTINGS");
+    title->SetForegroundColour(Style::TextPrimary);
+    title->SetFont(wxFont(7, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_BOLD, false, "Segoe UI"));
+    colSizer->Add(title, 0, wxLEFT | wxTOP, 12);
+    colSizer->AddSpacer(8);
+
+
+    // ---- Scrollable mould tool settings -------------------------------------
+    auto* scrollWin = new wxScrolledWindow(column, wxID_ANY,
+        wxDefaultPosition, wxDefaultSize,
+        wxVSCROLL | wxBORDER_NONE);
+    scrollWin->SetScrollRate(0, 8);
+    scrollWin->SetBackgroundColour(kRibbonBg);
 
     auto* sizer = new wxBoxSizer(wxVERTICAL);
 
-    // ---- Panel title -------------------------------------------------------
-    auto* title = new wxStaticText(panel, wxID_ANY, "MOULD TOOL SETTINGS");
-    title->SetForegroundColour(wxColour(0x44, 0x55, 0x66));
-    title->SetFont(wxFont(7, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
-        wxFONTWEIGHT_BOLD, false, "Segoe UI"));
-    sizer->Add(title, 0, wxLEFT | wxTOP, 12);
-
-    auto* titleLine = new wxPanel(panel, wxID_ANY,
-        wxDefaultPosition, wxSize(-1, 1));
-    titleLine->SetBackgroundColour(wxColour(0x2A, 0x38, 0x4A));
-    sizer->Add(titleLine, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
-
     sizer->AddSpacer(4);
 
-    // ---- Collapsible sections ----------------------------------------------
-    // Sprues — custom content
-    wxPanel* spruesContent = CreateSpruesContent(panel);
-    CreateCollapsibleSection(panel, sizer, "Sprues", &spruesContent);
-    // Runners — custom content
-    wxPanel* runnersContent = CreateRunnersContent(panel);
-    CreateCollapsibleSection(panel, sizer, "Runners", &runnersContent);
-    // Gates — custom content
-    wxPanel* gatesContent = CreateGatesContent(panel);
-    CreateCollapsibleSection(panel, sizer, "Gates", &gatesContent);
-    // Vents — custom content
-    wxPanel* ventsContent = CreateVentsContent(panel);
-    CreateCollapsibleSection(panel, sizer, "Vents", &ventsContent);
+    // ---- Feature sections (headers built into each content panel) -----------
+    wxPanel* spruesContent = CreateSpruesContent(scrollWin);
+    sizer->Add(spruesContent, 0, wxEXPAND | wxTOP, 8);
 
-    sizer->AddStretchSpacer();
+    wxPanel* runnersContent = CreateRunnersContent(scrollWin);
+    sizer->Add(runnersContent, 0, wxEXPAND | wxTOP, 8);
+
+    wxPanel* gatesContent = CreateGatesContent(scrollWin);
+    sizer->Add(gatesContent, 0, wxEXPAND | wxTOP, 8);
+
+    wxPanel* ventsContent = CreateVentsContent(scrollWin);
+    sizer->Add(ventsContent, 0, wxEXPAND | wxTOP, 8);
+
+    sizer->AddSpacer(12);
+
+    scrollWin->SetSizer(sizer);
+    colSizer->Add(scrollWin, 1, wxEXPAND);   // scroll area fills remaining space
+
+    column->SetSizer(colSizer);
+    outerSizer->Add(column, 1, wxEXPAND);
 
     // Right border line
-    auto* borderLine = new wxPanel(panel, wxID_ANY,
+    auto* borderLine = new wxPanel(outer, wxID_ANY,
         wxDefaultPosition, wxSize(1, -1));
-    borderLine->SetBackgroundColour(wxColour(0x2A, 0x38, 0x4A));
-    sizer->Add(borderLine, 0, wxEXPAND | wxRIGHT, 0);
+    borderLine->SetBackgroundColour(Style::Divider);
+    outerSizer->Add(borderLine, 0, wxEXPAND);
 
-    panel->SetSizer(sizer);
-    return panel;
+    outer->SetSizer(outerSizer);
+    return outer;
 }
