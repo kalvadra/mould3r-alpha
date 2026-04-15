@@ -1492,9 +1492,9 @@ wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
         // Fill in the path to each SVG file (relative to the executable, or absolute).
         // Leave a string empty ("") to show the text label only.
         static const wxString kIconMove = "res/icons/arrows-move.svg";
-        static const wxString kIconRotate = "rotate-2.svg";
-        static const wxString kIconScale = "resize.svg";
-        static const wxString kIconCenter = "focus-centered.svg";
+        static const wxString kIconRotate = "res/icons/rotate-2.svg";
+        static const wxString kIconScale = "res/icons/resize.svg";
+        static const wxString kIconCenter = "res/icons/focus-centered.svg";
 
         // Helper: load an SVG, recolor all strokes and fills to white, and return a
         // wxBitmapBundle.  Relative paths are anchored to the executable directory.
