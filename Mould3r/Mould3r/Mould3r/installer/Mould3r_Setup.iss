@@ -47,7 +47,7 @@
 
 ; ---- App metadata -----------------------------------------------------------
 #define MyAppName      "Mould3r"
-#define MyAppVersion   "0.1.3"
+#define MyAppVersion   "0.1.4"
 #define MyAppPublisher "Clayton Stewart"
 #define MyAppURL       "https://mould3r.com"
 #define MyAppExeName   "Mould3r.exe"
