@@ -108,6 +108,7 @@ public:
 
     // Sprue placement
     void SetActiveInjectionPoint(const InjectionPoint& ip);
+    void SetInjectionPoints(const std::vector<InjectionPoint>& pts);
     void PlaceSprue();
     void ClearSprue();
     bool IsDirectInjection() const { return m_sprue.isDirectInjection; }
@@ -255,6 +256,7 @@ private:
     // Sprue state (consolidated)
     InjectionPoint m_activeInjectionPoint;         // set from fixture on load
     bool           m_hasActiveInjectionPoint = false;
+    std::vector<InjectionPoint> m_injectionPoints; // all points from fixture
     SprueFeature   m_sprue;
 
     // Ghost preview for vent placement (follows mouse in PlaceVent mode)

@@ -62,6 +62,7 @@ struct ProjectParameters
     float sprueDiameter = 5.0f;
     float sprueDraftAngle = 1.0f;
     float sprueColdSlugDepth = 5.0f;
+    float sprueLength = 20.0f;
 
     float runnerDiameter = 5.0f;
     float runnerColdPlugDist = 5.0f;

@@ -13,7 +13,7 @@
 
 class GLCanvas;
 
-enum class TransformMode { Select, Translate, Rotate, Scale, PlaceVent, PlaceRunner, PlaceGate, RemoveVent, RemoveRunner, RemoveGate, RemoveSprue, EditVent, EditRunner, EditGate };
+enum class TransformMode { Select, Translate, Rotate, Scale, PlaceVent, PlaceRunner, PlaceGate, RemoveVent, RemoveRunner, RemoveGate, RemoveSprue, EditVent, EditRunner, EditGate, SelectInjectionPoint };
 
 class MainFrame : public wxFrame
 {
@@ -31,6 +31,7 @@ public:
     float GetSprueDiameter() const;
     float GetSprueDraftAngle() const;
     float GetSprueColdSlugDepth() const;
+    float GetSprueLength() const;
     float GetRunnerColdPlugDist() const;
 
     float GetRunnerDiameter() const;
@@ -80,6 +81,7 @@ private:
     void OnEditVent(wxCommandEvent&);
     void OnEditRunner(wxCommandEvent&);
     void OnEditGate(wxCommandEvent&);
+    void OnEditSprue(wxCommandEvent&);
 
     // Activates a tool button and deactivates the others (also called by GLCanvas on Escape)
 
@@ -108,6 +110,7 @@ private:
     wxTextCtrl* m_sprueDiameter = nullptr;
     wxTextCtrl* m_sprueDraftAngle = nullptr;
     wxTextCtrl* m_sprueColdSlugDepth = nullptr;
+    wxTextCtrl* m_sprueLength = nullptr;
 
     // Runner field members
     wxChoice* m_runnerTypeChoice = nullptr;
@@ -188,6 +191,7 @@ private:
         ID_EditVent,
         ID_EditRunner,
         ID_EditGate,
+        ID_EditSprue,
         ID_SaveProject,
         ID_LoadProject,
         ID_NewProject

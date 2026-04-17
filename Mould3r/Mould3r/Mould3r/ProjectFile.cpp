@@ -97,6 +97,7 @@ bool ProjectFile::Save(const std::string& path,
     file << "sprueDiameter    = " << data.params.sprueDiameter << "\n";
     file << "sprueDraftAngle  = " << data.params.sprueDraftAngle << "\n";
     file << "sprueColdSlugDepth = " << data.params.sprueColdSlugDepth << "\n";
+    file << "sprueLength      = " << data.params.sprueLength << "\n";
     file << "runnerDiameter   = " << data.params.runnerDiameter << "\n";
     file << "runnerColdPlugDist = " << data.params.runnerColdPlugDist << "\n";
     file << "gateDiameter     = " << data.params.gateDiameter << "\n";
@@ -274,6 +275,7 @@ bool ProjectFile::Load(const std::string& path,
             else if (key == "sprueDiameter")     p.sprueDiameter = ParseFloat(val, p.sprueDiameter);
             else if (key == "sprueDraftAngle")   p.sprueDraftAngle = ParseFloat(val, p.sprueDraftAngle);
             else if (key == "sprueColdSlugDepth") p.sprueColdSlugDepth = ParseFloat(val, p.sprueColdSlugDepth);
+            else if (key == "sprueLength")       p.sprueLength = ParseFloat(val, p.sprueLength);
             else if (key == "runnerDiameter")    p.runnerDiameter = ParseFloat(val, p.runnerDiameter);
             else if (key == "runnerColdPlugDist") p.runnerColdPlugDist = ParseFloat(val, p.runnerColdPlugDist);
             else if (key == "gateDiameter")      p.gateDiameter = ParseFloat(val, p.gateDiameter);

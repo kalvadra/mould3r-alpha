@@ -178,7 +178,10 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
 
     // Set the active injection point (first in the list for now)
     if (!fixture.injectionPoints.empty())
+    {
         m_canvas->SetActiveInjectionPoint(fixture.injectionPoints[0]);
+        m_canvas->SetInjectionPoints(fixture.injectionPoints);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -245,6 +248,7 @@ wxPanel* MainFrame::CreateRibbon(wxWindow* parent)
     Bind(wxEVT_BUTTON, &MainFrame::OnClearVentPoints, this, ID_ClearVentPoints);
     Bind(wxEVT_BUTTON, &MainFrame::OnPlaceSprue, this, ID_PlaceSprue);
     Bind(wxEVT_BUTTON, &MainFrame::OnClearSprue, this, ID_ClearSprue);
+    Bind(wxEVT_BUTTON, &MainFrame::OnEditSprue, this, ID_EditSprue);
     Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnPlaceRunner, this, ID_PlaceRunner);
     Bind(wxEVT_BUTTON, &MainFrame::OnClearRunners, this, ID_ClearRunners);
     Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnPlaceGate, this, ID_PlaceGate);
@@ -386,6 +390,7 @@ void MainFrame::SetActiveTool(TransformMode mode)
     case TransformMode::EditVent:
     case TransformMode::EditRunner:
     case TransformMode::EditGate:
+    case TransformMode::SelectInjectionPoint:
     case TransformMode::Select:
         break;
     }
@@ -587,6 +592,16 @@ void MainFrame::OnEditGate(wxCommandEvent&)
         SetActiveTool(TransformMode::EditGate);
 }
 
+void MainFrame::OnEditSprue(wxCommandEvent&)
+{
+    if (m_fixtureDef.injectionPoints.size() <= 1) return;  // nothing to choose
+
+    if (m_canvas && m_canvas->GetTransformMode() == TransformMode::SelectInjectionPoint)
+        SetActiveTool(TransformMode::Select);
+    else
+        SetActiveTool(TransformMode::SelectInjectionPoint);
+}
+
 void MainFrame::GetVentDimensions(float& outLength, float& outWidth,
     float& outOverrunStart, float& outOverrunEnd) const
 {
@@ -629,6 +644,15 @@ float MainFrame::GetSprueColdSlugDepth() const
     double v = 5.0;
     if (!m_sprueColdSlugDepth->GetValue().ToDouble(&v)) return 5.0f;
     if (v < 0.0) v = 0.0;
+    return static_cast<float>(v);
+}
+
+float MainFrame::GetSprueLength() const
+{
+    if (!m_sprueLength) return 20.0f;
+    double v = 20.0;
+    if (!m_sprueLength->GetValue().ToDouble(&v)) return 20.0f;
+    if (v <= 0.0) v = 20.0;
     return static_cast<float>(v);
 }
 
@@ -719,6 +743,12 @@ void MainFrame::OnChangeFixture(wxCommandEvent&)
         m_canvas->ImportStepFileAsFixture(fixture.modelAPath);
     if (!fixture.modelBPath.empty())
         m_canvas->ImportStepFileAsFixture(fixture.modelBPath);
+
+    if (!fixture.injectionPoints.empty())
+    {
+        m_canvas->SetActiveInjectionPoint(fixture.injectionPoints[0]);
+        m_canvas->SetInjectionPoints(fixture.injectionPoints);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -761,7 +791,10 @@ void MainFrame::OnNewProject(wxCommandEvent&)
         m_canvas->ImportStepFileAsFixture(fixture.modelBPath);
 
     if (!fixture.injectionPoints.empty())
+    {
         m_canvas->SetActiveInjectionPoint(fixture.injectionPoints[0]);
+        m_canvas->SetInjectionPoints(fixture.injectionPoints);
+    }
 
     // Reset project state
     m_projectPath.clear();
@@ -821,6 +854,7 @@ void MainFrame::OnSaveProject(wxCommandEvent&)
         p.sprueDiameter = GetSprueDiameter();
         p.sprueDraftAngle = GetSprueDraftAngle();
         p.sprueColdSlugDepth = GetSprueColdSlugDepth();
+        p.sprueLength = GetSprueLength();
         p.runnerDiameter = GetRunnerDiameter();
         p.runnerColdPlugDist = GetRunnerColdPlugDist();
         p.gateDiameter = GetGateDiameter();
@@ -918,6 +952,8 @@ void MainFrame::OnLoadProject(wxCommandEvent&)
                 m_canvas->SetActiveInjectionPoint(data.sprue.injectionPoint);
             else if (!fixDef.injectionPoints.empty())
                 m_canvas->SetActiveInjectionPoint(fixDef.injectionPoints[0]);
+
+            m_canvas->SetInjectionPoints(fixDef.injectionPoints);
         }
         else
         {
@@ -984,6 +1020,7 @@ void MainFrame::SetParameterFields(const ProjectParameters& p)
     setField(m_sprueDiameter, p.sprueDiameter);
     setField(m_sprueDraftAngle, p.sprueDraftAngle);
     setField(m_sprueColdSlugDepth, p.sprueColdSlugDepth);
+    setField(m_sprueLength, p.sprueLength);
     setField(m_runnerDiameter, p.runnerDiameter);
     setField(m_runnerColdSlugDepth, p.runnerColdPlugDist);
     setField(m_gateDiameter, p.gateDiameter);
@@ -1264,6 +1301,7 @@ wxPanel* MainFrame::CreateSpruesContent(wxWindow* parent)
         return btn;
         };
     auto* btnEdit = makeSmallBtn("Edit");
+    btnEdit->SetId(ID_EditSprue);
     auto* btnRemove = makeSmallBtn("Remove");
     btnRemove->SetId(ID_RemoveSprue);
     auto* btnClearAll = makeSmallBtn("Clear all");
@@ -1333,6 +1371,7 @@ wxPanel* MainFrame::CreateSpruesContent(wxWindow* parent)
     addRow("Diameter:", m_sprueDiameter, "5.0", "mm");
     addRow("Draft angle:", m_sprueDraftAngle, "1.0", wxString::FromUTF8("\xC2\xB0"));
     addRow("Cold slug:", m_sprueColdSlugDepth, "5.0", "mm");
+    addRow("Sprue length:", m_sprueLength, "20.0", "mm");
 
     dimsPanel->SetSizer(dimsSizer);
     settingsSizer->Add(dimsPanel, 0, wxEXPAND | wxBOTTOM, 10);
