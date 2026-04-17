@@ -3973,3 +3973,157 @@ void GLCanvas::ClearFixtures()
     for (auto& v : m_vents) v.Destroy(); m_vents.clear(); RebuildPathVBO(); RebuildCrossSectionVBO();
     Refresh(false);
 }
+
+// ---------------------------------------------------------------------------
+// Project restore helpers
+// ---------------------------------------------------------------------------
+
+void GLCanvas::ClearAll()
+{
+    SetCurrent(*m_context);
+
+    // Fixtures
+    for (auto& fix : m_fixtures) fix.mesh.Destroy();
+    m_fixtures.clear();
+    m_fixturePerimeter.clear();
+
+    // Objects
+    for (auto& obj : m_objects) obj.mesh.Destroy();
+    m_objects.clear();
+    m_selectedIndex = -1;
+
+    // Vents
+    for (auto& v : m_vents) v.Destroy();
+    m_vents.clear();
+
+    // Runners
+    for (auto& rf : m_runners) rf.Destroy();
+    m_runners.clear();
+
+    // Gates
+    for (auto& gf : m_gates) gf.Destroy();
+    m_gates.clear();
+
+    // Sprue
+    m_sprue.Clear();
+    m_sprue.DestroyGL();
+    m_hasActiveInjectionPoint = false;
+
+    // Ghost state
+    m_ventGhostActive = false;
+    m_runnerGhostActive = false;
+    m_gateGhostActive = false;
+    m_editFeatureIndex = -1;
+
+    // Rebuild all path/cross-section VBOs so stale highlights are cleared
+    RebuildPathVBO();
+    RebuildCrossSectionVBO();
+    RebuildSpruePathVBO();
+    RebuildSprueXsecVBO();
+    RebuildRunnerPathVBO();
+    RebuildGatePathVBO();
+
+    Refresh(false);
+}
+
+void GLCanvas::RestoreObject(const std::string& path, const glm::vec3& pos,
+    float yaw, float pitch, float roll, float scl)
+{
+    // Import the STEP file normally (this uploads GPU mesh)
+    ImportStepFile(path);
+
+    // Apply the saved transform to the last-added object
+    if (!m_objects.empty())
+    {
+        SceneObject& obj = m_objects.back();
+        obj.pos = pos;
+        obj.yawDeg = yaw;
+        obj.pitchDeg = pitch;
+        obj.rollDeg = roll;
+        obj.scale = scl;
+    }
+}
+
+void GLCanvas::RestoreSprue(const ProjectSprueData& data)
+{
+    SetCurrent(*m_context);
+
+    // Set the injection point so future PlaceSprue calls work
+    m_activeInjectionPoint = data.injectionPoint;
+    m_hasActiveInjectionPoint = true;
+
+    // Copy placement state
+    m_sprue.worldPos = data.worldPos;
+    m_sprue.hasPoint = true;
+    m_sprue.pathStart = data.pathStart;
+    m_sprue.pathEnd = data.pathEnd;
+    m_sprue.partingPos = data.partingPos;
+    m_sprue.hasPartingPoint = data.hasPartingPoint;
+    m_sprue.isDirectInjection = data.isDirectInjection;
+    m_sprue.radius = data.radius;
+    m_sprue.draftAngleDeg = data.draftAngleDeg;
+    m_sprue.coldSlugDepth = data.coldSlugDepth;
+
+    // Build the swept cylinder preview mesh
+    m_sprue.solid.Destroy();
+    m_sprue.solid = BuildCylinderMesh(m_sprue.pathStart, m_sprue.pathEnd,
+        m_sprue.radius, m_sprue.draftAngleDeg);
+
+    // Build cold slug well (same logic as PlaceSprue)
+    m_sprue.coldSlugSolid.Destroy();
+    if (!m_sprue.isDirectInjection && m_sprue.coldSlugDepth > 1e-6f)
+    {
+        const glm::vec3 sprueDir = glm::normalize(m_sprue.pathEnd - m_sprue.pathStart);
+        const float sprueLen = glm::length(m_sprue.pathEnd - m_sprue.pathStart);
+        const float draftRad = glm::radians(glm::clamp(m_sprue.draftAngleDeg, 0.0f, 45.0f));
+        const float endRadius = m_sprue.radius + sprueLen * std::tan(draftRad);
+
+        const glm::vec3 slugStart = m_sprue.pathEnd;
+        const glm::vec3 slugEnd = m_sprue.pathEnd + sprueDir * m_sprue.coldSlugDepth;
+        m_sprue.coldSlugSolid = BuildCylinderMesh(slugStart, slugEnd, endRadius, 0.0f);
+    }
+}
+
+void GLCanvas::RestoreRunner(const glm::vec3& point)
+{
+    m_runners.push_back(RunnerFeature{ point, {}, {} });
+}
+
+void GLCanvas::RestoreGate(const glm::vec3& pos, const glm::vec3& normal)
+{
+    GateFeature gf;
+    gf.point = VentPoint{ pos, normal };
+    m_gates.push_back(std::move(gf));
+}
+
+void GLCanvas::RestoreVent(const glm::vec3& pos, const glm::vec3& normal,
+    float ventWidth, float ventLength,
+    float overrunStart, float overrunEnd)
+{
+    SetCurrent(*m_context);
+
+    VentInstance vi;
+    vi.point = VentPoint{ pos, normal };
+    vi.path = ComputeVentPath(vi.point);
+    vi.path.overrunStart = overrunStart;
+    vi.path.overrunEnd = overrunEnd;
+    vi.crossSection = BuildVentCrossSection(vi.path, ventWidth, ventLength);
+    vi.solid = BuildBoxSweepMesh(vi.path, ventWidth, ventLength,
+        overrunStart, overrunEnd);
+    m_vents.push_back(std::move(vi));
+}
+
+void GLCanvas::RebuildAllFeatures()
+{
+    SetCurrent(*m_context);
+
+    RebuildSpruePathVBO();
+    RebuildSprueXsecVBO();
+    RebuildPathVBO();
+    RebuildCrossSectionVBO();
+    RebuildRunnerPathVBO();
+    RebuildRunnerSolids();
+    RebuildGatePathVBO();
+    RebuildGateSolids();
+    Refresh(false);
+}

@@ -9,6 +9,7 @@
 #include "FixtureFile.h"
 #include "AppConfig.h"
 #include "StartupDialog.h"
+#include "ProjectFile.h"
 
 class GLCanvas;
 
@@ -38,11 +39,21 @@ public:
     float GetGateDraftAngle() const;
     float GetSubRunnerDiameter() const;
 
+    // Project save/load support
+    const FixtureDefinition& GetFixtureDefinition() const { return m_fixtureDef; }
+    GLCanvas* GetCanvas() const { return m_canvas; }
+
+    // Set UI field values (used when restoring a project)
+    void SetParameterFields(const ProjectParameters& params);
+
 private:
     // Menu handlers
     void OnImport(wxCommandEvent& evt);
     void OnChangeFixture(wxCommandEvent&);
     void OnExit(wxCommandEvent& evt);
+    void OnSaveProject(wxCommandEvent&);
+    void OnLoadProject(wxCommandEvent&);
+    void OnNewProject(wxCommandEvent&);
 
     // Ribbon tool handlers
     void OnToolSelect(wxCommandEvent& evt);
@@ -117,6 +128,12 @@ private:
 
     GLCanvas* m_canvas = nullptr;
 
+    // Stored fixture definition (for project save/load)
+    FixtureDefinition m_fixtureDef;
+
+    // Current project file path (empty if unsaved)
+    std::string m_projectPath;
+
     // Transform tool buttons
     wxToggleButton* m_btnTranslate = nullptr;
     wxToggleButton* m_btnRotate = nullptr;
@@ -170,6 +187,9 @@ private:
         ID_RemoveGate,
         ID_EditVent,
         ID_EditRunner,
-        ID_EditGate
+        ID_EditGate,
+        ID_SaveProject,
+        ID_LoadProject,
+        ID_NewProject
     };
 };

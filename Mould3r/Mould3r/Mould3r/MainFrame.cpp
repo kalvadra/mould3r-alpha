@@ -99,8 +99,9 @@ static void StyleRibbonBtn(wxToggleButton* btn, bool active = false)
 // MainFrame
 // ---------------------------------------------------------------------------
 MainFrame::MainFrame(const FixtureDefinition& fixture)
-    : wxFrame(nullptr, wxID_ANY, "Mould3r",
+    : wxFrame(nullptr, wxID_ANY, "Mould3r - New Project",
         wxDefaultPosition, wxSize(1200, 800))
+    , m_fixtureDef(fixture)
 {
     // ---- Window icon from SVG -----------------------------------------------
     {
@@ -115,8 +116,12 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
 
     // ---- Menu bar ----------------------------------------------------------
     auto* fileMenu = new wxMenu();
+    fileMenu->Append(ID_NewProject, "New Project...\tCtrl+N");
+    fileMenu->Append(ID_LoadProject, "Open Project...\tCtrl+O");
+    fileMenu->Append(ID_SaveProject, "Save Project...\tCtrl+S");
+    fileMenu->AppendSeparator();
     fileMenu->Append(ID_Import, "Import...\tCtrl+I");
-    fileMenu->Append(ID_ChangeFixture, "Change Fixture...");  // add this
+    fileMenu->Append(ID_ChangeFixture, "Change Fixture...");
     fileMenu->AppendSeparator();
     fileMenu->Append(wxID_EXIT, "Exit\tAlt+F4");
 
@@ -127,6 +132,9 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
     Bind(wxEVT_MENU, &MainFrame::OnExit, this, wxID_EXIT);
     Bind(wxEVT_MENU, &MainFrame::OnImport, this, ID_Import);
     Bind(wxEVT_MENU, &MainFrame::OnChangeFixture, this, ID_ChangeFixture);
+    Bind(wxEVT_MENU, &MainFrame::OnSaveProject, this, ID_SaveProject);
+    Bind(wxEVT_MENU, &MainFrame::OnLoadProject, this, ID_LoadProject);
+    Bind(wxEVT_MENU, &MainFrame::OnNewProject, this, ID_NewProject);
 
     // ---- Layout: ribbon on top, canvas below --------------------------------
     auto* root = new wxPanel(this, wxID_ANY);
@@ -702,6 +710,7 @@ void MainFrame::OnChangeFixture(wxCommandEvent&)
 
     FixtureDefinition fixture = dlg.GetFixture();
     AppConfig::SaveLastFixture(fixture.fixturePath);
+    m_fixtureDef = fixture;   // keep for project save
 
     // Clear existing fixtures and reload
     m_canvas->ClearFixtures();
@@ -710,6 +719,276 @@ void MainFrame::OnChangeFixture(wxCommandEvent&)
         m_canvas->ImportStepFileAsFixture(fixture.modelAPath);
     if (!fixture.modelBPath.empty())
         m_canvas->ImportStepFileAsFixture(fixture.modelBPath);
+}
+
+// ---------------------------------------------------------------------------
+// New Project
+// ---------------------------------------------------------------------------
+void MainFrame::OnNewProject(wxCommandEvent&)
+{
+    const std::string lastFixture = AppConfig::LoadLastFixture();
+
+    FixtureDefinition fixture;
+    std::string error;
+
+    // If a valid default fixture exists, use it directly (same as startup)
+    if (!lastFixture.empty() && FixtureFile::Load(lastFixture, fixture, error))
+    {
+        // Use the default fixture without showing the dialog
+    }
+    else
+    {
+        // No valid default — show the selection dialog
+        StartupDialog dlg(this);
+        dlg.PreSelectFixture(lastFixture);
+
+        if (dlg.ShowModal() != wxID_OK)
+            return;
+
+        fixture = dlg.GetFixture();
+        AppConfig::SaveLastFixture(fixture.fixturePath);
+    }
+
+    // Clear the entire scene
+    m_canvas->ClearAll();
+
+    // Load the selected fixture
+    m_fixtureDef = fixture;
+
+    if (!fixture.modelAPath.empty())
+        m_canvas->ImportStepFileAsFixture(fixture.modelAPath);
+    if (!fixture.modelBPath.empty())
+        m_canvas->ImportStepFileAsFixture(fixture.modelBPath);
+
+    if (!fixture.injectionPoints.empty())
+        m_canvas->SetActiveInjectionPoint(fixture.injectionPoints[0]);
+
+    // Reset project state
+    m_projectPath.clear();
+    SetTitle("Mould3r - New Project");
+}
+
+// ---------------------------------------------------------------------------
+// Save Project
+// ---------------------------------------------------------------------------
+void MainFrame::OnSaveProject(wxCommandEvent&)
+{
+    wxFileDialog dlg(
+        this, "Save Project", "", "",
+        "Mould3r Project (*.m3d)|*.m3d|All files (*.*)|*.*",
+        wxFD_SAVE | wxFD_OVERWRITE_PROMPT
+    );
+
+    if (!m_projectPath.empty())
+    {
+        wxFileName fn(m_projectPath);
+        dlg.SetDirectory(fn.GetPath());
+        dlg.SetFilename(fn.GetFullName());
+    }
+
+    if (dlg.ShowModal() != wxID_OK)
+        return;
+
+    const std::string savePath = dlg.GetPath().ToStdString();
+
+    // Build ProjectData from current state
+    ProjectData data;
+    data.version = 1;
+    data.fixturePath = m_fixtureDef.fixturePath;
+
+    // Objects
+    for (const auto& obj : m_canvas->GetObjects())
+    {
+        ProjectObjectData od;
+        od.sourcePath = obj.sourcePath;
+        od.pos = obj.pos;
+        od.yawDeg = obj.yawDeg;
+        od.pitchDeg = obj.pitchDeg;
+        od.rollDeg = obj.rollDeg;
+        od.scale = obj.scale;
+        data.objects.push_back(od);
+    }
+
+    // Parameters (read from UI fields)
+    {
+        auto& p = data.params;
+        float ventLength, ventWidth, ventOverrunStart, ventOverrunEnd;
+        GetVentDimensions(ventLength, ventWidth, ventOverrunStart, ventOverrunEnd);
+        p.ventWidth = ventWidth;
+        p.ventLength = ventLength;
+        p.ventOverrunStart = ventOverrunStart;
+        p.ventOverrunEnd = ventOverrunEnd;
+        p.sprueDiameter = GetSprueDiameter();
+        p.sprueDraftAngle = GetSprueDraftAngle();
+        p.sprueColdSlugDepth = GetSprueColdSlugDepth();
+        p.runnerDiameter = GetRunnerDiameter();
+        p.runnerColdPlugDist = GetRunnerColdPlugDist();
+        p.gateDiameter = GetGateDiameter();
+        p.gateDraftAngle = GetGateDraftAngle();
+        p.subRunnerDiameter = GetSubRunnerDiameter();
+    }
+
+    // Sprue
+    {
+        const auto& sp = m_canvas->GetSprue();
+        auto& sd = data.sprue;
+        sd.placed = sp.hasPoint;
+        sd.worldPos = sp.worldPos;
+        sd.pathStart = sp.pathStart;
+        sd.pathEnd = sp.pathEnd;
+        sd.partingPos = sp.partingPos;
+        sd.hasPartingPoint = sp.hasPartingPoint;
+        sd.isDirectInjection = sp.isDirectInjection;
+        sd.radius = sp.radius;
+        sd.draftAngleDeg = sp.draftAngleDeg;
+        sd.coldSlugDepth = sp.coldSlugDepth;
+
+        if (m_canvas->HasActiveInjectionPoint())
+            sd.injectionPoint = m_canvas->GetActiveInjectionPoint();
+    }
+
+    // Runners
+    for (const auto& rf : m_canvas->GetRunners())
+        data.runners.push_back(ProjectRunnerData{ rf.point });
+
+    // Gates
+    for (const auto& gf : m_canvas->GetGates())
+        data.gates.push_back(ProjectGateData{ gf.point.worldPos, gf.point.worldNormal });
+
+    // Vents
+    for (const auto& vi : m_canvas->GetVents())
+        data.vents.push_back(ProjectVentData{ vi.point.worldPos, vi.point.worldNormal });
+
+    std::string error;
+    if (!ProjectFile::Save(savePath, data, error))
+    {
+        wxMessageBox(error, "Save Failed", wxOK | wxICON_ERROR, this);
+        return;
+    }
+
+    m_projectPath = savePath;
+    SetTitle("Mould3r - " + wxFileName(savePath).GetName());
+}
+
+// ---------------------------------------------------------------------------
+// Load Project
+// ---------------------------------------------------------------------------
+void MainFrame::OnLoadProject(wxCommandEvent&)
+{
+    wxFileDialog dlg(
+        this, "Open Project", "", "",
+        "Mould3r Project (*.m3d)|*.m3d|All files (*.*)|*.*",
+        wxFD_OPEN | wxFD_FILE_MUST_EXIST
+    );
+
+    if (dlg.ShowModal() != wxID_OK)
+        return;
+
+    const std::string loadPath = dlg.GetPath().ToStdString();
+
+    ProjectData data;
+    std::string error;
+    if (!ProjectFile::Load(loadPath, data, error))
+    {
+        wxMessageBox(error, "Load Failed", wxOK | wxICON_ERROR, this);
+        return;
+    }
+
+    // ---- Clear everything --------------------------------------------------
+    m_canvas->ClearAll();
+
+    // ---- Load fixture ------------------------------------------------------
+    if (!data.fixturePath.empty())
+    {
+        FixtureDefinition fixDef;
+        std::string fixError;
+        if (FixtureFile::Load(data.fixturePath, fixDef, fixError))
+        {
+            m_fixtureDef = fixDef;
+            AppConfig::SaveLastFixture(fixDef.fixturePath);
+
+            if (!fixDef.modelAPath.empty())
+                m_canvas->ImportStepFileAsFixture(fixDef.modelAPath);
+            if (!fixDef.modelBPath.empty())
+                m_canvas->ImportStepFileAsFixture(fixDef.modelBPath);
+
+            // Set injection point (use the one from the sprue data if available,
+            // otherwise fall back to the first in the fixture)
+            if (data.sprue.placed)
+                m_canvas->SetActiveInjectionPoint(data.sprue.injectionPoint);
+            else if (!fixDef.injectionPoints.empty())
+                m_canvas->SetActiveInjectionPoint(fixDef.injectionPoints[0]);
+        }
+        else
+        {
+            wxMessageBox("Could not load fixture:\n" + fixError,
+                "Warning", wxOK | wxICON_WARNING, this);
+        }
+    }
+
+    // ---- Restore UI parameters ---------------------------------------------
+    SetParameterFields(data.params);
+
+    // ---- Restore imported objects ------------------------------------------
+    for (const auto& obj : data.objects)
+    {
+        m_canvas->RestoreObject(obj.sourcePath, obj.pos,
+            obj.yawDeg, obj.pitchDeg,
+            obj.rollDeg, obj.scale);
+    }
+
+    // ---- Restore sprue -----------------------------------------------------
+    if (data.sprue.placed)
+        m_canvas->RestoreSprue(data.sprue);
+
+    // ---- Restore runners ---------------------------------------------------
+    for (const auto& rn : data.runners)
+        m_canvas->RestoreRunner(rn.point);
+
+    // ---- Restore gates -----------------------------------------------------
+    for (const auto& gt : data.gates)
+        m_canvas->RestoreGate(gt.pos, gt.normal);
+
+    // ---- Restore vents -----------------------------------------------------
+    for (const auto& vn : data.vents)
+    {
+        m_canvas->RestoreVent(vn.pos, vn.normal,
+            data.params.ventWidth,
+            data.params.ventLength,
+            data.params.ventOverrunStart,
+            data.params.ventOverrunEnd);
+    }
+
+    // ---- Rebuild all derived GPU geometry -----------------------------------
+    m_canvas->RebuildAllFeatures();
+
+    m_projectPath = loadPath;
+    SetTitle("Mould3r - " + wxFileName(loadPath).GetName());
+}
+
+// ---------------------------------------------------------------------------
+// SetParameterFields — populate the left-panel UI fields from saved data.
+// ---------------------------------------------------------------------------
+void MainFrame::SetParameterFields(const ProjectParameters& p)
+{
+    auto setField = [](wxTextCtrl* ctrl, float value)
+        {
+            if (ctrl)
+                ctrl->SetValue(wxString::Format("%.4g", value));
+        };
+
+    setField(m_ventWidth, p.ventWidth);
+    setField(m_ventLength, p.ventLength);
+    setField(m_ventOverrunStart, p.ventOverrunStart);
+    setField(m_ventOverrunEnd, p.ventOverrunEnd);
+    setField(m_sprueDiameter, p.sprueDiameter);
+    setField(m_sprueDraftAngle, p.sprueDraftAngle);
+    setField(m_sprueColdSlugDepth, p.sprueColdSlugDepth);
+    setField(m_runnerDiameter, p.runnerDiameter);
+    setField(m_runnerColdSlugDepth, p.runnerColdPlugDist);
+    setField(m_gateDiameter, p.gateDiameter);
+    setField(m_gateDraftAngle, p.gateDraftAngle);
+    setField(m_subRunnerDiameter, p.subRunnerDiameter);
 }
 
 void MainFrame::OnBrowseExport(wxCommandEvent&)

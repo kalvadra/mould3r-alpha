@@ -27,6 +27,7 @@
 #include "shaders.h"
 #include "MainFrame.h"
 #include "MouldFeature.h"
+#include "ProjectFile.h"
 
 struct GPUMesh
 {
@@ -128,6 +129,35 @@ public:
     void RemoveRunnerAtMouse(int mouseX, int mouseY);
     void RemoveGateAtMouse(int mouseX, int mouseY);
     void RemoveSprueAtMouse(int mouseX, int mouseY);
+
+    // ---- Project save/load support -----------------------------------------
+
+    // Read-only accessors for serialization
+    const std::vector<SceneObject>& GetObjects()  const { return m_objects; }
+    const std::vector<SceneObject>& GetFixtures() const { return m_fixtures; }
+    const SprueFeature& GetSprue()    const { return m_sprue; }
+    bool  HasActiveInjectionPoint()               const { return m_hasActiveInjectionPoint; }
+    const InjectionPoint& GetActiveInjectionPoint() const { return m_activeInjectionPoint; }
+
+    // Restore helpers — programmatic placement from saved data (no mouse/ray cast)
+    void RestoreObject(const std::string& path, const glm::vec3& pos,
+        float yaw, float pitch, float roll, float scale);
+
+    void RestoreSprue(const ProjectSprueData& data);
+
+    void RestoreRunner(const glm::vec3& point);
+
+    void RestoreGate(const glm::vec3& pos, const glm::vec3& normal);
+
+    void RestoreVent(const glm::vec3& pos, const glm::vec3& normal,
+        float ventWidth, float ventLength,
+        float overrunStart, float overrunEnd);
+
+    // Rebuild all derived geometry after a batch restore (call once at end)
+    void RebuildAllFeatures();
+
+    // Clear everything (fixtures, objects, features) for a fresh load
+    void ClearAll();
 
 private:
     void OnPaint(wxPaintEvent& evt);
