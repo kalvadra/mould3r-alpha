@@ -127,6 +127,13 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
 
     auto* menuBar = new wxMenuBar();
     menuBar->Append(fileMenu, "&File");
+
+    auto* unitsMenu = new wxMenu();
+    unitsMenu->AppendRadioItem(ID_UnitMetric, "Metric (mm)");
+    unitsMenu->AppendRadioItem(ID_UnitImperial, "Imperial (in)");
+    unitsMenu->Check(ID_UnitMetric, true);
+    menuBar->Append(unitsMenu, "&Units");
+
     SetMenuBar(menuBar);
 
     Bind(wxEVT_MENU, &MainFrame::OnExit, this, wxID_EXIT);
@@ -135,6 +142,8 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
     Bind(wxEVT_MENU, &MainFrame::OnSaveProject, this, ID_SaveProject);
     Bind(wxEVT_MENU, &MainFrame::OnLoadProject, this, ID_LoadProject);
     Bind(wxEVT_MENU, &MainFrame::OnNewProject, this, ID_NewProject);
+    Bind(wxEVT_MENU, &MainFrame::OnSetMetric, this, ID_UnitMetric);
+    Bind(wxEVT_MENU, &MainFrame::OnSetImperial, this, ID_UnitImperial);
 
     // ---- Layout: ribbon on top, canvas below --------------------------------
     auto* root = new wxPanel(this, wxID_ANY);
@@ -602,6 +611,61 @@ void MainFrame::OnEditSprue(wxCommandEvent&)
         SetActiveTool(TransformMode::SelectInjectionPoint);
 }
 
+// ---------------------------------------------------------------------------
+// Unit system toggle
+// ---------------------------------------------------------------------------
+void MainFrame::OnSetMetric(wxCommandEvent&)
+{
+    if (!m_imperial) return;   // already metric
+
+    // Convert all mm-based field values: displayed inches → mm
+    wxTextCtrl* mmFields[] = {
+        m_ventLength, m_ventWidth, m_ventOverrunStart, m_ventOverrunEnd,
+        m_sprueDiameter, m_sprueColdSlugDepth, m_sprueLength,
+        m_runnerDiameter, m_runnerColdSlugDepth,
+        m_gateDiameter, m_subRunnerDiameter
+    };
+    for (auto* ctrl : mmFields)
+    {
+        if (!ctrl) continue;
+        double v = 0.0;
+        if (ctrl->GetValue().ToDouble(&v))
+            ctrl->SetValue(wxString::Format("%.4g", v * 25.4));
+    }
+
+    // Update labels
+    for (auto* lbl : m_mmUnitLabels)
+        lbl->SetLabel("mm");
+
+    m_imperial = false;
+}
+
+void MainFrame::OnSetImperial(wxCommandEvent&)
+{
+    if (m_imperial) return;   // already imperial
+
+    // Convert all mm-based field values: displayed mm → inches
+    wxTextCtrl* mmFields[] = {
+        m_ventLength, m_ventWidth, m_ventOverrunStart, m_ventOverrunEnd,
+        m_sprueDiameter, m_sprueColdSlugDepth, m_sprueLength,
+        m_runnerDiameter, m_runnerColdSlugDepth,
+        m_gateDiameter, m_subRunnerDiameter
+    };
+    for (auto* ctrl : mmFields)
+    {
+        if (!ctrl) continue;
+        double v = 0.0;
+        if (ctrl->GetValue().ToDouble(&v))
+            ctrl->SetValue(wxString::Format("%.4g", v / 25.4));
+    }
+
+    // Update labels
+    for (auto* lbl : m_mmUnitLabels)
+        lbl->SetLabel("in");
+
+    m_imperial = true;
+}
+
 void MainFrame::GetVentDimensions(float& outLength, float& outWidth,
     float& outOverrunStart, float& outOverrunEnd) const
 {
@@ -614,10 +678,11 @@ void MainFrame::GetVentDimensions(float& outLength, float& outWidth,
             return (v > 0.0) ? static_cast<float>(v) : defaultVal;
         };
 
-    outLength = parseField(m_ventLength, 5.0f);
-    outWidth = parseField(m_ventWidth, 2.0f);
-    outOverrunStart = parseField(m_ventOverrunStart, 0.5f);
-    outOverrunEnd = parseField(m_ventOverrunEnd, 0.5f);
+    const float conv = m_imperial ? 25.4f : 1.0f;
+    outLength = parseField(m_ventLength, 5.0f) * conv;
+    outWidth = parseField(m_ventWidth, 2.0f) * conv;
+    outOverrunStart = parseField(m_ventOverrunStart, 0.5f) * conv;
+    outOverrunEnd = parseField(m_ventOverrunEnd, 0.5f) * conv;
 }
 
 float MainFrame::GetSprueDiameter() const
@@ -625,7 +690,8 @@ float MainFrame::GetSprueDiameter() const
     if (!m_sprueDiameter) return 5.0f;
     double v = 5.0;
     if (!m_sprueDiameter->GetValue().ToDouble(&v)) return 5.0f;
-    return (v > 0.0) ? static_cast<float>(v) : 5.0f;
+    if (v <= 0.0) v = 5.0;
+    return static_cast<float>(v) * (m_imperial ? 25.4f : 1.0f);
 }
 
 float MainFrame::GetSprueDraftAngle() const
@@ -635,7 +701,7 @@ float MainFrame::GetSprueDraftAngle() const
     if (!m_sprueDraftAngle->GetValue().ToDouble(&v)) return 1.0f;
     if (v < 0.0) v = 0.0;
     if (v > 45.0) v = 45.0;
-    return static_cast<float>(v);
+    return static_cast<float>(v);   // degrees — no unit conversion
 }
 
 float MainFrame::GetSprueColdSlugDepth() const
@@ -644,7 +710,7 @@ float MainFrame::GetSprueColdSlugDepth() const
     double v = 5.0;
     if (!m_sprueColdSlugDepth->GetValue().ToDouble(&v)) return 5.0f;
     if (v < 0.0) v = 0.0;
-    return static_cast<float>(v);
+    return static_cast<float>(v) * (m_imperial ? 25.4f : 1.0f);
 }
 
 float MainFrame::GetSprueLength() const
@@ -653,7 +719,7 @@ float MainFrame::GetSprueLength() const
     double v = 20.0;
     if (!m_sprueLength->GetValue().ToDouble(&v)) return 20.0f;
     if (v <= 0.0) v = 20.0;
-    return static_cast<float>(v);
+    return static_cast<float>(v) * (m_imperial ? 25.4f : 1.0f);
 }
 
 float MainFrame::GetRunnerDiameter() const
@@ -661,7 +727,8 @@ float MainFrame::GetRunnerDiameter() const
     if (!m_runnerDiameter) return 5.0f;
     double v = 5.0;
     if (!m_runnerDiameter->GetValue().ToDouble(&v)) return 5.0f;
-    return (v > 0.0) ? static_cast<float>(v) : 5.0f;
+    if (v <= 0.0) v = 5.0;
+    return static_cast<float>(v) * (m_imperial ? 25.4f : 1.0f);
 }
 
 float MainFrame::GetRunnerColdPlugDist() const
@@ -670,7 +737,7 @@ float MainFrame::GetRunnerColdPlugDist() const
     double v = 5.0;
     if (!m_runnerColdSlugDepth->GetValue().ToDouble(&v)) return 5.0f;
     if (v < 0.0) v = 0.0;
-    return static_cast<float>(v);
+    return static_cast<float>(v) * (m_imperial ? 25.4f : 1.0f);
 }
 
 float MainFrame::GetGateDiameter() const
@@ -679,7 +746,7 @@ float MainFrame::GetGateDiameter() const
     double v = 3.0;
     if (!m_gateDiameter->GetValue().ToDouble(&v)) return 3.0f;
     if (v < 0.0) v = 0.0;
-    return static_cast<float>(v);
+    return static_cast<float>(v) * (m_imperial ? 25.4f : 1.0f);
 }
 
 float MainFrame::GetGateDraftAngle() const
@@ -688,7 +755,7 @@ float MainFrame::GetGateDraftAngle() const
     double v = 1.0;
     if (!m_gateDraftAngle->GetValue().ToDouble(&v)) return 1.0f;
     if (v < 0.0) v = 0.0;
-    return static_cast<float>(v);
+    return static_cast<float>(v);   // degrees — no unit conversion
 }
 
 float MainFrame::GetSubRunnerDiameter() const
@@ -697,7 +764,7 @@ float MainFrame::GetSubRunnerDiameter() const
     double v = 5.0;
     if (!m_subRunnerDiameter->GetValue().ToDouble(&v)) return 5.0f;
     if (v <= 0.0) v = 5.0;
-    return static_cast<float>(v);
+    return static_cast<float>(v) * (m_imperial ? 25.4f : 1.0f);
 }
 
 // ---------------------------------------------------------------------------
@@ -1013,19 +1080,22 @@ void MainFrame::SetParameterFields(const ProjectParameters& p)
                 ctrl->SetValue(wxString::Format("%.4g", value));
         };
 
-    setField(m_ventWidth, p.ventWidth);
-    setField(m_ventLength, p.ventLength);
-    setField(m_ventOverrunStart, p.ventOverrunStart);
-    setField(m_ventOverrunEnd, p.ventOverrunEnd);
-    setField(m_sprueDiameter, p.sprueDiameter);
-    setField(m_sprueDraftAngle, p.sprueDraftAngle);
-    setField(m_sprueColdSlugDepth, p.sprueColdSlugDepth);
-    setField(m_sprueLength, p.sprueLength);
-    setField(m_runnerDiameter, p.runnerDiameter);
-    setField(m_runnerColdSlugDepth, p.runnerColdPlugDist);
-    setField(m_gateDiameter, p.gateDiameter);
-    setField(m_gateDraftAngle, p.gateDraftAngle);
-    setField(m_subRunnerDiameter, p.subRunnerDiameter);
+    // Project stores mm internally; convert for display if imperial
+    const float conv = m_imperial ? (1.0f / 25.4f) : 1.0f;
+
+    setField(m_ventWidth, p.ventWidth * conv);
+    setField(m_ventLength, p.ventLength * conv);
+    setField(m_ventOverrunStart, p.ventOverrunStart * conv);
+    setField(m_ventOverrunEnd, p.ventOverrunEnd * conv);
+    setField(m_sprueDiameter, p.sprueDiameter * conv);
+    setField(m_sprueDraftAngle, p.sprueDraftAngle);          // degrees — no conversion
+    setField(m_sprueColdSlugDepth, p.sprueColdSlugDepth * conv);
+    setField(m_sprueLength, p.sprueLength * conv);
+    setField(m_runnerDiameter, p.runnerDiameter * conv);
+    setField(m_runnerColdSlugDepth, p.runnerColdPlugDist * conv);
+    setField(m_gateDiameter, p.gateDiameter * conv);
+    setField(m_gateDraftAngle, p.gateDraftAngle);           // degrees — no conversion
+    setField(m_subRunnerDiameter, p.subRunnerDiameter * conv);
 }
 
 void MainFrame::OnBrowseExport(wxCommandEvent&)
@@ -1216,6 +1286,7 @@ wxPanel* MainFrame::CreateVentsContent(wxWindow* parent)
             ctrl->SetBackgroundColour(Style::BtnSmall);
             ctrl->SetForegroundColour(kTextDefault);
             auto* unit = new wxStaticText(m_ventDimsPanel, wxID_ANY, "mm");
+            m_mmUnitLabels.push_back(unit);
             unit->SetForegroundColour(Style::TextSubtle);
             unit->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
                 wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
@@ -1358,6 +1429,7 @@ wxPanel* MainFrame::CreateSpruesContent(wxWindow* parent)
         ctrl = new wxTextCtrl(dimsPanel, wxID_ANY, defVal, wxDefaultPosition, wxSize(kFieldWidth, 22));
         ctrl->SetBackgroundColour(Style::BtnSmall); ctrl->SetForegroundColour(kTextDefault);
         auto* u = new wxStaticText(dimsPanel, wxID_ANY, unitStr);
+        if (unitStr == "mm") m_mmUnitLabels.push_back(u);
         u->SetForegroundColour(Style::TextSubtle);
         u->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
         u->SetMinSize(wxSize(kUnitWidth, -1));
@@ -1517,6 +1589,7 @@ wxPanel* MainFrame::CreateRunnersContent(wxWindow* parent)
         m_runnerDiameter->SetForegroundColour(kTextDefault);
 
         auto* unit = new wxStaticText(dimsPanel, wxID_ANY, "mm");
+        m_mmUnitLabels.push_back(unit);
         unit->SetForegroundColour(Style::TextSubtle);
         unit->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
             wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
@@ -1544,6 +1617,7 @@ wxPanel* MainFrame::CreateRunnersContent(wxWindow* parent)
         m_runnerColdSlugDepth->SetForegroundColour(kTextDefault);
 
         auto* unit = new wxStaticText(dimsPanel, wxID_ANY, "mm");
+        m_mmUnitLabels.push_back(unit);
         unit->SetForegroundColour(Style::TextSubtle);
         unit->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
             wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
@@ -1674,6 +1748,7 @@ wxPanel* MainFrame::CreateGatesContent(wxWindow* parent)
             ctrl = new wxTextCtrl(parent_, wxID_ANY, defVal, wxDefaultPosition, wxSize(kFieldWidth, 22));
             ctrl->SetBackgroundColour(Style::BtnSmall); ctrl->SetForegroundColour(kTextDefault);
             auto* u = new wxStaticText(parent_, wxID_ANY, unitStr);
+            if (unitStr == "mm") m_mmUnitLabels.push_back(u);
             u->SetForegroundColour(Style::TextSubtle);
             u->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
             u->SetMinSize(wxSize(kUnitWidth, -1));

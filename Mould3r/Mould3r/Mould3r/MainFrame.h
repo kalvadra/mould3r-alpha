@@ -34,6 +34,9 @@ public:
     float GetSprueLength() const;
     float GetRunnerColdPlugDist() const;
 
+    // Unit system
+    bool IsImperial() const { return m_imperial; }
+
     float GetRunnerDiameter() const;
 
     float GetGateDiameter() const;
@@ -82,6 +85,9 @@ private:
     void OnEditRunner(wxCommandEvent&);
     void OnEditGate(wxCommandEvent&);
     void OnEditSprue(wxCommandEvent&);
+
+    void OnSetMetric(wxCommandEvent&);
+    void OnSetImperial(wxCommandEvent&);
 
     // Activates a tool button and deactivates the others (also called by GLCanvas on Escape)
 
@@ -136,6 +142,10 @@ private:
 
     // Current project file path (empty if unsaved)
     std::string m_projectPath;
+
+    // Unit system (false = metric/mm, true = imperial/in)
+    bool m_imperial = false;
+    std::vector<wxStaticText*> m_mmUnitLabels;  // labels that switch "mm"↔"in"
 
     // Transform tool buttons
     wxToggleButton* m_btnTranslate = nullptr;
@@ -194,6 +204,8 @@ private:
         ID_EditSprue,
         ID_SaveProject,
         ID_LoadProject,
-        ID_NewProject
+        ID_NewProject,
+        ID_UnitMetric,
+        ID_UnitImperial
     };
 };
