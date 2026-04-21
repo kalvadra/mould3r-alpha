@@ -193,7 +193,11 @@ void GLCanvas::SetTransformMode(TransformMode mode)
     case TransformMode::EditRunner:
     case TransformMode::EditGate:
         SetCursor(wxCursor(wxCURSOR_HAND));     break;
+    case TransformMode::SelectInjectionPoint:
+        SetCursor(wxCursor(wxCURSOR_HAND));     break;
     }
+
+    Refresh(false);
 }
 
 // ---------------------------------------------------------------------------
@@ -572,6 +576,11 @@ void GLCanvas::SetActiveInjectionPoint(const InjectionPoint& ip)
     Refresh(false);
 }
 
+void GLCanvas::SetInjectionPoints(const std::vector<InjectionPoint>& pts)
+{
+    m_injectionPoints = pts;
+}
+
 void GLCanvas::PlaceSprue()
 {
     if (!m_hasActiveInjectionPoint) return;
@@ -588,25 +597,6 @@ void GLCanvas::PlaceSprue()
 
     m_sprue.worldPos = glm::vec3(fixtureMatrix * localPos);
     m_sprue.hasPoint = true;
-    m_sprue.pathStart = m_sprue.worldPos;
-
-    // Fire a ray straight down toward y=0, max 1000mm (1m).
-    constexpr float kMaxDist = 1000.0f;
-    const glm::vec3 rayDir(0.0f, -1.0f, 0.0f);
-
-    glm::vec3 hitPos;
-    if (RayCastWorldRay(m_sprue.worldPos, rayDir, kMaxDist, hitPos))
-    {
-        // Ray hit an object — this is a direct-injection mould
-        m_sprue.pathEnd = hitPos;
-        m_sprue.isDirectInjection = true;
-    }
-    else
-    {
-        // No object hit — path terminates at the y=0 parting plane
-        m_sprue.pathEnd = glm::vec3(m_sprue.worldPos.x, 0.0f, m_sprue.worldPos.z);
-        m_sprue.isDirectInjection = false;
-    }
 
     // Read sprue dimensions from the left-panel UI
     if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
@@ -616,54 +606,138 @@ void GLCanvas::PlaceSprue()
         m_sprue.coldSlugDepth = frame->GetSprueColdSlugDepth();
     }
 
-    // Compute the point where the sprue path crosses the y=0 parting plane
+    if (m_activeInjectionPoint.type == InjectionType::Radial)
     {
-        const glm::vec3& S = m_sprue.pathStart;
-        const glm::vec3& E = m_sprue.pathEnd;
-        float dy = E.y - S.y;
-        if (std::abs(dy) > 1e-6f)
+        // ---- Radial sprue: horizontal path from injection point outward ----
+        // Project injection point onto the parting plane (y=0)
+        const glm::vec3 ipAtParting(m_sprue.worldPos.x, 0.0f, m_sprue.worldPos.z);
+        const glm::vec2 ipXZ(ipAtParting.x, ipAtParting.z);
+
+        // Find nearest point on the fixture perimeter
+        float     bestDist = std::numeric_limits<float>::max();
+        glm::vec2 bestPt(0.0f);
+
+        if (m_fixturePerimeter.size() >= 2)
         {
-            float t = -S.y / dy;               // parametric t where y == 0
-            if (t >= 0.0f && t <= 1.0f)
+            const int n = (int)m_fixturePerimeter.size();
+            for (int i = 0; i < n; ++i)
             {
-                m_sprue.partingPos = S + t * (E - S);
+                const glm::vec2& A = m_fixturePerimeter[i];
+                const glm::vec2& B = m_fixturePerimeter[(i + 1) % n];
+                const glm::vec2  AB = B - A;
+                const float      len2 = glm::dot(AB, AB);
+                float            t = 0.0f;
+                if (len2 > 1e-10f)
+                    t = glm::clamp(glm::dot(ipXZ - A, AB) / len2, 0.0f, 1.0f);
+                const glm::vec2 closest = A + t * AB;
+                const float     dist = glm::length(closest - ipXZ);
+                if (dist < bestDist)
+                {
+                    bestDist = dist;
+                    bestPt = closest;
+                }
+            }
+        }
+
+        // Direction from injection point outward toward the perimeter
+        glm::vec2 outDir(0.0f, 1.0f);
+        if (bestDist > 1e-6f)
+            outDir = glm::normalize(bestPt - ipXZ);
+
+        // Read the sprue length from the UI
+        float sprueLength = 20.0f;
+        if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+            sprueLength = frame->GetSprueLength();
+
+        // Path: from injection point outward past the perimeter by sprueLength
+        const glm::vec2 outerXZ = bestPt + outDir * sprueLength;
+
+        m_sprue.pathStart = ipAtParting;
+        m_sprue.pathEnd = glm::vec3(outerXZ.x, 0.0f, outerXZ.y);
+        m_sprue.partingPos = m_sprue.pathEnd;
+        m_sprue.hasPartingPoint = true;
+        m_sprue.isDirectInjection = false;
+
+        // Build the swept cylinder preview mesh
+        m_sprue.solid.Destroy();
+        m_sprue.solid = BuildCylinderMesh(m_sprue.pathStart, m_sprue.pathEnd,
+            m_sprue.radius, m_sprue.draftAngleDeg);
+
+        // No cold slug for radial sprues
+        m_sprue.coldSlugSolid.Destroy();
+    }
+    else
+    {
+        // ---- Axial sprue: vertical path downward from injection point ------
+        m_sprue.pathStart = m_sprue.worldPos;
+
+        // Fire a ray straight down toward y=0, max 1000mm (1m).
+        constexpr float kMaxDist = 1000.0f;
+        const glm::vec3 rayDir(0.0f, -1.0f, 0.0f);
+
+        glm::vec3 hitPos;
+        if (RayCastWorldRay(m_sprue.worldPos, rayDir, kMaxDist, hitPos))
+        {
+            // Ray hit an object — this is a direct-injection mould
+            m_sprue.pathEnd = hitPos;
+            m_sprue.isDirectInjection = true;
+        }
+        else
+        {
+            // No object hit — path terminates at the y=0 parting plane
+            m_sprue.pathEnd = glm::vec3(m_sprue.worldPos.x, 0.0f, m_sprue.worldPos.z);
+            m_sprue.isDirectInjection = false;
+        }
+
+        // Compute the point where the sprue path crosses the y=0 parting plane
+        {
+            const glm::vec3& S = m_sprue.pathStart;
+            const glm::vec3& E = m_sprue.pathEnd;
+            float dy = E.y - S.y;
+            if (std::abs(dy) > 1e-6f)
+            {
+                float t = -S.y / dy;               // parametric t where y == 0
+                if (t >= 0.0f && t <= 1.0f)
+                {
+                    m_sprue.partingPos = S + t * (E - S);
+                    m_sprue.hasPartingPoint = true;
+                }
+                else
+                {
+                    m_sprue.hasPartingPoint = false;
+                }
+            }
+            else if (std::abs(S.y) < 1e-6f)
+            {
+                // Both endpoints are already on the parting plane; use the end
+                m_sprue.partingPos = E;
                 m_sprue.hasPartingPoint = true;
             }
             else
             {
-                // Path doesn't cross y=0 within the segment
                 m_sprue.hasPartingPoint = false;
             }
         }
-        else if (std::abs(S.y) < 1e-6f)
+
+        // Build the swept cylinder preview mesh
+        m_sprue.solid.Destroy();
+        m_sprue.solid = BuildCylinderMesh(m_sprue.pathStart, m_sprue.pathEnd,
+            m_sprue.radius, m_sprue.draftAngleDeg);
+
+        // Build cold slug well — a straight cylinder extending beyond the sprue end,
+        // using the end radius of the drafted sprue.  Skipped for direct injection.
+        m_sprue.coldSlugSolid.Destroy();
+        if (!m_sprue.isDirectInjection && m_sprue.coldSlugDepth > 1e-6f)
         {
-            // Both endpoints are already on the parting plane; use the end
-            m_sprue.partingPos = E;
-            m_sprue.hasPartingPoint = true;
+            const glm::vec3 sprueDir = glm::normalize(m_sprue.pathEnd - m_sprue.pathStart);
+            const float sprueLen = glm::length(m_sprue.pathEnd - m_sprue.pathStart);
+            const float draftRad = glm::radians(glm::clamp(m_sprue.draftAngleDeg, 0.0f, 45.0f));
+            const float endRadius = m_sprue.radius + sprueLen * std::tan(draftRad);
+
+            const glm::vec3 slugStart = m_sprue.pathEnd;
+            const glm::vec3 slugEnd = m_sprue.pathEnd + sprueDir * m_sprue.coldSlugDepth;
+            m_sprue.coldSlugSolid = BuildCylinderMesh(slugStart, slugEnd, endRadius, 0.0f);
         }
-        else
-        {
-            m_sprue.hasPartingPoint = false;
-        }
-    }
-
-    // Build the swept cylinder preview mesh
-    m_sprue.solid.Destroy();
-    m_sprue.solid = BuildCylinderMesh(m_sprue.pathStart, m_sprue.pathEnd, m_sprue.radius, m_sprue.draftAngleDeg);
-
-    // Build cold slug well — a straight cylinder extending beyond the sprue end,
-    // using the end radius of the drafted sprue.  Skipped for direct injection.
-    m_sprue.coldSlugSolid.Destroy();
-    if (!m_sprue.isDirectInjection && m_sprue.coldSlugDepth > 1e-6f)
-    {
-        const glm::vec3 sprueDir = glm::normalize(m_sprue.pathEnd - m_sprue.pathStart);
-        const float sprueLen = glm::length(m_sprue.pathEnd - m_sprue.pathStart);
-        const float draftRad = glm::radians(glm::clamp(m_sprue.draftAngleDeg, 0.0f, 45.0f));
-        const float endRadius = m_sprue.radius + sprueLen * std::tan(draftRad);
-
-        const glm::vec3 slugStart = m_sprue.pathEnd;
-        const glm::vec3 slugEnd = m_sprue.pathEnd + sprueDir * m_sprue.coldSlugDepth;
-        m_sprue.coldSlugSolid = BuildCylinderMesh(slugStart, slugEnd, endRadius, 0.0f);
     }
 
     RebuildSpruePathVBO();
@@ -3054,6 +3128,48 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         glUseProgram(0);
     }
 
+    // ---- Injection point selection markers (purple spheres) -----------------
+    // Shown only in SelectInjectionPoint mode so the user can pick one.
+    if (m_program && m_sphereVAO && m_sphereIndexCount > 0 &&
+        m_transformMode == TransformMode::SelectInjectionPoint &&
+        !m_injectionPoints.empty())
+    {
+        glEnable(GL_DEPTH_TEST);
+        glUseProgram(m_program);
+
+        glUniform3fv(glGetUniformLocation(m_program, "uCameraPos"), 1, &camPos[0]);
+        glUniform3fv(glGetUniformLocation(m_program, "uLightDir"), 1, &lightDir[0]);
+        glUniform3fv(glGetUniformLocation(m_program, "uLightColor"), 1, &lightColor[0]);
+        glUniform1f(glGetUniformLocation(m_program, "uAmbient"), 0.35f);
+        glUniform1f(glGetUniformLocation(m_program, "uDiffuse"), 0.75f);
+        glUniform1f(glGetUniformLocation(m_program, "uSpecular"), 0.60f);
+        glUniform1f(glGetUniformLocation(m_program, "uShininess"), 48.0f);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uView"), 1, GL_FALSE, &view[0][0]);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uProj"), 1, GL_FALSE, &proj[0][0]);
+
+        const glm::vec3 ipColor(0.65f, 0.10f, 0.90f);   // purple
+        glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &ipColor[0]);
+        glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 1.0f);
+
+        glm::mat4 fixtureMatrix(1.0f);
+        if (!m_fixtures.empty())
+            fixtureMatrix = m_fixtures[0].BuildModelMatrix();
+
+        glBindVertexArray(m_sphereVAO);
+        for (const auto& ip : m_injectionPoints)
+        {
+            glm::vec3 worldPos = glm::vec3(fixtureMatrix *
+                glm::vec4(ip.x, ip.y, ip.z, 1.0f));
+            glm::mat4 model = glm::translate(glm::mat4(1.0f), worldPos);
+            model = glm::scale(model, glm::vec3(kVentMarkerRadius * 0.9f));
+            glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &model[0][0]);
+            glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
+        }
+        glBindVertexArray(0);
+
+        glUseProgram(0);
+    }
+
     // ---- Sprue path line (purple) ------------------------------------------
     if (m_flatProgram && m_sprue.pathVAO && m_sprue.pathVertexCount > 0)
     {
@@ -3535,6 +3651,44 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
             const wxPoint p = evt.GetPosition();
             RemoveSprueAtMouse(p.x, p.y);
         }
+        else if (m_transformMode == TransformMode::SelectInjectionPoint)
+        {
+            if (m_injectionPoints.empty()) { /* nothing to pick */ }
+            else
+            {
+                const wxPoint p = evt.GetPosition();
+                glm::vec3 rayOrig, rayDir;
+                BuildMouseRay(p.x, p.y, rayOrig, rayDir);
+
+                glm::mat4 fixtureMatrix(1.0f);
+                if (!m_fixtures.empty())
+                    fixtureMatrix = m_fixtures[0].BuildModelMatrix();
+
+                const float hitRadius = kVentMarkerRadius * 3.5f;
+                float bestDist = hitRadius;
+                int   bestIdx = -1;
+                for (int i = 0; i < (int)m_injectionPoints.size(); ++i)
+                {
+                    const auto& ip = m_injectionPoints[i];
+                    glm::vec3 worldPos = glm::vec3(fixtureMatrix *
+                        glm::vec4(ip.x, ip.y, ip.z, 1.0f));
+                    const float d = PointRayDistance(worldPos, rayOrig, rayDir);
+                    if (d < bestDist) { bestDist = d; bestIdx = i; }
+                }
+
+                if (bestIdx >= 0)
+                {
+                    SetActiveInjectionPoint(m_injectionPoints[bestIdx]);
+                    PlaceSprue();
+
+                    // Exit selection mode back to Select
+                    m_transformMode = TransformMode::Select;
+                    if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+                        frame->SetActiveTool(TransformMode::Select);
+                    Refresh(false);
+                }
+            }
+        }
         else if (m_transformMode == TransformMode::EditVent)
         {
             const wxPoint p = evt.GetPosition();
@@ -3971,5 +4125,160 @@ void GLCanvas::ClearFixtures()
     m_fixtures.clear();
     m_fixturePerimeter.clear();
     for (auto& v : m_vents) v.Destroy(); m_vents.clear(); RebuildPathVBO(); RebuildCrossSectionVBO();
+    Refresh(false);
+}
+
+// ---------------------------------------------------------------------------
+// Project restore helpers
+// ---------------------------------------------------------------------------
+
+void GLCanvas::ClearAll()
+{
+    SetCurrent(*m_context);
+
+    // Fixtures
+    for (auto& fix : m_fixtures) fix.mesh.Destroy();
+    m_fixtures.clear();
+    m_fixturePerimeter.clear();
+
+    // Objects
+    for (auto& obj : m_objects) obj.mesh.Destroy();
+    m_objects.clear();
+    m_selectedIndex = -1;
+
+    // Vents
+    for (auto& v : m_vents) v.Destroy();
+    m_vents.clear();
+
+    // Runners
+    for (auto& rf : m_runners) rf.Destroy();
+    m_runners.clear();
+
+    // Gates
+    for (auto& gf : m_gates) gf.Destroy();
+    m_gates.clear();
+
+    // Sprue
+    m_sprue.Clear();
+    m_sprue.DestroyGL();
+    m_hasActiveInjectionPoint = false;
+    m_injectionPoints.clear();
+
+    // Ghost state
+    m_ventGhostActive = false;
+    m_runnerGhostActive = false;
+    m_gateGhostActive = false;
+    m_editFeatureIndex = -1;
+
+    // Rebuild all path/cross-section VBOs so stale highlights are cleared
+    RebuildPathVBO();
+    RebuildCrossSectionVBO();
+    RebuildSpruePathVBO();
+    RebuildSprueXsecVBO();
+    RebuildRunnerPathVBO();
+    RebuildGatePathVBO();
+
+    Refresh(false);
+}
+
+void GLCanvas::RestoreObject(const std::string& path, const glm::vec3& pos,
+    float yaw, float pitch, float roll, float scl)
+{
+    // Import the STEP file normally (this uploads GPU mesh)
+    ImportStepFile(path);
+
+    // Apply the saved transform to the last-added object
+    if (!m_objects.empty())
+    {
+        SceneObject& obj = m_objects.back();
+        obj.pos = pos;
+        obj.yawDeg = yaw;
+        obj.pitchDeg = pitch;
+        obj.rollDeg = roll;
+        obj.scale = scl;
+    }
+}
+
+void GLCanvas::RestoreSprue(const ProjectSprueData& data)
+{
+    SetCurrent(*m_context);
+
+    // Set the injection point so future PlaceSprue calls work
+    m_activeInjectionPoint = data.injectionPoint;
+    m_hasActiveInjectionPoint = true;
+
+    // Copy placement state
+    m_sprue.worldPos = data.worldPos;
+    m_sprue.hasPoint = true;
+    m_sprue.pathStart = data.pathStart;
+    m_sprue.pathEnd = data.pathEnd;
+    m_sprue.partingPos = data.partingPos;
+    m_sprue.hasPartingPoint = data.hasPartingPoint;
+    m_sprue.isDirectInjection = data.isDirectInjection;
+    m_sprue.radius = data.radius;
+    m_sprue.draftAngleDeg = data.draftAngleDeg;
+    m_sprue.coldSlugDepth = data.coldSlugDepth;
+
+    // Build the swept cylinder preview mesh
+    m_sprue.solid.Destroy();
+    m_sprue.solid = BuildCylinderMesh(m_sprue.pathStart, m_sprue.pathEnd,
+        m_sprue.radius, m_sprue.draftAngleDeg);
+
+    // Build cold slug well (same logic as PlaceSprue)
+    m_sprue.coldSlugSolid.Destroy();
+    if (!m_sprue.isDirectInjection && m_sprue.coldSlugDepth > 1e-6f)
+    {
+        const glm::vec3 sprueDir = glm::normalize(m_sprue.pathEnd - m_sprue.pathStart);
+        const float sprueLen = glm::length(m_sprue.pathEnd - m_sprue.pathStart);
+        const float draftRad = glm::radians(glm::clamp(m_sprue.draftAngleDeg, 0.0f, 45.0f));
+        const float endRadius = m_sprue.radius + sprueLen * std::tan(draftRad);
+
+        const glm::vec3 slugStart = m_sprue.pathEnd;
+        const glm::vec3 slugEnd = m_sprue.pathEnd + sprueDir * m_sprue.coldSlugDepth;
+        m_sprue.coldSlugSolid = BuildCylinderMesh(slugStart, slugEnd, endRadius, 0.0f);
+    }
+}
+
+void GLCanvas::RestoreRunner(const glm::vec3& point)
+{
+    m_runners.push_back(RunnerFeature{ point, {}, {} });
+}
+
+void GLCanvas::RestoreGate(const glm::vec3& pos, const glm::vec3& normal)
+{
+    GateFeature gf;
+    gf.point = VentPoint{ pos, normal };
+    m_gates.push_back(std::move(gf));
+}
+
+void GLCanvas::RestoreVent(const glm::vec3& pos, const glm::vec3& normal,
+    float ventWidth, float ventLength,
+    float overrunStart, float overrunEnd)
+{
+    SetCurrent(*m_context);
+
+    VentInstance vi;
+    vi.point = VentPoint{ pos, normal };
+    vi.path = ComputeVentPath(vi.point);
+    vi.path.overrunStart = overrunStart;
+    vi.path.overrunEnd = overrunEnd;
+    vi.crossSection = BuildVentCrossSection(vi.path, ventWidth, ventLength);
+    vi.solid = BuildBoxSweepMesh(vi.path, ventWidth, ventLength,
+        overrunStart, overrunEnd);
+    m_vents.push_back(std::move(vi));
+}
+
+void GLCanvas::RebuildAllFeatures()
+{
+    SetCurrent(*m_context);
+
+    RebuildSpruePathVBO();
+    RebuildSprueXsecVBO();
+    RebuildPathVBO();
+    RebuildCrossSectionVBO();
+    RebuildRunnerPathVBO();
+    RebuildRunnerSolids();
+    RebuildGatePathVBO();
+    RebuildGateSolids();
     Refresh(false);
 }

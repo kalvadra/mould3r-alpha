@@ -99,8 +99,9 @@ static void StyleRibbonBtn(wxToggleButton* btn, bool active = false)
 // MainFrame
 // ---------------------------------------------------------------------------
 MainFrame::MainFrame(const FixtureDefinition& fixture)
-    : wxFrame(nullptr, wxID_ANY, "Mould3r",
+    : wxFrame(nullptr, wxID_ANY, "Mould3r - New Project",
         wxDefaultPosition, wxSize(1200, 800))
+    , m_fixtureDef(fixture)
 {
     // ---- Window icon from SVG -----------------------------------------------
     {
@@ -115,18 +116,34 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
 
     // ---- Menu bar ----------------------------------------------------------
     auto* fileMenu = new wxMenu();
+    fileMenu->Append(ID_NewProject, "New Project...\tCtrl+N");
+    fileMenu->Append(ID_LoadProject, "Open Project...\tCtrl+O");
+    fileMenu->Append(ID_SaveProject, "Save Project...\tCtrl+S");
+    fileMenu->AppendSeparator();
     fileMenu->Append(ID_Import, "Import...\tCtrl+I");
-    fileMenu->Append(ID_ChangeFixture, "Change Fixture...");  // add this
+    fileMenu->Append(ID_ChangeFixture, "Change Fixture...");
     fileMenu->AppendSeparator();
     fileMenu->Append(wxID_EXIT, "Exit\tAlt+F4");
 
     auto* menuBar = new wxMenuBar();
     menuBar->Append(fileMenu, "&File");
+
+    auto* unitsMenu = new wxMenu();
+    unitsMenu->AppendRadioItem(ID_UnitMetric, "Metric (mm)");
+    unitsMenu->AppendRadioItem(ID_UnitImperial, "Imperial (in)");
+    unitsMenu->Check(ID_UnitMetric, true);
+    menuBar->Append(unitsMenu, "&Units");
+
     SetMenuBar(menuBar);
 
     Bind(wxEVT_MENU, &MainFrame::OnExit, this, wxID_EXIT);
     Bind(wxEVT_MENU, &MainFrame::OnImport, this, ID_Import);
     Bind(wxEVT_MENU, &MainFrame::OnChangeFixture, this, ID_ChangeFixture);
+    Bind(wxEVT_MENU, &MainFrame::OnSaveProject, this, ID_SaveProject);
+    Bind(wxEVT_MENU, &MainFrame::OnLoadProject, this, ID_LoadProject);
+    Bind(wxEVT_MENU, &MainFrame::OnNewProject, this, ID_NewProject);
+    Bind(wxEVT_MENU, &MainFrame::OnSetMetric, this, ID_UnitMetric);
+    Bind(wxEVT_MENU, &MainFrame::OnSetImperial, this, ID_UnitImperial);
 
     // ---- Layout: ribbon on top, canvas below --------------------------------
     auto* root = new wxPanel(this, wxID_ANY);
@@ -170,7 +187,10 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
 
     // Set the active injection point (first in the list for now)
     if (!fixture.injectionPoints.empty())
+    {
         m_canvas->SetActiveInjectionPoint(fixture.injectionPoints[0]);
+        m_canvas->SetInjectionPoints(fixture.injectionPoints);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -237,6 +257,7 @@ wxPanel* MainFrame::CreateRibbon(wxWindow* parent)
     Bind(wxEVT_BUTTON, &MainFrame::OnClearVentPoints, this, ID_ClearVentPoints);
     Bind(wxEVT_BUTTON, &MainFrame::OnPlaceSprue, this, ID_PlaceSprue);
     Bind(wxEVT_BUTTON, &MainFrame::OnClearSprue, this, ID_ClearSprue);
+    Bind(wxEVT_BUTTON, &MainFrame::OnEditSprue, this, ID_EditSprue);
     Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnPlaceRunner, this, ID_PlaceRunner);
     Bind(wxEVT_BUTTON, &MainFrame::OnClearRunners, this, ID_ClearRunners);
     Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnPlaceGate, this, ID_PlaceGate);
@@ -378,6 +399,7 @@ void MainFrame::SetActiveTool(TransformMode mode)
     case TransformMode::EditVent:
     case TransformMode::EditRunner:
     case TransformMode::EditGate:
+    case TransformMode::SelectInjectionPoint:
     case TransformMode::Select:
         break;
     }
@@ -579,6 +601,71 @@ void MainFrame::OnEditGate(wxCommandEvent&)
         SetActiveTool(TransformMode::EditGate);
 }
 
+void MainFrame::OnEditSprue(wxCommandEvent&)
+{
+    if (m_fixtureDef.injectionPoints.size() <= 1) return;  // nothing to choose
+
+    if (m_canvas && m_canvas->GetTransformMode() == TransformMode::SelectInjectionPoint)
+        SetActiveTool(TransformMode::Select);
+    else
+        SetActiveTool(TransformMode::SelectInjectionPoint);
+}
+
+// ---------------------------------------------------------------------------
+// Unit system toggle
+// ---------------------------------------------------------------------------
+void MainFrame::OnSetMetric(wxCommandEvent&)
+{
+    if (!m_imperial) return;   // already metric
+
+    // Convert all mm-based field values: displayed inches → mm
+    wxTextCtrl* mmFields[] = {
+        m_ventLength, m_ventWidth, m_ventOverrunStart, m_ventOverrunEnd,
+        m_sprueDiameter, m_sprueColdSlugDepth, m_sprueLength,
+        m_runnerDiameter, m_runnerColdSlugDepth,
+        m_gateDiameter, m_subRunnerDiameter
+    };
+    for (auto* ctrl : mmFields)
+    {
+        if (!ctrl) continue;
+        double v = 0.0;
+        if (ctrl->GetValue().ToDouble(&v))
+            ctrl->SetValue(wxString::Format("%.4g", v * 25.4));
+    }
+
+    // Update labels
+    for (auto* lbl : m_mmUnitLabels)
+        lbl->SetLabel("mm");
+
+    m_imperial = false;
+}
+
+void MainFrame::OnSetImperial(wxCommandEvent&)
+{
+    if (m_imperial) return;   // already imperial
+
+    // Convert all mm-based field values: displayed mm → inches
+    wxTextCtrl* mmFields[] = {
+        m_ventLength, m_ventWidth, m_ventOverrunStart, m_ventOverrunEnd,
+        m_sprueDiameter, m_sprueColdSlugDepth, m_sprueLength,
+        m_runnerDiameter, m_runnerColdSlugDepth,
+        m_gateDiameter, m_subRunnerDiameter
+    };
+    for (auto* ctrl : mmFields)
+    {
+        if (!ctrl) continue;
+        double v = 0.0;
+        if (ctrl->GetValue().ToDouble(&v))
+            ctrl->SetValue(wxString::Format("%.4g", v / 25.4));
+    }
+
+    // Update labels
+    for (auto* lbl : m_mmUnitLabels)
+        lbl->SetLabel("in");
+
+    m_imperial = true;
+}
+
 void MainFrame::GetVentDimensions(float& outLength, float& outWidth,
     float& outOverrunStart, float& outOverrunEnd) const
 {
@@ -591,10 +678,11 @@ void MainFrame::GetVentDimensions(float& outLength, float& outWidth,
             return (v > 0.0) ? static_cast<float>(v) : defaultVal;
         };
 
-    outLength = parseField(m_ventLength, 5.0f);
-    outWidth = parseField(m_ventWidth, 2.0f);
-    outOverrunStart = parseField(m_ventOverrunStart, 0.5f);
-    outOverrunEnd = parseField(m_ventOverrunEnd, 0.5f);
+    const float conv = m_imperial ? 25.4f : 1.0f;
+    outLength = parseField(m_ventLength, 5.0f) * conv;
+    outWidth = parseField(m_ventWidth, 2.0f) * conv;
+    outOverrunStart = parseField(m_ventOverrunStart, 0.5f) * conv;
+    outOverrunEnd = parseField(m_ventOverrunEnd, 0.5f) * conv;
 }
 
 float MainFrame::GetSprueDiameter() const
@@ -602,7 +690,8 @@ float MainFrame::GetSprueDiameter() const
     if (!m_sprueDiameter) return 5.0f;
     double v = 5.0;
     if (!m_sprueDiameter->GetValue().ToDouble(&v)) return 5.0f;
-    return (v > 0.0) ? static_cast<float>(v) : 5.0f;
+    if (v <= 0.0) v = 5.0;
+    return static_cast<float>(v) * (m_imperial ? 25.4f : 1.0f);
 }
 
 float MainFrame::GetSprueDraftAngle() const
@@ -612,7 +701,7 @@ float MainFrame::GetSprueDraftAngle() const
     if (!m_sprueDraftAngle->GetValue().ToDouble(&v)) return 1.0f;
     if (v < 0.0) v = 0.0;
     if (v > 45.0) v = 45.0;
-    return static_cast<float>(v);
+    return static_cast<float>(v);   // degrees — no unit conversion
 }
 
 float MainFrame::GetSprueColdSlugDepth() const
@@ -621,7 +710,16 @@ float MainFrame::GetSprueColdSlugDepth() const
     double v = 5.0;
     if (!m_sprueColdSlugDepth->GetValue().ToDouble(&v)) return 5.0f;
     if (v < 0.0) v = 0.0;
-    return static_cast<float>(v);
+    return static_cast<float>(v) * (m_imperial ? 25.4f : 1.0f);
+}
+
+float MainFrame::GetSprueLength() const
+{
+    if (!m_sprueLength) return 20.0f;
+    double v = 20.0;
+    if (!m_sprueLength->GetValue().ToDouble(&v)) return 20.0f;
+    if (v <= 0.0) v = 20.0;
+    return static_cast<float>(v) * (m_imperial ? 25.4f : 1.0f);
 }
 
 float MainFrame::GetRunnerDiameter() const
@@ -629,7 +727,8 @@ float MainFrame::GetRunnerDiameter() const
     if (!m_runnerDiameter) return 5.0f;
     double v = 5.0;
     if (!m_runnerDiameter->GetValue().ToDouble(&v)) return 5.0f;
-    return (v > 0.0) ? static_cast<float>(v) : 5.0f;
+    if (v <= 0.0) v = 5.0;
+    return static_cast<float>(v) * (m_imperial ? 25.4f : 1.0f);
 }
 
 float MainFrame::GetRunnerColdPlugDist() const
@@ -638,7 +737,7 @@ float MainFrame::GetRunnerColdPlugDist() const
     double v = 5.0;
     if (!m_runnerColdSlugDepth->GetValue().ToDouble(&v)) return 5.0f;
     if (v < 0.0) v = 0.0;
-    return static_cast<float>(v);
+    return static_cast<float>(v) * (m_imperial ? 25.4f : 1.0f);
 }
 
 float MainFrame::GetGateDiameter() const
@@ -647,7 +746,7 @@ float MainFrame::GetGateDiameter() const
     double v = 3.0;
     if (!m_gateDiameter->GetValue().ToDouble(&v)) return 3.0f;
     if (v < 0.0) v = 0.0;
-    return static_cast<float>(v);
+    return static_cast<float>(v) * (m_imperial ? 25.4f : 1.0f);
 }
 
 float MainFrame::GetGateDraftAngle() const
@@ -656,7 +755,7 @@ float MainFrame::GetGateDraftAngle() const
     double v = 1.0;
     if (!m_gateDraftAngle->GetValue().ToDouble(&v)) return 1.0f;
     if (v < 0.0) v = 0.0;
-    return static_cast<float>(v);
+    return static_cast<float>(v);   // degrees — no unit conversion
 }
 
 float MainFrame::GetSubRunnerDiameter() const
@@ -665,7 +764,7 @@ float MainFrame::GetSubRunnerDiameter() const
     double v = 5.0;
     if (!m_subRunnerDiameter->GetValue().ToDouble(&v)) return 5.0f;
     if (v <= 0.0) v = 5.0;
-    return static_cast<float>(v);
+    return static_cast<float>(v) * (m_imperial ? 25.4f : 1.0f);
 }
 
 // ---------------------------------------------------------------------------
@@ -702,6 +801,7 @@ void MainFrame::OnChangeFixture(wxCommandEvent&)
 
     FixtureDefinition fixture = dlg.GetFixture();
     AppConfig::SaveLastFixture(fixture.fixturePath);
+    m_fixtureDef = fixture;   // keep for project save
 
     // Clear existing fixtures and reload
     m_canvas->ClearFixtures();
@@ -710,6 +810,292 @@ void MainFrame::OnChangeFixture(wxCommandEvent&)
         m_canvas->ImportStepFileAsFixture(fixture.modelAPath);
     if (!fixture.modelBPath.empty())
         m_canvas->ImportStepFileAsFixture(fixture.modelBPath);
+
+    if (!fixture.injectionPoints.empty())
+    {
+        m_canvas->SetActiveInjectionPoint(fixture.injectionPoints[0]);
+        m_canvas->SetInjectionPoints(fixture.injectionPoints);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// New Project
+// ---------------------------------------------------------------------------
+void MainFrame::OnNewProject(wxCommandEvent&)
+{
+    const std::string lastFixture = AppConfig::LoadLastFixture();
+
+    FixtureDefinition fixture;
+    std::string error;
+
+    // If a valid default fixture exists, use it directly (same as startup)
+    if (!lastFixture.empty() && FixtureFile::Load(lastFixture, fixture, error))
+    {
+        // Use the default fixture without showing the dialog
+    }
+    else
+    {
+        // No valid default — show the selection dialog
+        StartupDialog dlg(this);
+        dlg.PreSelectFixture(lastFixture);
+
+        if (dlg.ShowModal() != wxID_OK)
+            return;
+
+        fixture = dlg.GetFixture();
+        AppConfig::SaveLastFixture(fixture.fixturePath);
+    }
+
+    // Clear the entire scene
+    m_canvas->ClearAll();
+
+    // Load the selected fixture
+    m_fixtureDef = fixture;
+
+    if (!fixture.modelAPath.empty())
+        m_canvas->ImportStepFileAsFixture(fixture.modelAPath);
+    if (!fixture.modelBPath.empty())
+        m_canvas->ImportStepFileAsFixture(fixture.modelBPath);
+
+    if (!fixture.injectionPoints.empty())
+    {
+        m_canvas->SetActiveInjectionPoint(fixture.injectionPoints[0]);
+        m_canvas->SetInjectionPoints(fixture.injectionPoints);
+    }
+
+    // Reset project state
+    m_projectPath.clear();
+    SetTitle("Mould3r - New Project");
+}
+
+// ---------------------------------------------------------------------------
+// Save Project
+// ---------------------------------------------------------------------------
+void MainFrame::OnSaveProject(wxCommandEvent&)
+{
+    wxFileDialog dlg(
+        this, "Save Project", "", "",
+        "Mould3r Project (*.m3d)|*.m3d|All files (*.*)|*.*",
+        wxFD_SAVE | wxFD_OVERWRITE_PROMPT
+    );
+
+    if (!m_projectPath.empty())
+    {
+        wxFileName fn(m_projectPath);
+        dlg.SetDirectory(fn.GetPath());
+        dlg.SetFilename(fn.GetFullName());
+    }
+
+    if (dlg.ShowModal() != wxID_OK)
+        return;
+
+    const std::string savePath = dlg.GetPath().ToStdString();
+
+    // Build ProjectData from current state
+    ProjectData data;
+    data.version = 1;
+    data.fixturePath = m_fixtureDef.fixturePath;
+
+    // Objects
+    for (const auto& obj : m_canvas->GetObjects())
+    {
+        ProjectObjectData od;
+        od.sourcePath = obj.sourcePath;
+        od.pos = obj.pos;
+        od.yawDeg = obj.yawDeg;
+        od.pitchDeg = obj.pitchDeg;
+        od.rollDeg = obj.rollDeg;
+        od.scale = obj.scale;
+        data.objects.push_back(od);
+    }
+
+    // Parameters (read from UI fields)
+    {
+        auto& p = data.params;
+        float ventLength, ventWidth, ventOverrunStart, ventOverrunEnd;
+        GetVentDimensions(ventLength, ventWidth, ventOverrunStart, ventOverrunEnd);
+        p.ventWidth = ventWidth;
+        p.ventLength = ventLength;
+        p.ventOverrunStart = ventOverrunStart;
+        p.ventOverrunEnd = ventOverrunEnd;
+        p.sprueDiameter = GetSprueDiameter();
+        p.sprueDraftAngle = GetSprueDraftAngle();
+        p.sprueColdSlugDepth = GetSprueColdSlugDepth();
+        p.sprueLength = GetSprueLength();
+        p.runnerDiameter = GetRunnerDiameter();
+        p.runnerColdPlugDist = GetRunnerColdPlugDist();
+        p.gateDiameter = GetGateDiameter();
+        p.gateDraftAngle = GetGateDraftAngle();
+        p.subRunnerDiameter = GetSubRunnerDiameter();
+    }
+
+    // Sprue
+    {
+        const auto& sp = m_canvas->GetSprue();
+        auto& sd = data.sprue;
+        sd.placed = sp.hasPoint;
+        sd.worldPos = sp.worldPos;
+        sd.pathStart = sp.pathStart;
+        sd.pathEnd = sp.pathEnd;
+        sd.partingPos = sp.partingPos;
+        sd.hasPartingPoint = sp.hasPartingPoint;
+        sd.isDirectInjection = sp.isDirectInjection;
+        sd.radius = sp.radius;
+        sd.draftAngleDeg = sp.draftAngleDeg;
+        sd.coldSlugDepth = sp.coldSlugDepth;
+
+        if (m_canvas->HasActiveInjectionPoint())
+            sd.injectionPoint = m_canvas->GetActiveInjectionPoint();
+    }
+
+    // Runners
+    for (const auto& rf : m_canvas->GetRunners())
+        data.runners.push_back(ProjectRunnerData{ rf.point });
+
+    // Gates
+    for (const auto& gf : m_canvas->GetGates())
+        data.gates.push_back(ProjectGateData{ gf.point.worldPos, gf.point.worldNormal });
+
+    // Vents
+    for (const auto& vi : m_canvas->GetVents())
+        data.vents.push_back(ProjectVentData{ vi.point.worldPos, vi.point.worldNormal });
+
+    std::string error;
+    if (!ProjectFile::Save(savePath, data, error))
+    {
+        wxMessageBox(error, "Save Failed", wxOK | wxICON_ERROR, this);
+        return;
+    }
+
+    m_projectPath = savePath;
+    SetTitle("Mould3r - " + wxFileName(savePath).GetName());
+}
+
+// ---------------------------------------------------------------------------
+// Load Project
+// ---------------------------------------------------------------------------
+void MainFrame::OnLoadProject(wxCommandEvent&)
+{
+    wxFileDialog dlg(
+        this, "Open Project", "", "",
+        "Mould3r Project (*.m3d)|*.m3d|All files (*.*)|*.*",
+        wxFD_OPEN | wxFD_FILE_MUST_EXIST
+    );
+
+    if (dlg.ShowModal() != wxID_OK)
+        return;
+
+    const std::string loadPath = dlg.GetPath().ToStdString();
+
+    ProjectData data;
+    std::string error;
+    if (!ProjectFile::Load(loadPath, data, error))
+    {
+        wxMessageBox(error, "Load Failed", wxOK | wxICON_ERROR, this);
+        return;
+    }
+
+    // ---- Clear everything --------------------------------------------------
+    m_canvas->ClearAll();
+
+    // ---- Load fixture ------------------------------------------------------
+    if (!data.fixturePath.empty())
+    {
+        FixtureDefinition fixDef;
+        std::string fixError;
+        if (FixtureFile::Load(data.fixturePath, fixDef, fixError))
+        {
+            m_fixtureDef = fixDef;
+            AppConfig::SaveLastFixture(fixDef.fixturePath);
+
+            if (!fixDef.modelAPath.empty())
+                m_canvas->ImportStepFileAsFixture(fixDef.modelAPath);
+            if (!fixDef.modelBPath.empty())
+                m_canvas->ImportStepFileAsFixture(fixDef.modelBPath);
+
+            // Set injection point (use the one from the sprue data if available,
+            // otherwise fall back to the first in the fixture)
+            if (data.sprue.placed)
+                m_canvas->SetActiveInjectionPoint(data.sprue.injectionPoint);
+            else if (!fixDef.injectionPoints.empty())
+                m_canvas->SetActiveInjectionPoint(fixDef.injectionPoints[0]);
+
+            m_canvas->SetInjectionPoints(fixDef.injectionPoints);
+        }
+        else
+        {
+            wxMessageBox("Could not load fixture:\n" + fixError,
+                "Warning", wxOK | wxICON_WARNING, this);
+        }
+    }
+
+    // ---- Restore UI parameters ---------------------------------------------
+    SetParameterFields(data.params);
+
+    // ---- Restore imported objects ------------------------------------------
+    for (const auto& obj : data.objects)
+    {
+        m_canvas->RestoreObject(obj.sourcePath, obj.pos,
+            obj.yawDeg, obj.pitchDeg,
+            obj.rollDeg, obj.scale);
+    }
+
+    // ---- Restore sprue -----------------------------------------------------
+    if (data.sprue.placed)
+        m_canvas->RestoreSprue(data.sprue);
+
+    // ---- Restore runners ---------------------------------------------------
+    for (const auto& rn : data.runners)
+        m_canvas->RestoreRunner(rn.point);
+
+    // ---- Restore gates -----------------------------------------------------
+    for (const auto& gt : data.gates)
+        m_canvas->RestoreGate(gt.pos, gt.normal);
+
+    // ---- Restore vents -----------------------------------------------------
+    for (const auto& vn : data.vents)
+    {
+        m_canvas->RestoreVent(vn.pos, vn.normal,
+            data.params.ventWidth,
+            data.params.ventLength,
+            data.params.ventOverrunStart,
+            data.params.ventOverrunEnd);
+    }
+
+    // ---- Rebuild all derived GPU geometry -----------------------------------
+    m_canvas->RebuildAllFeatures();
+
+    m_projectPath = loadPath;
+    SetTitle("Mould3r - " + wxFileName(loadPath).GetName());
+}
+
+// ---------------------------------------------------------------------------
+// SetParameterFields — populate the left-panel UI fields from saved data.
+// ---------------------------------------------------------------------------
+void MainFrame::SetParameterFields(const ProjectParameters& p)
+{
+    auto setField = [](wxTextCtrl* ctrl, float value)
+        {
+            if (ctrl)
+                ctrl->SetValue(wxString::Format("%.4g", value));
+        };
+
+    // Project stores mm internally; convert for display if imperial
+    const float conv = m_imperial ? (1.0f / 25.4f) : 1.0f;
+
+    setField(m_ventWidth, p.ventWidth * conv);
+    setField(m_ventLength, p.ventLength * conv);
+    setField(m_ventOverrunStart, p.ventOverrunStart * conv);
+    setField(m_ventOverrunEnd, p.ventOverrunEnd * conv);
+    setField(m_sprueDiameter, p.sprueDiameter * conv);
+    setField(m_sprueDraftAngle, p.sprueDraftAngle);          // degrees — no conversion
+    setField(m_sprueColdSlugDepth, p.sprueColdSlugDepth * conv);
+    setField(m_sprueLength, p.sprueLength * conv);
+    setField(m_runnerDiameter, p.runnerDiameter * conv);
+    setField(m_runnerColdSlugDepth, p.runnerColdPlugDist * conv);
+    setField(m_gateDiameter, p.gateDiameter * conv);
+    setField(m_gateDraftAngle, p.gateDraftAngle);           // degrees — no conversion
+    setField(m_subRunnerDiameter, p.subRunnerDiameter * conv);
 }
 
 void MainFrame::OnBrowseExport(wxCommandEvent&)
@@ -900,6 +1286,7 @@ wxPanel* MainFrame::CreateVentsContent(wxWindow* parent)
             ctrl->SetBackgroundColour(Style::BtnSmall);
             ctrl->SetForegroundColour(kTextDefault);
             auto* unit = new wxStaticText(m_ventDimsPanel, wxID_ANY, "mm");
+            m_mmUnitLabels.push_back(unit);
             unit->SetForegroundColour(Style::TextSubtle);
             unit->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
                 wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
@@ -985,6 +1372,7 @@ wxPanel* MainFrame::CreateSpruesContent(wxWindow* parent)
         return btn;
         };
     auto* btnEdit = makeSmallBtn("Edit");
+    btnEdit->SetId(ID_EditSprue);
     auto* btnRemove = makeSmallBtn("Remove");
     btnRemove->SetId(ID_RemoveSprue);
     auto* btnClearAll = makeSmallBtn("Clear all");
@@ -1041,6 +1429,7 @@ wxPanel* MainFrame::CreateSpruesContent(wxWindow* parent)
         ctrl = new wxTextCtrl(dimsPanel, wxID_ANY, defVal, wxDefaultPosition, wxSize(kFieldWidth, 22));
         ctrl->SetBackgroundColour(Style::BtnSmall); ctrl->SetForegroundColour(kTextDefault);
         auto* u = new wxStaticText(dimsPanel, wxID_ANY, unitStr);
+        if (unitStr == "mm") m_mmUnitLabels.push_back(u);
         u->SetForegroundColour(Style::TextSubtle);
         u->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
         u->SetMinSize(wxSize(kUnitWidth, -1));
@@ -1054,6 +1443,7 @@ wxPanel* MainFrame::CreateSpruesContent(wxWindow* parent)
     addRow("Diameter:", m_sprueDiameter, "5.0", "mm");
     addRow("Draft angle:", m_sprueDraftAngle, "1.0", wxString::FromUTF8("\xC2\xB0"));
     addRow("Cold slug:", m_sprueColdSlugDepth, "5.0", "mm");
+    addRow("Sprue length:", m_sprueLength, "20.0", "mm");
 
     dimsPanel->SetSizer(dimsSizer);
     settingsSizer->Add(dimsPanel, 0, wxEXPAND | wxBOTTOM, 10);
@@ -1199,6 +1589,7 @@ wxPanel* MainFrame::CreateRunnersContent(wxWindow* parent)
         m_runnerDiameter->SetForegroundColour(kTextDefault);
 
         auto* unit = new wxStaticText(dimsPanel, wxID_ANY, "mm");
+        m_mmUnitLabels.push_back(unit);
         unit->SetForegroundColour(Style::TextSubtle);
         unit->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
             wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
@@ -1226,6 +1617,7 @@ wxPanel* MainFrame::CreateRunnersContent(wxWindow* parent)
         m_runnerColdSlugDepth->SetForegroundColour(kTextDefault);
 
         auto* unit = new wxStaticText(dimsPanel, wxID_ANY, "mm");
+        m_mmUnitLabels.push_back(unit);
         unit->SetForegroundColour(Style::TextSubtle);
         unit->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
             wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
@@ -1356,6 +1748,7 @@ wxPanel* MainFrame::CreateGatesContent(wxWindow* parent)
             ctrl = new wxTextCtrl(parent_, wxID_ANY, defVal, wxDefaultPosition, wxSize(kFieldWidth, 22));
             ctrl->SetBackgroundColour(Style::BtnSmall); ctrl->SetForegroundColour(kTextDefault);
             auto* u = new wxStaticText(parent_, wxID_ANY, unitStr);
+            if (unitStr == "mm") m_mmUnitLabels.push_back(u);
             u->SetForegroundColour(Style::TextSubtle);
             u->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
             u->SetMinSize(wxSize(kUnitWidth, -1));

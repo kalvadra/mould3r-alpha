@@ -9,10 +9,11 @@
 #include "FixtureFile.h"
 #include "AppConfig.h"
 #include "StartupDialog.h"
+#include "ProjectFile.h"
 
 class GLCanvas;
 
-enum class TransformMode { Select, Translate, Rotate, Scale, PlaceVent, PlaceRunner, PlaceGate, RemoveVent, RemoveRunner, RemoveGate, RemoveSprue, EditVent, EditRunner, EditGate };
+enum class TransformMode { Select, Translate, Rotate, Scale, PlaceVent, PlaceRunner, PlaceGate, RemoveVent, RemoveRunner, RemoveGate, RemoveSprue, EditVent, EditRunner, EditGate, SelectInjectionPoint };
 
 class MainFrame : public wxFrame
 {
@@ -30,7 +31,11 @@ public:
     float GetSprueDiameter() const;
     float GetSprueDraftAngle() const;
     float GetSprueColdSlugDepth() const;
+    float GetSprueLength() const;
     float GetRunnerColdPlugDist() const;
+
+    // Unit system
+    bool IsImperial() const { return m_imperial; }
 
     float GetRunnerDiameter() const;
 
@@ -38,11 +43,21 @@ public:
     float GetGateDraftAngle() const;
     float GetSubRunnerDiameter() const;
 
+    // Project save/load support
+    const FixtureDefinition& GetFixtureDefinition() const { return m_fixtureDef; }
+    GLCanvas* GetCanvas() const { return m_canvas; }
+
+    // Set UI field values (used when restoring a project)
+    void SetParameterFields(const ProjectParameters& params);
+
 private:
     // Menu handlers
     void OnImport(wxCommandEvent& evt);
     void OnChangeFixture(wxCommandEvent&);
     void OnExit(wxCommandEvent& evt);
+    void OnSaveProject(wxCommandEvent&);
+    void OnLoadProject(wxCommandEvent&);
+    void OnNewProject(wxCommandEvent&);
 
     // Ribbon tool handlers
     void OnToolSelect(wxCommandEvent& evt);
@@ -69,6 +84,10 @@ private:
     void OnEditVent(wxCommandEvent&);
     void OnEditRunner(wxCommandEvent&);
     void OnEditGate(wxCommandEvent&);
+    void OnEditSprue(wxCommandEvent&);
+
+    void OnSetMetric(wxCommandEvent&);
+    void OnSetImperial(wxCommandEvent&);
 
     // Activates a tool button and deactivates the others (also called by GLCanvas on Escape)
 
@@ -97,6 +116,7 @@ private:
     wxTextCtrl* m_sprueDiameter = nullptr;
     wxTextCtrl* m_sprueDraftAngle = nullptr;
     wxTextCtrl* m_sprueColdSlugDepth = nullptr;
+    wxTextCtrl* m_sprueLength = nullptr;
 
     // Runner field members
     wxChoice* m_runnerTypeChoice = nullptr;
@@ -116,6 +136,16 @@ private:
     wxPanel* CreateRibbon(wxWindow* parent);
 
     GLCanvas* m_canvas = nullptr;
+
+    // Stored fixture definition (for project save/load)
+    FixtureDefinition m_fixtureDef;
+
+    // Current project file path (empty if unsaved)
+    std::string m_projectPath;
+
+    // Unit system (false = metric/mm, true = imperial/in)
+    bool m_imperial = false;
+    std::vector<wxStaticText*> m_mmUnitLabels;  // labels that switch "mm"↔"in"
 
     // Transform tool buttons
     wxToggleButton* m_btnTranslate = nullptr;
@@ -170,6 +200,12 @@ private:
         ID_RemoveGate,
         ID_EditVent,
         ID_EditRunner,
-        ID_EditGate
+        ID_EditGate,
+        ID_EditSprue,
+        ID_SaveProject,
+        ID_LoadProject,
+        ID_NewProject,
+        ID_UnitMetric,
+        ID_UnitImperial
     };
 };
