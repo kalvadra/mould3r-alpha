@@ -2066,7 +2066,7 @@ wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
 
     wxPanel* gatesContent = CreateGatesContent(scrollWin);
     sizer->Add(gatesContent, 0, wxEXPAND | wxTOP, 8);
-
+     
     wxPanel* ventsContent = CreateVentsContent(scrollWin);
     sizer->Add(ventsContent, 0, wxEXPAND | wxTOP, 8);
 
