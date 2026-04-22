@@ -7,9 +7,40 @@
 
 namespace fs = std::filesystem;
 
+namespace
+{
+    // Shared font for all dialog buttons — matches the ribbon buttons in
+    // MainFrame (9pt Segoe UI semibold).
+    wxFont DialogBtnFont()
+    {
+        return wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI");
+    }
+
+    // Style a button as a "secondary / neutral" action — dark input-bg,
+    // white label, semibold, no system border. Matches the Export button
+    // in the main ribbon.
+    void StyleSecondaryButton(wxButton* btn)
+    {
+        btn->SetBackgroundColour(Style::InputBg);
+        btn->SetForegroundColour(Style::TextPrimary);
+        btn->SetFont(DialogBtnFont());
+    }
+
+    // Style a button as the "primary" action — indigo, white label,
+    // semibold, no system border. Matches the Import button in the main
+    // ribbon.
+    void StylePrimaryButton(wxButton* btn)
+    {
+        btn->SetBackgroundColour(Style::BtnSecondary);
+        btn->SetForegroundColour(*wxWHITE);
+        btn->SetFont(DialogBtnFont());
+    }
+}
+
 StartupDialog::StartupDialog(wxWindow* parent)
     : wxDialog(parent, wxID_ANY, "Mould3r - Select Fixture",
-        wxDefaultPosition, wxSize(560, 480),
+        wxDefaultPosition, wxSize(560, 500),
         wxDEFAULT_DIALOG_STYLE)
 {
     SetBackgroundColour(Style::AppBg);
@@ -57,9 +88,8 @@ StartupDialog::StartupDialog(wxWindow* parent)
         wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
 
     auto* btnBrowse = new wxButton(this, ID_BrowseFolder, "Browse...",
-        wxDefaultPosition, wxSize(80, 26));
-    btnBrowse->SetBackgroundColour(Style::InputBg);
-    btnBrowse->SetForegroundColour(Style::TextPrimary);
+        wxDefaultPosition, wxSize(90, 32), wxBORDER_NONE);
+    StyleSecondaryButton(btnBrowse);
 
     folderRow->Add(m_lblFolder, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
     folderRow->Add(btnBrowse, 0, wxALIGN_CENTER_VERTICAL);
@@ -79,15 +109,25 @@ StartupDialog::StartupDialog(wxWindow* parent)
 
     main->Add(m_list, 1, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 14);
 
-    // ---- Preview box -------------------------------------------------------
-    auto* previewBox = new wxStaticBoxSizer(wxVERTICAL, this, "Selected Fixture");
-    previewBox->GetStaticBox()->SetForegroundColour(Style::TextSubtext);
-    previewBox->GetStaticBox()->SetBackgroundColour(Style::AppBg);
+    // ---- Preview card ------------------------------------------------------
+    // Previously a wxStaticBoxSizer — its system-painted border clashed with
+    // the dark theme. Rebuild as a CardBg panel with a small header label,
+    // matching the card pattern used by Vent / Sprue settings in the main app.
+    auto* previewPanel = new wxPanel(this, wxID_ANY);
+    previewPanel->SetBackgroundColour(Style::CardBg);
+    auto* previewInner = new wxBoxSizer(wxVERTICAL);
 
-    m_lblModelA = new wxStaticText(this, wxID_ANY, "Model A: —",
+    auto* previewHeader = new wxStaticText(previewPanel, wxID_ANY,
+        "Selected Fixture");
+    previewHeader->SetForegroundColour(Style::TextSubtle);
+    previewHeader->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_BOLD, false, "Segoe UI"));
+    previewInner->Add(previewHeader, 0, wxLEFT | wxTOP, 10);
+
+    m_lblModelA = new wxStaticText(previewPanel, wxID_ANY, "Model A: —",
         wxDefaultPosition, wxDefaultSize,
         wxST_ELLIPSIZE_END);
-    m_lblModelB = new wxStaticText(this, wxID_ANY, "Model B: —",
+    m_lblModelB = new wxStaticText(previewPanel, wxID_ANY, "Model B: —",
         wxDefaultPosition, wxDefaultSize,
         wxST_ELLIPSIZE_END);
 
@@ -96,33 +136,31 @@ StartupDialog::StartupDialog(wxWindow* parent)
         lbl->SetForegroundColour(Style::TextPrimary);
         lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
             wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
-        previewBox->Add(lbl, 0, wxEXPAND | wxALL, 4);
+        previewInner->Add(lbl, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
     }
+    previewInner->AddSpacer(10);
 
-    main->Add(previewBox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 14);
+    previewPanel->SetSizer(previewInner);
+    main->Add(previewPanel, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 14);
 
     // ---- Buttons -----------------------------------------------------------
     auto* btnSizer = new wxBoxSizer(wxHORIZONTAL);
 
     auto* btnNew = new wxButton(this, ID_NewFixture, "New Fixture...",
-        wxDefaultPosition, wxSize(110, 30));
-    btnNew->SetBackgroundColour(Style::InputBg);
-    btnNew->SetForegroundColour(Style::TextPrimary);
+        wxDefaultPosition, wxSize(130, 32), wxBORDER_NONE);
+    StyleSecondaryButton(btnNew);
 
     btnSizer->Add(btnNew, 0);
     btnSizer->AddStretchSpacer();
 
     auto* btnCancel = new wxButton(this, wxID_CANCEL, "Cancel",
-        wxDefaultPosition, wxSize(90, 30));
-    auto* btnOK = new wxButton(this, wxID_OK, "Open",
-        wxDefaultPosition, wxSize(90, 30));
+        wxDefaultPosition, wxSize(90, 32), wxBORDER_NONE);
+    StyleSecondaryButton(btnCancel);
 
-    btnOK->SetBackgroundColour(Style::Accent);
-    btnOK->SetForegroundColour(*wxWHITE);
-    btnOK->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
-        wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
-    btnCancel->SetBackgroundColour(Style::InputBg);
-    btnCancel->SetForegroundColour(Style::TextPrimary);
+    auto* btnOK = new wxButton(this, wxID_OK, "Open",
+        wxDefaultPosition, wxSize(90, 32), wxBORDER_NONE);
+    // Primary action — matches the indigo Import button on the main ribbon.
+    StylePrimaryButton(btnOK);
 
     btnSizer->Add(btnCancel, 0, wxRIGHT, 8);
     btnSizer->Add(btnOK, 0);

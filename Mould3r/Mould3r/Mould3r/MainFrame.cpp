@@ -143,19 +143,19 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
     wxMenuItem* meshHeader =
         importMenu->Append(wxID_ANY, "Mesh Simplification (STL/OBJ):");
     meshHeader->Enable(false);  // visual label only
-    importMenu->AppendRadioItem(ID_MeshQualityOff,    "Off (no simplification)");
-    importMenu->AppendRadioItem(ID_MeshQualityDraft,  "Draft (~2,000 triangles)");
+    importMenu->AppendRadioItem(ID_MeshQualityOff, "Off (no simplification)");
+    importMenu->AppendRadioItem(ID_MeshQualityDraft, "Draft (~2,000 triangles)");
     importMenu->AppendRadioItem(ID_MeshQualityNormal, "Normal (~10,000 triangles)");
-    importMenu->AppendRadioItem(ID_MeshQualityHigh,   "High (~50,000 triangles)");
+    importMenu->AppendRadioItem(ID_MeshQualityHigh, "High (~50,000 triangles)");
     menuBar->Append(importMenu, "&Import");
 
     // Reflect the persisted setting in the radio state.
     {
         const auto q = MeshImportSettings::GetQuality();
-        importMenu->Check(ID_MeshQualityOff,    q == MeshImportSettings::Quality::Off);
-        importMenu->Check(ID_MeshQualityDraft,  q == MeshImportSettings::Quality::Draft);
+        importMenu->Check(ID_MeshQualityOff, q == MeshImportSettings::Quality::Off);
+        importMenu->Check(ID_MeshQualityDraft, q == MeshImportSettings::Quality::Draft);
         importMenu->Check(ID_MeshQualityNormal, q == MeshImportSettings::Quality::Normal);
-        importMenu->Check(ID_MeshQualityHigh,   q == MeshImportSettings::Quality::High);
+        importMenu->Check(ID_MeshQualityHigh, q == MeshImportSettings::Quality::High);
     }
 
     SetMenuBar(menuBar);
@@ -218,17 +218,22 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
     // Start with Select active
     SetActiveTool(TransformMode::Select);
 
-    // Load models from startup config
-    if (!fixture.modelAPath.empty())
-        m_canvas->ImportFileAsFixture(fixture.modelAPath);
-    if (!fixture.modelBPath.empty())
-        m_canvas->ImportFileAsFixture(fixture.modelBPath);
-
-    // Set the active injection point (first in the list for now)
-    if (!fixture.injectionPoints.empty())
+    // Load models from startup config (may be absent on first launch — the
+    // app now opens an empty frame and prompts for a fixture afterward via
+    // PromptForFixtureIfMissing()).
+    if (fixture.IsValid())
     {
-        m_canvas->SetActiveInjectionPoint(fixture.injectionPoints[0]);
-        m_canvas->SetInjectionPoints(fixture.injectionPoints);
+        if (!fixture.modelAPath.empty())
+            m_canvas->ImportFileAsFixture(fixture.modelAPath);
+        if (!fixture.modelBPath.empty())
+            m_canvas->ImportFileAsFixture(fixture.modelBPath);
+
+        // Set the active injection point (first in the list for now)
+        if (!fixture.injectionPoints.empty())
+        {
+            m_canvas->SetActiveInjectionPoint(fixture.injectionPoints[0]);
+            m_canvas->SetInjectionPoints(fixture.injectionPoints);
+        }
     }
 }
 
@@ -849,6 +854,41 @@ void MainFrame::OnChangeFixture(wxCommandEvent&)
     // Clear existing fixtures and reload
     m_canvas->ClearFixtures();
 
+    if (!fixture.modelAPath.empty())
+        m_canvas->ImportFileAsFixture(fixture.modelAPath);
+    if (!fixture.modelBPath.empty())
+        m_canvas->ImportFileAsFixture(fixture.modelBPath);
+
+    if (!fixture.injectionPoints.empty())
+    {
+        m_canvas->SetActiveInjectionPoint(fixture.injectionPoints[0]);
+        m_canvas->SetInjectionPoints(fixture.injectionPoints);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// First-launch fixture prompt
+// ---------------------------------------------------------------------------
+// Called by the app after the main frame is shown. If the user already had a
+// fixture on disk, the constructor has loaded it and this is a no-op. If not,
+// we present the fixture picker on top of the now-visible main window so the
+// user gets the full app chrome as context instead of a modal-over-nothing.
+void MainFrame::PromptForFixtureIfMissing()
+{
+    if (m_fixtureDef.IsValid())
+        return;
+
+    StartupDialog dlg(this);
+    dlg.PreSelectFixture(AppConfig::LoadLastFixture());
+
+    if (dlg.ShowModal() != wxID_OK)
+        return;  // user cancelled — leave the app open with no fixture loaded
+
+    FixtureDefinition fixture = dlg.GetFixture();
+    AppConfig::SaveLastFixture(fixture.fixturePath);
+    m_fixtureDef = fixture;
+
+    // Fresh frame, so no need to ClearFixtures() — just load.
     if (!fixture.modelAPath.empty())
         m_canvas->ImportFileAsFixture(fixture.modelAPath);
     if (!fixture.modelBPath.empty())
@@ -2109,7 +2149,7 @@ wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
 
     wxPanel* gatesContent = CreateGatesContent(scrollWin);
     sizer->Add(gatesContent, 0, wxEXPAND | wxTOP, 8);
-     
+
     wxPanel* ventsContent = CreateVentsContent(scrollWin);
     sizer->Add(ventsContent, 0, wxEXPAND | wxTOP, 8);
 
