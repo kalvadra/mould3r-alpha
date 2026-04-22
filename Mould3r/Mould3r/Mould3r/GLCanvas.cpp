@@ -808,18 +808,28 @@ void GLCanvas::GenerateMould()
         const std::string fixLabel = "Fixture " + std::to_string(fi + 1);
 
         // Step: read fixture
-        progress.Update(step++, fixLabel + ": reading source file...");
+        progress.Update(step++, fixLabel + ": loading source geometry...");
 
-        STEPControl_Reader fixReader;
-        if (fixReader.ReadFile(fix.sourcePath.c_str()) != IFSelect_RetDone)
+        TopoDS_Shape fixtureShape;
+        if (fix.hasSourceShape)
         {
-            wxMessageBox("Failed to re-read fixture: " + fix.sourcePath,
-                "Generate Mould", wxOK | wxICON_ERROR, this);
-            step += stepsPerFixture - 1;  // skip remaining steps for this fixture
-            continue;
+            // Use the shape cached at import time (STEP native or faceted mesh).
+            fixtureShape = fix.sourceShape;
         }
-        fixReader.TransferRoots();
-        TopoDS_Shape fixtureShape = fixReader.OneShape();
+        else
+        {
+            // Legacy fallback: re-read from disk (only works for STEP).
+            STEPControl_Reader fixReader;
+            if (fixReader.ReadFile(fix.sourcePath.c_str()) != IFSelect_RetDone)
+            {
+                wxMessageBox("Failed to re-read fixture: " + fix.sourcePath,
+                    "Generate Mould", wxOK | wxICON_ERROR, this);
+                step += stepsPerFixture - 1;  // skip remaining steps for this fixture
+                continue;
+            }
+            fixReader.TransferRoots();
+            fixtureShape = fixReader.OneShape();
+        }
         if (fixtureShape.IsNull()) continue;
 
         // Step: apply fixture transform
@@ -844,13 +854,22 @@ void GLCanvas::GenerateMould()
                 std::to_string(oi + 1) + " of " +
                 std::to_string((int)m_objects.size()) + "...");
 
-            if (obj.sourcePath.empty()) continue;
+            if (obj.sourcePath.empty() && !obj.hasSourceShape) continue;
 
-            STEPControl_Reader objReader;
-            if (objReader.ReadFile(obj.sourcePath.c_str()) != IFSelect_RetDone)
-                continue;
-            objReader.TransferRoots();
-            TopoDS_Shape objShape = objReader.OneShape();
+            TopoDS_Shape objShape;
+            if (obj.hasSourceShape)
+            {
+                objShape = obj.sourceShape;
+            }
+            else
+            {
+                // Legacy fallback: re-read from disk (STEP only).
+                STEPControl_Reader objReader;
+                if (objReader.ReadFile(obj.sourcePath.c_str()) != IFSelect_RetDone)
+                    continue;
+                objReader.TransferRoots();
+                objShape = objReader.OneShape();
+            }
             if (objShape.IsNull()) continue;
 
             gp_Trsf objTrsf;
@@ -2435,19 +2454,28 @@ void GLCanvas::ExportFixtures(const std::string& pathA, const std::string& pathB
         }
         else
         {
-            // Fall back to re-reading source and applying current transform
-            if (fix.sourcePath.empty()) continue;
-
-            STEPControl_Reader reader;
-            if (reader.ReadFile(fix.sourcePath.c_str()) != IFSelect_RetDone)
+            // No mould yet: transform the source shape by the fixture's
+            // current pose and export that. Prefer the cached import shape;
+            // fall back to re-reading a STEP source for old projects.
+            TopoDS_Shape sourceShape;
+            if (fix.hasSourceShape)
             {
-                wxMessageBox("Failed to re-read: " + fix.sourcePath,
-                    "Export Failed", wxOK | wxICON_ERROR, this);
-                continue;
+                sourceShape = fix.sourceShape;
             }
-            reader.TransferRoots();
-            TopoDS_Shape shape = reader.OneShape();
-            if (shape.IsNull()) continue;
+            else
+            {
+                if (fix.sourcePath.empty()) continue;
+                STEPControl_Reader reader;
+                if (reader.ReadFile(fix.sourcePath.c_str()) != IFSelect_RetDone)
+                {
+                    wxMessageBox("Failed to re-read: " + fix.sourcePath,
+                        "Export Failed", wxOK | wxICON_ERROR, this);
+                    continue;
+                }
+                reader.TransferRoots();
+                sourceShape = reader.OneShape();
+            }
+            if (sourceShape.IsNull()) continue;
 
             gp_Trsf trsf;
             glm::mat4 m = fix.BuildModelMatrix();
@@ -2456,7 +2484,7 @@ void GLCanvas::ExportFixtures(const std::string& pathA, const std::string& pathB
                 m[0][1], m[1][1], m[2][1], m[3][1],
                 m[0][2], m[1][2], m[2][2], m[3][2]
             );
-            BRepBuilderAPI_Transform xform(shape, trsf, true);
+            BRepBuilderAPI_Transform xform(sourceShape, trsf, true);
             shapeToExport = xform.Shape();
         }
 
@@ -2474,16 +2502,31 @@ void GLCanvas::ExportFixtures(const std::string& pathA, const std::string& pathB
 }
 
 // ---------------------------------------------------------------------------
-// Import — appends a new SceneObject
+// Import — appends a new SceneObject (STEP / STL / OBJ)
 // ---------------------------------------------------------------------------
-void GLCanvas::ImportStepFile(const std::string& path)
+void GLCanvas::ImportFile(const std::string& path)
 {
     SetCurrent(*m_context);
     InitGLOnce();
 
+    // Give mesh-format imports a more accurate progress label, since
+    // BuildFacetedShape() runs synchronously inside ImportAuto and can be
+    // the dominant cost for large meshes.
+    auto lower = [](std::string s) {
+        for (char& c : s) c = (char)std::tolower((unsigned char)c);
+        return s;
+        };
+    const std::string ext = (path.find_last_of('.') == std::string::npos)
+        ? std::string()
+        : lower(path.substr(path.find_last_of('.') + 1));
+    const bool isMeshFormat = (ext == "stl" || ext == "obj");
+    const wxString firstMsg = isMeshFormat
+        ? "Parsing mesh and building solid (may take a while)..."
+        : "Reading STEP file...";
+
     wxProgressDialog progress(
         "Importing File",
-        "Reading STEP file...",
+        firstMsg,
         5,
         nullptr,
         wxPD_APP_MODAL | wxPD_AUTO_HIDE | wxPD_SMOOTH | wxPD_ELAPSED_TIME
@@ -2491,9 +2534,9 @@ void GLCanvas::ImportStepFile(const std::string& path)
 
     int step = 0;
 
-    progress.Update(step++, "Reading STEP file...");
+    progress.Update(step++, firstMsg);
     FileImporter importer;
-    auto res = importer.ImportSTEP(path, 0.05, 0.5);
+    auto res = importer.ImportAuto(path, 0.05, 0.5);
 
     if (!res.ok()) {
         wxMessageBox(res.error, "Import failed", wxOK | wxICON_ERROR, this);
@@ -2522,20 +2565,48 @@ void GLCanvas::ImportStepFile(const std::string& path)
     m_objects.back().sourcePath = path;
     m_objects.back().cpuVerts = std::move(cpuVerts);
     m_objects.back().cpuIndices = std::move(cpuIndices);
+    if (res.hasShape) {
+        m_objects.back().sourceShape = res.shape;
+        m_objects.back().hasSourceShape = true;
+    }
     UploadMeshToGPU(res.meshes[0], m_objects.back());
 
     progress.Update(step++, "Done.");
+
+    // For mesh imports that couldn't be sewn into a closed solid, warn the
+    // user: booleans (mould cut) against an open shell are unreliable.
+    if (isMeshFormat && res.hasShape && !res.shapeIsClosedSolid) {
+        wxMessageBox(
+            "The imported mesh could not be sewn into a closed solid. "
+            "It will display correctly, but the mould cut may produce "
+            "incorrect results against this object. Consider repairing "
+            "the mesh (e.g. with MeshLab or Blender) so it is watertight.",
+            "Non-manifold mesh", wxOK | wxICON_WARNING, this);
+    }
+
     Refresh(false);
 }
 
-void GLCanvas::ImportStepFileAsFixture(const std::string& path)
+void GLCanvas::ImportFileAsFixture(const std::string& path)
 {
     SetCurrent(*m_context);
     InitGLOnce();
 
+    auto lower = [](std::string s) {
+        for (char& c : s) c = (char)std::tolower((unsigned char)c);
+        return s;
+        };
+    const std::string ext = (path.find_last_of('.') == std::string::npos)
+        ? std::string()
+        : lower(path.substr(path.find_last_of('.') + 1));
+    const bool isMeshFormat = (ext == "stl" || ext == "obj");
+    const wxString firstMsg = isMeshFormat
+        ? "Parsing mesh and building solid (may take a while)..."
+        : "Reading STEP file...";
+
     wxProgressDialog progress(
         "Importing Fixture",
-        "Reading STEP file...",
+        firstMsg,
         5,
         nullptr,
         wxPD_APP_MODAL | wxPD_AUTO_HIDE | wxPD_SMOOTH | wxPD_ELAPSED_TIME
@@ -2543,9 +2614,9 @@ void GLCanvas::ImportStepFileAsFixture(const std::string& path)
 
     int step = 0;
 
-    progress.Update(step++, "Reading STEP file...");
+    progress.Update(step++, firstMsg);
     FileImporter importer;
-    auto res = importer.ImportSTEP(path, 0.05, 0.5);
+    auto res = importer.ImportAuto(path, 0.05, 0.5);
 
     if (!res.ok()) {
         wxMessageBox(res.error, "Import failed", wxOK | wxICON_ERROR, this);
@@ -2554,7 +2625,7 @@ void GLCanvas::ImportStepFileAsFixture(const std::string& path)
 
     progress.Update(step++, "Computing vertex normals...");
 
-    // Snapshot geometry before crease split (same pattern as ImportStepFile)
+    // Snapshot geometry before crease split (same pattern as ImportFile)
     std::vector<float>    cpuVerts = res.meshes[0].vertices;
     std::vector<uint32_t> cpuIndices = res.meshes[0].indices;
 
@@ -2574,9 +2645,23 @@ void GLCanvas::ImportStepFileAsFixture(const std::string& path)
     m_fixtures.back().sourcePath = path;
     m_fixtures.back().cpuVerts = std::move(cpuVerts);
     m_fixtures.back().cpuIndices = std::move(cpuIndices);
+    if (res.hasShape) {
+        m_fixtures.back().sourceShape = res.shape;
+        m_fixtures.back().hasSourceShape = true;
+    }
     UploadMeshToGPU(res.meshes[0], m_fixtures.back());
 
     progress.Update(step++, "Done.");
+
+    if (isMeshFormat && res.hasShape && !res.shapeIsClosedSolid) {
+        wxMessageBox(
+            "The imported fixture mesh could not be sewn into a closed "
+            "solid. The mould cut uses this as the blank — results against "
+            "an open shell will be unreliable. Consider repairing the mesh "
+            "so it is watertight before using it as a fixture.",
+            "Non-manifold mesh", wxOK | wxICON_WARNING, this);
+    }
+
     BuildFixturePerimeter();
     Refresh(false);
 }
@@ -4184,8 +4269,8 @@ void GLCanvas::ClearAll()
 void GLCanvas::RestoreObject(const std::string& path, const glm::vec3& pos,
     float yaw, float pitch, float roll, float scl)
 {
-    // Import the STEP file normally (this uploads GPU mesh)
-    ImportStepFile(path);
+    // Import the model normally (dispatches on extension, uploads GPU mesh)
+    ImportFile(path);
 
     // Apply the saved transform to the last-added object
     if (!m_objects.empty())

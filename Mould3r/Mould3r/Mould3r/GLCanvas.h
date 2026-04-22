@@ -55,6 +55,12 @@ struct SceneObject
     TopoDS_Shape mouldShape;
     bool         hasMould = false;
 
+    // Cached BREP shape from import (native for STEP, faceted shell/solid
+    // for mesh formats). Populated at import time so boolean operations and
+    // export don't have to re-read the source file.
+    TopoDS_Shape sourceShape;
+    bool         hasSourceShape = false;
+
     // CPU-side geometry for ray casting (position-only, object space)
     std::vector<float>    cpuVerts;    // 3 floats per vertex
     std::vector<uint32_t> cpuIndices;  // triangle indices
@@ -82,8 +88,9 @@ public:
     GLCanvas(wxWindow* parent);
     ~GLCanvas() override;
 
-    void ImportStepFile(const std::string& path);
-    void ImportStepFileAsFixture(const std::string& path);
+    // Imports any supported format (STEP, STL, OBJ) based on file extension.
+    void ImportFile(const std::string& path);
+    void ImportFileAsFixture(const std::string& path);
 
     // Called by MainFrame ribbon buttons
     void SetTransformMode(TransformMode mode);

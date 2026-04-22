@@ -206,6 +206,10 @@ private:
         ID_LoadProject,
         ID_NewProject,
         ID_UnitMetric,
-        ID_UnitImperial
+        ID_UnitImperial,
+        ID_MeshQualityOff,
+        ID_MeshQualityDraft,
+        ID_MeshQualityNormal,
+        ID_MeshQualityHigh
     };
 };
