@@ -11,6 +11,7 @@
 #include "TranslateDialog.h"
 #include "ScaleDialog.h"
 #include "AppConfig.h"
+#include "MeshImportSettings.h"
 #include "style.h"
 
 // ---------------------------------------------------------------------------
@@ -120,7 +121,6 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
     fileMenu->Append(ID_LoadProject, "Open Project...\tCtrl+O");
     fileMenu->Append(ID_SaveProject, "Save Project...\tCtrl+S");
     fileMenu->AppendSeparator();
-    fileMenu->Append(ID_Import, "Import...\tCtrl+I");
     fileMenu->Append(ID_ChangeFixture, "Change Fixture...");
     fileMenu->AppendSeparator();
     fileMenu->Append(wxID_EXIT, "Exit\tAlt+F4");
@@ -134,6 +134,30 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
     unitsMenu->Check(ID_UnitMetric, true);
     menuBar->Append(unitsMenu, "&Units");
 
+    // ---- Import menu: action + mesh-simplification settings ----------------
+    // Settings are applied to STL/OBJ imports only; STEP tessellation is
+    // governed by its own deflection parameters.
+    auto* importMenu = new wxMenu();
+    importMenu->Append(ID_Import, "Import Model...\tCtrl+I");
+    importMenu->AppendSeparator();
+    wxMenuItem* meshHeader =
+        importMenu->Append(wxID_ANY, "Mesh Simplification (STL/OBJ):");
+    meshHeader->Enable(false);  // visual label only
+    importMenu->AppendRadioItem(ID_MeshQualityOff,    "Off (no simplification)");
+    importMenu->AppendRadioItem(ID_MeshQualityDraft,  "Draft (~2,000 triangles)");
+    importMenu->AppendRadioItem(ID_MeshQualityNormal, "Normal (~10,000 triangles)");
+    importMenu->AppendRadioItem(ID_MeshQualityHigh,   "High (~50,000 triangles)");
+    menuBar->Append(importMenu, "&Import");
+
+    // Reflect the persisted setting in the radio state.
+    {
+        const auto q = MeshImportSettings::GetQuality();
+        importMenu->Check(ID_MeshQualityOff,    q == MeshImportSettings::Quality::Off);
+        importMenu->Check(ID_MeshQualityDraft,  q == MeshImportSettings::Quality::Draft);
+        importMenu->Check(ID_MeshQualityNormal, q == MeshImportSettings::Quality::Normal);
+        importMenu->Check(ID_MeshQualityHigh,   q == MeshImportSettings::Quality::High);
+    }
+
     SetMenuBar(menuBar);
 
     Bind(wxEVT_MENU, &MainFrame::OnExit, this, wxID_EXIT);
@@ -144,6 +168,21 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
     Bind(wxEVT_MENU, &MainFrame::OnNewProject, this, ID_NewProject);
     Bind(wxEVT_MENU, &MainFrame::OnSetMetric, this, ID_UnitMetric);
     Bind(wxEVT_MENU, &MainFrame::OnSetImperial, this, ID_UnitImperial);
+
+    // Mesh quality radio items just persist the chosen preset; the next
+    // import picks it up via MeshImportSettings::GetQuality().
+    Bind(wxEVT_MENU,
+        [](wxCommandEvent&) { MeshImportSettings::SetQuality(MeshImportSettings::Quality::Off); },
+        ID_MeshQualityOff);
+    Bind(wxEVT_MENU,
+        [](wxCommandEvent&) { MeshImportSettings::SetQuality(MeshImportSettings::Quality::Draft); },
+        ID_MeshQualityDraft);
+    Bind(wxEVT_MENU,
+        [](wxCommandEvent&) { MeshImportSettings::SetQuality(MeshImportSettings::Quality::Normal); },
+        ID_MeshQualityNormal);
+    Bind(wxEVT_MENU,
+        [](wxCommandEvent&) { MeshImportSettings::SetQuality(MeshImportSettings::Quality::High); },
+        ID_MeshQualityHigh);
 
     // ---- Layout: ribbon on top, canvas below --------------------------------
     auto* root = new wxPanel(this, wxID_ANY);
@@ -181,9 +220,9 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
 
     // Load models from startup config
     if (!fixture.modelAPath.empty())
-        m_canvas->ImportStepFileAsFixture(fixture.modelAPath);
+        m_canvas->ImportFileAsFixture(fixture.modelAPath);
     if (!fixture.modelBPath.empty())
-        m_canvas->ImportStepFileAsFixture(fixture.modelBPath);
+        m_canvas->ImportFileAsFixture(fixture.modelBPath);
 
     // Set the active injection point (first in the list for now)
     if (!fixture.injectionPoints.empty())
@@ -778,15 +817,19 @@ void MainFrame::OnExit(wxCommandEvent&)
 void MainFrame::OnImport(wxCommandEvent&)
 {
     wxFileDialog dlg(
-        this, "Import STEP", "", "",
-        "STEP files (*.step;*.stp)|*.step;*.stp|All files (*.*)|*.*",
+        this, "Import Model", "", "",
+        "All supported (*.step;*.stp;*.stl;*.obj)|*.step;*.stp;*.stl;*.obj|"
+        "STEP files (*.step;*.stp)|*.step;*.stp|"
+        "STL files (*.stl)|*.stl|"
+        "OBJ files (*.obj)|*.obj|"
+        "All files (*.*)|*.*",
         wxFD_OPEN | wxFD_FILE_MUST_EXIST
     );
 
     if (dlg.ShowModal() != wxID_OK)
         return;
 
-    m_canvas->ImportStepFile(dlg.GetPath().ToStdString());
+    m_canvas->ImportFile(dlg.GetPath().ToStdString());
 }
 
 void MainFrame::OnChangeFixture(wxCommandEvent&)
@@ -807,9 +850,9 @@ void MainFrame::OnChangeFixture(wxCommandEvent&)
     m_canvas->ClearFixtures();
 
     if (!fixture.modelAPath.empty())
-        m_canvas->ImportStepFileAsFixture(fixture.modelAPath);
+        m_canvas->ImportFileAsFixture(fixture.modelAPath);
     if (!fixture.modelBPath.empty())
-        m_canvas->ImportStepFileAsFixture(fixture.modelBPath);
+        m_canvas->ImportFileAsFixture(fixture.modelBPath);
 
     if (!fixture.injectionPoints.empty())
     {
@@ -853,9 +896,9 @@ void MainFrame::OnNewProject(wxCommandEvent&)
     m_fixtureDef = fixture;
 
     if (!fixture.modelAPath.empty())
-        m_canvas->ImportStepFileAsFixture(fixture.modelAPath);
+        m_canvas->ImportFileAsFixture(fixture.modelAPath);
     if (!fixture.modelBPath.empty())
-        m_canvas->ImportStepFileAsFixture(fixture.modelBPath);
+        m_canvas->ImportFileAsFixture(fixture.modelBPath);
 
     if (!fixture.injectionPoints.empty())
     {
@@ -1009,9 +1052,9 @@ void MainFrame::OnLoadProject(wxCommandEvent&)
             AppConfig::SaveLastFixture(fixDef.fixturePath);
 
             if (!fixDef.modelAPath.empty())
-                m_canvas->ImportStepFileAsFixture(fixDef.modelAPath);
+                m_canvas->ImportFileAsFixture(fixDef.modelAPath);
             if (!fixDef.modelBPath.empty())
-                m_canvas->ImportStepFileAsFixture(fixDef.modelBPath);
+                m_canvas->ImportFileAsFixture(fixDef.modelBPath);
 
             // Set injection point (use the one from the sprue data if available,
             // otherwise fall back to the first in the fixture)
