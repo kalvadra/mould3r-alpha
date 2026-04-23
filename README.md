@@ -1,5 +1,5 @@
 # Mould3r
-<img width="1263" height="847" alt="FullGrid" src="https://github.com/user-attachments/assets/a91d890b-dddf-451b-bea0-82734ab388cf" />
+<img width="1917" height="1078" alt="FullApp" src="https://github.com/user-attachments/assets/96a3b5f6-c203-44ef-ad4a-72dbd57d2ce9" />
 
 A desktop application for designing injection mould tooling.
 
