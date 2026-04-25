@@ -3,6 +3,7 @@
 #include <glad/glad.h>
 #include <wx/glcanvas.h>
 #include <vector>
+#include <array>
 
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
@@ -64,6 +65,14 @@ struct SceneObject
     // CPU-side geometry for ray casting (position-only, object space)
     std::vector<float>    cpuVerts;    // 3 floats per vertex
     std::vector<uint32_t> cpuIndices;  // triangle indices
+
+    // Per-triangle edge adjacency for face-region growing (Align Face).
+    // triNeighbors[t][k] = the triangle that shares edge k of triangle t
+    // (where edge k is between local vertex k and (k+1)%3), or -1 if none.
+    // Built lazily on first use; persists for the object's lifetime since
+    // local mesh topology never changes after import.
+    std::vector<std::array<int, 3>> triNeighbors;
+    bool                            adjacencyBuilt = false;
 
     glm::vec3 pos{ 0.0f, 0.0f, 0.0f };
     float     yawDeg = 0.0f;
@@ -244,6 +253,36 @@ private:
     // Sphere mesh for vent point markers
     void BuildSphereGPU(float radius, int stacks, int slices);
 
+    // ---- Align Face ---------------------------------------------------------
+    // Pick a triangle on an imported model and grow a coplanar region. Used
+    // for hover highlighting and click-to-align. The seed triangle index lets
+    // OnPaint detect when the hover changed and avoid redundant region growth.
+    bool RayCastFacePick(int mouseX, int mouseY, int& outObj, int& outTri);
+
+    // Build edge adjacency for the object's CPU mesh if not already built.
+    void EnsureTriAdjacency(SceneObject& obj);
+
+    // BFS from seedTri across edge-shared neighbors whose triangle normal is
+    // within ~1° of the seed's normal. Output is in local (object) space.
+    void GrowCoplanarFace(const SceneObject& obj, int seedTri,
+        std::vector<uint32_t>& outTris, glm::vec3& outNormalLocal);
+
+    // Upload world-space triangles for the highlighted face to m_alignHighlight*.
+    // Pass an empty triangle list to clear the highlight.
+    void RebuildAlignHighlightVBO(const SceneObject& obj,
+        const std::vector<uint32_t>& tris);
+
+    // Compute and apply the rotation+translation that snaps the picked face's
+    // plane onto Y=0 (world parting plane). Rotates around the face centroid
+    // so the picked face stays roughly in place laterally.
+    void ApplyAlignFaceToObject(int objIdx, const glm::vec3& nLocal,
+        const std::vector<uint32_t>& faceTris);
+
+    // Decompose a YXZ-Euler rotation matrix back to (yaw, pitch, roll).
+    // Handles the gimbal-lock case where pitch ≈ ±90°.
+    static void DecomposeYXZ(const glm::mat3& R,
+        float& yawDeg, float& pitchDeg, float& rollDeg);
+
 private:
     wxGLContext* m_context = nullptr;
     bool         m_inited = false;
@@ -364,4 +403,18 @@ private:
     GLuint m_pickDepthRb = 0;
     int    m_pickW = 0;
     int    m_pickH = 0;
+
+    // ---- Align Face state ---------------------------------------------------
+    // Hover state for AlignFace mode. Mouse position is captured in OnMouse
+    // and the ray cast is deferred to OnPaint (one cast per frame).
+    wxPoint               m_alignMousePos;
+    int                   m_alignHoverObject = -1;
+    int                   m_alignSeedTri = -1;       // last grown seed; -1 = no hover
+    std::vector<uint32_t> m_alignFaceTris;           // tris in current hover region
+    glm::vec3             m_alignFaceNormalLocal{ 0.0f };
+
+    // GPU resources for the dark-grey highlight overlay (world-space triangles).
+    GLuint  m_alignHighlightVAO = 0;
+    GLuint  m_alignHighlightVBO = 0;
+    GLsizei m_alignHighlightVertexCount = 0;
 };

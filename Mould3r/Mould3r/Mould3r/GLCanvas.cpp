@@ -6,6 +6,8 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
 
+#include <unordered_map>
+
 #include "GLCanvas.h"
 #include <wx/dcclient.h>
 #include <wx/log.h>
@@ -167,6 +169,17 @@ void GLCanvas::SetTransformMode(TransformMode mode)
         m_editNeedsUpdate = false;
     }
 
+    // Clear AlignFace hover state and highlight VBO when leaving AlignFace.
+    // The VBO itself is kept (just zeroed via vertex count) so we don't
+    // re-create GL objects on every mode switch.
+    if (m_transformMode == TransformMode::AlignFace && mode != TransformMode::AlignFace)
+    {
+        m_alignHoverObject = -1;
+        m_alignSeedTri = -1;
+        m_alignFaceTris.clear();
+        m_alignHighlightVertexCount = 0;
+    }
+
     m_transformMode = mode;
     switch (mode)
     {
@@ -194,6 +207,8 @@ void GLCanvas::SetTransformMode(TransformMode mode)
     case TransformMode::EditGate:
         SetCursor(wxCursor(wxCURSOR_HAND));     break;
     case TransformMode::SelectInjectionPoint:
+        SetCursor(wxCursor(wxCURSOR_HAND));     break;
+    case TransformMode::AlignFace:
         SetCursor(wxCursor(wxCURSOR_HAND));     break;
     }
 
@@ -1542,6 +1557,392 @@ bool GLCanvas::RayCastWorldRay(const glm::vec3& origin, const glm::vec3& dir,
     return hit;
 }
 
+// ===========================================================================
+// Align Face — face-region picking and alignment math.
+// ===========================================================================
+//
+// RayCastFacePick — like RayCastObjects but returns which object and which
+// triangle was hit, without computing the surface normal (the BFS does that
+// once it knows the triangle). Manual unprojection rather than reusing
+// RayCastObjects because we need the triangle index, not just the position.
+// ---------------------------------------------------------------------------
+bool GLCanvas::RayCastFacePick(int mouseX, int mouseY, int& outObj, int& outTri)
+{
+    outObj = -1;
+    outTri = -1;
+
+    const wxSize sz = GetClientSize();
+    const int    w = std::max(1, sz.x);
+    const int    h = std::max(1, sz.y);
+
+    const float ndcX = (2.0f * float(mouseX)) / float(w) - 1.0f;
+    const float ndcY = 1.0f - (2.0f * float(mouseY)) / float(h);
+
+    m_camera.SetAspect(float(w) / float(h));
+    const glm::mat4 view = m_camera.View();
+    const glm::mat4 proj = m_camera.Projection();
+    const glm::mat4 invVP = glm::inverse(proj * view);
+
+    glm::vec4 nearH = invVP * glm::vec4(ndcX, ndcY, -1.0f, 1.0f);
+    glm::vec4 farH = invVP * glm::vec4(ndcX, ndcY, 1.0f, 1.0f);
+    nearH /= nearH.w;
+    farH /= farH.w;
+
+    const glm::vec3 rayOrig = glm::vec3(nearH);
+    const glm::vec3 rayDir = glm::normalize(glm::vec3(farH) - glm::vec3(nearH));
+
+    float bestWorldT = std::numeric_limits<float>::max();
+
+    for (int oi = 0; oi < (int)m_objects.size(); ++oi)
+    {
+        const SceneObject& obj = m_objects[oi];
+        if (obj.cpuVerts.empty() || obj.cpuIndices.empty()) continue;
+
+        const glm::mat4 model = obj.BuildModelMatrix();
+        const glm::mat4 invModel = glm::inverse(model);
+
+        const glm::vec3 localOrig = glm::vec3(invModel * glm::vec4(rayOrig, 1.0f));
+        const glm::vec3 localDir = glm::normalize(glm::vec3(invModel * glm::vec4(rayDir, 0.0f)));
+
+        const size_t triCount = obj.cpuIndices.size() / 3;
+        for (size_t t = 0; t < triCount; ++t)
+        {
+            const uint32_t i0 = obj.cpuIndices[3 * t + 0];
+            const uint32_t i1 = obj.cpuIndices[3 * t + 1];
+            const uint32_t i2 = obj.cpuIndices[3 * t + 2];
+
+            const glm::vec3 v0(obj.cpuVerts[i0 * 3], obj.cpuVerts[i0 * 3 + 1], obj.cpuVerts[i0 * 3 + 2]);
+            const glm::vec3 v1(obj.cpuVerts[i1 * 3], obj.cpuVerts[i1 * 3 + 1], obj.cpuVerts[i1 * 3 + 2]);
+            const glm::vec3 v2(obj.cpuVerts[i2 * 3], obj.cpuVerts[i2 * 3 + 1], obj.cpuVerts[i2 * 3 + 2]);
+
+            float localT = 0.0f;
+            if (!RayTriangle(localOrig, localDir, v0, v1, v2, localT)) continue;
+
+            const glm::vec3 localHit = localOrig + localDir * localT;
+            const glm::vec3 worldHit = glm::vec3(model * glm::vec4(localHit, 1.0f));
+            const float     worldT = glm::length(worldHit - rayOrig);
+
+            if (worldT < bestWorldT)
+            {
+                bestWorldT = worldT;
+                outObj = oi;
+                outTri = (int)t;
+            }
+        }
+    }
+
+    return outObj >= 0;
+}
+
+// ---------------------------------------------------------------------------
+// EnsureTriAdjacency — build edge → neighbour-triangle map for one object.
+// Manifold edges (exactly 2 triangles) link both ways. Non-manifold edges
+// (3+ triangles meeting) are robust but degraded: extras are left unlinked
+// rather than overwriting an existing pairing, so BFS may miss some tris on
+// truly non-manifold geometry. Acceptable for a UI feature; revisit if it
+// hurts.
+// ---------------------------------------------------------------------------
+void GLCanvas::EnsureTriAdjacency(SceneObject& obj)
+{
+    if (obj.adjacencyBuilt) return;
+
+    const size_t triCount = obj.cpuIndices.size() / 3;
+    obj.triNeighbors.assign(triCount, std::array<int, 3>{ -1, -1, -1 });
+
+    // Sentinel "already paired" value stored in the temporary edge map so a
+    // 3rd triangle on the same edge gets ignored rather than corrupting the
+    // existing pairing.
+    constexpr int kPaired = -2;
+
+    // Pack (a,b) into a 64-bit key with min-first canonical ordering.
+    auto pack = [](uint32_t a, uint32_t b) -> uint64_t {
+        if (a > b) std::swap(a, b);
+        return (uint64_t(a) << 32) | uint64_t(b);
+        };
+
+    std::unordered_map<uint64_t, std::pair<int, int>> edgeMap;
+    edgeMap.reserve(triCount * 3);
+
+    for (size_t t = 0; t < triCount; ++t)
+    {
+        const uint32_t verts[3] = {
+            obj.cpuIndices[3 * t + 0],
+            obj.cpuIndices[3 * t + 1],
+            obj.cpuIndices[3 * t + 2]
+        };
+        for (int s = 0; s < 3; ++s)
+        {
+            const uint64_t key = pack(verts[s], verts[(s + 1) % 3]);
+            auto it = edgeMap.find(key);
+            if (it == edgeMap.end())
+            {
+                edgeMap.emplace(key, std::make_pair((int)t, s));
+            }
+            else if (it->second.first != kPaired)
+            {
+                const int otherT = it->second.first;
+                const int otherS = it->second.second;
+                obj.triNeighbors[t][s] = otherT;
+                obj.triNeighbors[otherT][otherS] = (int)t;
+                it->second.first = kPaired;  // prevent 3rd-tri corruption
+            }
+            // else: edge already had its pair — leave the 3rd+ tri unlinked.
+        }
+    }
+
+    obj.adjacencyBuilt = true;
+}
+
+// ---------------------------------------------------------------------------
+// GrowCoplanarFace — BFS from a seed triangle across edge-shared neighbours
+// whose normal is within ~1° of the seed's normal. Uses dot > cos(1°), so
+// only same-side coplanar tris are merged (anti-parallel back-faces are
+// excluded — important for thin shells where front and back faces are
+// geometrically coplanar but logically distinct).
+// ---------------------------------------------------------------------------
+void GLCanvas::GrowCoplanarFace(const SceneObject& obj, int seedTri,
+    std::vector<uint32_t>& outTris, glm::vec3& outNormalLocal)
+{
+    outTris.clear();
+    outNormalLocal = glm::vec3(0.0f);
+    if (seedTri < 0 || seedTri >= (int)obj.triNeighbors.size()) return;
+
+    auto triNormal = [&](int t) -> glm::vec3 {
+        const uint32_t i0 = obj.cpuIndices[3 * t + 0];
+        const uint32_t i1 = obj.cpuIndices[3 * t + 1];
+        const uint32_t i2 = obj.cpuIndices[3 * t + 2];
+        const glm::vec3 v0(obj.cpuVerts[i0 * 3], obj.cpuVerts[i0 * 3 + 1], obj.cpuVerts[i0 * 3 + 2]);
+        const glm::vec3 v1(obj.cpuVerts[i1 * 3], obj.cpuVerts[i1 * 3 + 1], obj.cpuVerts[i1 * 3 + 2]);
+        const glm::vec3 v2(obj.cpuVerts[i2 * 3], obj.cpuVerts[i2 * 3 + 1], obj.cpuVerts[i2 * 3 + 2]);
+        const glm::vec3 n = glm::cross(v1 - v0, v2 - v0);
+        const float     len = glm::length(n);
+        return (len > 1e-12f) ? (n / len) : glm::vec3(0.0f, 1.0f, 0.0f);
+        };
+
+    const glm::vec3 seedNormal = triNormal(seedTri);
+    outNormalLocal = seedNormal;
+    constexpr float kCosTol = 0.99985f;  // cos(~1°)
+
+    const size_t triCount = obj.triNeighbors.size();
+    std::vector<uint8_t> visited(triCount, 0);
+    std::vector<int>     stack;
+    stack.reserve(64);
+
+    visited[seedTri] = 1;
+    stack.push_back(seedTri);
+    outTris.push_back((uint32_t)seedTri);
+
+    while (!stack.empty())
+    {
+        const int t = stack.back();
+        stack.pop_back();
+        for (int s = 0; s < 3; ++s)
+        {
+            const int nb = obj.triNeighbors[t][s];
+            if (nb < 0 || visited[nb]) continue;
+
+            const glm::vec3 nNb = triNormal(nb);
+            // dot > kCosTol enforces both "near-parallel" and "same-side".
+            if (glm::dot(nNb, seedNormal) > kCosTol)
+            {
+                visited[nb] = 1;
+                stack.push_back(nb);
+                outTris.push_back((uint32_t)nb);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RebuildAlignHighlightVBO — upload the highlighted face's triangles in
+// world space (model matrix baked in here on the CPU). Lazily creates the
+// VAO/VBO on first use; reuses them on subsequent calls.
+// ---------------------------------------------------------------------------
+void GLCanvas::RebuildAlignHighlightVBO(const SceneObject& obj,
+    const std::vector<uint32_t>& tris)
+{
+    if (tris.empty())
+    {
+        m_alignHighlightVertexCount = 0;
+        return;
+    }
+
+    const glm::mat4 model = obj.BuildModelMatrix();
+
+    std::vector<float> verts;
+    verts.reserve(tris.size() * 9);
+
+    for (uint32_t t : tris)
+    {
+        for (int k = 0; k < 3; ++k)
+        {
+            const uint32_t vi = obj.cpuIndices[3 * t + k];
+            const glm::vec3 vL(obj.cpuVerts[vi * 3],
+                obj.cpuVerts[vi * 3 + 1],
+                obj.cpuVerts[vi * 3 + 2]);
+            const glm::vec3 vW = glm::vec3(model * glm::vec4(vL, 1.0f));
+            verts.push_back(vW.x);
+            verts.push_back(vW.y);
+            verts.push_back(vW.z);
+        }
+    }
+
+    if (m_alignHighlightVAO == 0)
+    {
+        glGenVertexArrays(1, &m_alignHighlightVAO);
+        glGenBuffers(1, &m_alignHighlightVBO);
+        glBindVertexArray(m_alignHighlightVAO);
+        glBindBuffer(GL_ARRAY_BUFFER, m_alignHighlightVBO);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+        glBindVertexArray(0);
+    }
+
+    glBindBuffer(GL_ARRAY_BUFFER, m_alignHighlightVBO);
+    glBufferData(GL_ARRAY_BUFFER, verts.size() * sizeof(float),
+        verts.data(), GL_DYNAMIC_DRAW);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+    m_alignHighlightVertexCount = (GLsizei)(verts.size() / 3);
+}
+
+// ---------------------------------------------------------------------------
+// DecomposeYXZ — extract YXZ Euler angles from a rotation matrix R that was
+// constructed as Ry(yaw) * Rx(pitch) * Rz(roll). Returns degrees.
+//
+// Derivation: with the YXZ convention and column-major glm storage,
+//     R[2][1] = -sin(pitch)
+//     R[2][0] =  sin(yaw)*cos(pitch)
+//     R[2][2] =  cos(yaw)*cos(pitch)
+//     R[0][1] =  cos(pitch)*sin(roll)
+//     R[1][1] =  cos(pitch)*cos(roll)
+// When |cos(pitch)| ≈ 0 (gimbal lock at pitch = ±90°), yaw and roll are
+// indistinguishable along one axis. Convention here: lock roll = 0 and put
+// the rotation into yaw using R[0][0] = cos(yaw) and R[0][2] = -sin(yaw).
+// ---------------------------------------------------------------------------
+void GLCanvas::DecomposeYXZ(const glm::mat3& R,
+    float& yawDeg, float& pitchDeg, float& rollDeg)
+{
+    constexpr float kGimbalEps = 1.0e-5f;
+
+    const float sinPitch = -R[2][1];
+    const float pitch = std::asin(glm::clamp(sinPitch, -1.0f, 1.0f));
+    const float cosPitch = std::cos(pitch);
+
+    float yaw, roll;
+    if (std::abs(cosPitch) > kGimbalEps)
+    {
+        yaw = std::atan2(R[2][0], R[2][2]);
+        roll = std::atan2(R[0][1], R[1][1]);
+    }
+    else
+    {
+        // Gimbal-locked: pin roll to 0 and recover yaw from the X column.
+        roll = 0.0f;
+        yaw = std::atan2(-R[0][2], R[0][0]);
+    }
+
+    yawDeg = glm::degrees(yaw);
+    pitchDeg = glm::degrees(pitch);
+    rollDeg = glm::degrees(roll);
+}
+
+// ---------------------------------------------------------------------------
+// ApplyAlignFaceToObject — rotate + translate the picked object so the
+// chosen face lies on the world Y=0 parting plane.
+//
+// Strategy:
+//   1. Compute the face centroid in local space (average of triangle centroids).
+//   2. Map the local face normal to world space: n_w = R_old * n_local
+//      (uniform scale doesn't affect normal direction).
+//   3. Pick the target axis as whichever of ±Y is closer to n_w — this gives
+//      the smallest-rotation alignment, so the user's existing orientation
+//      is respected.
+//   4. Build R_delta as the smallest rotation from n_w to the target axis.
+//   5. Compose: R_new = R_delta * R_old, decompose back to YXZ Euler.
+//   6. Solve for the new translation so the face centroid stays in place
+//      laterally (X/Z unchanged in world) and lands exactly on Y=0.
+// ---------------------------------------------------------------------------
+void GLCanvas::ApplyAlignFaceToObject(int objIdx, const glm::vec3& nLocal,
+    const std::vector<uint32_t>& faceTris)
+{
+    if (objIdx < 0 || objIdx >= (int)m_objects.size()) return;
+    if (faceTris.empty()) return;
+
+    SceneObject& obj = m_objects[objIdx];
+
+    // ---- 1. Local-space face centroid ---------------------------------------
+    glm::vec3 centroidLocal(0.0f);
+    int       triCounted = 0;
+    for (uint32_t t : faceTris)
+    {
+        const uint32_t i0 = obj.cpuIndices[3 * t + 0];
+        const uint32_t i1 = obj.cpuIndices[3 * t + 1];
+        const uint32_t i2 = obj.cpuIndices[3 * t + 2];
+        const glm::vec3 v0(obj.cpuVerts[i0 * 3], obj.cpuVerts[i0 * 3 + 1], obj.cpuVerts[i0 * 3 + 2]);
+        const glm::vec3 v1(obj.cpuVerts[i1 * 3], obj.cpuVerts[i1 * 3 + 1], obj.cpuVerts[i1 * 3 + 2]);
+        const glm::vec3 v2(obj.cpuVerts[i2 * 3], obj.cpuVerts[i2 * 3 + 1], obj.cpuVerts[i2 * 3 + 2]);
+        centroidLocal += (v0 + v1 + v2) * (1.0f / 3.0f);
+        ++triCounted;
+    }
+    centroidLocal /= float(triCounted);
+
+    // ---- 2. Rotation pieces -------------------------------------------------
+    // R_old is the existing object rotation (YXZ). We extract just the 3x3
+    // rotation block of the model matrix and re-orthonormalize because the
+    // model matrix also contains scale; we want pure rotation.
+    const glm::mat4 modelOld = obj.BuildModelMatrix();
+    glm::mat3 R_old(modelOld);
+    if (obj.scale > 1e-12f)
+        R_old /= obj.scale;
+
+    const glm::vec3 nLocalUnit = glm::normalize(nLocal);
+    const glm::vec3 nWorld = glm::normalize(R_old * nLocalUnit);
+
+    // ---- 3. Smallest-rotation target on ±Y ---------------------------------
+    const glm::vec3 targetY =
+        (nWorld.y >= 0.0f) ? glm::vec3(0, 1, 0) : glm::vec3(0, -1, 0);
+
+    // ---- 4. R_delta from nWorld to targetY ---------------------------------
+    glm::mat3 R_delta(1.0f);  // identity
+    const float d = glm::clamp(glm::dot(nWorld, targetY), -1.0f, 1.0f);
+    if (d < 0.99999f)
+    {
+        if (d < -0.99999f)
+        {
+            // Anti-parallel: 180° rotation about any axis perpendicular to nWorld.
+            // Pick the world axis least parallel to nWorld for numerical stability.
+            const glm::vec3 candidate =
+                (std::abs(nWorld.x) < 0.9f) ? glm::vec3(1, 0, 0) : glm::vec3(0, 0, 1);
+            const glm::vec3 axis = glm::normalize(glm::cross(nWorld, candidate));
+            R_delta = glm::mat3(glm::rotate(glm::mat4(1.0f),
+                glm::radians(180.0f), axis));
+        }
+        else
+        {
+            const glm::vec3 axis = glm::normalize(glm::cross(nWorld, targetY));
+            const float     angle = std::acos(d);
+            R_delta = glm::mat3(glm::rotate(glm::mat4(1.0f), angle, axis));
+        }
+    }
+
+    // ---- 5. Compose and decompose ------------------------------------------
+    const glm::mat3 R_new = R_delta * R_old;
+    DecomposeYXZ(R_new, obj.yawDeg, obj.pitchDeg, obj.rollDeg);
+
+    // ---- 6. Solve translation ----------------------------------------------
+    // Old: c_w = pos_old + R_old * (s * c_local)
+    // New: c_w' = pos_new + R_new * (s * c_local) = pos_new + R_delta * (c_w - pos_old)
+    // We want c_w'.y = 0 and c_w'.xz = c_w.xz (face stays put laterally).
+    const glm::vec3 v_old = R_old * (obj.scale * centroidLocal);
+    const glm::vec3 c_w = obj.pos + v_old;
+    const glm::vec3 v_new = R_delta * v_old;
+
+    obj.pos.x = c_w.x - v_new.x;
+    obj.pos.y = -v_new.y;
+    obj.pos.z = c_w.z - v_new.z;
+}
+
 // ---------------------------------------------------------------------------
 // RayCastParting — snaps to the nearest point on the mesh's parting line.
 //
@@ -2370,6 +2771,9 @@ void GLCanvas::DestroyGL()
     if (m_runnerPathVAO) { glDeleteVertexArrays(1, &m_runnerPathVAO);    m_runnerPathVAO = 0; }
     if (m_gatePathVBO) { glDeleteBuffers(1, &m_gatePathVBO);           m_gatePathVBO = 0; }
     if (m_gatePathVAO) { glDeleteVertexArrays(1, &m_gatePathVAO);      m_gatePathVAO = 0; }
+    if (m_alignHighlightVBO) { glDeleteBuffers(1, &m_alignHighlightVBO);     m_alignHighlightVBO = 0; }
+    if (m_alignHighlightVAO) { glDeleteVertexArrays(1, &m_alignHighlightVAO); m_alignHighlightVAO = 0; }
+    m_alignHighlightVertexCount = 0;
     if (m_sphereEBO) { glDeleteBuffers(1, &m_sphereEBO);          m_sphereEBO = 0; }
     if (m_sphereVBO) { glDeleteBuffers(1, &m_sphereVBO);          m_sphereVBO = 0; }
     if (m_sphereVAO) { glDeleteVertexArrays(1, &m_sphereVAO);     m_sphereVAO = 0; }
@@ -2731,6 +3135,67 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         glBindVertexArray(obj.mesh.vao);
         glDrawElements(GL_TRIANGLES, obj.mesh.indexCount, GL_UNSIGNED_INT, 0);
         glBindVertexArray(0);
+    }
+
+    // ---- AlignFace hover highlight -----------------------------------------
+    // Deferred ray-cast pass: runs once per rendered frame regardless of how
+    // many mouse-motion events have queued up. Detects whether the hover has
+    // moved to a new face/object and rebuilds the highlight VBO only on change.
+    if (m_transformMode == TransformMode::AlignFace)
+    {
+        int hoverObj = -1, hoverTri = -1;
+        const bool hovered = RayCastFacePick(m_alignMousePos.x,
+            m_alignMousePos.y, hoverObj, hoverTri);
+
+        if (!hovered)
+        {
+            if (m_alignHoverObject != -1 || m_alignSeedTri != -1)
+            {
+                m_alignHoverObject = -1;
+                m_alignSeedTri = -1;
+                m_alignFaceTris.clear();
+                m_alignHighlightVertexCount = 0;
+            }
+        }
+        else if (hoverObj != m_alignHoverObject || hoverTri != m_alignSeedTri)
+        {
+            // New face hovered: grow region and rebuild VBO.
+            EnsureTriAdjacency(m_objects[hoverObj]);
+            GrowCoplanarFace(m_objects[hoverObj], hoverTri,
+                m_alignFaceTris, m_alignFaceNormalLocal);
+            RebuildAlignHighlightVBO(m_objects[hoverObj], m_alignFaceTris);
+            m_alignHoverObject = hoverObj;
+            m_alignSeedTri = hoverTri;
+        }
+
+        // Render the highlight overlay using the flat shader. The triangles
+        // are already in world space, so uModel isn't needed — only uVP.
+        // glPolygonOffset pulls the highlight slightly toward the camera so
+        // it wins the depth fight against the underlying object surface.
+        if (m_flatProgram && m_alignHighlightVAO &&
+            m_alignHighlightVertexCount > 0)
+        {
+            glEnable(GL_DEPTH_TEST);
+            glDepthFunc(GL_LEQUAL);
+            glEnable(GL_POLYGON_OFFSET_FILL);
+            glPolygonOffset(-1.0f, -1.0f);
+
+            glUseProgram(m_flatProgram);
+            const glm::mat4 VP = proj * view;
+            glUniformMatrix4fv(m_flat_uVP, 1, GL_FALSE, &VP[0][0]);
+            const glm::vec4 highlightColor(0.18f, 0.18f, 0.18f, 1.0f);
+            glUniform4fv(m_flat_uColor, 1, &highlightColor[0]);
+
+            glBindVertexArray(m_alignHighlightVAO);
+            glDrawArrays(GL_TRIANGLES, 0, m_alignHighlightVertexCount);
+            glBindVertexArray(0);
+
+            glDisable(GL_POLYGON_OFFSET_FILL);
+            glDepthFunc(GL_LESS);
+
+            // Restore the lit shader for any subsequent passes that expect it.
+            glUseProgram(m_program);
+        }
     }
 
     // Determine which fixture is transparent this frame
@@ -3736,6 +4201,35 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
             const wxPoint p = evt.GetPosition();
             RemoveSprueAtMouse(p.x, p.y);
         }
+        else if (m_transformMode == TransformMode::AlignFace)
+        {
+            // Click commits whatever face is currently highlighted under the
+            // cursor. We re-run the cast here rather than trusting the cached
+            // hover state, in case a click arrives before OnPaint refreshes.
+            const wxPoint p = evt.GetPosition();
+            int objIdx = -1, triIdx = -1;
+            if (RayCastFacePick(p.x, p.y, objIdx, triIdx))
+            {
+                std::vector<uint32_t> faceTris;
+                glm::vec3 nLocal(0.0f);
+                EnsureTriAdjacency(m_objects[objIdx]);
+                GrowCoplanarFace(m_objects[objIdx], triIdx, faceTris, nLocal);
+                if (!faceTris.empty())
+                {
+                    ApplyAlignFaceToObject(objIdx, nLocal, faceTris);
+
+                    // After applying, the cached world-space triangles are
+                    // stale and the new pose may not project under the cursor
+                    // anymore — drop the highlight so OnPaint regenerates it
+                    // from the next motion event.
+                    m_alignHoverObject = -1;
+                    m_alignSeedTri = -1;
+                    m_alignFaceTris.clear();
+                    m_alignHighlightVertexCount = 0;
+                    Refresh(false);
+                }
+            }
+        }
         else if (m_transformMode == TransformMode::SelectInjectionPoint)
         {
             if (m_injectionPoints.empty()) { /* nothing to pick */ }
@@ -3856,6 +4350,11 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
         if (m_transformMode == TransformMode::PlaceGate)
         {
             m_gateGhostMousePos = pos;
+            Refresh(false);
+        }
+        if (m_transformMode == TransformMode::AlignFace)
+        {
+            m_alignMousePos = pos;
             Refresh(false);
         }
         evt.Skip();
@@ -3982,6 +4481,17 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
             Refresh(false);
         }
     }
+    else if (m_lmb && m_transformMode == TransformMode::AlignFace)
+    {
+        // Orbit while holding LMB in AlignFace mode (matches Place* modes).
+        if (shift)
+            m_camera.Pan(dx, -dy);
+        else if (ctrl)
+            m_camera.Dolly(dy * 0.05f);
+        else
+            m_camera.Orbit(dx, dy);
+        Refresh(false);
+    }
 
     // Update ghost preview whenever the mouse moves in PlaceVent mode.
     // The actual ray cast is deferred to OnPaint so only one cast runs per
@@ -3999,6 +4509,12 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
     else if (m_transformMode == TransformMode::PlaceGate)
     {
         m_gateGhostMousePos = evt.GetPosition();
+        Refresh(false);
+    }
+    else if (m_transformMode == TransformMode::AlignFace)
+    {
+        // Same deferred-cast pattern as Place* ghosts: store mouse, defer to OnPaint.
+        m_alignMousePos = evt.GetPosition();
         Refresh(false);
     }
     else if (m_ventGhostActive || m_runnerGhostActive || m_gateGhostActive)

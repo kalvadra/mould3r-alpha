@@ -13,7 +13,7 @@
 
 class GLCanvas;
 
-enum class TransformMode { Select, Translate, Rotate, Scale, PlaceVent, PlaceRunner, PlaceGate, RemoveVent, RemoveRunner, RemoveGate, RemoveSprue, EditVent, EditRunner, EditGate, SelectInjectionPoint };
+enum class TransformMode { Select, Translate, Rotate, Scale, PlaceVent, PlaceRunner, PlaceGate, RemoveVent, RemoveRunner, RemoveGate, RemoveSprue, EditVent, EditRunner, EditGate, SelectInjectionPoint, AlignFace };
 
 class MainFrame : public wxFrame
 {
@@ -71,6 +71,8 @@ private:
     void OnToolRotate(wxCommandEvent& evt);
     void OnToolScale(wxCommandEvent& evt);
     void OnToolCenter(wxCommandEvent& evt);
+    void OnToolAlignFace(wxCommandEvent& evt);
+    void OnToolAlignMidplane(wxCommandEvent& evt);
     void OnToolPlaceVent(wxCommandEvent& evt);
 
     void OnPlaceSprue(wxCommandEvent&);
@@ -188,6 +190,8 @@ private:
         ID_ToolRotate,
         ID_ToolScale,
         ID_ToolCenter,
+        ID_ToolAlignFace,
+        ID_ToolAlignMidplane,
         ID_ToolPlaceVent,
         ID_BrowseExport,
         ID_Export,

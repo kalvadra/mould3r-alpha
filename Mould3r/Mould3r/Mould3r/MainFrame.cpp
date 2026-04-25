@@ -3,6 +3,7 @@
 #include <wx/stdpaths.h>
 #include <wx/filename.h>
 #include <wx/file.h>
+#include <wx/dnd.h>
 #include <memory>
 
 #include "MainFrame.h"
@@ -95,6 +96,77 @@ static void StyleRibbonBtn(wxToggleButton* btn, bool active = false)
         wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
     btn->Refresh();
 }
+
+// ---------------------------------------------------------------------------
+// Drag-and-drop target for the 3D viewport.
+// Accepts STEP/STL/OBJ files dropped onto the canvas and routes them through
+// the same import path as the File -> Import Model menu item, so a dropped
+// file gets the same progress dialog, faceting, normal/crease processing and
+// non-manifold warnings as a file picked through the dialog.
+// Mixed drops (some supported, some not) are partitioned: the user gets a
+// single up-front warning listing the unsupported files, then the supported
+// ones import sequentially.
+// ---------------------------------------------------------------------------
+namespace {
+
+    bool IsSupportedModelExt(const wxString& path)
+    {
+        const wxString ext = wxFileName(path).GetExt().Lower();
+        return ext == "step" || ext == "stp" || ext == "stl" || ext == "obj";
+    }
+
+    class ModelFileDropTarget : public wxFileDropTarget
+    {
+    public:
+        explicit ModelFileDropTarget(MainFrame* frame) : m_frame(frame) {}
+
+        bool OnDropFiles(wxCoord, wxCoord, const wxArrayString& filenames) override
+        {
+            if (!m_frame || filenames.IsEmpty())
+                return false;
+
+            // Partition into supported and unsupported by extension before doing
+            // any work, so the user is warned about unreadable files up front
+            // rather than after several long imports have already run.
+            wxArrayString accepted;
+            wxArrayString rejected;
+            accepted.reserve(filenames.size());
+            for (const wxString& f : filenames) {
+                if (IsSupportedModelExt(f))
+                    accepted.Add(f);
+                else
+                    rejected.Add(wxFileName(f).GetFullName());
+            }
+
+            if (!rejected.IsEmpty()) {
+                wxString msg = "The following file(s) cannot be imported "
+                    "(only STEP, STL and OBJ are supported):\n\n";
+                for (const wxString& name : rejected)
+                    msg << "    " << name << "\n";
+                wxMessageBox(msg, "Unsupported file type",
+                    wxOK | wxICON_WARNING, m_frame);
+            }
+
+            if (accepted.IsEmpty())
+                return false;
+
+            GLCanvas* canvas = m_frame->GetCanvas();
+            if (!canvas)
+                return false;
+
+            // ImportFile shows its own progress dialog, so multi-file drops will
+            // display one progress per file in sequence.
+            for (const wxString& path : accepted)
+                canvas->ImportFile(path.ToStdString());
+
+            return true;
+        }
+
+    private:
+        MainFrame* m_frame;  // not owned
+    };
+
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // MainFrame
@@ -201,6 +273,10 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
     m_canvas = new GLCanvas(root);
     m_leftPanel = CreateLeftPanel(root);
 
+    // Drag-and-drop import: drop STEP/STL/OBJ files onto the 3D viewport
+    // to import them. wxWidgets takes ownership of the drop target.
+    m_canvas->SetDropTarget(new ModelFileDropTarget(this));
+
     contentSizer->Add(m_leftPanel, 0, wxEXPAND);
     contentSizer->Add(m_canvas, 1, wxEXPAND);
 
@@ -297,6 +373,8 @@ wxPanel* MainFrame::CreateRibbon(wxWindow* parent)
     Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolRotate, this, ID_ToolRotate);
     Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolScale, this, ID_ToolScale);
     Bind(wxEVT_BUTTON, &MainFrame::OnToolCenter, this, ID_ToolCenter);
+    Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolAlignFace, this, ID_ToolAlignFace);
+    Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolAlignMidplane, this, ID_ToolAlignMidplane);
     Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolPlaceVent, this, ID_ToolPlaceVent);
     Bind(wxEVT_BUTTON, &MainFrame::OnClearVentPoints, this, ID_ClearVentPoints);
     Bind(wxEVT_BUTTON, &MainFrame::OnPlaceSprue, this, ID_PlaceSprue);
@@ -526,6 +604,26 @@ void MainFrame::OnToolCenter(wxCommandEvent&)
     }
 
     m_canvas->CenterSelectedObject();
+}
+
+// ---------------------------------------------------------------------------
+// Align Face / Align Midplane — UI scaffolding only.
+// Behaviour will be wired up in a follow-up change. The buttons toggle their
+// own visual state inside makeToolBtn, so for now these handlers can stay
+// empty without affecting the ribbon's appearance.
+// ---------------------------------------------------------------------------
+void MainFrame::OnToolAlignFace(wxCommandEvent&)
+{
+    // Toggle: if already in AlignFace mode, return to Select
+    if (m_canvas && m_canvas->GetTransformMode() == TransformMode::AlignFace)
+        SetActiveTool(TransformMode::Select);
+    else
+        SetActiveTool(TransformMode::AlignFace);
+}
+
+void MainFrame::OnToolAlignMidplane(wxCommandEvent&)
+{
+    // TODO: align the selected object's midplane to the fixture midplane.
 }
 
 void MainFrame::OnToolPlaceVent(wxCommandEvent&)
@@ -1962,7 +2060,7 @@ wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
 
         toolsSizer->AddSpacer(8);
 
-        auto* grid = new wxGridSizer(2, 2, 4, 4);
+        auto* grid = new wxGridSizer(3, 2, 4, 4);
 
         // ---- SVG icon paths for model tool buttons --------------------------------
         // Fill in the path to each SVG file (relative to the executable, or absolute).
@@ -1971,6 +2069,8 @@ wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
         static const wxString kIconRotate = "res/icons/rotate-2.svg";
         static const wxString kIconScale = "res/icons/resize.svg";
         static const wxString kIconCenter = "res/icons/focus-centered.svg";
+        static const wxString kIconAlignFace = "res/icons/align-face.svg";
+        static const wxString kIconAlignMidplane = "res/icons/align-midplane.svg";
 
         // Helper: load an SVG, recolor all strokes and fills to white, and return a
         // wxBitmapBundle.  Relative paths are anchored to the executable directory.
@@ -2105,6 +2205,8 @@ wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
         grid->Add(makeToolBtn(ID_ToolRotate, "Rotate", true, kIconRotate), 0, wxEXPAND);
         grid->Add(makeToolBtn(ID_ToolScale, "Scale", true, kIconScale), 0, wxEXPAND);
         grid->Add(makeToolBtn(ID_ToolCenter, "Center", false, kIconCenter), 0, wxEXPAND);
+        grid->Add(makeToolBtn(ID_ToolAlignFace, "Align Face", true, kIconAlignFace), 0, wxEXPAND);
+        grid->Add(makeToolBtn(ID_ToolAlignMidplane, "Align Midplane", true, kIconAlignMidplane), 0, wxEXPAND);
 
         toolsSizer->Add(grid, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
         toolsSizer->AddSpacer(10);
