@@ -47,7 +47,7 @@
 
 ; ---- App metadata -----------------------------------------------------------
 #define MyAppName      "Mould3r"
-#define MyAppVersion   "0.1.4"
+#define MyAppVersion   "0.1.6"
 #define MyAppPublisher "Clayton Stewart"
 #define MyAppURL       "https://mould3r.com"
 #define MyAppExeName   "Mould3r.exe"
@@ -86,7 +86,7 @@ UninstallDisplayName={#MyAppName}
 AllowNoIcons=yes
 ; WizardStyle=modern                            ← uncomment for Inno 6+ modern look
 PrivilegesRequired=lowest
-SetupIconFile=logo-icon-nobackground2.ico
+SetupIconFile=logo-icon-nobackground.ico
 
 ; License file (optional — uncomment and point at your license)
 ; LicenseFile={#StagingDir}\LICENSE.txt
