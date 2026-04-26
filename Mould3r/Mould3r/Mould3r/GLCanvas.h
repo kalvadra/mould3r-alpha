@@ -272,11 +272,29 @@ private:
     void RebuildAlignHighlightVBO(const SceneObject& obj,
         const std::vector<uint32_t>& tris);
 
-    // Compute and apply the rotation+translation that snaps the picked face's
-    // plane onto Y=0 (world parting plane). Rotates around the face centroid
-    // so the picked face stays roughly in place laterally.
+    // Apply the rotation+translation that snaps an arbitrary plane (defined
+    // by a local-space normal and a local-space anchor point on the plane)
+    // onto the world Y=0 parting plane. The anchor is held fixed laterally
+    // (X/Z) so the picked geometry stays put in screen space and only the
+    // pose changes. Used by both AlignFace and AlignMidplane.
+    void ApplyPlaneAlignmentToObject(int objIdx,
+        const glm::vec3& planeNormalLocal,
+        const glm::vec3& anchorLocal);
+
+    // AlignFace: thin wrapper around ApplyPlaneAlignmentToObject that uses
+    // the picked face's own normal and centroid.
     void ApplyAlignFaceToObject(int objIdx, const glm::vec3& nLocal,
         const std::vector<uint32_t>& faceTris);
+
+    // AlignMidplane: combine the locked first face with a freshly-picked
+    // second face into a midplane, then apply alignment.
+    void ApplyAlignMidplaneToObject(int objIdx,
+        const glm::vec3& n2Local,
+        const std::vector<uint32_t>& faceTris2);
+
+    // Build/clear the persistent locked-face overlay used in midplane mode.
+    void RebuildMidplaneLockedVBO(const SceneObject& obj,
+        const std::vector<uint32_t>& tris);
 
     // Decompose a YXZ-Euler rotation matrix back to (yaw, pitch, roll).
     // Handles the gimbal-lock case where pitch ≈ ±90°.
@@ -417,4 +435,20 @@ private:
     GLuint  m_alignHighlightVAO = 0;
     GLuint  m_alignHighlightVBO = 0;
     GLsizei m_alignHighlightVertexCount = 0;
+
+    // ---- Align Midplane state ----------------------------------------------
+    // Locked first-face state for two-click midplane alignment. Reuses the
+    // hover state above for the current cursor highlight, and adds a separate
+    // VBO for the persistent locked-face overlay (yellow, matches selection
+    // outline). Object-local data is captured at click time so subsequent
+    // mouse motion or transforms don't invalidate it.
+    bool                  m_midplaneFaceLocked = false;
+    int                   m_midplaneFaceObject = -1;
+    std::vector<uint32_t> m_midplaneFaceTris;
+    glm::vec3             m_midplaneFaceNormalLocal{ 0.0f };
+    glm::vec3             m_midplaneFaceCentroidLocal{ 0.0f };
+
+    GLuint  m_midplaneLockedVAO = 0;
+    GLuint  m_midplaneLockedVBO = 0;
+    GLsizei m_midplaneLockedVertexCount = 0;
 };

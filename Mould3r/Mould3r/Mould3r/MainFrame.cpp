@@ -623,7 +623,11 @@ void MainFrame::OnToolAlignFace(wxCommandEvent&)
 
 void MainFrame::OnToolAlignMidplane(wxCommandEvent&)
 {
-    // TODO: align the selected object's midplane to the fixture midplane.
+    // Toggle: if already in AlignMidplane mode, return to Select
+    if (m_canvas && m_canvas->GetTransformMode() == TransformMode::AlignMidplane)
+        SetActiveTool(TransformMode::Select);
+    else
+        SetActiveTool(TransformMode::AlignMidplane);
 }
 
 void MainFrame::OnToolPlaceVent(wxCommandEvent&)

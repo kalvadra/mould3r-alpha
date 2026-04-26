@@ -180,6 +180,21 @@ void GLCanvas::SetTransformMode(TransformMode mode)
         m_alignHighlightVertexCount = 0;
     }
 
+    // Clear AlignMidplane state when leaving the mode. Hover state is shared
+    // with AlignFace and cleared above; this drops the locked-face data.
+    if (m_transformMode == TransformMode::AlignMidplane && mode != TransformMode::AlignMidplane)
+    {
+        m_alignHoverObject = -1;
+        m_alignSeedTri = -1;
+        m_alignFaceTris.clear();
+        m_alignHighlightVertexCount = 0;
+
+        m_midplaneFaceLocked = false;
+        m_midplaneFaceObject = -1;
+        m_midplaneFaceTris.clear();
+        m_midplaneLockedVertexCount = 0;
+    }
+
     m_transformMode = mode;
     switch (mode)
     {
@@ -209,6 +224,8 @@ void GLCanvas::SetTransformMode(TransformMode mode)
     case TransformMode::SelectInjectionPoint:
         SetCursor(wxCursor(wxCURSOR_HAND));     break;
     case TransformMode::AlignFace:
+        SetCursor(wxCursor(wxCURSOR_HAND));     break;
+    case TransformMode::AlignMidplane:
         SetCursor(wxCursor(wxCURSOR_HAND));     break;
     }
 
@@ -1848,62 +1865,46 @@ void GLCanvas::DecomposeYXZ(const glm::mat3& R,
 }
 
 // ---------------------------------------------------------------------------
-// ApplyAlignFaceToObject — rotate + translate the picked object so the
-// chosen face lies on the world Y=0 parting plane.
+// ApplyPlaneAlignmentToObject — core math shared by AlignFace and AlignMidplane.
+//
+// Snaps the local-space plane (planeNormalLocal, anchorLocal) onto world Y=0.
+// The anchor is held fixed laterally (X/Z stays put in world), only Y and the
+// rotation change.
 //
 // Strategy:
-//   1. Compute the face centroid in local space (average of triangle centroids).
-//   2. Map the local face normal to world space: n_w = R_old * n_local
-//      (uniform scale doesn't affect normal direction).
-//   3. Pick the target axis as whichever of ±Y is closer to n_w — this gives
-//      the smallest-rotation alignment, so the user's existing orientation
-//      is respected.
-//   4. Build R_delta as the smallest rotation from n_w to the target axis.
-//   5. Compose: R_new = R_delta * R_old, decompose back to YXZ Euler.
-//   6. Solve for the new translation so the face centroid stays in place
-//      laterally (X/Z unchanged in world) and lands exactly on Y=0.
+//   1. Map the local plane normal to world space using R_old (object rotation
+//      without scale). Uniform scale doesn't affect normal direction.
+//   2. Pick the target axis as whichever of ±Y is closer to n_w — smallest
+//      rotation, so the user's existing orientation is respected.
+//   3. Build R_delta as the smallest rotation from n_w to the target axis.
+//   4. Compose: R_new = R_delta * R_old, decompose back to YXZ Euler.
+//   5. Solve for the new translation so the anchor stays in place laterally
+//      and lands exactly on Y=0.
 // ---------------------------------------------------------------------------
-void GLCanvas::ApplyAlignFaceToObject(int objIdx, const glm::vec3& nLocal,
-    const std::vector<uint32_t>& faceTris)
+void GLCanvas::ApplyPlaneAlignmentToObject(int objIdx,
+    const glm::vec3& planeNormalLocal,
+    const glm::vec3& anchorLocal)
 {
     if (objIdx < 0 || objIdx >= (int)m_objects.size()) return;
-    if (faceTris.empty()) return;
 
     SceneObject& obj = m_objects[objIdx];
 
-    // ---- 1. Local-space face centroid ---------------------------------------
-    glm::vec3 centroidLocal(0.0f);
-    int       triCounted = 0;
-    for (uint32_t t : faceTris)
-    {
-        const uint32_t i0 = obj.cpuIndices[3 * t + 0];
-        const uint32_t i1 = obj.cpuIndices[3 * t + 1];
-        const uint32_t i2 = obj.cpuIndices[3 * t + 2];
-        const glm::vec3 v0(obj.cpuVerts[i0 * 3], obj.cpuVerts[i0 * 3 + 1], obj.cpuVerts[i0 * 3 + 2]);
-        const glm::vec3 v1(obj.cpuVerts[i1 * 3], obj.cpuVerts[i1 * 3 + 1], obj.cpuVerts[i1 * 3 + 2]);
-        const glm::vec3 v2(obj.cpuVerts[i2 * 3], obj.cpuVerts[i2 * 3 + 1], obj.cpuVerts[i2 * 3 + 2]);
-        centroidLocal += (v0 + v1 + v2) * (1.0f / 3.0f);
-        ++triCounted;
-    }
-    centroidLocal /= float(triCounted);
-
-    // ---- 2. Rotation pieces -------------------------------------------------
-    // R_old is the existing object rotation (YXZ). We extract just the 3x3
-    // rotation block of the model matrix and re-orthonormalize because the
-    // model matrix also contains scale; we want pure rotation.
+    // ---- 1. Rotation pieces -------------------------------------------------
+    // R_old is the existing object rotation (YXZ). Strip uniform scale from
+    // the model matrix's 3x3 block to get pure rotation.
     const glm::mat4 modelOld = obj.BuildModelMatrix();
     glm::mat3 R_old(modelOld);
     if (obj.scale > 1e-12f)
         R_old /= obj.scale;
 
-    const glm::vec3 nLocalUnit = glm::normalize(nLocal);
+    const glm::vec3 nLocalUnit = glm::normalize(planeNormalLocal);
     const glm::vec3 nWorld = glm::normalize(R_old * nLocalUnit);
 
-    // ---- 3. Smallest-rotation target on ±Y ---------------------------------
+    // ---- 2. Smallest-rotation target on ±Y ---------------------------------
     const glm::vec3 targetY =
         (nWorld.y >= 0.0f) ? glm::vec3(0, 1, 0) : glm::vec3(0, -1, 0);
 
-    // ---- 4. R_delta from nWorld to targetY ---------------------------------
+    // ---- 3. R_delta from nWorld to targetY ---------------------------------
     glm::mat3 R_delta(1.0f);  // identity
     const float d = glm::clamp(glm::dot(nWorld, targetY), -1.0f, 1.0f);
     if (d < 0.99999f)
@@ -1926,21 +1927,232 @@ void GLCanvas::ApplyAlignFaceToObject(int objIdx, const glm::vec3& nLocal,
         }
     }
 
-    // ---- 5. Compose and decompose ------------------------------------------
+    // ---- 4. Compose and decompose ------------------------------------------
     const glm::mat3 R_new = R_delta * R_old;
     DecomposeYXZ(R_new, obj.yawDeg, obj.pitchDeg, obj.rollDeg);
 
-    // ---- 6. Solve translation ----------------------------------------------
-    // Old: c_w = pos_old + R_old * (s * c_local)
-    // New: c_w' = pos_new + R_new * (s * c_local) = pos_new + R_delta * (c_w - pos_old)
-    // We want c_w'.y = 0 and c_w'.xz = c_w.xz (face stays put laterally).
-    const glm::vec3 v_old = R_old * (obj.scale * centroidLocal);
-    const glm::vec3 c_w = obj.pos + v_old;
+    // ---- 5. Solve translation ----------------------------------------------
+    // Anchor world position before the rotation:
+    //     a_w = pos_old + R_old * (s * a_local)
+    // After: a_w' = pos_new + R_new * (s * a_local) = pos_new + R_delta * (a_w - pos_old)
+    // We want a_w'.y = 0 and a_w'.xz = a_w.xz (anchor stays put laterally).
+    const glm::vec3 v_old = R_old * (obj.scale * anchorLocal);
+    const glm::vec3 a_w = obj.pos + v_old;
     const glm::vec3 v_new = R_delta * v_old;
 
-    obj.pos.x = c_w.x - v_new.x;
+    obj.pos.x = a_w.x - v_new.x;
     obj.pos.y = -v_new.y;
-    obj.pos.z = c_w.z - v_new.z;
+    obj.pos.z = a_w.z - v_new.z;
+}
+
+// ---------------------------------------------------------------------------
+// ApplyAlignFaceToObject — thin wrapper. Computes face centroid in local
+// space and delegates to the shared aligner using the face's own normal.
+// ---------------------------------------------------------------------------
+void GLCanvas::ApplyAlignFaceToObject(int objIdx, const glm::vec3& nLocal,
+    const std::vector<uint32_t>& faceTris)
+{
+    if (objIdx < 0 || objIdx >= (int)m_objects.size()) return;
+    if (faceTris.empty()) return;
+
+    const SceneObject& obj = m_objects[objIdx];
+
+    glm::vec3 centroidLocal(0.0f);
+    int       triCounted = 0;
+    for (uint32_t t : faceTris)
+    {
+        const uint32_t i0 = obj.cpuIndices[3 * t + 0];
+        const uint32_t i1 = obj.cpuIndices[3 * t + 1];
+        const uint32_t i2 = obj.cpuIndices[3 * t + 2];
+        const glm::vec3 v0(obj.cpuVerts[i0 * 3], obj.cpuVerts[i0 * 3 + 1], obj.cpuVerts[i0 * 3 + 2]);
+        const glm::vec3 v1(obj.cpuVerts[i1 * 3], obj.cpuVerts[i1 * 3 + 1], obj.cpuVerts[i1 * 3 + 2]);
+        const glm::vec3 v2(obj.cpuVerts[i2 * 3], obj.cpuVerts[i2 * 3 + 1], obj.cpuVerts[i2 * 3 + 2]);
+        centroidLocal += (v0 + v1 + v2) * (1.0f / 3.0f);
+        ++triCounted;
+    }
+    centroidLocal /= float(triCounted);
+
+    ApplyPlaneAlignmentToObject(objIdx, nLocal, centroidLocal);
+}
+
+// ---------------------------------------------------------------------------
+// ApplyAlignMidplaneToObject — combine the locked first face with the
+// freshly-picked second face to derive a midplane, then align that midplane
+// to Y=0.
+//
+// Bisector selection rule: there are two valid bisector planes. We pick the
+// one that *separates the two centroids* — that's bisector B, with normal
+// (n1 - n2), when c1 and c2 lie on opposite sides of it. Otherwise we use
+// bisector A with normal (n1 + n2). This handles both common cases:
+//   • Parallel slab (top + bottom face, n1·n2 ≈ -1): bisector B, parallel to
+//     both faces, halfway between.
+//   • V-shape / wedge (two angled walls): bisector B, the axis-of-symmetry
+//     plane.
+//   • Two parallel same-normal faces (rare; n1·n2 ≈ +1): bisector A.
+//
+// Anchor: midpoint of the two centroids, then projected onto the midplane
+// for numerical cleanliness (the midpoint is already on the midplane in
+// exact arithmetic, but the projection costs one dot product and avoids
+// accumulating any drift).
+// ---------------------------------------------------------------------------
+void GLCanvas::ApplyAlignMidplaneToObject(int objIdx,
+    const glm::vec3& n2Local,
+    const std::vector<uint32_t>& faceTris2)
+{
+    if (objIdx < 0 || objIdx >= (int)m_objects.size()) return;
+    if (faceTris2.empty()) return;
+    if (!m_midplaneFaceLocked || m_midplaneFaceObject != objIdx) return;
+
+    const SceneObject& obj = m_objects[objIdx];
+
+    // ---- Centroid of face 2 (local) ----------------------------------------
+    glm::vec3 c2(0.0f);
+    int       triCounted = 0;
+    for (uint32_t t : faceTris2)
+    {
+        const uint32_t i0 = obj.cpuIndices[3 * t + 0];
+        const uint32_t i1 = obj.cpuIndices[3 * t + 1];
+        const uint32_t i2 = obj.cpuIndices[3 * t + 2];
+        const glm::vec3 v0(obj.cpuVerts[i0 * 3], obj.cpuVerts[i0 * 3 + 1], obj.cpuVerts[i0 * 3 + 2]);
+        const glm::vec3 v1(obj.cpuVerts[i1 * 3], obj.cpuVerts[i1 * 3 + 1], obj.cpuVerts[i1 * 3 + 2]);
+        const glm::vec3 v2(obj.cpuVerts[i2 * 3], obj.cpuVerts[i2 * 3 + 1], obj.cpuVerts[i2 * 3 + 2]);
+        c2 += (v0 + v1 + v2) * (1.0f / 3.0f);
+        ++triCounted;
+    }
+    c2 /= float(triCounted);
+
+    const glm::vec3 n1 = glm::normalize(m_midplaneFaceNormalLocal);
+    const glm::vec3 n2 = glm::normalize(n2Local);
+    const glm::vec3 c1 = m_midplaneFaceCentroidLocal;
+
+    // ---- Bisector selection ------------------------------------------------
+    // Two bisector planes exist between the two face planes:
+    //   A: normal nA = n1 - n2, offset dA = n1·c1 - n2·c2
+    //   B: normal nB = n1 + n2, offset dB = n1·c1 + n2·c2
+    //
+    // We want the bisector that *separates the two centroids* — that's the
+    // one threading between the faces rather than running parallel to both
+    // far away from them.
+    //
+    // Signed distances of c1, c2 from bisector A simplify to:
+    //   sd(c1) = n2 · (c2 - c1)
+    //   sd(c2) = n1 · (c2 - c1)
+    // A separates c1 and c2 iff these have opposite signs (product < 0).
+    //
+    // Worked examples:
+    //   • Parallel slab (n1=+Y, n2=-Y, c1 above, c2 below):
+    //       sd(c1) = -2h, sd(c2) = +2h, opposite signs → A wins, plane y=0. ✓
+    //   • V-wedge (two angled walls, c1 left, c2 right):
+    //       sd(c1) and sd(c2) opposite signs → A wins, plane x=0. ✓
+    //   • Two parallel same-normal stairs (n1 ≈ n2):
+    //       sd(c1)·sd(c2) > 0 → fall through to B, which is the midline
+    //       parallel to both faces. ✓
+    //
+    // The chosen bisector's *unnormalized* normal and offset are kept in
+    // (nRaw, dRaw) so anchor projection below can use the matching sign
+    // pair — picking the right normal but the wrong offset would give the
+    // wrong plane.
+    glm::vec3 nRaw;
+    float     dRaw;
+    {
+        const glm::vec3 nA = n1 - n2;
+        const glm::vec3 nB_vec = n1 + n2;
+        const float     dA = glm::dot(n1, c1) - glm::dot(n2, c2);
+        const float     dB = glm::dot(n1, c1) + glm::dot(n2, c2);
+
+        const float aLen2 = glm::dot(nA, nA);
+        const float bLen2 = glm::dot(nB_vec, nB_vec);
+
+        const glm::vec3 dC = c2 - c1;
+        const float sd1 = glm::dot(n2, dC);
+        const float sd2 = glm::dot(n1, dC);
+
+        if (aLen2 < 1e-10f)
+        {
+            // n1 ≈ n2 (parallel same-normal): A is degenerate, must use B.
+            nRaw = nB_vec;  dRaw = dB;
+        }
+        else if (bLen2 < 1e-10f)
+        {
+            // n1 ≈ -n2 (anti-parallel): B is degenerate, must use A.
+            nRaw = nA;      dRaw = dA;
+        }
+        else if (sd1 * sd2 < 0.0f)
+        {
+            // A separates the centroids — preferred case for slab and wedge.
+            nRaw = nA;      dRaw = dA;
+        }
+        else
+        {
+            // A doesn't separate — fall back to B.
+            nRaw = nB_vec;  dRaw = dB;
+        }
+    }
+
+    const float     rawLen = glm::length(nRaw);
+    const glm::vec3 nMid = nRaw / rawLen;
+    const float     dMid = dRaw / rawLen;
+
+    // ---- Anchor: midpoint of centroids, projected onto the midplane --------
+    // (mid is generally NOT on either bisector — projection is a real step,
+    // not a no-op.)
+    const glm::vec3 mid = 0.5f * (c1 + c2);
+    const glm::vec3 anchorLocal = mid - (glm::dot(nMid, mid) - dMid) * nMid;
+
+    ApplyPlaneAlignmentToObject(objIdx, nMid, anchorLocal);
+}
+
+// ---------------------------------------------------------------------------
+// RebuildMidplaneLockedVBO — twin of RebuildAlignHighlightVBO for the
+// persistent locked-face overlay shown after the user picks face 1 in
+// midplane mode.
+// ---------------------------------------------------------------------------
+void GLCanvas::RebuildMidplaneLockedVBO(const SceneObject& obj,
+    const std::vector<uint32_t>& tris)
+{
+    if (tris.empty())
+    {
+        m_midplaneLockedVertexCount = 0;
+        return;
+    }
+
+    const glm::mat4 model = obj.BuildModelMatrix();
+
+    std::vector<float> verts;
+    verts.reserve(tris.size() * 9);
+
+    for (uint32_t t : tris)
+    {
+        for (int k = 0; k < 3; ++k)
+        {
+            const uint32_t vi = obj.cpuIndices[3 * t + k];
+            const glm::vec3 vL(obj.cpuVerts[vi * 3],
+                obj.cpuVerts[vi * 3 + 1],
+                obj.cpuVerts[vi * 3 + 2]);
+            const glm::vec3 vW = glm::vec3(model * glm::vec4(vL, 1.0f));
+            verts.push_back(vW.x);
+            verts.push_back(vW.y);
+            verts.push_back(vW.z);
+        }
+    }
+
+    if (m_midplaneLockedVAO == 0)
+    {
+        glGenVertexArrays(1, &m_midplaneLockedVAO);
+        glGenBuffers(1, &m_midplaneLockedVBO);
+        glBindVertexArray(m_midplaneLockedVAO);
+        glBindBuffer(GL_ARRAY_BUFFER, m_midplaneLockedVBO);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+        glBindVertexArray(0);
+    }
+
+    glBindBuffer(GL_ARRAY_BUFFER, m_midplaneLockedVBO);
+    glBufferData(GL_ARRAY_BUFFER, verts.size() * sizeof(float),
+        verts.data(), GL_DYNAMIC_DRAW);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+    m_midplaneLockedVertexCount = (GLsizei)(verts.size() / 3);
 }
 
 // ---------------------------------------------------------------------------
@@ -2774,6 +2986,9 @@ void GLCanvas::DestroyGL()
     if (m_alignHighlightVBO) { glDeleteBuffers(1, &m_alignHighlightVBO);     m_alignHighlightVBO = 0; }
     if (m_alignHighlightVAO) { glDeleteVertexArrays(1, &m_alignHighlightVAO); m_alignHighlightVAO = 0; }
     m_alignHighlightVertexCount = 0;
+    if (m_midplaneLockedVBO) { glDeleteBuffers(1, &m_midplaneLockedVBO);     m_midplaneLockedVBO = 0; }
+    if (m_midplaneLockedVAO) { glDeleteVertexArrays(1, &m_midplaneLockedVAO); m_midplaneLockedVAO = 0; }
+    m_midplaneLockedVertexCount = 0;
     if (m_sphereEBO) { glDeleteBuffers(1, &m_sphereEBO);          m_sphereEBO = 0; }
     if (m_sphereVBO) { glDeleteBuffers(1, &m_sphereVBO);          m_sphereVBO = 0; }
     if (m_sphereVAO) { glDeleteVertexArrays(1, &m_sphereVAO);     m_sphereVAO = 0; }
@@ -3141,7 +3356,8 @@ void GLCanvas::OnPaint(wxPaintEvent&)
     // Deferred ray-cast pass: runs once per rendered frame regardless of how
     // many mouse-motion events have queued up. Detects whether the hover has
     // moved to a new face/object and rebuilds the highlight VBO only on change.
-    if (m_transformMode == TransformMode::AlignFace)
+    if (m_transformMode == TransformMode::AlignFace ||
+        m_transformMode == TransformMode::AlignMidplane)
     {
         int hoverObj = -1, hoverTri = -1;
         const bool hovered = RayCastFacePick(m_alignMousePos.x,
@@ -3168,12 +3384,23 @@ void GLCanvas::OnPaint(wxPaintEvent&)
             m_alignSeedTri = hoverTri;
         }
 
-        // Render the highlight overlay using the flat shader. The triangles
-        // are already in world space, so uModel isn't needed — only uVP.
-        // glPolygonOffset pulls the highlight slightly toward the camera so
-        // it wins the depth fight against the underlying object surface.
-        if (m_flatProgram && m_alignHighlightVAO &&
-            m_alignHighlightVertexCount > 0)
+        // Two render passes share the same flat-shader setup. The locked
+        // face (AlignMidplane only) draws first in selection-outline yellow,
+        // then the dark-grey hover highlight on top — so when the cursor is
+        // hovering over the locked face the hover colour wins, giving the
+        // user clear feedback that re-clicking the same face is possible.
+        // Both passes use glPolygonOffset to win the depth fight against
+        // the underlying object surface.
+        const bool drawLocked =
+            (m_transformMode == TransformMode::AlignMidplane) &&
+            m_midplaneFaceLocked &&
+            m_midplaneLockedVAO != 0 &&
+            m_midplaneLockedVertexCount > 0;
+        const bool drawHover =
+            (m_alignHighlightVAO != 0) &&
+            (m_alignHighlightVertexCount > 0);
+
+        if (m_flatProgram && (drawLocked || drawHover))
         {
             glEnable(GL_DEPTH_TEST);
             glDepthFunc(GL_LEQUAL);
@@ -3183,12 +3410,25 @@ void GLCanvas::OnPaint(wxPaintEvent&)
             glUseProgram(m_flatProgram);
             const glm::mat4 VP = proj * view;
             glUniformMatrix4fv(m_flat_uVP, 1, GL_FALSE, &VP[0][0]);
-            const glm::vec4 highlightColor(0.18f, 0.18f, 0.18f, 1.0f);
-            glUniform4fv(m_flat_uColor, 1, &highlightColor[0]);
 
-            glBindVertexArray(m_alignHighlightVAO);
-            glDrawArrays(GL_TRIANGLES, 0, m_alignHighlightVertexCount);
-            glBindVertexArray(0);
+            if (drawLocked)
+            {
+                // Selection-outline yellow (matches fsOutline shader).
+                const glm::vec4 lockedColor(1.0f, 0.75f, 0.2f, 1.0f);
+                glUniform4fv(m_flat_uColor, 1, &lockedColor[0]);
+                glBindVertexArray(m_midplaneLockedVAO);
+                glDrawArrays(GL_TRIANGLES, 0, m_midplaneLockedVertexCount);
+                glBindVertexArray(0);
+            }
+
+            if (drawHover)
+            {
+                const glm::vec4 hoverColor(0.18f, 0.18f, 0.18f, 1.0f);
+                glUniform4fv(m_flat_uColor, 1, &hoverColor[0]);
+                glBindVertexArray(m_alignHighlightVAO);
+                glDrawArrays(GL_TRIANGLES, 0, m_alignHighlightVertexCount);
+                glBindVertexArray(0);
+            }
 
             glDisable(GL_POLYGON_OFFSET_FILL);
             glDepthFunc(GL_LESS);
@@ -4230,6 +4470,76 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
                 }
             }
         }
+        else if (m_transformMode == TransformMode::AlignMidplane)
+        {
+            // Two-click flow:
+            //   • No face locked yet → first click locks face 1.
+            //   • Face 1 locked → second click computes the midplane between
+            //     face 1 and the picked face 2, applies the alignment, and
+            //     resets to "no lock" so the user can do another midplane
+            //     alignment without leaving the mode.
+            //   • Second click on a different object than face 1 is silently
+            //     ignored (alignment only makes sense within one object).
+            const wxPoint p = evt.GetPosition();
+            int objIdx = -1, triIdx = -1;
+            if (RayCastFacePick(p.x, p.y, objIdx, triIdx))
+            {
+                std::vector<uint32_t> faceTris;
+                glm::vec3 nLocal(0.0f);
+                EnsureTriAdjacency(m_objects[objIdx]);
+                GrowCoplanarFace(m_objects[objIdx], triIdx, faceTris, nLocal);
+                if (!faceTris.empty())
+                {
+                    if (!m_midplaneFaceLocked)
+                    {
+                        // First click: lock the face. Compute its centroid in
+                        // local space now so we don't need the tri list later.
+                        const SceneObject& obj = m_objects[objIdx];
+                        glm::vec3 c1Local(0.0f);
+                        for (uint32_t t : faceTris)
+                        {
+                            const uint32_t i0 = obj.cpuIndices[3 * t + 0];
+                            const uint32_t i1 = obj.cpuIndices[3 * t + 1];
+                            const uint32_t i2 = obj.cpuIndices[3 * t + 2];
+                            const glm::vec3 v0(obj.cpuVerts[i0 * 3], obj.cpuVerts[i0 * 3 + 1], obj.cpuVerts[i0 * 3 + 2]);
+                            const glm::vec3 v1(obj.cpuVerts[i1 * 3], obj.cpuVerts[i1 * 3 + 1], obj.cpuVerts[i1 * 3 + 2]);
+                            const glm::vec3 v2(obj.cpuVerts[i2 * 3], obj.cpuVerts[i2 * 3 + 1], obj.cpuVerts[i2 * 3 + 2]);
+                            c1Local += (v0 + v1 + v2) * (1.0f / 3.0f);
+                        }
+                        c1Local /= float(faceTris.size());
+
+                        m_midplaneFaceLocked = true;
+                        m_midplaneFaceObject = objIdx;
+                        m_midplaneFaceTris = faceTris;
+                        m_midplaneFaceNormalLocal = nLocal;
+                        m_midplaneFaceCentroidLocal = c1Local;
+
+                        RebuildMidplaneLockedVBO(obj, faceTris);
+                        Refresh(false);
+                    }
+                    else if (objIdx == m_midplaneFaceObject)
+                    {
+                        // Second click on the same object: apply midplane alignment.
+                        ApplyAlignMidplaneToObject(objIdx, nLocal, faceTris);
+
+                        // Reset to "no lock" so the user can do another pair.
+                        // Highlight state is also cleared since the object
+                        // moved and the cached world-space tris are stale.
+                        m_midplaneFaceLocked = false;
+                        m_midplaneFaceObject = -1;
+                        m_midplaneFaceTris.clear();
+                        m_midplaneLockedVertexCount = 0;
+
+                        m_alignHoverObject = -1;
+                        m_alignSeedTri = -1;
+                        m_alignFaceTris.clear();
+                        m_alignHighlightVertexCount = 0;
+                        Refresh(false);
+                    }
+                    // else: second click was on a different object — ignored.
+                }
+            }
+        }
         else if (m_transformMode == TransformMode::SelectInjectionPoint)
         {
             if (m_injectionPoints.empty()) { /* nothing to pick */ }
@@ -4327,6 +4637,20 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
     if (evt.RightDown()) { m_rmb = true;  m_hasLast = false; CaptureMouse(); }
     if (evt.RightUp()) { m_rmb = false; if (HasCapture()) ReleaseMouse(); }
 
+    // RMB cancels the locked first face in AlignMidplane mode (without
+    // leaving the mode). Mirrors the click-to-cancel idiom used elsewhere
+    // for partial selections.
+    if (evt.RightDown() &&
+        m_transformMode == TransformMode::AlignMidplane &&
+        m_midplaneFaceLocked)
+    {
+        m_midplaneFaceLocked = false;
+        m_midplaneFaceObject = -1;
+        m_midplaneFaceTris.clear();
+        m_midplaneLockedVertexCount = 0;
+        Refresh(false);
+    }
+
     if (evt.Dragging() && m_lmb && !HasCapture())
         CaptureMouse();
 
@@ -4352,7 +4676,8 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
             m_gateGhostMousePos = pos;
             Refresh(false);
         }
-        if (m_transformMode == TransformMode::AlignFace)
+        if (m_transformMode == TransformMode::AlignFace ||
+            m_transformMode == TransformMode::AlignMidplane)
         {
             m_alignMousePos = pos;
             Refresh(false);
@@ -4481,9 +4806,10 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
             Refresh(false);
         }
     }
-    else if (m_lmb && m_transformMode == TransformMode::AlignFace)
+    else if (m_lmb && (m_transformMode == TransformMode::AlignFace ||
+        m_transformMode == TransformMode::AlignMidplane))
     {
-        // Orbit while holding LMB in AlignFace mode (matches Place* modes).
+        // Orbit while holding LMB in alignment modes (matches Place* modes).
         if (shift)
             m_camera.Pan(dx, -dy);
         else if (ctrl)
@@ -4511,7 +4837,8 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
         m_gateGhostMousePos = evt.GetPosition();
         Refresh(false);
     }
-    else if (m_transformMode == TransformMode::AlignFace)
+    else if (m_transformMode == TransformMode::AlignFace ||
+        m_transformMode == TransformMode::AlignMidplane)
     {
         // Same deferred-cast pattern as Place* ghosts: store mouse, defer to OnPaint.
         m_alignMousePos = evt.GetPosition();
