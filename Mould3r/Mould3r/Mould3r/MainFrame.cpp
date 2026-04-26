@@ -19,8 +19,6 @@
 // Ribbon colour aliases (shorthand into the Style namespace)
 // ---------------------------------------------------------------------------
 static const wxColour& kRibbonBg = Style::AppBg;
-static const wxColour& kBtnDefault = Style::BtnDefault;
-static const wxColour& kBtnActive = Style::BtnActive;
 static const wxColour& kBtnHover = Style::BtnHover;
 static const wxColour& kTextDefault = Style::TextPrimary;
 static const wxColour& kTextActive = Style::TextActive;
@@ -83,18 +81,6 @@ static wxBitmapBundle LoadSvgBundle(const wxString& svgPath,
 
     const wxScopedCharBuffer utf8 = svg.utf8_str();
     return wxBitmapBundle::FromSVG(utf8.data(), size);
-}
-
-// ---------------------------------------------------------------------------
-// Helper: style a single toggle button
-// ---------------------------------------------------------------------------
-static void StyleRibbonBtn(wxToggleButton* btn, bool active = false)
-{
-    btn->SetBackgroundColour(active ? kBtnActive : kBtnDefault);
-    btn->SetForegroundColour(active ? kTextActive : kTextDefault);
-    btn->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
-        wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
-    btn->Refresh();
 }
 
 // ---------------------------------------------------------------------------
@@ -372,6 +358,7 @@ wxPanel* MainFrame::CreateRibbon(wxWindow* parent)
     Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolTranslate, this, ID_ToolTranslate);
     Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolRotate, this, ID_ToolRotate);
     Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolScale, this, ID_ToolScale);
+    Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolPattern, this, ID_ToolPattern);
     Bind(wxEVT_BUTTON, &MainFrame::OnToolCenter, this, ID_ToolCenter);
     Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolAlignFace, this, ID_ToolAlignFace);
     Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolAlignMidplane, this, ID_ToolAlignMidplane);
@@ -458,73 +445,33 @@ wxPanel* MainFrame::CreateSidePanel(wxWindow* parent)
 }
 // ---------------------------------------------------------------------------
 // SetActiveTool – mutually exclusive toggle + notify canvas
+//
+// Drives every toggle-style ribbon button's visual state from the canonical
+// TransformMode. This is the single sync point: button clicks, Escape, and
+// canvas-internal mode transitions (e.g. vent placement completing) all
+// route through here, so it's enough to rebuild the visuals once.
 // ---------------------------------------------------------------------------
 void MainFrame::SetActiveTool(TransformMode mode)
 {
-    // Reset all buttons
-    if (m_btnTranslate) { StyleRibbonBtn(m_btnTranslate, false); m_btnTranslate->SetValue(false); }
-    if (m_btnRotate) { StyleRibbonBtn(m_btnRotate, false);    m_btnRotate->SetValue(false); }
-    if (m_btnScale) { StyleRibbonBtn(m_btnScale, false);     m_btnScale->SetValue(false); }
-    if (m_btnPlaceVent)
-    {
-        StyleRibbonBtn(m_btnPlaceVent, false);
-        m_btnPlaceVent->SetValue(false);
-    }
-    if (m_btnPlaceRunner)
-    {
-        StyleRibbonBtn(m_btnPlaceRunner, false);
-        m_btnPlaceRunner->SetValue(false);
-    }
-    if (m_btnPlaceGate)
-    {
-        StyleRibbonBtn(m_btnPlaceGate, false);
-        m_btnPlaceGate->SetValue(false);
-    }
-
-    // Activate selected
+    // Map TransformMode -> the command ID of the toggle button that should
+    // appear active. Modes without an associated toggle button (Select,
+    // Center, Remove*, Edit*, ...) yield -1, which clears all buttons.
+    int activeId = -1;
     switch (mode)
     {
-    case TransformMode::Translate:
-        if (m_btnTranslate) { StyleRibbonBtn(m_btnTranslate, true); m_btnTranslate->SetValue(true); }
-        break;
-    case TransformMode::Rotate:
-        if (m_btnRotate) { StyleRibbonBtn(m_btnRotate, true); m_btnRotate->SetValue(true); }
-        break;
-    case TransformMode::Scale:
-        if (m_btnScale) { StyleRibbonBtn(m_btnScale, true); m_btnScale->SetValue(true); }
-        break;
-    case TransformMode::PlaceVent:
-        if (m_btnPlaceVent)
-        {
-            StyleRibbonBtn(m_btnPlaceVent, true);
-            m_btnPlaceVent->SetValue(true);
-        }
-        break;
-    case TransformMode::PlaceRunner:
-        if (m_btnPlaceRunner)
-        {
-            StyleRibbonBtn(m_btnPlaceRunner, true);
-            m_btnPlaceRunner->SetValue(true);
-        }
-        break;
-    case TransformMode::PlaceGate:
-        if (m_btnPlaceGate)
-        {
-            StyleRibbonBtn(m_btnPlaceGate, true);
-            m_btnPlaceGate->SetValue(true);
-        }
-        break;
-    case TransformMode::RemoveVent:
-    case TransformMode::RemoveRunner:
-    case TransformMode::RemoveGate:
-    case TransformMode::RemoveSprue:
-    case TransformMode::EditVent:
-    case TransformMode::EditRunner:
-    case TransformMode::EditGate:
-    case TransformMode::SelectInjectionPoint:
-    case TransformMode::Select:
-        break;
+    case TransformMode::Translate:     activeId = ID_ToolTranslate;     break;
+    case TransformMode::Rotate:        activeId = ID_ToolRotate;        break;
+    case TransformMode::Scale:         activeId = ID_ToolScale;         break;
+    case TransformMode::PlaceVent:     activeId = ID_ToolPlaceVent;     break;
+    case TransformMode::PlaceRunner:   activeId = ID_PlaceRunner;       break;
+    case TransformMode::PlaceGate:     activeId = ID_PlaceGate;         break;
+    case TransformMode::AlignFace:     activeId = ID_ToolAlignFace;     break;
+    case TransformMode::AlignMidplane: activeId = ID_ToolAlignMidplane; break;
+    default:                                                            break;
     }
+
+    for (auto& kv : m_toolBtnSetters)
+        kv.second(kv.first == activeId);
 
     if (m_canvas)
         m_canvas->SetTransformMode(mode);
@@ -592,6 +539,28 @@ void MainFrame::OnToolScale(wxCommandEvent&)
 
     const ScaleValues v = dlg.GetValues();
     m_canvas->ApplyScale(v.uniform);
+}
+
+// ---------------------------------------------------------------------------
+// Pattern — opens the PatternDialog. UI scaffolding only for now; the
+// canvas-side pattern application will be wired up in a follow-up change.
+// ---------------------------------------------------------------------------
+void MainFrame::OnToolPattern(wxCommandEvent&)
+{
+    SetActiveTool(TransformMode::Select);
+
+    if (!m_canvas) return;
+
+    PatternDialog dlg(this);
+    if (dlg.ShowModal() != wxID_OK)
+        return;
+
+    if (!m_canvas->HasSelection())
+        return;
+
+    // Values are parsed and ready; canvas-side application is a follow-up.
+    // const PatternValues v = dlg.GetValues();
+    // m_canvas->ApplyPattern(v);
 }
 
 void MainFrame::OnToolCenter(wxCommandEvent&)
@@ -1367,6 +1336,32 @@ wxPanel* MainFrame::CreateCollapsibleSection(wxWindow* parent,
     return content;
 }
 
+wxToggleButton* MainFrame::MakePlaceButton(wxWindow* parent, int id,
+    const wxString& label)
+{
+    auto* btn = new wxToggleButton(parent, id, label,
+        wxDefaultPosition, wxSize(-1, 32), wxBORDER_NONE);
+    btn->SetBackgroundColour(Style::BtnPlace);
+    btn->SetForegroundColour(*wxWHITE);
+    btn->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
+
+    // Register a setter so SetActiveTool can drive this button's visual
+    // state externally (e.g. when Escape clears the mode, or when the
+    // canvas finishes a placement and snaps back to Select). The setter
+    // also keeps the wxToggleButton's internal value in sync so the next
+    // user click toggles correctly.
+    m_toolBtnSetters[id] = [btn](bool active) {
+        if (btn->GetValue() == active) return;     // already in target state
+        btn->SetValue(active);
+        btn->SetBackgroundColour(active ? Style::BtnSecondarySelected
+            : Style::BtnPlace);
+        btn->Refresh();
+        };
+
+    return btn;
+}
+
 wxPanel* MainFrame::CreateVentsContent(wxWindow* parent)
 {
 
@@ -1384,12 +1379,7 @@ wxPanel* MainFrame::CreateVentsContent(wxWindow* parent)
     sizer->AddSpacer(6);
 
     // ---- "Place Vent" toggle button -----------------------------------------
-    auto* btnPlace = new wxToggleButton(panel, ID_ToolPlaceVent, "Place Vent",
-        wxDefaultPosition, wxSize(-1, 32), wxBORDER_NONE);
-    btnPlace->SetBackgroundColour(Style::BtnPlace);
-    btnPlace->SetForegroundColour(*wxWHITE);
-    btnPlace->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
-        wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
+    auto* btnPlace = MakePlaceButton(panel, ID_ToolPlaceVent, "Place Vent");
     sizer->Add(btnPlace, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
     sizer->AddSpacer(6);
 
@@ -1679,12 +1669,7 @@ wxPanel* MainFrame::CreateRunnersContent(wxWindow* parent)
     sizer->AddSpacer(6);
 
     // ---- "Place Runner" toggle button (full-width, muted indigo) -------------
-    auto* btnPlace = new wxToggleButton(panel, ID_PlaceRunner, "Place Runner",
-        wxDefaultPosition, wxSize(-1, 32), wxBORDER_NONE);
-    btnPlace->SetBackgroundColour(Style::BtnPlace);
-    btnPlace->SetForegroundColour(*wxWHITE);
-    btnPlace->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
-        wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
+    auto* btnPlace = MakePlaceButton(panel, ID_PlaceRunner, "Place Runner");
     sizer->Add(btnPlace, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
 
     sizer->AddSpacer(6);
@@ -1873,12 +1858,7 @@ wxPanel* MainFrame::CreateGatesContent(wxWindow* parent)
     sizer->Add(titleLabel, 0, wxLEFT | wxTOP, 12);
     sizer->AddSpacer(6);
 
-    auto* btnPlace = new wxToggleButton(panel, ID_PlaceGate, "Place Gate",
-        wxDefaultPosition, wxSize(-1, 32), wxBORDER_NONE);
-    btnPlace->SetBackgroundColour(Style::BtnPlace);
-    btnPlace->SetForegroundColour(*wxWHITE);
-    btnPlace->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
-        wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
+    auto* btnPlace = MakePlaceButton(panel, ID_PlaceGate, "Place Gate");
     sizer->Add(btnPlace, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
     sizer->AddSpacer(6);
 
@@ -2064,7 +2044,7 @@ wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
 
         toolsSizer->AddSpacer(8);
 
-        auto* grid = new wxGridSizer(3, 2, 4, 4);
+        auto* grid = new wxGridSizer(4, 2, 4, 4);
 
         // ---- SVG icon paths for model tool buttons --------------------------------
         // Fill in the path to each SVG file (relative to the executable, or absolute).
@@ -2072,6 +2052,7 @@ wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
         static const wxString kIconMove = "res/icons/arrows-move.svg";
         static const wxString kIconRotate = "res/icons/rotate-2.svg";
         static const wxString kIconScale = "res/icons/resize.svg";
+        static const wxString kIconPattern = "res/icons/pattern.svg";
         static const wxString kIconCenter = "res/icons/focus-centered.svg";
         static const wxString kIconAlignFace = "res/icons/align-face.svg";
         static const wxString kIconAlignMidplane = "res/icons/align-midplane.svg";
@@ -2159,6 +2140,20 @@ wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
                     txt->Refresh();
                     };
 
+                // Register a setter so SetActiveTool can drive this button's
+                // visual state externally (e.g. when Escape clears the mode).
+                // The lambda closes over the same `toggled` pointer the click
+                // handler uses, so both routes converge on the same state.
+                if (toggle)
+                {
+                    m_toolBtnSetters[id] = [toggled, applyColours](bool active) {
+                        if (*toggled == active) return;  // already in target state
+                        *toggled = active;
+                        applyColours(active ? Style::BtnSecondarySelected : Style::BtnSecondary,
+                            active ? kTextActive : Style::TextPrimary);
+                        };
+                }
+
                 // Left-click: fire the appropriate command event and update visuals
                 auto onClick = [=](wxMouseEvent& e) {
                     if (toggle)
@@ -2208,6 +2203,7 @@ wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
         grid->Add(makeToolBtn(ID_ToolTranslate, "Move", true, kIconMove), 0, wxEXPAND);
         grid->Add(makeToolBtn(ID_ToolRotate, "Rotate", true, kIconRotate), 0, wxEXPAND);
         grid->Add(makeToolBtn(ID_ToolScale, "Scale", true, kIconScale), 0, wxEXPAND);
+        grid->Add(makeToolBtn(ID_ToolPattern, "Pattern", true, kIconPattern), 0, wxEXPAND);
         grid->Add(makeToolBtn(ID_ToolCenter, "Center", false, kIconCenter), 0, wxEXPAND);
         grid->Add(makeToolBtn(ID_ToolAlignFace, "Align Face", true, kIconAlignFace), 0, wxEXPAND);
         grid->Add(makeToolBtn(ID_ToolAlignMidplane, "Align Midplane", true, kIconAlignMidplane), 0, wxEXPAND);

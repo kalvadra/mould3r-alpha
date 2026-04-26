@@ -4,12 +4,16 @@
 #include "RotateDialog.h"
 #include "TranslateDialog.h"
 #include "ScaleDialog.h"
+#include "PatternDialog.h"
 #include "StartupDialog.h"
 #include <wx/textctrl.h>
 #include "FixtureFile.h"
 #include "AppConfig.h"
 #include "StartupDialog.h"
 #include "ProjectFile.h"
+
+#include <functional>
+#include <unordered_map>
 
 class GLCanvas;
 
@@ -70,6 +74,7 @@ private:
     void OnToolTranslate(wxCommandEvent& evt);
     void OnToolRotate(wxCommandEvent& evt);
     void OnToolScale(wxCommandEvent& evt);
+    void OnToolPattern(wxCommandEvent& evt);
     void OnToolCenter(wxCommandEvent& evt);
     void OnToolAlignFace(wxCommandEvent& evt);
     void OnToolAlignMidplane(wxCommandEvent& evt);
@@ -110,6 +115,13 @@ private:
     wxPanel* CreateSpruesContent(wxWindow* parent);
     wxPanel* CreateRunnersContent(wxWindow* parent);
     wxPanel* CreateGatesContent(wxWindow* parent);
+
+    // Builds a "Place …" toggle button with the standard side-panel styling
+    // and registers a setter into m_toolBtnSetters so SetActiveTool can
+    // drive its visual state externally (button click, Escape, canvas-
+    // internal mode transitions).
+    wxToggleButton* MakePlaceButton(wxWindow* parent, int id,
+        const wxString& label);
 
     // Vent field members
     wxChoice* m_ventTypeChoice = nullptr;
@@ -155,23 +167,16 @@ private:
     bool m_imperial = false;
     std::vector<wxStaticText*> m_mmUnitLabels;  // labels that switch "mm"↔"in"
 
-    // Transform tool buttons
-    wxToggleButton* m_btnTranslate = nullptr;
-    wxToggleButton* m_btnRotate = nullptr;
-    wxToggleButton* m_btnScale = nullptr;
-    wxButton* m_btnCenter = nullptr;
-
-    // Vent tool button (ribbon — Vents group)
-    wxToggleButton* m_btnPlaceVent = nullptr;
-
-    // Sprue tool buttons (ribbon — Sprues group)
-    wxButton* m_btnPlaceSprue = nullptr;
-
-    // Runner tool button (ribbon — Runners group)
-    wxToggleButton* m_btnPlaceRunner = nullptr;
-
-    // Gate tool button (ribbon — Gates group)
-    wxToggleButton* m_btnPlaceGate = nullptr;
+    // Toggle-button setter registry. Each entry is (command-id → set-active(bool)).
+    // makeToolBtn registers a setter for each toggle-style ribbon button so that
+    // SetActiveTool can drive the visuals from the canonical TransformMode,
+    // regardless of how the mode was changed (button click, Escape key,
+    // mode-completion in the canvas, programmatic, ...).
+    //
+    // Replaces the previous wxToggleButton* member pointers, which were never
+    // assigned because the actual ribbon buttons are custom wxPanel-based
+    // controls built inside makeToolBtn rather than native wxToggleButton.
+    std::unordered_map<int, std::function<void(bool)>> m_toolBtnSetters;
 
     wxPanel* m_sidePanel = nullptr;
     wxTextCtrl* m_exportPath = nullptr;
@@ -189,6 +194,7 @@ private:
         ID_ToolTranslate,
         ID_ToolRotate,
         ID_ToolScale,
+        ID_ToolPattern,
         ID_ToolCenter,
         ID_ToolAlignFace,
         ID_ToolAlignMidplane,
