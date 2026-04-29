@@ -462,6 +462,7 @@ void MainFrame::SetActiveTool(TransformMode mode)
     case TransformMode::Translate:     activeId = ID_ToolTranslate;     break;
     case TransformMode::Rotate:        activeId = ID_ToolRotate;        break;
     case TransformMode::Scale:         activeId = ID_ToolScale;         break;
+    case TransformMode::Pattern:       activeId = ID_ToolPattern;       break;
     case TransformMode::PlaceVent:     activeId = ID_ToolPlaceVent;     break;
     case TransformMode::PlaceRunner:   activeId = ID_PlaceRunner;       break;
     case TransformMode::PlaceGate:     activeId = ID_PlaceGate;         break;
@@ -547,6 +548,9 @@ void MainFrame::OnToolScale(wxCommandEvent&)
 // ---------------------------------------------------------------------------
 void MainFrame::OnToolPattern(wxCommandEvent&)
 {
+    // Dialog tool, not a placement-mode toggle — clear any active toggle so
+    // the button doesn't appear stuck on after the dialog closes (matches the
+    // Translate/Rotate/Scale convention).
     SetActiveTool(TransformMode::Select);
 
     if (!m_canvas) return;
@@ -558,9 +562,21 @@ void MainFrame::OnToolPattern(wxCommandEvent&)
     if (!m_canvas->HasSelection())
         return;
 
-    // Values are parsed and ready; canvas-side application is a follow-up.
-    // const PatternValues v = dlg.GetValues();
-    // m_canvas->ApplyPattern(v);
+    const PatternValues v = dlg.GetValues();
+
+    switch (v.type)
+    {
+    case PatternValues::Type::Circular:
+        m_canvas->ApplyCircularPattern(v.number, v.overrideRadius, v.radius,
+            v.rotateCopies);
+        break;
+
+    case PatternValues::Type::Grid:
+        m_canvas->ApplyGridPattern(v.numberH, v.numberV,
+            v.mirrorH, v.mirrorV,
+            v.overrideLengthWidth, v.length, v.width);
+        break;
+    }
 }
 
 void MainFrame::OnToolCenter(wxCommandEvent&)
@@ -1060,6 +1076,8 @@ void MainFrame::OnSaveProject(wxCommandEvent&)
         od.pitchDeg = obj.pitchDeg;
         od.rollDeg = obj.rollDeg;
         od.scale = obj.scale;
+        od.mirrorX = obj.mirrorX;
+        od.mirrorZ = obj.mirrorZ;
         data.objects.push_back(od);
     }
 
@@ -1191,7 +1209,8 @@ void MainFrame::OnLoadProject(wxCommandEvent&)
     {
         m_canvas->RestoreObject(obj.sourcePath, obj.pos,
             obj.yawDeg, obj.pitchDeg,
-            obj.rollDeg, obj.scale);
+            obj.rollDeg, obj.scale,
+            obj.mirrorX, obj.mirrorZ);
     }
 
     // ---- Restore sprue -----------------------------------------------------
@@ -2044,7 +2063,7 @@ wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
 
         toolsSizer->AddSpacer(8);
 
-        auto* grid = new wxGridSizer(4, 2, 4, 4);
+        auto* grid = new wxGridSizer(3, 2, 4, 4);
 
         // ---- SVG icon paths for model tool buttons --------------------------------
         // Fill in the path to each SVG file (relative to the executable, or absolute).
@@ -2258,7 +2277,7 @@ wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
     sizer->AddSpacer(12);
 
     scrollWin->SetSizer(sizer);
-    colSizer->Add(scrollWin, 1, wxEXPAND);   // scroll area fills remaining space
+    colSizer->Add(scrollWin, 1, wxEXPAND);   // scroll area fills remaining space 
 
     column->SetSizer(colSizer);
     outerSizer->Add(column, 1, wxEXPAND);

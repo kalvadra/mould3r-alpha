@@ -117,6 +117,8 @@ bool ProjectFile::Save(const std::string& path,
         file << "pitch = " << obj.pitchDeg << "\n";
         file << "roll  = " << obj.rollDeg << "\n";
         file << "scale = " << obj.scale << "\n";
+        file << "mirrorX = " << (obj.mirrorX ? "true" : "false") << "\n";
+        file << "mirrorZ = " << (obj.mirrorZ ? "true" : "false") << "\n";
     }
 
     // -- [sprue] -------------------------------------------------------------
@@ -293,6 +295,8 @@ bool ProjectFile::Load(const std::string& path,
             else if (key == "pitch") pendingObj.pitchDeg = ParseFloat(val, 0.0f);
             else if (key == "roll")  pendingObj.rollDeg = ParseFloat(val, 0.0f);
             else if (key == "scale") pendingObj.scale = ParseFloat(val, 1.0f);
+            else if (key == "mirrorX") pendingObj.mirrorX = ParseBool(val);
+            else if (key == "mirrorZ") pendingObj.mirrorZ = ParseBool(val);
             break;
 
         case Section::Sprue:

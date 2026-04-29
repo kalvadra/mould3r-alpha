@@ -270,6 +270,290 @@ void GLCanvas::CenterSelectedObject()
     Refresh(false);
 }
 
+// ---------------------------------------------------------------------------
+// Circular pattern around the world origin in the XZ plane.
+//
+// The original keeps its existing pose; (count - 1) clones are placed at
+// equally-spaced angular offsets around (0, *, 0). Each clone shares the
+// original's Y, scale, and rotation — only its XZ position changes.
+//
+// Cloning approach: we re-build the GPU mesh per instance from the cached
+// CPU position-only buffer (cpuVerts/cpuIndices), reusing the importer's
+// normal-computation and crease-split helpers. This avoids re-running the
+// full file import (no progress dialog, no BuildFacetedShape, no file I/O)
+// while keeping each clone's GPU buffers independently owned, so the
+// existing per-object Destroy() lifetime model still works.
+//
+// OpenCascade TopoDS_Shape uses value semantics with shared internal data,
+// so plain copy-by-assignment of sourceShape is safe and cheap.
+// ---------------------------------------------------------------------------
+void GLCanvas::ApplyCircularPattern(int count, bool overrideRadius, float radius,
+    bool rotateCopies)
+{
+    if (!HasSelection()) return;
+    if (count <= 1)      return;     // a "pattern" of one is just the original
+
+    SetCurrent(*m_context);
+    InitGLOnce();
+
+    // Take a copy of the original by value — m_objects may reallocate when we
+    // emplace_back the clones below, invalidating any reference we held.
+    const SceneObject orig = m_objects[m_selectedIndex];
+
+    // Determine each clone's radius and starting angle in the XZ plane.
+    // The original's angle is preserved so it remains part of the pattern.
+    const float origRadius = std::sqrt(orig.pos.x * orig.pos.x +
+        orig.pos.z * orig.pos.z);
+    const float r = overrideRadius ? radius : origRadius;
+
+    // If the original sits exactly on the Y axis (radius == 0), there's no
+    // meaningful angular reference, so anchor at angle 0. Otherwise use the
+    // original's existing direction so it remains the k=0 instance.
+    const float theta0 = (origRadius > 1e-6f)
+        ? std::atan2(orig.pos.z, orig.pos.x)
+        : 0.0f;
+    const float dtheta = 2.0f * 3.14159265358979323846f / static_cast<float>(count);
+
+    for (int k = 1; k < count; ++k)
+    {
+        const float theta = theta0 + dtheta * static_cast<float>(k);
+
+        m_objects.emplace_back();
+        SceneObject& clone = m_objects.back();
+
+        // Copy non-GPU, non-mould state. mouldShape is intentionally left
+        // unset — the user re-generates the mould after patterning.
+        clone.role = orig.role;
+        clone.sourcePath = orig.sourcePath;
+        clone.sourceShape = orig.sourceShape;
+        clone.hasSourceShape = orig.hasSourceShape;
+        clone.cpuVerts = orig.cpuVerts;
+        clone.cpuIndices = orig.cpuIndices;
+        // triNeighbors / adjacencyBuilt deliberately left at defaults — they
+        // depend only on local mesh topology and will be rebuilt lazily on
+        // first use, identically to the original.
+
+        // Pose: same Y, scale, pitch, roll. XZ from polar coords. Yaw
+        // depends on rotateCopies:
+        //   off -> clone keeps the original's local rotation verbatim
+        //   on  -> clone's yaw is offset by its angular position so it
+        //          "faces outward" like the original (gear-tooth style).
+        //
+        // Sign note: glm::rotate around +Y by positive yawDeg sends +X to -Z,
+        // whereas our position formula (r cos theta, _, r sin theta) sends
+        // +X to +Z as theta increases. The two rotations have opposite signs
+        // in this convention, so the yaw offset is *negative* k * dtheta to
+        // match the angular position rotation.
+        clone.pos = glm::vec3(r * std::cos(theta), orig.pos.y,
+            r * std::sin(theta));
+        clone.yawDeg = orig.yawDeg
+            + (rotateCopies
+                ? -static_cast<float>(k) * (360.0f / static_cast<float>(count))
+                : 0.0f);
+        clone.pitchDeg = orig.pitchDeg;
+        clone.rollDeg = orig.rollDeg;
+        clone.scale = orig.scale;
+
+        // Build the GPU mesh from the cached CPU vertices, mirroring the
+        // post-import pipeline in ImportFile().
+        FileImporter::MeshData md;
+        md.vertices = orig.cpuVerts;
+        md.indices = orig.cpuIndices;
+        ComputeVertexNormals_Pos3(md.vertices, md.indices, md.posNorm);
+        auto split = SplitByCreaseAngle_Pos3(md.vertices, md.indices, 35.0f);
+        md.posNorm = std::move(split.posNorm);
+        md.indices = std::move(split.indices);
+        UploadMeshToGPU(md, clone);
+    }
+
+    // Apply the override radius to the original too, if requested. We do this
+    // *after* the clone loop so the original's old position is preserved as
+    // the angular anchor (theta0) — moving it earlier would re-anchor the
+    // whole pattern.
+    if (overrideRadius && origRadius > 1e-6f)
+    {
+        SceneObject& origRef = m_objects[m_selectedIndex];
+        origRef.pos.x = r * std::cos(theta0);
+        origRef.pos.z = r * std::sin(theta0);
+    }
+
+    // Pattern invalidates any cached mould and existing vent geometry, same
+    // as the other Apply* transforms.
+    for (auto& v : m_vents) v.Destroy();
+    m_vents.clear();
+    RebuildPathVBO();
+    RebuildCrossSectionVBO();
+    Refresh(false);
+}
+
+// ---------------------------------------------------------------------------
+// ApplyGridPattern — duplicates the selected object into a 2-D grid that is
+// CENTRED on the world origin, in the y=0 plane.
+//
+// The grid spans [-halfX, +halfX] x [-halfZ, +halfZ] with numH x numV cells
+// linearly spaced across each axis. (halfX, halfZ) is derived as:
+//   default     : (|orig.x|, |orig.z|) - the original's (x,z) is treated as
+//                 HALF the full grid extent, so the model already sits at
+//                 a corner of the centred grid.
+//   override on : (length/2, width/2) - the override fields specify the
+//                 FULL grid extents, so we halve them. The original is
+//                 moved to the corner that matches its current XZ-quadrant.
+//
+// The "anchor" cell is the corner indexed by the sign of the original's
+// XZ-quadrant: (numH-1, numV-1) for the (+,+) quadrant, (0, numV-1) for
+// (-,+), etc. The original ends up at this corner; the remaining
+// (numH*numV - 1) cells are filled with clones. With override off, the
+// anchor naturally coincides with the original's existing position so no
+// movement happens; with override on, the original is repositioned to the
+// new corner.
+//
+// Mirror flags:
+//   mirrorH - if true, every clone whose cell X coordinate sits on the
+//             opposite side of x=0 from the original has its mesh
+//             reflected about the local YZ plane (clone.mirrorX = true).
+//   mirrorV - same for Z (reflection about local XY plane).
+// Cells that lie exactly on an axis (cell.x == 0 or cell.z == 0, possible
+// with odd grid counts) are not flipped on that axis - they're on the
+// boundary, not on the other side. With both flags set, a clone in the
+// diagonally-opposite quadrant gets reflected on both axes (parity
+// preserved overall).
+//
+// Edge cases:
+//   numH == 1 (or numV == 1): that axis collapses to a single position at
+//     0, so the grid degenerates to a column (or row) on the perpendicular
+//     axis. The anchor index on the collapsed axis is always 0.
+//   On-axis original (x == 0 or z == 0): sign defaults to positive so
+//     override has a deterministic landing corner.
+//   On-origin original with override off: half-extents are zero and all
+//     cells overlap at origin - degenerate but not a crash.
+//
+// Cloning approach mirrors ApplyCircularPattern: each clone re-builds its
+// GPU mesh from the cached CPU position-only buffer, sharing the source
+// shape and CPU mesh data with the original. Vents and the cached mould
+// are invalidated as with other Apply* transforms.
+// ---------------------------------------------------------------------------
+void GLCanvas::ApplyGridPattern(int numH, int numV, bool mirrorH, bool mirrorV,
+    bool overrideLengthWidth, float length, float width)
+{
+    if (!HasSelection())   return;
+    if (numH <= 0)         return;
+    if (numV <= 0)         return;
+    if (numH * numV <= 1)  return;     // 1x1 has no clones to make
+
+    SetCurrent(*m_context);
+    InitGLOnce();
+
+    // Take a copy of the original by value - m_objects may reallocate when
+    // we emplace_back the clones below, invalidating any reference we held.
+    const SceneObject orig = m_objects[m_selectedIndex];
+
+    // Half-extents of the centred grid. See header comment for the rules.
+    const float halfX = overrideLengthWidth
+        ? length * 0.5f
+        : std::abs(orig.pos.x);
+    const float halfZ = overrideLengthWidth
+        ? width * 0.5f
+        : std::abs(orig.pos.z);
+
+    // Sign of the original's XZ-quadrant. Used to choose which corner of
+    // the centred grid the original anchors. Zero defaults to positive so
+    // an on-axis original gets a deterministic corner when the override
+    // moves it off-axis.
+    const float signX = (orig.pos.x >= 0.0f) ? 1.0f : -1.0f;
+    const float signZ = (orig.pos.z >= 0.0f) ? 1.0f : -1.0f;
+
+    // Anchor cell index. With numH==1 (numV==1) the corresponding axis has
+    // only one valid index (0) regardless of sign.
+    const int anchorI = (signX > 0.0f && numH > 1) ? (numH - 1) : 0;
+    const int anchorJ = (signZ > 0.0f && numV > 1) ? (numV - 1) : 0;
+
+    // Cell-centre coordinates for indices (i, j). Linear interpolation from
+    // -halfX..+halfX (or just 0 when numH == 1); same for Z.
+    auto cellPos = [&](int i, int j) -> glm::vec3
+        {
+            const float cx = (numH == 1) ? 0.0f
+                : -halfX + static_cast<float>(i) * (2.0f * halfX) /
+                static_cast<float>(numH - 1);
+            const float cz = (numV == 1) ? 0.0f
+                : -halfZ + static_cast<float>(j) * (2.0f * halfZ) /
+                static_cast<float>(numV - 1);
+            return glm::vec3(cx, orig.pos.y, cz);
+        };
+
+    for (int i = 0; i < numH; ++i)
+    {
+        for (int j = 0; j < numV; ++j)
+        {
+            if (i == anchorI && j == anchorJ) continue;     // original sits here
+
+            const glm::vec3 cell = cellPos(i, j);
+
+            // "Other side of x=0" iff cell.x and signX have opposite signs
+            // (product < 0). On-axis cells (cell.x == 0) have product 0
+            // and are treated as boundary - no flip. signX/signZ are always
+            // +/-1 so the product test is unambiguous. Same logic for Z.
+            const bool flipX = mirrorH && (cell.x * signX < 0.0f);
+            const bool flipZ = mirrorV && (cell.z * signZ < 0.0f);
+
+            m_objects.emplace_back();
+            SceneObject& clone = m_objects.back();
+
+            // Copy non-GPU, non-mould state. mouldShape is intentionally
+            // left unset - the user re-generates the mould after patterning.
+            clone.role = orig.role;
+            clone.sourcePath = orig.sourcePath;
+            clone.sourceShape = orig.sourceShape;
+            clone.hasSourceShape = orig.hasSourceShape;
+            clone.cpuVerts = orig.cpuVerts;
+            clone.cpuIndices = orig.cpuIndices;
+            // triNeighbors / adjacencyBuilt deliberately left at defaults -
+            // they depend only on local mesh topology and will be rebuilt
+            // lazily on first use, identically to the original.
+
+            // Pose: same Y, scale and full rotation. Position from cell
+            // grid; mirror flags from the cross-axis test above.
+            clone.pos = cell;
+            clone.yawDeg = orig.yawDeg;
+            clone.pitchDeg = orig.pitchDeg;
+            clone.rollDeg = orig.rollDeg;
+            clone.scale = orig.scale;
+            clone.mirrorX = flipX;
+            clone.mirrorZ = flipZ;
+
+            // Build the GPU mesh from the cached CPU vertices, mirroring
+            // the post-import pipeline in ImportFile() (same pipeline used
+            // by ApplyCircularPattern).
+            FileImporter::MeshData md;
+            md.vertices = orig.cpuVerts;
+            md.indices = orig.cpuIndices;
+            ComputeVertexNormals_Pos3(md.vertices, md.indices, md.posNorm);
+            auto split = SplitByCreaseAngle_Pos3(md.vertices, md.indices, 35.0f);
+            md.posNorm = std::move(split.posNorm);
+            md.indices = std::move(split.indices);
+            UploadMeshToGPU(md, clone);
+        }
+    }
+
+    // Move the original to its anchor cell. With override off this is
+    // typically a no-op (orig was already at this corner, since the grid
+    // was sized to put it there); with override on, the original moves to
+    // the matching corner of the new grid extents.
+    {
+        SceneObject& origRef = m_objects[m_selectedIndex];
+        const glm::vec3 anchorPos = cellPos(anchorI, anchorJ);
+        origRef.pos.x = anchorPos.x;
+        origRef.pos.z = anchorPos.z;
+    }
+
+    // Pattern invalidates any cached mould and existing vent geometry, same
+    // as the other Apply* transforms.
+    for (auto& v : m_vents) v.Destroy();
+    m_vents.clear();
+    RebuildPathVBO();
+    RebuildCrossSectionVBO();
+    Refresh(false);
+}
+
 void GLCanvas::ClearVentPoints()
 {
     for (auto& v : m_vents) v.Destroy();
@@ -5110,7 +5394,8 @@ void GLCanvas::ClearAll()
 }
 
 void GLCanvas::RestoreObject(const std::string& path, const glm::vec3& pos,
-    float yaw, float pitch, float roll, float scl)
+    float yaw, float pitch, float roll, float scl,
+    bool mirrorX, bool mirrorZ)
 {
     // Import the model normally (dispatches on extension, uploads GPU mesh)
     ImportFile(path);
@@ -5124,6 +5409,8 @@ void GLCanvas::RestoreObject(const std::string& path, const glm::vec3& pos,
         obj.pitchDeg = pitch;
         obj.rollDeg = roll;
         obj.scale = scl;
+        obj.mirrorX = mirrorX;
+        obj.mirrorZ = mirrorZ;
     }
 }
 

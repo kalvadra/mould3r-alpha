@@ -17,7 +17,7 @@
 
 class GLCanvas;
 
-enum class TransformMode { Select, Translate, Rotate, Scale, PlaceVent, PlaceRunner, PlaceGate, RemoveVent, RemoveRunner, RemoveGate, RemoveSprue, EditVent, EditRunner, EditGate, SelectInjectionPoint, AlignFace, AlignMidplane };
+enum class TransformMode { Select, Translate, Rotate, Scale, Pattern, PlaceVent, PlaceRunner, PlaceGate, RemoveVent, RemoveRunner, RemoveGate, RemoveSprue, EditVent, EditRunner, EditGate, SelectInjectionPoint, AlignFace, AlignMidplane };
 
 class MainFrame : public wxFrame
 {

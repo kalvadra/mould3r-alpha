@@ -1,60 +1,72 @@
 #pragma once
 #include <wx/wx.h>
 
-// ---------------------------------------------------------------------------
-// PatternValues — captures the user's choices from a PatternDialog.
-//
-// Two pattern types are supported. The fields relevant to the chosen type are
-// guaranteed to be populated; the other fields hold safe defaults.
-// ---------------------------------------------------------------------------
+// Result struct filled in by the dialog.
+// The active fields depend on `type`:
+//   Circular -> { number, overrideRadius, radius }
+//   Grid     -> { numberH, numberV }
 struct PatternValues
 {
     enum class Type { Circular, Grid };
 
     Type type = Type::Circular;
 
-    // Circular ---------------------------------------------------------------
-    int   count = 4;        // number of objects around the circle
-    bool  radiusOverride = false;    // if false, caller infers radius from scene
-    float radius = 0.0f;     // mm; meaningful only when radiusOverride
+    // Circular
+    int   number = 4;
+    bool  overrideRadius = false;
+    float radius = 50.0f;     // mm, only used when overrideRadius is true
+    bool  rotateCopies = false;     // gear-tooth: clone yaw matches angular position
 
-    // Grid -------------------------------------------------------------------
-    int   countX = 2;                // number of objects horizontally
-    int   countY = 2;                // number of objects vertically
+    // Grid
+    int   numberH = 2;
+    int   numberV = 2;
+    bool  mirrorH = false;
+    bool  mirrorV = false;
+    bool  overrideLengthWidth = false;
+    float length = 100.0f;     // mm, only used when overrideLengthWidth is true
+    float width = 100.0f;     // mm, only used when overrideLengthWidth is true
 };
 
-// ---------------------------------------------------------------------------
-// PatternDialog — modal dialog for the Pattern model tool.
-//
-// Layout swaps based on the radio selection: choosing "Circular" shows the
-// count + optional radius-override row; choosing "Grid" shows two count
-// fields. The dialog re-fits itself when the layout changes.
-// ---------------------------------------------------------------------------
 class PatternDialog : public wxDialog
 {
 public:
     PatternDialog(wxWindow* parent);
+
+    // Call after ShowModal() == wxID_OK
     PatternValues GetValues() const;
 
 private:
     // Type selector
-    wxRadioBox* m_typeRadio = nullptr;
+    wxChoice* m_typeChoice = nullptr;
 
-    // Circular sub-panel
+    // Circular pane
     wxPanel* m_circularPanel = nullptr;
-    wxTextCtrl* m_ctrlCount = nullptr;
-    wxCheckBox* m_chkRadiusOverride = nullptr;
-    wxPanel* m_radiusRow = nullptr;   // hidden until override on
-    wxTextCtrl* m_ctrlRadius = nullptr;
+    wxTextCtrl* m_circularNumber = nullptr;
+    wxCheckBox* m_overrideRadius = nullptr;
+    wxPanel* m_radiusRow = nullptr;     // shown only when overrideRadius
+    wxTextCtrl* m_radius = nullptr;
+    wxCheckBox* m_rotateCopies = nullptr;
 
-    // Grid sub-panel
+    // Grid pane
     wxPanel* m_gridPanel = nullptr;
-    wxTextCtrl* m_ctrlCountX = nullptr;
-    wxTextCtrl* m_ctrlCountY = nullptr;
+    wxTextCtrl* m_gridNumH = nullptr;
+    wxTextCtrl* m_gridNumV = nullptr;
+    wxCheckBox* m_mirrorH = nullptr;
+    wxCheckBox* m_mirrorV = nullptr;
+    wxCheckBox* m_overrideLW = nullptr;
+    wxPanel* m_lwRows = nullptr;     // shown only when overrideLW
+    wxTextCtrl* m_length = nullptr;
+    wxTextCtrl* m_width = nullptr;
 
+    // Visibility handlers
     void OnTypeChanged(wxCommandEvent&);
-    void OnRadiusOverrideToggled(wxCommandEvent&);
+    void OnOverrideToggled(wxCommandEvent&);
+    void OnLengthWidthOverrideToggled(wxCommandEvent&);
 
+    // Re-runs Layout/Fit on the dialog after show/hide changes
+    void RelayoutForVisibility();
+
+    // Parsing helpers (fall back to the supplied default on bad input)
     int   ParseInt(wxTextCtrl* ctrl, int fallback) const;
     float ParseFloat(wxTextCtrl* ctrl, float fallback) const;
 };

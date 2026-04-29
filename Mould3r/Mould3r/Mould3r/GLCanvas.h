@@ -80,13 +80,31 @@ struct SceneObject
     float     rollDeg = 0.0f;
     float     scale = 1.0f;
 
+    // Optional reflections about the local YZ / XY planes, applied as a
+    // negative component in the scale matrix. Used by the grid-pattern
+    // tool to mirror clones placed on the opposite side of the world X
+    // or Z axis. With both flags set the mesh is reflected through the
+    // local Y axis (parity preserved). The lit shader uses the
+    // transpose-inverse normal matrix so reflections light correctly,
+    // and face culling is off so reversed winding renders fine.
+    bool mirrorX = false;
+    bool mirrorZ = false;
+
     glm::mat4 BuildModelMatrix() const
     {
         glm::mat4 T = glm::translate(glm::mat4(1.0f), pos);
         glm::mat4 RY = glm::rotate(glm::mat4(1.0f), glm::radians(yawDeg), glm::vec3(0, 1, 0));
         glm::mat4 RX = glm::rotate(glm::mat4(1.0f), glm::radians(pitchDeg), glm::vec3(1, 0, 0));
         glm::mat4 RZ = glm::rotate(glm::mat4(1.0f), glm::radians(rollDeg), glm::vec3(0, 0, 1));
-        glm::mat4 S = glm::scale(glm::mat4(1.0f), glm::vec3(scale));
+        // Per-axis scale: uniform `scale`, with optional mirror flipping
+        // X and/or Z. Applied at the innermost (local) step so the
+        // reflection acts on the un-rotated mesh; the rotation +
+        // translation that follow place the mirrored shape into world
+        // space.
+        const glm::vec3 sv(scale * (mirrorX ? -1.0f : 1.0f),
+            scale,
+            scale * (mirrorZ ? -1.0f : 1.0f));
+        glm::mat4 S = glm::scale(glm::mat4(1.0f), sv);
         return T * RY * RX * RZ * S;
     }
 };
@@ -109,6 +127,40 @@ public:
     void ApplyTranslation(float x, float y, float z);
     void ApplyScale(float factor);
     void CenterSelectedObject();
+
+    // Circular pattern around the world origin in the XZ plane.
+    //   count          - total instances including the original (no-op if <= 1)
+    //   overrideRadius - if true, place clones at `radius` instead of the
+    //                    original's current XZ distance from the origin
+    //   radius         - the override radius, in world units (mm)
+    //   rotateCopies   - if true, each clone's local yaw is rotated by its
+    //                    angular offset (gear-tooth style — every instance
+    //                    faces outward like the original). If false, every
+    //                    clone keeps the original's local rotation verbatim.
+    // The original keeps its position; (count - 1) clones are placed at
+    // equally-spaced angular offsets around the origin.
+    void ApplyCircularPattern(int count, bool overrideRadius, float radius,
+        bool rotateCopies);
+
+    // Grid pattern in the y=0 plane, centred on the world origin.
+    //   numH               - cell count along X (>= 1)
+    //   numV               - cell count along Z (>= 1)
+    //   mirrorH            - if true, clones whose X coordinate sits on the
+    //                        opposite side of x=0 from the original have
+    //                        their mesh reflected about the local YZ plane
+    //   mirrorV            - same for Z (reflection about local XY plane)
+    //   overrideLengthWidth- if true, use `length`/`width` (interpreted as
+    //                        full grid extents) instead of deriving from
+    //                        the original's (x,z), which is treated as
+    //                        half the full grid extent.
+    //   length             - full X extent of the grid (mm), override only
+    //   width              - full Z extent of the grid (mm), override only
+    // The grid spans [-halfX, +halfX] x [-halfZ, +halfZ] in the y=0 plane,
+    // with halfX,halfZ derived per above. The original is anchored to the
+    // corner cell matching its current XZ-quadrant (and is moved there if
+    // override is on or if its position no longer matches the anchor).
+    void ApplyGridPattern(int numH, int numV, bool mirrorH, bool mirrorV,
+        bool overrideLengthWidth, float length, float width);
 
     bool HasSelection() const { return m_selectedIndex >= 0; }
     TransformMode GetTransformMode() const { return m_transformMode; }
@@ -158,7 +210,8 @@ public:
 
     // Restore helpers — programmatic placement from saved data (no mouse/ray cast)
     void RestoreObject(const std::string& path, const glm::vec3& pos,
-        float yaw, float pitch, float roll, float scale);
+        float yaw, float pitch, float roll, float scale,
+        bool mirrorX, bool mirrorZ);
 
     void RestoreSprue(const ProjectSprueData& data);
 

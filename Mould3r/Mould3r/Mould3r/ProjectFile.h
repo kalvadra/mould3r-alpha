@@ -16,6 +16,8 @@ struct ProjectObjectData
     float       pitchDeg = 0.0f;
     float       rollDeg = 0.0f;
     float       scale = 1.0f;
+    bool        mirrorX = false;
+    bool        mirrorZ = false;
 };
 
 struct ProjectSprueData
