@@ -1126,11 +1126,27 @@ void MainFrame::OnSaveProject(wxCommandEvent&)
 
     // Gates
     for (const auto& gf : m_canvas->GetGates())
-        data.gates.push_back(ProjectGateData{ gf.point.worldPos, gf.point.worldNormal });
+    {
+        ProjectGateData pg;
+        pg.pos = gf.point.worldPos;
+        pg.normal = gf.point.worldNormal;
+        pg.parentIndex = gf.parentIndex;
+        pg.localPos = gf.localPos;
+        pg.localNormal = gf.localNormal;
+        data.gates.push_back(pg);
+    }
 
     // Vents
     for (const auto& vi : m_canvas->GetVents())
-        data.vents.push_back(ProjectVentData{ vi.point.worldPos, vi.point.worldNormal });
+    {
+        ProjectVentData pv;
+        pv.pos = vi.point.worldPos;
+        pv.normal = vi.point.worldNormal;
+        pv.parentIndex = vi.parentIndex;
+        pv.localPos = vi.localPos;
+        pv.localNormal = vi.localNormal;
+        data.vents.push_back(pv);
+    }
 
     std::string error;
     if (!ProjectFile::Save(savePath, data, error))
@@ -1223,7 +1239,8 @@ void MainFrame::OnLoadProject(wxCommandEvent&)
 
     // ---- Restore gates -----------------------------------------------------
     for (const auto& gt : data.gates)
-        m_canvas->RestoreGate(gt.pos, gt.normal);
+        m_canvas->RestoreGate(gt.pos, gt.normal,
+            gt.parentIndex, gt.localPos, gt.localNormal);
 
     // ---- Restore vents -----------------------------------------------------
     for (const auto& vn : data.vents)
@@ -1232,7 +1249,8 @@ void MainFrame::OnLoadProject(wxCommandEvent&)
             data.params.ventWidth,
             data.params.ventLength,
             data.params.ventOverrunStart,
-            data.params.ventOverrunEnd);
+            data.params.ventOverrunEnd,
+            vn.parentIndex, vn.localPos, vn.localNormal);
     }
 
     // ---- Rebuild all derived GPU geometry -----------------------------------
@@ -2063,7 +2081,7 @@ wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
 
         toolsSizer->AddSpacer(8);
 
-        auto* grid = new wxGridSizer(3, 2, 4, 4);
+        auto* grid = new wxGridSizer(4, 2, 4, 4);
 
         // ---- SVG icon paths for model tool buttons --------------------------------
         // Fill in the path to each SVG file (relative to the executable, or absolute).

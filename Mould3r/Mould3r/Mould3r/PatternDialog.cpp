@@ -68,6 +68,7 @@ PatternDialog::PatternDialog(wxWindow* parent)
         // adjusted so it faces outward like the original (gear-tooth style).
         m_rotateCopies = new wxCheckBox(m_circularPanel, wxID_ANY,
             "Rotate copies");
+        m_rotateCopies->SetValue(true);
         s->Add(m_rotateCopies, 0, wxTOP, 10);
 
         m_circularPanel->SetSizer(s);

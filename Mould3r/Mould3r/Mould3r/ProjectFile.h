@@ -46,12 +46,24 @@ struct ProjectGateData
 {
     glm::vec3 pos{ 0.0f };
     glm::vec3 normal{ 0.0f, 1.0f, 0.0f };
+
+    // Parent-object association (v2+). parentIndex < 0 = unparented; v1
+    // files load with parentIndex defaulted to -1 so they round-trip as
+    // before. localPos / localNormal are valid when parentIndex >= 0.
+    int       parentIndex = -1;
+    glm::vec3 localPos{ 0.0f };
+    glm::vec3 localNormal{ 0.0f, 0.0f, 1.0f };
 };
 
 struct ProjectVentData
 {
     glm::vec3 pos{ 0.0f };
     glm::vec3 normal{ 0.0f, 1.0f, 0.0f };
+
+    // Parent-object association (v2+). See ProjectGateData.
+    int       parentIndex = -1;
+    glm::vec3 localPos{ 0.0f };
+    glm::vec3 localNormal{ 0.0f, 0.0f, 1.0f };
 };
 
 struct ProjectParameters

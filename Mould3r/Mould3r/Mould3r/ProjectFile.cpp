@@ -84,7 +84,11 @@ bool ProjectFile::Save(const std::string& path,
 
     // -- [project] -----------------------------------------------------------
     file << "[project]\n";
-    file << "version = " << data.version << "\n";
+    // v2: added parentIndex / localPos / localNormal to [gate.N] and [vent.N]
+    // for sticky-placement (vents and gates track their parent objects through
+    // transforms and patterning). v1 files round-trip cleanly: missing keys
+    // load as parentIndex=-1 (unparented), preserving the old behaviour.
+    file << "version = 2\n";
     if (!data.fixturePath.empty())
         file << "fixture = " << MakeRelative(data.fixturePath, baseDir) << "\n";
 
@@ -173,6 +177,15 @@ bool ProjectFile::Save(const std::string& path,
         file << "normalX = " << gt.normal.x << "\n";
         file << "normalY = " << gt.normal.y << "\n";
         file << "normalZ = " << gt.normal.z << "\n";
+        // v2 sticky-placement fields. Always written; loader treats them
+        // as optional so v1 files round-trip.
+        file << "parentIndex  = " << gt.parentIndex << "\n";
+        file << "localPosX    = " << gt.localPos.x << "\n";
+        file << "localPosY    = " << gt.localPos.y << "\n";
+        file << "localPosZ    = " << gt.localPos.z << "\n";
+        file << "localNormalX = " << gt.localNormal.x << "\n";
+        file << "localNormalY = " << gt.localNormal.y << "\n";
+        file << "localNormalZ = " << gt.localNormal.z << "\n";
     }
 
     // -- [vent.N] ------------------------------------------------------------
@@ -186,6 +199,13 @@ bool ProjectFile::Save(const std::string& path,
         file << "normalX = " << vn.normal.x << "\n";
         file << "normalY = " << vn.normal.y << "\n";
         file << "normalZ = " << vn.normal.z << "\n";
+        file << "parentIndex  = " << vn.parentIndex << "\n";
+        file << "localPosX    = " << vn.localPos.x << "\n";
+        file << "localPosY    = " << vn.localPos.y << "\n";
+        file << "localPosZ    = " << vn.localPos.z << "\n";
+        file << "localNormalX = " << vn.localNormal.x << "\n";
+        file << "localNormalY = " << vn.localNormal.y << "\n";
+        file << "localNormalZ = " << vn.localNormal.z << "\n";
     }
 
     return true;
@@ -340,6 +360,16 @@ bool ProjectFile::Load(const std::string& path,
             else if (key == "normalX") pendingGate.normal.x = ParseFloat(val, 0.0f);
             else if (key == "normalY") pendingGate.normal.y = ParseFloat(val, 1.0f);
             else if (key == "normalZ") pendingGate.normal.z = ParseFloat(val, 0.0f);
+            // v2 sticky-placement keys. Missing in v1 files; defaults on
+            // the struct (-1 / zero / +Z) preserve the old "world-anchored"
+            // behaviour for those.
+            else if (key == "parentIndex")  pendingGate.parentIndex = ParseInt(val, -1);
+            else if (key == "localPosX")    pendingGate.localPos.x = ParseFloat(val, 0.0f);
+            else if (key == "localPosY")    pendingGate.localPos.y = ParseFloat(val, 0.0f);
+            else if (key == "localPosZ")    pendingGate.localPos.z = ParseFloat(val, 0.0f);
+            else if (key == "localNormalX") pendingGate.localNormal.x = ParseFloat(val, 0.0f);
+            else if (key == "localNormalY") pendingGate.localNormal.y = ParseFloat(val, 0.0f);
+            else if (key == "localNormalZ") pendingGate.localNormal.z = ParseFloat(val, 1.0f);
             break;
 
         case Section::Vent:
@@ -349,6 +379,14 @@ bool ProjectFile::Load(const std::string& path,
             else if (key == "normalX") pendingVent.normal.x = ParseFloat(val, 0.0f);
             else if (key == "normalY") pendingVent.normal.y = ParseFloat(val, 1.0f);
             else if (key == "normalZ") pendingVent.normal.z = ParseFloat(val, 0.0f);
+            // v2 sticky-placement keys.
+            else if (key == "parentIndex")  pendingVent.parentIndex = ParseInt(val, -1);
+            else if (key == "localPosX")    pendingVent.localPos.x = ParseFloat(val, 0.0f);
+            else if (key == "localPosY")    pendingVent.localPos.y = ParseFloat(val, 0.0f);
+            else if (key == "localPosZ")    pendingVent.localPos.z = ParseFloat(val, 0.0f);
+            else if (key == "localNormalX") pendingVent.localNormal.x = ParseFloat(val, 0.0f);
+            else if (key == "localNormalY") pendingVent.localNormal.y = ParseFloat(val, 0.0f);
+            else if (key == "localNormalZ") pendingVent.localNormal.z = ParseFloat(val, 1.0f);
             break;
 
         default:

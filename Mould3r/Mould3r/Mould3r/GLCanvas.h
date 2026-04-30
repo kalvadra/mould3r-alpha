@@ -162,7 +162,7 @@ public:
     void ApplyGridPattern(int numH, int numV, bool mirrorH, bool mirrorV,
         bool overrideLengthWidth, float length, float width);
 
-    bool HasSelection() const { return m_selectedIndex >= 0; }
+    bool HasSelection() const { return !m_selectedIndices.empty(); }
     TransformMode GetTransformMode() const { return m_transformMode; }
 
     void GenerateMould();
@@ -217,11 +217,17 @@ public:
 
     void RestoreRunner(const glm::vec3& point);
 
-    void RestoreGate(const glm::vec3& pos, const glm::vec3& normal);
+    void RestoreGate(const glm::vec3& pos, const glm::vec3& normal,
+        int parentIndex = -1,
+        const glm::vec3& localPos = glm::vec3(0.0f),
+        const glm::vec3& localNormal = glm::vec3(0.0f, 0.0f, 1.0f));
 
     void RestoreVent(const glm::vec3& pos, const glm::vec3& normal,
         float ventWidth, float ventLength,
-        float overrunStart, float overrunEnd);
+        float overrunStart, float overrunEnd,
+        int parentIndex = -1,
+        const glm::vec3& localPos = glm::vec3(0.0f),
+        const glm::vec3& localNormal = glm::vec3(0.0f, 0.0f, 1.0f));
 
     // Rebuild all derived geometry after a batch restore (call once at end)
     void RebuildAllFeatures();
@@ -251,12 +257,27 @@ private:
     bool RayCastObjects(int mouseX, int mouseY,
         glm::vec3& outPos, glm::vec3& outNormal);
 
-    // Parting-plane snap: finds closest point on the mesh's y=0 intersection
+    // Parting-plane snap: finds closest point on the mesh's y=0 intersection.
+    // outObjectIndex (optional): if non-null and the cast succeeds, receives
+    // the index into m_objects of the object whose parting segment won the
+    // snap. -1 means no nearby object (cast still fails as before).
     bool RayCastParting(int mouseX, int mouseY,
-        glm::vec3& outPos, glm::vec3& outNormal);
+        glm::vec3& outPos, glm::vec3& outNormal,
+        int* outObjectIndex = nullptr);
 
     // Simple ray–plane intersection with y=0 (no mesh snapping)
     bool RayCastToPartingPlane(int mouseX, int mouseY, glm::vec3& outPos);
+
+    // Sticky placement helpers — re-derive a parented vent's / gate's
+    // world-space data from its parent object's current transform plus the
+    // stored local-space placement, then rebuild GPU geometry. No-op when
+    // parentIndex is out of range. ReanchorFeaturesForObjects walks both
+    // feature lists once and re-anchors anything whose parent is in the
+    // supplied set; called from Apply* transforms, drag-translate, and
+    // patterning so features track their parent objects automatically.
+    void ReanchorVent(VentInstance& vi);
+    void ReanchorGate(GateFeature& gf);
+    void ReanchorFeaturesForObjects(const std::vector<int>& objIndices);
 
     // Vent path computation and GPU upload
     VentPath         ComputeVentPath(const VentPoint& vp);
@@ -365,7 +386,16 @@ private:
     // Scene
     std::vector<SceneObject> m_fixtures;
     std::vector<SceneObject> m_objects;
-    int                      m_selectedIndex = -1;
+    // Selected object indices into m_objects, in click order.
+    // Last entry is the "primary" selection (used by single-seed operations
+    // such as Pattern). Empty when nothing is selected.
+    //   - Plain LMB on an unselected object: replaces the vector with {hit}.
+    //   - Plain LMB on an already-selected object: leaves the vector alone
+    //     (so a subsequent drag moves the whole group).
+    //   - Plain LMB miss: clears the vector.
+    //   - Ctrl+LMB on an object: toggles that index in the vector.
+    //   - Ctrl+A: fills the vector with every object index.
+    std::vector<int>         m_selectedIndices;
 
     // Vent features (consolidated: point + path + cross-section + solid)
     std::vector<VentInstance> m_vents;

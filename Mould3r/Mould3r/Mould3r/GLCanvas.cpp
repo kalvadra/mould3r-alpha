@@ -7,6 +7,7 @@
 #include <glm/gtc/type_ptr.hpp>
 
 #include <unordered_map>
+#include <set>
 
 #include "GLCanvas.h"
 #include <wx/dcclient.h>
@@ -238,35 +239,68 @@ void GLCanvas::SetTransformMode(TransformMode mode)
 void GLCanvas::ApplyRotation(float xDeg, float yDeg, float zDeg)
 {
     if (!HasSelection()) return;
-    m_objects[m_selectedIndex].pitchDeg += xDeg;
-    m_objects[m_selectedIndex].yawDeg += yDeg;
-    m_objects[m_selectedIndex].rollDeg += zDeg;
-    for (auto& v : m_vents) v.Destroy(); m_vents.clear(); RebuildPathVBO(); RebuildCrossSectionVBO();
+    for (int idx : m_selectedIndices)
+    {
+        if (idx < 0 || idx >= (int)m_objects.size()) continue;
+        m_objects[idx].pitchDeg += xDeg;
+        m_objects[idx].yawDeg += yDeg;
+        m_objects[idx].rollDeg += zDeg;
+    }
+    // Parented vents/gates ride along with their parent; unparented features
+    // are independent of object transforms and are left alone.
+    ReanchorFeaturesForObjects(m_selectedIndices);
     Refresh(false);
 }
 
 void GLCanvas::ApplyTranslation(float x, float y, float z)
 {
     if (!HasSelection()) return;
-    m_objects[m_selectedIndex].pos += glm::vec3(x, y, z);
-    for (auto& v : m_vents) v.Destroy(); m_vents.clear(); RebuildPathVBO(); RebuildCrossSectionVBO();
+    const glm::vec3 d(x, y, z);
+    for (int idx : m_selectedIndices)
+    {
+        if (idx < 0 || idx >= (int)m_objects.size()) continue;
+        m_objects[idx].pos += d;
+    }
+    ReanchorFeaturesForObjects(m_selectedIndices);
     Refresh(false);
 }
 
 void GLCanvas::ApplyScale(float factor)
 {
     if (!HasSelection()) return;
-    m_objects[m_selectedIndex].scale =
-        std::max(0.001f, m_objects[m_selectedIndex].scale * factor);
-    for (auto& v : m_vents) v.Destroy(); m_vents.clear(); RebuildPathVBO(); RebuildCrossSectionVBO();
+    for (int idx : m_selectedIndices)
+    {
+        if (idx < 0 || idx >= (int)m_objects.size()) continue;
+        m_objects[idx].scale = std::max(0.001f, m_objects[idx].scale * factor);
+    }
+    ReanchorFeaturesForObjects(m_selectedIndices);
     Refresh(false);
 }
 
 void GLCanvas::CenterSelectedObject()
 {
     if (!HasSelection()) return;
-    m_objects[m_selectedIndex].pos = glm::vec3(0.0f);
-    for (auto& v : m_vents) v.Destroy(); m_vents.clear(); RebuildPathVBO(); RebuildCrossSectionVBO();
+
+    // Translate the whole selection so the centroid of its members'
+    // positions lands at the world origin. Preserves relative arrangement
+    // (single-selection degenerates to "set pos = (0,0,0)" as before).
+    glm::vec3 centroid(0.0f);
+    int n = 0;
+    for (int idx : m_selectedIndices)
+    {
+        if (idx < 0 || idx >= (int)m_objects.size()) continue;
+        centroid += m_objects[idx].pos;
+        ++n;
+    }
+    if (n == 0) return;
+    centroid /= static_cast<float>(n);
+
+    for (int idx : m_selectedIndices)
+    {
+        if (idx < 0 || idx >= (int)m_objects.size()) continue;
+        m_objects[idx].pos -= centroid;
+    }
+    ReanchorFeaturesForObjects(m_selectedIndices);
     Refresh(false);
 }
 
@@ -291,14 +325,25 @@ void GLCanvas::ApplyCircularPattern(int count, bool overrideRadius, float radius
     bool rotateCopies)
 {
     if (!HasSelection()) return;
+    if (m_selectedIndices.size() != 1)
+    {
+        // Pattern is inherently a single-seed operation. Refuse to run on
+        // a multi-selection rather than guessing which object should be the
+        // anchor (or stamping overlapping patterns from each).
+        wxMessageBox("Pattern requires exactly one object to be selected.",
+            "Circular Pattern", wxOK | wxICON_INFORMATION, this);
+        return;
+    }
     if (count <= 1)      return;     // a "pattern" of one is just the original
+
+    const int seedIndex = m_selectedIndices.front();
 
     SetCurrent(*m_context);
     InitGLOnce();
 
     // Take a copy of the original by value — m_objects may reallocate when we
     // emplace_back the clones below, invalidating any reference we held.
-    const SceneObject orig = m_objects[m_selectedIndex];
+    const SceneObject orig = m_objects[seedIndex];
 
     // Determine each clone's radius and starting angle in the XZ plane.
     // The original's angle is preserved so it remains part of the pattern.
@@ -372,17 +417,69 @@ void GLCanvas::ApplyCircularPattern(int count, bool overrideRadius, float radius
     // whole pattern.
     if (overrideRadius && origRadius > 1e-6f)
     {
-        SceneObject& origRef = m_objects[m_selectedIndex];
+        SceneObject& origRef = m_objects[seedIndex];
         origRef.pos.x = r * std::cos(theta0);
         origRef.pos.z = r * std::sin(theta0);
     }
 
-    // Pattern invalidates any cached mould and existing vent geometry, same
-    // as the other Apply* transforms.
-    for (auto& v : m_vents) v.Destroy();
-    m_vents.clear();
-    RebuildPathVBO();
-    RebuildCrossSectionVBO();
+    // Clone the seed's parented vents/gates onto each new clone object so
+    // patterning carries placement context (sticky-placement). For each
+    // feature parented to the seed, push a fresh feature carrying the same
+    // local-space placement but parented to the clone's m_objects index;
+    // ReanchorVent / ReanchorGate then materialise its world data + GPU
+    // resources from the clone's transform.
+    //
+    // Clones were just appended to the tail of m_objects in k=1..count-1
+    // order, so their indices are firstCloneIdx + 0, +1, ... +(count-2).
+    const int firstCloneIdx = (int)m_objects.size() - (count - 1);
+
+    // Snapshot local placements of seed-parented features. Reading m_vents
+    // / m_gates while we push to them would loop indefinitely, so we
+    // snapshot first, then push.
+    struct LocalPlacement { glm::vec3 pos; glm::vec3 normal; };
+    std::vector<LocalPlacement> seedVentPlacements;
+    std::vector<LocalPlacement> seedGatePlacements;
+    for (const auto& vi : m_vents)
+        if (vi.parentIndex == seedIndex)
+            seedVentPlacements.push_back({ vi.localPos, vi.localNormal });
+    for (const auto& gf : m_gates)
+        if (gf.parentIndex == seedIndex)
+            seedGatePlacements.push_back({ gf.localPos, gf.localNormal });
+
+    std::vector<int> reanchorTargets;
+    reanchorTargets.reserve(count);
+    reanchorTargets.push_back(seedIndex);   // seed's pos may have shifted
+
+    for (int k = 0; k < count - 1; ++k)
+    {
+        const int cloneIdx = firstCloneIdx + k;
+        reanchorTargets.push_back(cloneIdx);
+
+        for (const auto& lp : seedVentPlacements)
+        {
+            VentInstance vi;
+            vi.parentIndex = cloneIdx;
+            vi.localPos = lp.pos;
+            vi.localNormal = lp.normal;
+            // World point + GPU mesh built by ReanchorVent below.
+            m_vents.push_back(std::move(vi));
+        }
+        for (const auto& lp : seedGatePlacements)
+        {
+            GateFeature gf;
+            gf.parentIndex = cloneIdx;
+            gf.localPos = lp.pos;
+            gf.localNormal = lp.normal;
+            // World point + path + solid built by ReanchorGate +
+            // RebuildGatePathVBO/Solids below.
+            m_gates.push_back(std::move(gf));
+        }
+    }
+
+    // Single batch reanchor for the seed (in case override-radius moved it)
+    // and every new clone. Also handles RebuildPathVBO / RebuildGatePathVBO
+    // / RebuildGateSolids internally if either feature list was touched.
+    ReanchorFeaturesForObjects(reanchorTargets);
     Refresh(false);
 }
 
@@ -436,16 +533,25 @@ void GLCanvas::ApplyGridPattern(int numH, int numV, bool mirrorH, bool mirrorV,
     bool overrideLengthWidth, float length, float width)
 {
     if (!HasSelection())   return;
+    if (m_selectedIndices.size() != 1)
+    {
+        // Same single-seed restriction as ApplyCircularPattern.
+        wxMessageBox("Pattern requires exactly one object to be selected.",
+            "Grid Pattern", wxOK | wxICON_INFORMATION, this);
+        return;
+    }
     if (numH <= 0)         return;
     if (numV <= 0)         return;
     if (numH * numV <= 1)  return;     // 1x1 has no clones to make
+
+    const int seedIndex = m_selectedIndices.front();
 
     SetCurrent(*m_context);
     InitGLOnce();
 
     // Take a copy of the original by value - m_objects may reallocate when
     // we emplace_back the clones below, invalidating any reference we held.
-    const SceneObject orig = m_objects[m_selectedIndex];
+    const SceneObject orig = m_objects[seedIndex];
 
     // Half-extents of the centred grid. See header comment for the rules.
     const float halfX = overrideLengthWidth
@@ -539,18 +645,59 @@ void GLCanvas::ApplyGridPattern(int numH, int numV, bool mirrorH, bool mirrorV,
     // was sized to put it there); with override on, the original moves to
     // the matching corner of the new grid extents.
     {
-        SceneObject& origRef = m_objects[m_selectedIndex];
+        SceneObject& origRef = m_objects[seedIndex];
         const glm::vec3 anchorPos = cellPos(anchorI, anchorJ);
         origRef.pos.x = anchorPos.x;
         origRef.pos.z = anchorPos.z;
     }
 
-    // Pattern invalidates any cached mould and existing vent geometry, same
-    // as the other Apply* transforms.
-    for (auto& v : m_vents) v.Destroy();
-    m_vents.clear();
-    RebuildPathVBO();
-    RebuildCrossSectionVBO();
+    // Clone the seed's parented vents/gates onto each new clone object so
+    // patterning carries placement context (sticky-placement). Mirrored
+    // clones (mirrorX / mirrorZ) get correctly-mirrored feature placements
+    // for free because BuildModelMatrix encodes the negative scale and
+    // ReanchorVent / ReanchorGate go through it. See ApplyCircularPattern
+    // for the symmetric explanation.
+    const int numClones = numH * numV - 1;
+    const int firstCloneIdx = (int)m_objects.size() - numClones;
+
+    struct LocalPlacement { glm::vec3 pos; glm::vec3 normal; };
+    std::vector<LocalPlacement> seedVentPlacements;
+    std::vector<LocalPlacement> seedGatePlacements;
+    for (const auto& vi : m_vents)
+        if (vi.parentIndex == seedIndex)
+            seedVentPlacements.push_back({ vi.localPos, vi.localNormal });
+    for (const auto& gf : m_gates)
+        if (gf.parentIndex == seedIndex)
+            seedGatePlacements.push_back({ gf.localPos, gf.localNormal });
+
+    std::vector<int> reanchorTargets;
+    reanchorTargets.reserve(numClones + 1);
+    reanchorTargets.push_back(seedIndex);   // seed's pos may have shifted
+
+    for (int k = 0; k < numClones; ++k)
+    {
+        const int cloneIdx = firstCloneIdx + k;
+        reanchorTargets.push_back(cloneIdx);
+
+        for (const auto& lp : seedVentPlacements)
+        {
+            VentInstance vi;
+            vi.parentIndex = cloneIdx;
+            vi.localPos = lp.pos;
+            vi.localNormal = lp.normal;
+            m_vents.push_back(std::move(vi));
+        }
+        for (const auto& lp : seedGatePlacements)
+        {
+            GateFeature gf;
+            gf.parentIndex = cloneIdx;
+            gf.localPos = lp.pos;
+            gf.localNormal = lp.normal;
+            m_gates.push_back(std::move(gf));
+        }
+    }
+
+    ReanchorFeaturesForObjects(reanchorTargets);
     Refresh(false);
 }
 
@@ -2463,7 +2610,8 @@ static glm::vec3 ClosestPointOnSegment(const glm::vec3& a, const glm::vec3& b, c
 }
 
 bool GLCanvas::RayCastParting(int mouseX, int mouseY,
-    glm::vec3& outPos, glm::vec3& outNormal)
+    glm::vec3& outPos, glm::vec3& outNormal,
+    int* outObjectIndex)
 {
     const wxSize sz = GetClientSize();
     const int    w = std::max(1, sz.x);
@@ -2493,10 +2641,12 @@ bool GLCanvas::RayCastParting(int mouseX, int mouseY,
     float     bestDist = kVentSnapRadius;
     glm::vec3 bestPos(0.0f);
     glm::vec3 bestNormal(0.0f, 1.0f, 0.0f);
+    int       bestObj = -1;
     bool      found = false;
 
-    for (const auto& obj : m_objects)
+    for (int objIdx = 0; objIdx < (int)m_objects.size(); ++objIdx)
     {
+        const auto& obj = m_objects[objIdx];
         if (obj.cpuVerts.empty() || obj.cpuIndices.empty()) continue;
 
         const glm::mat4 model = obj.BuildModelMatrix();
@@ -2565,6 +2715,7 @@ bool GLCanvas::RayCastParting(int mouseX, int mouseY,
                 worldFaceN.y = 0.0f;
                 const float nlen = glm::length(worldFaceN);
                 bestNormal = (nlen > 1e-4f) ? worldFaceN / nlen : glm::vec3(0.0f, 0.0f, 1.0f);
+                bestObj = objIdx;
                 found = true;
             }
         }
@@ -2575,6 +2726,7 @@ bool GLCanvas::RayCastParting(int mouseX, int mouseY,
         outPos = bestPos;
         outNormal = bestNormal;
     }
+    if (outObjectIndex) *outObjectIndex = found ? bestObj : -1;
     return found;
 }
 
@@ -3747,6 +3899,15 @@ void GLCanvas::OnPaint(wxPaintEvent&)
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glDepthMask(GL_FALSE);   // don't write depth — keeps vent markers visible through the tint
 
+    // Nudge the transparent half's fragments back in depth-buffer space so
+    // its parting face (coplanar with the opaque half's parting face at y=0)
+    // loses the depth test cleanly instead of z-fighting against it. Without
+    // this, fragments on both faces share the same post-projection depth and
+    // floating-point rounding flips individual pixels frame-to-frame, which
+    // shows up as flicker along the parting line.
+    glEnable(GL_POLYGON_OFFSET_FILL);
+    glPolygonOffset(1.0f, 1.0f);
+
     if (transparentIndex < (int)m_fixtures.size())
     {
         const SceneObject& obj = m_fixtures[transparentIndex];
@@ -3761,6 +3922,9 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         }
     }
 
+    glPolygonOffset(0.0f, 0.0f);
+    glDisable(GL_POLYGON_OFFSET_FILL);
+
     glDepthMask(GL_TRUE);
     glDisable(GL_BLEND);
 
@@ -3773,7 +3937,7 @@ void GLCanvas::OnPaint(wxPaintEvent&)
     m_grid.Draw(view, proj);
 
     // Outline for selected object
-    if (m_selectedIndex >= 0 && m_selectedIndex < (int)m_objects.size())
+    if (!m_selectedIndices.empty())
     {
         RenderPickPass_NoRead(w, h);
 
@@ -3789,15 +3953,26 @@ void GLCanvas::OnPaint(wxPaintEvent&)
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, m_pickColorTex);
 
-            const uint32_t targetId = (uint32_t)(m_selectedIndex + 1);
+            // Per-pass-invariant uniforms set once.
             glUniform1i(m_outline_uIdTex, 0);
-            glUniform1ui(m_outline_uTargetId, targetId);
             glUniform2i(m_outline_uTexSize, m_pickW, m_pickH);
             glUniform1f(m_outline_uAlpha, 0.9f);
             glUniform1i(m_outline_uThickness, 2);
 
             glBindVertexArray(m_fullscreenVAO);
-            glDrawArrays(GL_TRIANGLES, 0, 3);
+
+            // The outline shader takes a single uTargetId and detects edges
+            // between that ID and everything else in the pick texture, so we
+            // do one fullscreen pass per selected object. The pick texture
+            // is shared across passes — only uTargetId varies.
+            for (int idx : m_selectedIndices)
+            {
+                if (idx < 0 || idx >= (int)m_objects.size()) continue;
+                const uint32_t targetId = (uint32_t)(idx + 1);
+                glUniform1ui(m_outline_uTargetId, targetId);
+                glDrawArrays(GL_TRIANGLES, 0, 3);
+            }
+
             glBindVertexArray(0);
             glBindTexture(GL_TEXTURE_2D, 0);
             glUseProgram(0);
@@ -3817,11 +3992,31 @@ void GLCanvas::OnPaint(wxPaintEvent&)
             m_editFeatureIndex >= 0 && m_editFeatureIndex < (int)m_vents.size())
         {
             glm::vec3 hitPos, hitNormal;
-            if (RayCastParting(m_editMousePos.x, m_editMousePos.y, hitPos, hitNormal))
+            int       hitObj = -1;
+            if (RayCastParting(m_editMousePos.x, m_editMousePos.y, hitPos, hitNormal, &hitObj))
             {
                 VentInstance& vi = m_vents[m_editFeatureIndex];
                 vi.Destroy();
                 vi.point = VentPoint{ hitPos, hitNormal };
+
+                // Edit-drag re-captures parent association: if the user drags
+                // a vent onto a different object's surface, the new object
+                // becomes its parent. Snapping to no object resets to
+                // unparented (vent stops following any object).
+                if (hitObj >= 0 && hitObj < (int)m_objects.size())
+                {
+                    const glm::mat4 m = m_objects[hitObj].BuildModelMatrix();
+                    const glm::mat4 invM = glm::inverse(m);
+                    vi.parentIndex = hitObj;
+                    vi.localPos = glm::vec3(invM * glm::vec4(hitPos, 1.0f));
+                    glm::vec3 ln = glm::transpose(glm::mat3(m)) * hitNormal;
+                    const float lnLen = glm::length(ln);
+                    vi.localNormal = (lnLen > 1e-6f) ? ln / lnLen : glm::vec3(0, 0, 1);
+                }
+                else
+                {
+                    vi.parentIndex = -1;
+                }
 
                 float ventLength = 5.0f, ventWidth = 2.0f,
                     ventOverrunStart = 0.5f, ventOverrunEnd = 0.5f;
@@ -3864,11 +4059,29 @@ void GLCanvas::OnPaint(wxPaintEvent&)
             m_editFeatureIndex >= 0 && m_editFeatureIndex < (int)m_gates.size())
         {
             glm::vec3 hitPos, hitNormal;
-            if (RayCastParting(m_editMousePos.x, m_editMousePos.y, hitPos, hitNormal))
+            int       hitObj = -1;
+            if (RayCastParting(m_editMousePos.x, m_editMousePos.y, hitPos, hitNormal, &hitObj))
             {
                 GateFeature& gf = m_gates[m_editFeatureIndex];
                 gf.Destroy();
                 gf.point = VentPoint{ hitPos, hitNormal };
+
+                // Edit-drag re-captures parent association — see the EditVent
+                // branch above for the rationale.
+                if (hitObj >= 0 && hitObj < (int)m_objects.size())
+                {
+                    const glm::mat4 m = m_objects[hitObj].BuildModelMatrix();
+                    const glm::mat4 invM = glm::inverse(m);
+                    gf.parentIndex = hitObj;
+                    gf.localPos = glm::vec3(invM * glm::vec4(hitPos, 1.0f));
+                    glm::vec3 ln = glm::transpose(glm::mat3(m)) * hitNormal;
+                    const float lnLen = glm::length(ln);
+                    gf.localNormal = (lnLen > 1e-6f) ? ln / lnLen : glm::vec3(0, 0, 1);
+                }
+                else
+                {
+                    gf.parentIndex = -1;
+                }
 
                 RebuildGatePathVBO();
                 RebuildGateSolids();
@@ -4636,17 +4849,77 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
         if (m_transformMode == TransformMode::Select)
         {
             const wxPoint p = evt.GetPosition();
-            m_selectedIndex = PickObjectAt(p.x, p.y);
+            const int hit = PickObjectAt(p.x, p.y);
+            const bool ctrl = evt.ControlDown();
+
+            if (ctrl)
+            {
+                // Ctrl+LMB: toggle the hit object in the selection. A miss
+                // is a no-op so users can drift the cursor mid-modifier
+                // without losing selection.
+                if (hit >= 0)
+                {
+                    auto it = std::find(m_selectedIndices.begin(),
+                        m_selectedIndices.end(), hit);
+                    if (it != m_selectedIndices.end())
+                        m_selectedIndices.erase(it);
+                    else
+                        m_selectedIndices.push_back(hit);
+                }
+            }
+            else
+            {
+                // Plain LMB:
+                //   miss          -> clear selection
+                //   hit unselected -> replace selection with {hit}
+                //   hit already-selected -> leave the vector alone, so the
+                //     follow-up drag in OnMotion moves the whole group as
+                //     a rigid unit (without this, clicking any member of a
+                //     multi-selection would collapse it to that one object).
+                if (hit < 0)
+                {
+                    m_selectedIndices.clear();
+                }
+                else
+                {
+                    const bool already = std::find(m_selectedIndices.begin(),
+                        m_selectedIndices.end(), hit) != m_selectedIndices.end();
+                    if (!already)
+                    {
+                        m_selectedIndices.clear();
+                        m_selectedIndices.push_back(hit);
+                    }
+                }
+            }
             Refresh(false);
         }
         else if (m_transformMode == TransformMode::PlaceVent)
         {
             const wxPoint p = evt.GetPosition();
             glm::vec3 hitPos, hitNormal;
-            if (RayCastParting(p.x, p.y, hitPos, hitNormal))
+            int       hitObj = -1;
+            if (RayCastParting(p.x, p.y, hitPos, hitNormal, &hitObj))
             {
                 VentInstance vi;
                 vi.point = VentPoint{ hitPos, hitNormal };
+
+                // Capture parent association so the vent travels with its
+                // object on subsequent transforms / patterning. localPos /
+                // localNormal are computed from the parent's current model
+                // matrix; transpose(model3x3) applied to a world normal
+                // produces the matching local normal because the inverse
+                // and transpose-inverse are themselves transposes for
+                // rotations (and the magnitude is renormalised below).
+                if (hitObj >= 0 && hitObj < (int)m_objects.size())
+                {
+                    const glm::mat4 m = m_objects[hitObj].BuildModelMatrix();
+                    const glm::mat4 invM = glm::inverse(m);
+                    vi.parentIndex = hitObj;
+                    vi.localPos = glm::vec3(invM * glm::vec4(hitPos, 1.0f));
+                    glm::vec3 ln = glm::transpose(glm::mat3(m)) * hitNormal;
+                    const float lnLen = glm::length(ln);
+                    vi.localNormal = (lnLen > 1e-6f) ? ln / lnLen : glm::vec3(0, 0, 1);
+                }
 
                 // Read dimensions from the left-panel UI
                 float ventLength = 5.0f, ventWidth = 2.0f,
@@ -4695,10 +4968,26 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
         {
             const wxPoint p = evt.GetPosition();
             glm::vec3 hitPos, hitNormal;
-            if (RayCastParting(p.x, p.y, hitPos, hitNormal))
+            int       hitObj = -1;
+            if (RayCastParting(p.x, p.y, hitPos, hitNormal, &hitObj))
             {
                 GateFeature gf;
                 gf.point = VentPoint{ hitPos, hitNormal };
+
+                // Capture parent association — see PlaceVent for the rationale
+                // behind the transpose(model3x3) used to take a world normal
+                // back into local space.
+                if (hitObj >= 0 && hitObj < (int)m_objects.size())
+                {
+                    const glm::mat4 m = m_objects[hitObj].BuildModelMatrix();
+                    const glm::mat4 invM = glm::inverse(m);
+                    gf.parentIndex = hitObj;
+                    gf.localPos = glm::vec3(invM * glm::vec4(hitPos, 1.0f));
+                    glm::vec3 ln = glm::transpose(glm::mat3(m)) * hitNormal;
+                    const float lnLen = glm::length(ln);
+                    gf.localNormal = (lnLen > 1e-6f) ? ln / lnLen : glm::vec3(0, 0, 1);
+                }
+
                 m_gates.push_back(std::move(gf));
                 RebuildGatePathVBO();
                 RebuildGateSolids();
@@ -4988,7 +5277,7 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
     }
     else if (m_lmb && m_transformMode == TransformMode::Select)
     {
-        if (m_selectedIndex >= 0)
+        if (!m_selectedIndices.empty())
         {
             const float dist = m_camera.GetDistance();
             const float unitsPerPx = dist * 0.0015f;
@@ -5004,10 +5293,18 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
             // Flip dy when camera is below the grid to keep drag direction consistent
             const float dyAdjusted = (m_camera.Position().y < 0.0f) ? -dy : dy;
 
-            m_objects[m_selectedIndex].pos += right * (dx * unitsPerPx);
-            m_objects[m_selectedIndex].pos += forward * (-dyAdjusted * unitsPerPx);
-            for (auto& v : m_vents) v.Destroy(); m_vents.clear(); RebuildPathVBO(); RebuildCrossSectionVBO();
-            for (auto& gf : m_gates) gf.Destroy(); m_gates.clear(); RebuildGatePathVBO();
+            // Same delta applied to every selected object so they move as a
+            // rigid group, preserving relative positions.
+            const glm::vec3 delta = right * (dx * unitsPerPx)
+                + forward * (-dyAdjusted * unitsPerPx);
+            for (int idx : m_selectedIndices)
+            {
+                if (idx < 0 || idx >= (int)m_objects.size()) continue;
+                m_objects[idx].pos += delta;
+            }
+            // Parented vents/gates ride along with their parents; unparented
+            // features are independent and left alone.
+            ReanchorFeaturesForObjects(m_selectedIndices);
             Refresh(false);
         }
         else
@@ -5162,11 +5459,59 @@ void GLCanvas::OnKeyDown(wxKeyEvent& evt)
                 frame->SetActiveTool(TransformMode::Select);
         }
     }
-    else if (evt.GetKeyCode() == WXK_DELETE && m_selectedIndex >= 0)
+    else if (evt.GetKeyCode() == 'A' && evt.ControlDown()
+        && m_transformMode == TransformMode::Select)
     {
-        m_objects[m_selectedIndex].mesh.Destroy();
-        m_objects.erase(m_objects.begin() + m_selectedIndex);
-        m_selectedIndex = -1;
+        // Ctrl+A: select every imported object. Restricted to Select mode
+        // so it doesn't fire while the user is mid-placement (vents,
+        // runners, gates, etc.) — those modes shouldn't surface a
+        // selection state at all.
+        m_selectedIndices.clear();
+        m_selectedIndices.reserve(m_objects.size());
+        for (int i = 0; i < (int)m_objects.size(); ++i)
+            m_selectedIndices.push_back(i);
+        Refresh(false);
+    }
+    else if (evt.GetKeyCode() == WXK_DELETE && !m_selectedIndices.empty())
+    {
+        // Sort selection in descending order so erasing each entry doesn't
+        // shift the indices we still need to delete.
+        std::vector<int> toDelete = m_selectedIndices;
+        std::sort(toDelete.begin(), toDelete.end(), std::greater<int>());
+        for (int idx : toDelete)
+        {
+            if (idx < 0 || idx >= (int)m_objects.size()) continue;
+
+            // Drop any vents/gates parented to this object, then decrement
+            // parentIndex on every surviving feature whose parent index is
+            // above idx (those parents just shifted down by one). Doing this
+            // inside the descending loop keeps the renumbering local — by
+            // the time we reach a smaller idx, indices we already processed
+            // (which were higher) have all been erased, so any remaining
+            // parentIndex > idx is still valid in the now-shrunk m_objects.
+            m_vents.erase(std::remove_if(m_vents.begin(), m_vents.end(),
+                [idx](VentInstance& vi) {
+                    if (vi.parentIndex == idx) { vi.Destroy(); return true; }
+                    return false;
+                }), m_vents.end());
+            m_gates.erase(std::remove_if(m_gates.begin(), m_gates.end(),
+                [idx](GateFeature& gf) {
+                    if (gf.parentIndex == idx) { gf.Destroy(); return true; }
+                    return false;
+                }), m_gates.end());
+            for (auto& vi : m_vents) if (vi.parentIndex > idx) --vi.parentIndex;
+            for (auto& gf : m_gates) if (gf.parentIndex > idx) --gf.parentIndex;
+
+            m_objects[idx].mesh.Destroy();
+            m_objects.erase(m_objects.begin() + idx);
+        }
+        m_selectedIndices.clear();
+        // VBOs that aggregate vent / gate state need refreshing in case
+        // we deleted any.
+        RebuildPathVBO();
+        RebuildCrossSectionVBO();
+        RebuildGatePathVBO();
+        RebuildGateSolids();
         Refresh(false);
     }
     else
@@ -5356,7 +5701,7 @@ void GLCanvas::ClearAll()
     // Objects
     for (auto& obj : m_objects) obj.mesh.Destroy();
     m_objects.clear();
-    m_selectedIndex = -1;
+    m_selectedIndices.clear();
 
     // Vents
     for (auto& v : m_vents) v.Destroy();
@@ -5459,16 +5804,25 @@ void GLCanvas::RestoreRunner(const glm::vec3& point)
     m_runners.push_back(RunnerFeature{ point, {}, {} });
 }
 
-void GLCanvas::RestoreGate(const glm::vec3& pos, const glm::vec3& normal)
+void GLCanvas::RestoreGate(const glm::vec3& pos, const glm::vec3& normal,
+    int parentIndex,
+    const glm::vec3& localPos,
+    const glm::vec3& localNormal)
 {
     GateFeature gf;
     gf.point = VentPoint{ pos, normal };
+    gf.parentIndex = parentIndex;
+    gf.localPos = localPos;
+    gf.localNormal = localNormal;
     m_gates.push_back(std::move(gf));
 }
 
 void GLCanvas::RestoreVent(const glm::vec3& pos, const glm::vec3& normal,
     float ventWidth, float ventLength,
-    float overrunStart, float overrunEnd)
+    float overrunStart, float overrunEnd,
+    int parentIndex,
+    const glm::vec3& localPos,
+    const glm::vec3& localNormal)
 {
     SetCurrent(*m_context);
 
@@ -5480,7 +5834,123 @@ void GLCanvas::RestoreVent(const glm::vec3& pos, const glm::vec3& normal,
     vi.crossSection = BuildVentCrossSection(vi.path, ventWidth, ventLength);
     vi.solid = BuildBoxSweepMesh(vi.path, ventWidth, ventLength,
         overrunStart, overrunEnd);
+    vi.parentIndex = parentIndex;
+    vi.localPos = localPos;
+    vi.localNormal = localNormal;
     m_vents.push_back(std::move(vi));
+}
+
+// ---------------------------------------------------------------------------
+// ReanchorVent / ReanchorGate — re-derive a parented feature's world-space
+// data from its parent object's current transform plus its stored local
+// placement, then rebuild GPU geometry.  No-op when parentIndex is out of
+// range (the feature is unparented or its parent has been deleted).
+//
+// This is what makes vents/gates "stick" to their parent objects:
+//   - Apply* transforms call ReanchorFeaturesForObjects on the affected
+//     selection, so moving an object drags its features along.
+//   - Patterning clones the parented features onto each new clone object
+//     and then reanchors so the clone's features land on the clone's
+//     surface (mirrored / rotated as appropriate).
+//
+// Vent geometry is rebuilt with current UI dimensions, matching the
+// existing edit-drag convention.  Gate geometry is rebuilt by the global
+// RebuildGateSolids pass invoked by callers; this helper only refreshes
+// the gate's world point + the gate-path VBO seed.
+// ---------------------------------------------------------------------------
+void GLCanvas::ReanchorVent(VentInstance& vi)
+{
+    if (vi.parentIndex < 0 || vi.parentIndex >= (int)m_objects.size())
+        return;
+
+    const SceneObject& parent = m_objects[vi.parentIndex];
+    const glm::mat4 m = parent.BuildModelMatrix();
+    const glm::mat3 normMat = glm::transpose(glm::inverse(glm::mat3(m)));
+
+    // World point + normal from the stored local placement.  Normal is
+    // re-normalised because non-uniform scaling (or reflection) could
+    // alter its magnitude.
+    vi.point.worldPos = glm::vec3(m * glm::vec4(vi.localPos, 1.0f));
+    glm::vec3 wn = normMat * vi.localNormal;
+    const float wnLen = glm::length(wn);
+    vi.point.worldNormal = (wnLen > 1e-6f) ? wn / wnLen : glm::vec3(0, 1, 0);
+
+    // Read current UI dimensions, same convention as edit-drag.
+    float ventLength = 5.0f, ventWidth = 2.0f,
+        ventOverrunStart = vi.path.overrunStart,
+        ventOverrunEnd = vi.path.overrunEnd;
+    if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+        frame->GetVentDimensions(ventLength, ventWidth,
+            ventOverrunStart, ventOverrunEnd);
+
+    // Destroy and rebuild the GPU mesh — vi.solid currently references the
+    // pre-reanchor geometry which is now stale.
+    vi.Destroy();
+    vi.path = ComputeVentPath(vi.point);
+    vi.path.overrunStart = ventOverrunStart;
+    vi.path.overrunEnd = ventOverrunEnd;
+    vi.crossSection = BuildVentCrossSection(vi.path, ventWidth, ventLength);
+    vi.solid = BuildBoxSweepMesh(vi.path, ventWidth, ventLength,
+        ventOverrunStart, ventOverrunEnd);
+}
+
+void GLCanvas::ReanchorGate(GateFeature& gf)
+{
+    if (gf.parentIndex < 0 || gf.parentIndex >= (int)m_objects.size())
+        return;
+
+    const SceneObject& parent = m_objects[gf.parentIndex];
+    const glm::mat4 m = parent.BuildModelMatrix();
+    const glm::mat3 normMat = glm::transpose(glm::inverse(glm::mat3(m)));
+
+    gf.point.worldPos = glm::vec3(m * glm::vec4(gf.localPos, 1.0f));
+    glm::vec3 wn = normMat * gf.localNormal;
+    const float wnLen = glm::length(wn);
+    gf.point.worldNormal = (wnLen > 1e-6f) ? wn / wnLen : glm::vec3(0, 1, 0);
+
+    // Gate solids are rebuilt globally by RebuildGateSolids() (it always
+    // reads current UI dimensions and processes every gate), so we just
+    // refresh the world point here. Callers invoke RebuildGatePathVBO()
+    // and RebuildGateSolids() once after the batch reanchor finishes.
+}
+
+void GLCanvas::ReanchorFeaturesForObjects(const std::vector<int>& objIndices)
+{
+    if (objIndices.empty()) return;
+
+    // Quick membership lookup. Selection sizes are tiny in practice, but a
+    // set keeps the per-feature check O(log n) and avoids surprises if the
+    // caller passes a large selection (e.g. after Ctrl+A).
+    std::set<int> affected(objIndices.begin(), objIndices.end());
+
+    bool touchedVent = false;
+    bool touchedGate = false;
+
+    for (auto& vi : m_vents)
+    {
+        if (vi.parentIndex < 0) continue;
+        if (affected.find(vi.parentIndex) == affected.end()) continue;
+        ReanchorVent(vi);
+        touchedVent = true;
+    }
+    for (auto& gf : m_gates)
+    {
+        if (gf.parentIndex < 0) continue;
+        if (affected.find(gf.parentIndex) == affected.end()) continue;
+        ReanchorGate(gf);
+        touchedGate = true;
+    }
+
+    if (touchedVent)
+    {
+        RebuildPathVBO();
+        RebuildCrossSectionVBO();
+    }
+    if (touchedGate)
+    {
+        RebuildGatePathVBO();
+        RebuildGateSolids();
+    }
 }
 
 void GLCanvas::RebuildAllFeatures()

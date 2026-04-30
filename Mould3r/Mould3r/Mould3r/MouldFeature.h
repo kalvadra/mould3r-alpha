@@ -92,6 +92,23 @@ struct VentInstance
     VentCrossSection crossSection;
     SolidMesh        solid;
 
+    // Parent-object association for sticky placement.
+    //   -1                   — unparented (placed without an object snap, or
+    //                          loaded from a pre-v2 project file).  World
+    //                          position is the source of truth, transforms
+    //                          on objects do not affect the vent.
+    //   >= 0                 — index into GLCanvas::m_objects.  localPos
+    //                          and localNormal are valid and ARE the source
+    //                          of truth: world position is re-derived from
+    //                          parent.BuildModelMatrix() * localPos whenever
+    //                          the parent is transformed (move / rotate /
+    //                          scale, mirroring during grid pattern, etc.).
+    //                          Patterning clones the parented vent onto each
+    //                          new clone object with the same local data.
+    int       parentIndex = -1;
+    glm::vec3 localPos{ 0.0f, 0.0f, 0.0f };
+    glm::vec3 localNormal{ 0.0f, 0.0f, 1.0f };
+
     void Destroy() { solid.Destroy(); }
 };
 
@@ -124,6 +141,11 @@ struct GateFeature
     // Path from the gate to the nearest feed point (sprue parting pt or runner pt)
     glm::vec3 pathEnd{ 0.0f };
     bool      hasPath = false;
+
+    // Parent-object association — same semantics as VentInstance.
+    int       parentIndex = -1;
+    glm::vec3 localPos{ 0.0f, 0.0f, 0.0f };
+    glm::vec3 localNormal{ 0.0f, 0.0f, 1.0f };
 
     void Destroy() { solid.Destroy(); subRunnerSolid.Destroy(); }
 };
