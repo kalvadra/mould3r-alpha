@@ -3,6 +3,7 @@
 #include <glad/glad.h>
 #include <wx/glcanvas.h>
 #include <vector>
+#include <array>
 
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
@@ -65,11 +66,29 @@ struct SceneObject
     std::vector<float>    cpuVerts;    // 3 floats per vertex
     std::vector<uint32_t> cpuIndices;  // triangle indices
 
+    // Per-triangle edge adjacency for face-region growing (Align Face).
+    // triNeighbors[t][k] = the triangle that shares edge k of triangle t
+    // (where edge k is between local vertex k and (k+1)%3), or -1 if none.
+    // Built lazily on first use; persists for the object's lifetime since
+    // local mesh topology never changes after import.
+    std::vector<std::array<int, 3>> triNeighbors;
+    bool                            adjacencyBuilt = false;
+
     glm::vec3 pos{ 0.0f, 0.0f, 0.0f };
     float     yawDeg = 0.0f;
     float     pitchDeg = 0.0f;
     float     rollDeg = 0.0f;
     float     scale = 1.0f;
+
+    // Optional reflections about the local YZ / XY planes, applied as a
+    // negative component in the scale matrix. Used by the grid-pattern
+    // tool to mirror clones placed on the opposite side of the world X
+    // or Z axis. With both flags set the mesh is reflected through the
+    // local Y axis (parity preserved). The lit shader uses the
+    // transpose-inverse normal matrix so reflections light correctly,
+    // and face culling is off so reversed winding renders fine.
+    bool mirrorX = false;
+    bool mirrorZ = false;
 
     glm::mat4 BuildModelMatrix() const
     {
@@ -77,7 +96,15 @@ struct SceneObject
         glm::mat4 RY = glm::rotate(glm::mat4(1.0f), glm::radians(yawDeg), glm::vec3(0, 1, 0));
         glm::mat4 RX = glm::rotate(glm::mat4(1.0f), glm::radians(pitchDeg), glm::vec3(1, 0, 0));
         glm::mat4 RZ = glm::rotate(glm::mat4(1.0f), glm::radians(rollDeg), glm::vec3(0, 0, 1));
-        glm::mat4 S = glm::scale(glm::mat4(1.0f), glm::vec3(scale));
+        // Per-axis scale: uniform `scale`, with optional mirror flipping
+        // X and/or Z. Applied at the innermost (local) step so the
+        // reflection acts on the un-rotated mesh; the rotation +
+        // translation that follow place the mirrored shape into world
+        // space.
+        const glm::vec3 sv(scale * (mirrorX ? -1.0f : 1.0f),
+            scale,
+            scale * (mirrorZ ? -1.0f : 1.0f));
+        glm::mat4 S = glm::scale(glm::mat4(1.0f), sv);
         return T * RY * RX * RZ * S;
     }
 };
@@ -101,7 +128,41 @@ public:
     void ApplyScale(float factor);
     void CenterSelectedObject();
 
-    bool HasSelection() const { return m_selectedIndex >= 0; }
+    // Circular pattern around the world origin in the XZ plane.
+    //   count          - total instances including the original (no-op if <= 1)
+    //   overrideRadius - if true, place clones at `radius` instead of the
+    //                    original's current XZ distance from the origin
+    //   radius         - the override radius, in world units (mm)
+    //   rotateCopies   - if true, each clone's local yaw is rotated by its
+    //                    angular offset (gear-tooth style — every instance
+    //                    faces outward like the original). If false, every
+    //                    clone keeps the original's local rotation verbatim.
+    // The original keeps its position; (count - 1) clones are placed at
+    // equally-spaced angular offsets around the origin.
+    void ApplyCircularPattern(int count, bool overrideRadius, float radius,
+        bool rotateCopies);
+
+    // Grid pattern in the y=0 plane, centred on the world origin.
+    //   numH               - cell count along X (>= 1)
+    //   numV               - cell count along Z (>= 1)
+    //   mirrorH            - if true, clones whose X coordinate sits on the
+    //                        opposite side of x=0 from the original have
+    //                        their mesh reflected about the local YZ plane
+    //   mirrorV            - same for Z (reflection about local XY plane)
+    //   overrideLengthWidth- if true, use `length`/`width` (interpreted as
+    //                        full grid extents) instead of deriving from
+    //                        the original's (x,z), which is treated as
+    //                        half the full grid extent.
+    //   length             - full X extent of the grid (mm), override only
+    //   width              - full Z extent of the grid (mm), override only
+    // The grid spans [-halfX, +halfX] x [-halfZ, +halfZ] in the y=0 plane,
+    // with halfX,halfZ derived per above. The original is anchored to the
+    // corner cell matching its current XZ-quadrant (and is moved there if
+    // override is on or if its position no longer matches the anchor).
+    void ApplyGridPattern(int numH, int numV, bool mirrorH, bool mirrorV,
+        bool overrideLengthWidth, float length, float width);
+
+    bool HasSelection() const { return !m_selectedIndices.empty(); }
     TransformMode GetTransformMode() const { return m_transformMode; }
 
     void GenerateMould();
@@ -132,11 +193,23 @@ public:
     const std::vector<GateFeature>& GetGates() const { return m_gates; }
     void ClearGatePoints();
 
+    // Ejector placement
+    const std::vector<EjectorFeature>& GetEjectors() const { return m_ejectors; }
+    void ClearEjectors();
+    // Rebuild every ejector's preview cylinder. Called after place / clear /
+    // any operation that changes the ejector list. Reads diameter and
+    // length from the MainFrame UI at call time, same convention as
+    // RebuildGateSolids — so changing the dimension fields and placing a
+    // new ejector picks up fresh values, but existing ejectors keep
+    // whatever dimensions they were built with.
+    void RebuildEjectorSolids();
+
     // Remove individual features by clicking their marker
     void RemoveVentAtMouse(int mouseX, int mouseY);
     void RemoveRunnerAtMouse(int mouseX, int mouseY);
     void RemoveGateAtMouse(int mouseX, int mouseY);
     void RemoveSprueAtMouse(int mouseX, int mouseY);
+    void RemoveEjectorAtMouse(int mouseX, int mouseY);
 
     // ---- Project save/load support -----------------------------------------
 
@@ -149,17 +222,30 @@ public:
 
     // Restore helpers — programmatic placement from saved data (no mouse/ray cast)
     void RestoreObject(const std::string& path, const glm::vec3& pos,
-        float yaw, float pitch, float roll, float scale);
+        float yaw, float pitch, float roll, float scale,
+        bool mirrorX, bool mirrorZ);
 
     void RestoreSprue(const ProjectSprueData& data);
 
     void RestoreRunner(const glm::vec3& point);
 
-    void RestoreGate(const glm::vec3& pos, const glm::vec3& normal);
+    void RestoreGate(const glm::vec3& pos, const glm::vec3& normal,
+        int parentIndex = -1,
+        const glm::vec3& localPos = glm::vec3(0.0f),
+        const glm::vec3& localNormal = glm::vec3(0.0f, 0.0f, 1.0f));
 
     void RestoreVent(const glm::vec3& pos, const glm::vec3& normal,
         float ventWidth, float ventLength,
-        float overrunStart, float overrunEnd);
+        float overrunStart, float overrunEnd,
+        int parentIndex = -1,
+        const glm::vec3& localPos = glm::vec3(0.0f),
+        const glm::vec3& localNormal = glm::vec3(0.0f, 0.0f, 1.0f));
+
+    // Restore an ejector during project load. No batch rebuild is performed
+    // here — the caller is expected to invoke RebuildAllFeatures() once at
+    // the end of the load to materialise GPU resources for every restored
+    // feature in one pass.
+    void RestoreEjector(const glm::vec3& point);
 
     // Rebuild all derived geometry after a batch restore (call once at end)
     void RebuildAllFeatures();
@@ -189,12 +275,38 @@ private:
     bool RayCastObjects(int mouseX, int mouseY,
         glm::vec3& outPos, glm::vec3& outNormal);
 
-    // Parting-plane snap: finds closest point on the mesh's y=0 intersection
+    // Parting-plane snap: finds closest point on the mesh's y=0 intersection.
+    // outObjectIndex (optional): if non-null and the cast succeeds, receives
+    // the index into m_objects of the object whose parting segment won the
+    // snap. -1 means no nearby object (cast still fails as before).
     bool RayCastParting(int mouseX, int mouseY,
-        glm::vec3& outPos, glm::vec3& outNormal);
+        glm::vec3& outPos, glm::vec3& outNormal,
+        int* outObjectIndex = nullptr);
 
     // Simple ray–plane intersection with y=0 (no mesh snapping)
     bool RayCastToPartingPlane(int mouseX, int mouseY, glm::vec3& outPos);
+
+    // Snap-pick for ejector placement. Considers four candidate sources:
+    //   1. Sprue path's intersection with y=0 (m_sprue.partingPos),
+    //   2. Any runner segment (sprue parting pos -> runner pt, on y=0),
+    //   3. Any gate segment (gate worldPos -> gate.pathEnd),
+    //   4. Any object face (full mesh ray-cast).
+    // Path candidates win when within kEjectorSnapRadiusPx screen-space
+    // pixels of the cursor; otherwise falls through to the face hit.
+    // Returns false if nothing is in range. See implementation for the
+    // ranking rationale.
+    bool RayCastEjectorSnap(int mouseX, int mouseY, glm::vec3& outPos);
+
+    // Sticky placement helpers — re-derive a parented vent's / gate's
+    // world-space data from its parent object's current transform plus the
+    // stored local-space placement, then rebuild GPU geometry. No-op when
+    // parentIndex is out of range. ReanchorFeaturesForObjects walks both
+    // feature lists once and re-anchors anything whose parent is in the
+    // supplied set; called from Apply* transforms, drag-translate, and
+    // patterning so features track their parent objects automatically.
+    void ReanchorVent(VentInstance& vi);
+    void ReanchorGate(GateFeature& gf);
+    void ReanchorFeaturesForObjects(const std::vector<int>& objIndices);
 
     // Vent path computation and GPU upload
     VentPath         ComputeVentPath(const VentPoint& vp);
@@ -244,6 +356,54 @@ private:
     // Sphere mesh for vent point markers
     void BuildSphereGPU(float radius, int stacks, int slices);
 
+    // ---- Align Face ---------------------------------------------------------
+    // Pick a triangle on an imported model and grow a coplanar region. Used
+    // for hover highlighting and click-to-align. The seed triangle index lets
+    // OnPaint detect when the hover changed and avoid redundant region growth.
+    bool RayCastFacePick(int mouseX, int mouseY, int& outObj, int& outTri);
+
+    // Build edge adjacency for the object's CPU mesh if not already built.
+    void EnsureTriAdjacency(SceneObject& obj);
+
+    // BFS from seedTri across edge-shared neighbors whose triangle normal is
+    // within ~1° of the seed's normal. Output is in local (object) space.
+    void GrowCoplanarFace(const SceneObject& obj, int seedTri,
+        std::vector<uint32_t>& outTris, glm::vec3& outNormalLocal);
+
+    // Upload world-space triangles for the highlighted face to m_alignHighlight*.
+    // Pass an empty triangle list to clear the highlight.
+    void RebuildAlignHighlightVBO(const SceneObject& obj,
+        const std::vector<uint32_t>& tris);
+
+    // Apply the rotation+translation that snaps an arbitrary plane (defined
+    // by a local-space normal and a local-space anchor point on the plane)
+    // onto the world Y=0 parting plane. The anchor is held fixed laterally
+    // (X/Z) so the picked geometry stays put in screen space and only the
+    // pose changes. Used by both AlignFace and AlignMidplane.
+    void ApplyPlaneAlignmentToObject(int objIdx,
+        const glm::vec3& planeNormalLocal,
+        const glm::vec3& anchorLocal);
+
+    // AlignFace: thin wrapper around ApplyPlaneAlignmentToObject that uses
+    // the picked face's own normal and centroid.
+    void ApplyAlignFaceToObject(int objIdx, const glm::vec3& nLocal,
+        const std::vector<uint32_t>& faceTris);
+
+    // AlignMidplane: combine the locked first face with a freshly-picked
+    // second face into a midplane, then apply alignment.
+    void ApplyAlignMidplaneToObject(int objIdx,
+        const glm::vec3& n2Local,
+        const std::vector<uint32_t>& faceTris2);
+
+    // Build/clear the persistent locked-face overlay used in midplane mode.
+    void RebuildMidplaneLockedVBO(const SceneObject& obj,
+        const std::vector<uint32_t>& tris);
+
+    // Decompose a YXZ-Euler rotation matrix back to (yaw, pitch, roll).
+    // Handles the gimbal-lock case where pitch ≈ ±90°.
+    static void DecomposeYXZ(const glm::mat3& R,
+        float& yawDeg, float& pitchDeg, float& rollDeg);
+
 private:
     wxGLContext* m_context = nullptr;
     bool         m_inited = false;
@@ -255,7 +415,16 @@ private:
     // Scene
     std::vector<SceneObject> m_fixtures;
     std::vector<SceneObject> m_objects;
-    int                      m_selectedIndex = -1;
+    // Selected object indices into m_objects, in click order.
+    // Last entry is the "primary" selection (used by single-seed operations
+    // such as Pattern). Empty when nothing is selected.
+    //   - Plain LMB on an unselected object: replaces the vector with {hit}.
+    //   - Plain LMB on an already-selected object: leaves the vector alone
+    //     (so a subsequent drag moves the whole group).
+    //   - Plain LMB miss: clears the vector.
+    //   - Ctrl+LMB on an object: toggles that index in the vector.
+    //   - Ctrl+A: fills the vector with every object index.
+    std::vector<int>         m_selectedIndices;
 
     // Vent features (consolidated: point + path + cross-section + solid)
     std::vector<VentInstance> m_vents;
@@ -286,6 +455,15 @@ private:
     VentPoint m_gateGhost;
     bool      m_gateGhostActive = false;
     wxPoint   m_gateGhostMousePos;
+
+    // Ejector features (placement points only, geometry TBD)
+    std::vector<EjectorFeature> m_ejectors;
+
+    // Ghost preview for ejector placement (follows mouse in PlaceEjector mode).
+    // No normal field — see EjectorFeature comment in MouldFeature.h.
+    glm::vec3 m_ejectorGhostPos{ 0.0f };
+    bool      m_ejectorGhostActive = false;
+    wxPoint   m_ejectorGhostMousePos;
 
     // Fallback test geometry (pyramid)
     unsigned int m_vao = 0;
@@ -364,4 +542,34 @@ private:
     GLuint m_pickDepthRb = 0;
     int    m_pickW = 0;
     int    m_pickH = 0;
+
+    // ---- Align Face state ---------------------------------------------------
+    // Hover state for AlignFace mode. Mouse position is captured in OnMouse
+    // and the ray cast is deferred to OnPaint (one cast per frame).
+    wxPoint               m_alignMousePos;
+    int                   m_alignHoverObject = -1;
+    int                   m_alignSeedTri = -1;       // last grown seed; -1 = no hover
+    std::vector<uint32_t> m_alignFaceTris;           // tris in current hover region
+    glm::vec3             m_alignFaceNormalLocal{ 0.0f };
+
+    // GPU resources for the dark-grey highlight overlay (world-space triangles).
+    GLuint  m_alignHighlightVAO = 0;
+    GLuint  m_alignHighlightVBO = 0;
+    GLsizei m_alignHighlightVertexCount = 0;
+
+    // ---- Align Midplane state ----------------------------------------------
+    // Locked first-face state for two-click midplane alignment. Reuses the
+    // hover state above for the current cursor highlight, and adds a separate
+    // VBO for the persistent locked-face overlay (yellow, matches selection
+    // outline). Object-local data is captured at click time so subsequent
+    // mouse motion or transforms don't invalidate it.
+    bool                  m_midplaneFaceLocked = false;
+    int                   m_midplaneFaceObject = -1;
+    std::vector<uint32_t> m_midplaneFaceTris;
+    glm::vec3             m_midplaneFaceNormalLocal{ 0.0f };
+    glm::vec3             m_midplaneFaceCentroidLocal{ 0.0f };
+
+    GLuint  m_midplaneLockedVAO = 0;
+    GLuint  m_midplaneLockedVBO = 0;
+    GLsizei m_midplaneLockedVertexCount = 0;
 };

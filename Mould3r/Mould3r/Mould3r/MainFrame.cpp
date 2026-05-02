@@ -3,6 +3,7 @@
 #include <wx/stdpaths.h>
 #include <wx/filename.h>
 #include <wx/file.h>
+#include <wx/dnd.h>
 #include <memory>
 
 #include "MainFrame.h"
@@ -18,8 +19,6 @@
 // Ribbon colour aliases (shorthand into the Style namespace)
 // ---------------------------------------------------------------------------
 static const wxColour& kRibbonBg = Style::AppBg;
-static const wxColour& kBtnDefault = Style::BtnDefault;
-static const wxColour& kBtnActive = Style::BtnActive;
 static const wxColour& kBtnHover = Style::BtnHover;
 static const wxColour& kTextDefault = Style::TextPrimary;
 static const wxColour& kTextActive = Style::TextActive;
@@ -85,16 +84,75 @@ static wxBitmapBundle LoadSvgBundle(const wxString& svgPath,
 }
 
 // ---------------------------------------------------------------------------
-// Helper: style a single toggle button
+// Drag-and-drop target for the 3D viewport.
+// Accepts STEP/STL/OBJ files dropped onto the canvas and routes them through
+// the same import path as the File -> Import Model menu item, so a dropped
+// file gets the same progress dialog, faceting, normal/crease processing and
+// non-manifold warnings as a file picked through the dialog.
+// Mixed drops (some supported, some not) are partitioned: the user gets a
+// single up-front warning listing the unsupported files, then the supported
+// ones import sequentially.
 // ---------------------------------------------------------------------------
-static void StyleRibbonBtn(wxToggleButton* btn, bool active = false)
-{
-    btn->SetBackgroundColour(active ? kBtnActive : kBtnDefault);
-    btn->SetForegroundColour(active ? kTextActive : kTextDefault);
-    btn->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
-        wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
-    btn->Refresh();
-}
+namespace {
+
+    bool IsSupportedModelExt(const wxString& path)
+    {
+        const wxString ext = wxFileName(path).GetExt().Lower();
+        return ext == "step" || ext == "stp" || ext == "stl" || ext == "obj";
+    }
+
+    class ModelFileDropTarget : public wxFileDropTarget
+    {
+    public:
+        explicit ModelFileDropTarget(MainFrame* frame) : m_frame(frame) {}
+
+        bool OnDropFiles(wxCoord, wxCoord, const wxArrayString& filenames) override
+        {
+            if (!m_frame || filenames.IsEmpty())
+                return false;
+
+            // Partition into supported and unsupported by extension before doing
+            // any work, so the user is warned about unreadable files up front
+            // rather than after several long imports have already run.
+            wxArrayString accepted;
+            wxArrayString rejected;
+            accepted.reserve(filenames.size());
+            for (const wxString& f : filenames) {
+                if (IsSupportedModelExt(f))
+                    accepted.Add(f);
+                else
+                    rejected.Add(wxFileName(f).GetFullName());
+            }
+
+            if (!rejected.IsEmpty()) {
+                wxString msg = "The following file(s) cannot be imported "
+                    "(only STEP, STL and OBJ are supported):\n\n";
+                for (const wxString& name : rejected)
+                    msg << "    " << name << "\n";
+                wxMessageBox(msg, "Unsupported file type",
+                    wxOK | wxICON_WARNING, m_frame);
+            }
+
+            if (accepted.IsEmpty())
+                return false;
+
+            GLCanvas* canvas = m_frame->GetCanvas();
+            if (!canvas)
+                return false;
+
+            // ImportFile shows its own progress dialog, so multi-file drops will
+            // display one progress per file in sequence.
+            for (const wxString& path : accepted)
+                canvas->ImportFile(path.ToStdString());
+
+            return true;
+        }
+
+    private:
+        MainFrame* m_frame;  // not owned
+    };
+
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // MainFrame
@@ -201,6 +259,10 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
     m_canvas = new GLCanvas(root);
     m_leftPanel = CreateLeftPanel(root);
 
+    // Drag-and-drop import: drop STEP/STL/OBJ files onto the 3D viewport
+    // to import them. wxWidgets takes ownership of the drop target.
+    m_canvas->SetDropTarget(new ModelFileDropTarget(this));
+
     contentSizer->Add(m_leftPanel, 0, wxEXPAND);
     contentSizer->Add(m_canvas, 1, wxEXPAND);
 
@@ -296,7 +358,10 @@ wxPanel* MainFrame::CreateRibbon(wxWindow* parent)
     Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolTranslate, this, ID_ToolTranslate);
     Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolRotate, this, ID_ToolRotate);
     Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolScale, this, ID_ToolScale);
+    Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolPattern, this, ID_ToolPattern);
     Bind(wxEVT_BUTTON, &MainFrame::OnToolCenter, this, ID_ToolCenter);
+    Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolAlignFace, this, ID_ToolAlignFace);
+    Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolAlignMidplane, this, ID_ToolAlignMidplane);
     Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolPlaceVent, this, ID_ToolPlaceVent);
     Bind(wxEVT_BUTTON, &MainFrame::OnClearVentPoints, this, ID_ClearVentPoints);
     Bind(wxEVT_BUTTON, &MainFrame::OnPlaceSprue, this, ID_PlaceSprue);
@@ -306,13 +371,17 @@ wxPanel* MainFrame::CreateRibbon(wxWindow* parent)
     Bind(wxEVT_BUTTON, &MainFrame::OnClearRunners, this, ID_ClearRunners);
     Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnPlaceGate, this, ID_PlaceGate);
     Bind(wxEVT_BUTTON, &MainFrame::OnClearGates, this, ID_ClearGates);
+    Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnPlaceEjector, this, ID_PlaceEjector);
+    Bind(wxEVT_BUTTON, &MainFrame::OnClearEjectors, this, ID_ClearEjectors);
     Bind(wxEVT_BUTTON, &MainFrame::OnRemoveVent, this, ID_RemoveVent);
     Bind(wxEVT_BUTTON, &MainFrame::OnRemoveSprue, this, ID_RemoveSprue);
     Bind(wxEVT_BUTTON, &MainFrame::OnRemoveRunner, this, ID_RemoveRunner);
     Bind(wxEVT_BUTTON, &MainFrame::OnRemoveGate, this, ID_RemoveGate);
+    Bind(wxEVT_BUTTON, &MainFrame::OnRemoveEjector, this, ID_RemoveEjector);
     Bind(wxEVT_BUTTON, &MainFrame::OnEditVent, this, ID_EditVent);
     Bind(wxEVT_BUTTON, &MainFrame::OnEditRunner, this, ID_EditRunner);
     Bind(wxEVT_BUTTON, &MainFrame::OnEditGate, this, ID_EditGate);
+    Bind(wxEVT_BUTTON, &MainFrame::OnEditEjector, this, ID_EditEjector);
     Bind(wxEVT_BUTTON, &MainFrame::OnGenerateMould, this, ID_GenerateMould);
     Bind(wxEVT_BUTTON, &MainFrame::OnExport, this, ID_Export);
 
@@ -380,73 +449,35 @@ wxPanel* MainFrame::CreateSidePanel(wxWindow* parent)
 }
 // ---------------------------------------------------------------------------
 // SetActiveTool – mutually exclusive toggle + notify canvas
+//
+// Drives every toggle-style ribbon button's visual state from the canonical
+// TransformMode. This is the single sync point: button clicks, Escape, and
+// canvas-internal mode transitions (e.g. vent placement completing) all
+// route through here, so it's enough to rebuild the visuals once.
 // ---------------------------------------------------------------------------
 void MainFrame::SetActiveTool(TransformMode mode)
 {
-    // Reset all buttons
-    if (m_btnTranslate) { StyleRibbonBtn(m_btnTranslate, false); m_btnTranslate->SetValue(false); }
-    if (m_btnRotate) { StyleRibbonBtn(m_btnRotate, false);    m_btnRotate->SetValue(false); }
-    if (m_btnScale) { StyleRibbonBtn(m_btnScale, false);     m_btnScale->SetValue(false); }
-    if (m_btnPlaceVent)
-    {
-        StyleRibbonBtn(m_btnPlaceVent, false);
-        m_btnPlaceVent->SetValue(false);
-    }
-    if (m_btnPlaceRunner)
-    {
-        StyleRibbonBtn(m_btnPlaceRunner, false);
-        m_btnPlaceRunner->SetValue(false);
-    }
-    if (m_btnPlaceGate)
-    {
-        StyleRibbonBtn(m_btnPlaceGate, false);
-        m_btnPlaceGate->SetValue(false);
-    }
-
-    // Activate selected
+    // Map TransformMode -> the command ID of the toggle button that should
+    // appear active. Modes without an associated toggle button (Select,
+    // Center, Remove*, Edit*, ...) yield -1, which clears all buttons.
+    int activeId = -1;
     switch (mode)
     {
-    case TransformMode::Translate:
-        if (m_btnTranslate) { StyleRibbonBtn(m_btnTranslate, true); m_btnTranslate->SetValue(true); }
-        break;
-    case TransformMode::Rotate:
-        if (m_btnRotate) { StyleRibbonBtn(m_btnRotate, true); m_btnRotate->SetValue(true); }
-        break;
-    case TransformMode::Scale:
-        if (m_btnScale) { StyleRibbonBtn(m_btnScale, true); m_btnScale->SetValue(true); }
-        break;
-    case TransformMode::PlaceVent:
-        if (m_btnPlaceVent)
-        {
-            StyleRibbonBtn(m_btnPlaceVent, true);
-            m_btnPlaceVent->SetValue(true);
-        }
-        break;
-    case TransformMode::PlaceRunner:
-        if (m_btnPlaceRunner)
-        {
-            StyleRibbonBtn(m_btnPlaceRunner, true);
-            m_btnPlaceRunner->SetValue(true);
-        }
-        break;
-    case TransformMode::PlaceGate:
-        if (m_btnPlaceGate)
-        {
-            StyleRibbonBtn(m_btnPlaceGate, true);
-            m_btnPlaceGate->SetValue(true);
-        }
-        break;
-    case TransformMode::RemoveVent:
-    case TransformMode::RemoveRunner:
-    case TransformMode::RemoveGate:
-    case TransformMode::RemoveSprue:
-    case TransformMode::EditVent:
-    case TransformMode::EditRunner:
-    case TransformMode::EditGate:
-    case TransformMode::SelectInjectionPoint:
-    case TransformMode::Select:
-        break;
+    case TransformMode::Translate:     activeId = ID_ToolTranslate;     break;
+    case TransformMode::Rotate:        activeId = ID_ToolRotate;        break;
+    case TransformMode::Scale:         activeId = ID_ToolScale;         break;
+    case TransformMode::Pattern:       activeId = ID_ToolPattern;       break;
+    case TransformMode::PlaceVent:     activeId = ID_ToolPlaceVent;     break;
+    case TransformMode::PlaceRunner:   activeId = ID_PlaceRunner;       break;
+    case TransformMode::PlaceGate:     activeId = ID_PlaceGate;         break;
+    case TransformMode::PlaceEjector:  activeId = ID_PlaceEjector;      break;
+    case TransformMode::AlignFace:     activeId = ID_ToolAlignFace;     break;
+    case TransformMode::AlignMidplane: activeId = ID_ToolAlignMidplane; break;
+    default:                                                            break;
     }
+
+    for (auto& kv : m_toolBtnSetters)
+        kv.second(kv.first == activeId);
 
     if (m_canvas)
         m_canvas->SetTransformMode(mode);
@@ -516,6 +547,43 @@ void MainFrame::OnToolScale(wxCommandEvent&)
     m_canvas->ApplyScale(v.uniform);
 }
 
+// ---------------------------------------------------------------------------
+// Pattern — opens the PatternDialog. UI scaffolding only for now; the
+// canvas-side pattern application will be wired up in a follow-up change.
+// ---------------------------------------------------------------------------
+void MainFrame::OnToolPattern(wxCommandEvent&)
+{
+    // Dialog tool, not a placement-mode toggle — clear any active toggle so
+    // the button doesn't appear stuck on after the dialog closes (matches the
+    // Translate/Rotate/Scale convention).
+    SetActiveTool(TransformMode::Select);
+
+    if (!m_canvas) return;
+
+    PatternDialog dlg(this);
+    if (dlg.ShowModal() != wxID_OK)
+        return;
+
+    if (!m_canvas->HasSelection())
+        return;
+
+    const PatternValues v = dlg.GetValues();
+
+    switch (v.type)
+    {
+    case PatternValues::Type::Circular:
+        m_canvas->ApplyCircularPattern(v.number, v.overrideRadius, v.radius,
+            v.rotateCopies);
+        break;
+
+    case PatternValues::Type::Grid:
+        m_canvas->ApplyGridPattern(v.numberH, v.numberV,
+            v.mirrorH, v.mirrorV,
+            v.overrideLengthWidth, v.length, v.width);
+        break;
+    }
+}
+
 void MainFrame::OnToolCenter(wxCommandEvent&)
 {
     if (!m_canvas) return;
@@ -526,6 +594,30 @@ void MainFrame::OnToolCenter(wxCommandEvent&)
     }
 
     m_canvas->CenterSelectedObject();
+}
+
+// ---------------------------------------------------------------------------
+// Align Face / Align Midplane — UI scaffolding only.
+// Behaviour will be wired up in a follow-up change. The buttons toggle their
+// own visual state inside makeToolBtn, so for now these handlers can stay
+// empty without affecting the ribbon's appearance.
+// ---------------------------------------------------------------------------
+void MainFrame::OnToolAlignFace(wxCommandEvent&)
+{
+    // Toggle: if already in AlignFace mode, return to Select
+    if (m_canvas && m_canvas->GetTransformMode() == TransformMode::AlignFace)
+        SetActiveTool(TransformMode::Select);
+    else
+        SetActiveTool(TransformMode::AlignFace);
+}
+
+void MainFrame::OnToolAlignMidplane(wxCommandEvent&)
+{
+    // Toggle: if already in AlignMidplane mode, return to Select
+    if (m_canvas && m_canvas->GetTransformMode() == TransformMode::AlignMidplane)
+        SetActiveTool(TransformMode::Select);
+    else
+        SetActiveTool(TransformMode::AlignMidplane);
 }
 
 void MainFrame::OnToolPlaceVent(wxCommandEvent&)
@@ -643,6 +735,48 @@ void MainFrame::OnEditGate(wxCommandEvent&)
         SetActiveTool(TransformMode::Select);
     else
         SetActiveTool(TransformMode::EditGate);
+}
+
+// ---------------------------------------------------------------------------
+// Ejector handlers — UI scaffolding only.
+//
+// PlaceEjector / RemoveEjector / EditEjector toggle into their respective
+// modes via SetActiveTool; the canvas-side mode-change handlers are
+// placeholders right now (see GLCanvas.cpp), so clicking these buttons
+// activates the toggle visually and switches mode but does not yet perform
+// any geometry. ClearEjectors routes through the canvas helper, which
+// likewise no-ops until ejector storage is wired up. These hooks let the
+// UI ship now and let the canvas-side implementation drop in later
+// without touching MainFrame.
+// ---------------------------------------------------------------------------
+void MainFrame::OnPlaceEjector(wxCommandEvent&)
+{
+    if (m_canvas && m_canvas->GetTransformMode() == TransformMode::PlaceEjector)
+        SetActiveTool(TransformMode::Select);
+    else
+        SetActiveTool(TransformMode::PlaceEjector);
+}
+
+void MainFrame::OnClearEjectors(wxCommandEvent&)
+{
+    if (m_canvas)
+        m_canvas->ClearEjectors();
+}
+
+void MainFrame::OnRemoveEjector(wxCommandEvent&)
+{
+    if (m_canvas && m_canvas->GetTransformMode() == TransformMode::RemoveEjector)
+        SetActiveTool(TransformMode::Select);
+    else
+        SetActiveTool(TransformMode::RemoveEjector);
+}
+
+void MainFrame::OnEditEjector(wxCommandEvent&)
+{
+    if (m_canvas && m_canvas->GetTransformMode() == TransformMode::EditEjector)
+        SetActiveTool(TransformMode::Select);
+    else
+        SetActiveTool(TransformMode::EditEjector);
 }
 
 void MainFrame::OnEditSprue(wxCommandEvent&)
@@ -808,6 +942,28 @@ float MainFrame::GetSubRunnerDiameter() const
     double v = 5.0;
     if (!m_subRunnerDiameter->GetValue().ToDouble(&v)) return 5.0f;
     if (v <= 0.0) v = 5.0;
+    return static_cast<float>(v) * (m_imperial ? 25.4f : 1.0f);
+}
+
+// Ejector dimension accessors. Returns mm regardless of the active unit
+// system, matching the convention used by the other Get*Dimension getters.
+// Defaults are returned when the field hasn't been built yet (early calls)
+// or contains an unparseable value, so callers never get NaN.
+float MainFrame::GetEjectorDiameter() const
+{
+    if (!m_ejectorDiameter) return 3.0f;
+    double v = 3.0;
+    if (!m_ejectorDiameter->GetValue().ToDouble(&v)) return 3.0f;
+    if (v <= 0.0) v = 3.0;
+    return static_cast<float>(v) * (m_imperial ? 25.4f : 1.0f);
+}
+
+float MainFrame::GetEjectorLength() const
+{
+    if (!m_ejectorLength) return 25.0f;
+    double v = 25.0;
+    if (!m_ejectorLength->GetValue().ToDouble(&v)) return 25.0f;
+    if (v <= 0.0) v = 25.0;
     return static_cast<float>(v) * (m_imperial ? 25.4f : 1.0f);
 }
 
@@ -989,6 +1145,8 @@ void MainFrame::OnSaveProject(wxCommandEvent&)
         od.pitchDeg = obj.pitchDeg;
         od.rollDeg = obj.rollDeg;
         od.scale = obj.scale;
+        od.mirrorX = obj.mirrorX;
+        od.mirrorZ = obj.mirrorZ;
         data.objects.push_back(od);
     }
 
@@ -1010,6 +1168,8 @@ void MainFrame::OnSaveProject(wxCommandEvent&)
         p.gateDiameter = GetGateDiameter();
         p.gateDraftAngle = GetGateDraftAngle();
         p.subRunnerDiameter = GetSubRunnerDiameter();
+        p.ejectorDiameter = GetEjectorDiameter();
+        p.ejectorLength = GetEjectorLength();
     }
 
     // Sprue
@@ -1037,11 +1197,37 @@ void MainFrame::OnSaveProject(wxCommandEvent&)
 
     // Gates
     for (const auto& gf : m_canvas->GetGates())
-        data.gates.push_back(ProjectGateData{ gf.point.worldPos, gf.point.worldNormal });
+    {
+        ProjectGateData pg;
+        pg.pos = gf.point.worldPos;
+        pg.normal = gf.point.worldNormal;
+        pg.parentIndex = gf.parentIndex;
+        pg.localPos = gf.localPos;
+        pg.localNormal = gf.localNormal;
+        data.gates.push_back(pg);
+    }
 
     // Vents
     for (const auto& vi : m_canvas->GetVents())
-        data.vents.push_back(ProjectVentData{ vi.point.worldPos, vi.point.worldNormal });
+    {
+        ProjectVentData pv;
+        pv.pos = vi.point.worldPos;
+        pv.normal = vi.point.worldNormal;
+        pv.parentIndex = vi.parentIndex;
+        pv.localPos = vi.localPos;
+        pv.localNormal = vi.localNormal;
+        data.vents.push_back(pv);
+    }
+
+    // Ejectors — just the world-space placement point. Sticky-placement
+    // (parent tracking) isn't wired up for ejectors yet; if it's added
+    // later the corresponding fields will be populated on ProjectEjectorData.
+    for (const auto& ef : m_canvas->GetEjectors())
+    {
+        ProjectEjectorData pe;
+        pe.point = ef.point;
+        data.ejectors.push_back(pe);
+    }
 
     std::string error;
     if (!ProjectFile::Save(savePath, data, error))
@@ -1120,7 +1306,8 @@ void MainFrame::OnLoadProject(wxCommandEvent&)
     {
         m_canvas->RestoreObject(obj.sourcePath, obj.pos,
             obj.yawDeg, obj.pitchDeg,
-            obj.rollDeg, obj.scale);
+            obj.rollDeg, obj.scale,
+            obj.mirrorX, obj.mirrorZ);
     }
 
     // ---- Restore sprue -----------------------------------------------------
@@ -1133,7 +1320,8 @@ void MainFrame::OnLoadProject(wxCommandEvent&)
 
     // ---- Restore gates -----------------------------------------------------
     for (const auto& gt : data.gates)
-        m_canvas->RestoreGate(gt.pos, gt.normal);
+        m_canvas->RestoreGate(gt.pos, gt.normal,
+            gt.parentIndex, gt.localPos, gt.localNormal);
 
     // ---- Restore vents -----------------------------------------------------
     for (const auto& vn : data.vents)
@@ -1142,8 +1330,16 @@ void MainFrame::OnLoadProject(wxCommandEvent&)
             data.params.ventWidth,
             data.params.ventLength,
             data.params.ventOverrunStart,
-            data.params.ventOverrunEnd);
+            data.params.ventOverrunEnd,
+            vn.parentIndex, vn.localPos, vn.localNormal);
     }
+
+    // ---- Restore ejectors --------------------------------------------------
+    // Diameter and length come from data.params and are applied by
+    // RebuildEjectorSolids (called via RebuildAllFeatures below) which
+    // reads them out of the now-populated UI fields.
+    for (const auto& ej : data.ejectors)
+        m_canvas->RestoreEjector(ej.point);
 
     // ---- Rebuild all derived GPU geometry -----------------------------------
     m_canvas->RebuildAllFeatures();
@@ -1179,6 +1375,8 @@ void MainFrame::SetParameterFields(const ProjectParameters& p)
     setField(m_gateDiameter, p.gateDiameter * conv);
     setField(m_gateDraftAngle, p.gateDraftAngle);           // degrees — no conversion
     setField(m_subRunnerDiameter, p.subRunnerDiameter * conv);
+    setField(m_ejectorDiameter, p.ejectorDiameter * conv);
+    setField(m_ejectorLength, p.ejectorLength * conv);
 }
 
 void MainFrame::OnBrowseExport(wxCommandEvent&)
@@ -1265,6 +1463,32 @@ wxPanel* MainFrame::CreateCollapsibleSection(wxWindow* parent,
     return content;
 }
 
+wxToggleButton* MainFrame::MakePlaceButton(wxWindow* parent, int id,
+    const wxString& label)
+{
+    auto* btn = new wxToggleButton(parent, id, label,
+        wxDefaultPosition, wxSize(-1, 32), wxBORDER_NONE);
+    btn->SetBackgroundColour(Style::BtnPlace);
+    btn->SetForegroundColour(*wxWHITE);
+    btn->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
+
+    // Register a setter so SetActiveTool can drive this button's visual
+    // state externally (e.g. when Escape clears the mode, or when the
+    // canvas finishes a placement and snaps back to Select). The setter
+    // also keeps the wxToggleButton's internal value in sync so the next
+    // user click toggles correctly.
+    m_toolBtnSetters[id] = [btn](bool active) {
+        if (btn->GetValue() == active) return;     // already in target state
+        btn->SetValue(active);
+        btn->SetBackgroundColour(active ? Style::BtnSecondarySelected
+            : Style::BtnPlace);
+        btn->Refresh();
+        };
+
+    return btn;
+}
+
 wxPanel* MainFrame::CreateVentsContent(wxWindow* parent)
 {
 
@@ -1282,12 +1506,7 @@ wxPanel* MainFrame::CreateVentsContent(wxWindow* parent)
     sizer->AddSpacer(6);
 
     // ---- "Place Vent" toggle button -----------------------------------------
-    auto* btnPlace = new wxToggleButton(panel, ID_ToolPlaceVent, "Place Vent",
-        wxDefaultPosition, wxSize(-1, 32), wxBORDER_NONE);
-    btnPlace->SetBackgroundColour(Style::BtnPlace);
-    btnPlace->SetForegroundColour(*wxWHITE);
-    btnPlace->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
-        wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
+    auto* btnPlace = MakePlaceButton(panel, ID_ToolPlaceVent, "Place Vent");
     sizer->Add(btnPlace, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
     sizer->AddSpacer(6);
 
@@ -1577,12 +1796,7 @@ wxPanel* MainFrame::CreateRunnersContent(wxWindow* parent)
     sizer->AddSpacer(6);
 
     // ---- "Place Runner" toggle button (full-width, muted indigo) -------------
-    auto* btnPlace = new wxToggleButton(panel, ID_PlaceRunner, "Place Runner",
-        wxDefaultPosition, wxSize(-1, 32), wxBORDER_NONE);
-    btnPlace->SetBackgroundColour(Style::BtnPlace);
-    btnPlace->SetForegroundColour(*wxWHITE);
-    btnPlace->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
-        wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
+    auto* btnPlace = MakePlaceButton(panel, ID_PlaceRunner, "Place Runner");
     sizer->Add(btnPlace, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
 
     sizer->AddSpacer(6);
@@ -1771,12 +1985,7 @@ wxPanel* MainFrame::CreateGatesContent(wxWindow* parent)
     sizer->Add(titleLabel, 0, wxLEFT | wxTOP, 12);
     sizer->AddSpacer(6);
 
-    auto* btnPlace = new wxToggleButton(panel, ID_PlaceGate, "Place Gate",
-        wxDefaultPosition, wxSize(-1, 32), wxBORDER_NONE);
-    btnPlace->SetBackgroundColour(Style::BtnPlace);
-    btnPlace->SetForegroundColour(*wxWHITE);
-    btnPlace->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
-        wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
+    auto* btnPlace = MakePlaceButton(panel, ID_PlaceGate, "Place Gate");
     sizer->Add(btnPlace, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
     sizer->AddSpacer(6);
 
@@ -1928,6 +2137,164 @@ wxPanel* MainFrame::CreateGatesContent(wxWindow* parent)
     return panel;
 }
 
+// ---------------------------------------------------------------------------
+// CreateEjectorsContent — left-panel "Ejectors" feature card.
+//
+// Mirrors CreateGatesContent's layout (title, Place button, three small
+// action buttons, collapsible Settings panel with a type dropdown and
+// dimension rows). Currently UI-only: the Place / Edit / Remove / Clear
+// buttons fire the corresponding TransformMode handlers, but the canvas-
+// side mode behaviour is a placeholder pending the geometry implementation.
+//
+// The Type dropdown is wired the same way as the Gates card's "Tapered
+// Cylinder" branch: changing the dropdown shows / hides the Cylindrical
+// dimension panel. To add a new ejector geometry later, append the type
+// to m_ejectorTypeChoice and add a parallel dimension panel + Show()
+// branch in the EVT_CHOICE handler — no other plumbing required.
+// ---------------------------------------------------------------------------
+wxPanel* MainFrame::CreateEjectorsContent(wxWindow* parent)
+{
+    auto* panel = new wxPanel(parent, wxID_ANY);
+    panel->SetBackgroundColour(Style::CardBg);
+    auto* sizer = new wxBoxSizer(wxVERTICAL);
+
+    auto* titleLabel = new wxStaticText(panel, wxID_ANY, "Ejectors");
+    titleLabel->SetForegroundColour(*wxWHITE);
+    titleLabel->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_BOLD, false, "Segoe UI"));
+    sizer->Add(titleLabel, 0, wxLEFT | wxTOP, 12);
+    sizer->AddSpacer(6);
+
+    auto* btnPlace = MakePlaceButton(panel, ID_PlaceEjector, "Place Ejector");
+    sizer->Add(btnPlace, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
+    sizer->AddSpacer(6);
+
+    auto* actionGrid = new wxGridSizer(1, 3, 0, 4);
+    auto makeSmallBtn = [&](const wxString& label) -> wxButton* {
+        auto* btn = new wxButton(panel, wxID_ANY, label,
+            wxDefaultPosition, wxSize(-1, 26), wxBORDER_NONE);
+        btn->SetBackgroundColour(Style::BtnSmall);
+        btn->SetForegroundColour(Style::TextPrimary);
+        btn->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+        return btn;
+        };
+    auto* btnEdit = makeSmallBtn("Edit");
+    btnEdit->SetId(ID_EditEjector);
+    auto* btnRemove = makeSmallBtn("Remove");
+    btnRemove->SetId(ID_RemoveEjector);
+    auto* btnClearAll = makeSmallBtn("Clear all");
+    btnClearAll->SetId(ID_ClearEjectors);
+    actionGrid->Add(btnEdit, 0, wxEXPAND);
+    actionGrid->Add(btnRemove, 0, wxEXPAND);
+    actionGrid->Add(btnClearAll, 0, wxEXPAND);
+    sizer->Add(actionGrid, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
+    sizer->AddSpacer(8);
+
+    // Collapsible Settings — same chevron / debounce pattern as the other cards.
+    auto* settingsBtn = new wxToggleButton(panel, wxID_ANY,
+        "Settings",
+        wxDefaultPosition, wxSize(-1, 22), wxBU_LEFT | wxBORDER_NONE);
+    settingsBtn->SetValue(false);
+    settingsBtn->SetBackgroundColour(Style::CardBg);
+    settingsBtn->SetForegroundColour(Style::TextSubtle);
+    settingsBtn->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+    settingsBtn->SetBitmap(LoadSvgBundle(kChevronRightSvg, wxSize(12, 12), true));
+    settingsBtn->SetBitmapPosition(wxRIGHT);
+    sizer->Add(settingsBtn, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
+
+    auto* settingsPanel = new wxPanel(panel, wxID_ANY);
+    settingsPanel->SetBackgroundColour(Style::CardBg);
+    auto* settingsSizer = new wxBoxSizer(wxVERTICAL);
+
+    // Dimension-row helper — identical to the one used in CreateGatesContent.
+    auto addRow = [&](wxWindow* parent_, wxSizer* parentSz,
+        const wxString& label, wxTextCtrl*& ctrl,
+        const wxString& defVal, const wxString& unitStr, int /*lblW*/ = 60)
+        {
+            auto* row = new wxBoxSizer(wxHORIZONTAL);
+            auto* lbl = new wxStaticText(parent_, wxID_ANY, label);
+            lbl->SetForegroundColour(Style::TextMuted);
+            lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+            ctrl = new wxTextCtrl(parent_, wxID_ANY, defVal, wxDefaultPosition, wxSize(kFieldWidth, 22));
+            ctrl->SetBackgroundColour(Style::BtnSmall); ctrl->SetForegroundColour(kTextDefault);
+            auto* u = new wxStaticText(parent_, wxID_ANY, unitStr);
+            if (unitStr == "mm") m_mmUnitLabels.push_back(u);
+            u->SetForegroundColour(Style::TextSubtle);
+            u->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+            u->SetMinSize(wxSize(kUnitWidth, -1));
+            row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL);
+            row->AddStretchSpacer(1);
+            row->Add(ctrl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, kFieldGap);
+            row->Add(u, 0, wxALIGN_CENTER_VERTICAL);
+            parentSz->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
+        };
+
+    // ---- Ejector type dropdown (inline with label) ------------------------
+    auto* typeRow = new wxBoxSizer(wxHORIZONTAL);
+    auto* typeLabel = new wxStaticText(settingsPanel, wxID_ANY, "Ejector type:");
+    typeLabel->SetForegroundColour(Style::TextMuted);
+    typeLabel->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+
+    m_ejectorTypeChoice = new wxChoice(settingsPanel, wxID_ANY,
+        wxDefaultPosition, wxSize(kCtrlColWidth, -1));
+    m_ejectorTypeChoice->SetBackgroundColour(Style::BtnSmall);
+    m_ejectorTypeChoice->SetForegroundColour(Style::TextMuted);
+    m_ejectorTypeChoice->Append("Cylindrical");
+    m_ejectorTypeChoice->SetSelection(0);
+    typeRow->Add(typeLabel, 0, wxALIGN_CENTER_VERTICAL);
+    typeRow->AddStretchSpacer(1);
+    typeRow->Add(m_ejectorTypeChoice, 0, wxALIGN_CENTER_VERTICAL);
+    settingsSizer->Add(typeRow, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
+
+    // Cylindrical dimensions. When a second geometry is added later, build
+    // a parallel dimension panel and toggle visibility in the EVT_CHOICE
+    // handler below — same structure as the gate card's tapered-cylinder
+    // branch.
+    auto* dimsPanel = new wxPanel(settingsPanel, wxID_ANY);
+    dimsPanel->SetBackgroundColour(Style::CardBg);
+    auto* dimsSizer = new wxBoxSizer(wxVERTICAL);
+    addRow(dimsPanel, dimsSizer, "Diameter:", m_ejectorDiameter, "3.0", "mm");
+    addRow(dimsPanel, dimsSizer, "Length:", m_ejectorLength, "25.0", "mm");
+    dimsPanel->SetSizer(dimsSizer);
+    settingsSizer->Add(dimsPanel, 0, wxEXPAND | wxBOTTOM, 10);
+
+    settingsPanel->SetSizer(settingsSizer);
+    settingsPanel->Show(false);
+    sizer->Add(settingsPanel, 0, wxEXPAND);
+
+    m_ejectorTypeChoice->Bind(wxEVT_CHOICE, [dimsPanel, this](wxCommandEvent&) {
+        // Currently only one type — left as a Show() toggle so additional
+        // types can be added by appending an else-if without restructuring.
+        dimsPanel->Show(m_ejectorTypeChoice->GetStringSelection() == "Cylindrical");
+        dimsPanel->GetParent()->Layout();
+        dimsPanel->GetParent()->GetParent()->Layout();
+        dimsPanel->GetParent()->GetParent()->GetParent()->Layout();
+        });
+
+    settingsBtn->Bind(wxEVT_TOGGLEBUTTON, [settingsBtn, settingsPanel, panel](wxCommandEvent&) {
+        // Same 200ms debounce as the other settings togglers — mid-frame
+        // double-clicks (often from a touchpad tap) otherwise re-collapse
+        // the panel before the layout finishes.
+        static wxLongLong lastToggleMs = 0;
+        wxLongLong now = wxGetLocalTimeMillis();
+        if ((now - lastToggleMs).GetValue() < 200) { settingsBtn->SetValue(!settingsBtn->GetValue()); return; }
+        lastToggleMs = now;
+        const bool expanded = settingsBtn->GetValue();
+        settingsBtn->SetBitmap(LoadSvgBundle(
+            expanded ? kChevronDownSvg : kChevronRightSvg,
+            wxSize(12, 12), true));
+        settingsBtn->SetBitmapPosition(wxRIGHT);
+        settingsPanel->Show(expanded);
+        panel->Layout(); panel->GetParent()->Layout(); panel->GetParent()->GetParent()->Layout();
+        });
+
+    panel->SetSizer(sizer);
+    return panel;
+}
+
 wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
 {
     // Outer container: content column + right border
@@ -1962,7 +2329,7 @@ wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
 
         toolsSizer->AddSpacer(8);
 
-        auto* grid = new wxGridSizer(2, 2, 4, 4);
+        auto* grid = new wxGridSizer(3, 2, 4, 4);
 
         // ---- SVG icon paths for model tool buttons --------------------------------
         // Fill in the path to each SVG file (relative to the executable, or absolute).
@@ -1970,7 +2337,10 @@ wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
         static const wxString kIconMove = "res/icons/arrows-move.svg";
         static const wxString kIconRotate = "res/icons/rotate-2.svg";
         static const wxString kIconScale = "res/icons/resize.svg";
+        static const wxString kIconPattern = "res/icons/pattern.svg";
         static const wxString kIconCenter = "res/icons/focus-centered.svg";
+        static const wxString kIconAlignFace = "res/icons/align-face.svg";
+        static const wxString kIconAlignMidplane = "res/icons/align-midplane.svg";
 
         // Helper: load an SVG, recolor all strokes and fills to white, and return a
         // wxBitmapBundle.  Relative paths are anchored to the executable directory.
@@ -2055,6 +2425,20 @@ wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
                     txt->Refresh();
                     };
 
+                // Register a setter so SetActiveTool can drive this button's
+                // visual state externally (e.g. when Escape clears the mode).
+                // The lambda closes over the same `toggled` pointer the click
+                // handler uses, so both routes converge on the same state.
+                if (toggle)
+                {
+                    m_toolBtnSetters[id] = [toggled, applyColours](bool active) {
+                        if (*toggled == active) return;  // already in target state
+                        *toggled = active;
+                        applyColours(active ? Style::BtnSecondarySelected : Style::BtnSecondary,
+                            active ? kTextActive : Style::TextPrimary);
+                        };
+                }
+
                 // Left-click: fire the appropriate command event and update visuals
                 auto onClick = [=](wxMouseEvent& e) {
                     if (toggle)
@@ -2104,7 +2488,10 @@ wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
         grid->Add(makeToolBtn(ID_ToolTranslate, "Move", true, kIconMove), 0, wxEXPAND);
         grid->Add(makeToolBtn(ID_ToolRotate, "Rotate", true, kIconRotate), 0, wxEXPAND);
         grid->Add(makeToolBtn(ID_ToolScale, "Scale", true, kIconScale), 0, wxEXPAND);
+        grid->Add(makeToolBtn(ID_ToolPattern, "Pattern", true, kIconPattern), 0, wxEXPAND);
         grid->Add(makeToolBtn(ID_ToolCenter, "Center", false, kIconCenter), 0, wxEXPAND);
+        grid->Add(makeToolBtn(ID_ToolAlignFace, "Align Face", true, kIconAlignFace), 0, wxEXPAND);
+        grid->Add(makeToolBtn(ID_ToolAlignMidplane, "Align Midplane", true, kIconAlignMidplane), 0, wxEXPAND);
 
         toolsSizer->Add(grid, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
         toolsSizer->AddSpacer(10);
@@ -2153,10 +2540,13 @@ wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
     wxPanel* ventsContent = CreateVentsContent(scrollWin);
     sizer->Add(ventsContent, 0, wxEXPAND | wxTOP, 8);
 
+    wxPanel* ejectorsContent = CreateEjectorsContent(scrollWin);
+    sizer->Add(ejectorsContent, 0, wxEXPAND | wxTOP, 8);
+
     sizer->AddSpacer(12);
 
     scrollWin->SetSizer(sizer);
-    colSizer->Add(scrollWin, 1, wxEXPAND);   // scroll area fills remaining space
+    colSizer->Add(scrollWin, 1, wxEXPAND);   // scroll area fills remaining space 
 
     column->SetSizer(colSizer);
     outerSizer->Add(column, 1, wxEXPAND);

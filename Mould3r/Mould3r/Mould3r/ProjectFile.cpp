@@ -84,7 +84,11 @@ bool ProjectFile::Save(const std::string& path,
 
     // -- [project] -----------------------------------------------------------
     file << "[project]\n";
-    file << "version = " << data.version << "\n";
+    // v2: added parentIndex / localPos / localNormal to [gate.N] and [vent.N]
+    // for sticky-placement (vents and gates track their parent objects through
+    // transforms and patterning). v1 files round-trip cleanly: missing keys
+    // load as parentIndex=-1 (unparented), preserving the old behaviour.
+    file << "version = 2\n";
     if (!data.fixturePath.empty())
         file << "fixture = " << MakeRelative(data.fixturePath, baseDir) << "\n";
 
@@ -103,6 +107,8 @@ bool ProjectFile::Save(const std::string& path,
     file << "gateDiameter     = " << data.params.gateDiameter << "\n";
     file << "gateDraftAngle   = " << data.params.gateDraftAngle << "\n";
     file << "subRunnerDiameter = " << data.params.subRunnerDiameter << "\n";
+    file << "ejectorDiameter   = " << data.params.ejectorDiameter << "\n";
+    file << "ejectorLength     = " << data.params.ejectorLength << "\n";
 
     // -- [object.N] ----------------------------------------------------------
     for (int i = 0; i < (int)data.objects.size(); ++i)
@@ -117,6 +123,8 @@ bool ProjectFile::Save(const std::string& path,
         file << "pitch = " << obj.pitchDeg << "\n";
         file << "roll  = " << obj.rollDeg << "\n";
         file << "scale = " << obj.scale << "\n";
+        file << "mirrorX = " << (obj.mirrorX ? "true" : "false") << "\n";
+        file << "mirrorZ = " << (obj.mirrorZ ? "true" : "false") << "\n";
     }
 
     // -- [sprue] -------------------------------------------------------------
@@ -171,6 +179,15 @@ bool ProjectFile::Save(const std::string& path,
         file << "normalX = " << gt.normal.x << "\n";
         file << "normalY = " << gt.normal.y << "\n";
         file << "normalZ = " << gt.normal.z << "\n";
+        // v2 sticky-placement fields. Always written; loader treats them
+        // as optional so v1 files round-trip.
+        file << "parentIndex  = " << gt.parentIndex << "\n";
+        file << "localPosX    = " << gt.localPos.x << "\n";
+        file << "localPosY    = " << gt.localPos.y << "\n";
+        file << "localPosZ    = " << gt.localPos.z << "\n";
+        file << "localNormalX = " << gt.localNormal.x << "\n";
+        file << "localNormalY = " << gt.localNormal.y << "\n";
+        file << "localNormalZ = " << gt.localNormal.z << "\n";
     }
 
     // -- [vent.N] ------------------------------------------------------------
@@ -184,6 +201,27 @@ bool ProjectFile::Save(const std::string& path,
         file << "normalX = " << vn.normal.x << "\n";
         file << "normalY = " << vn.normal.y << "\n";
         file << "normalZ = " << vn.normal.z << "\n";
+        file << "parentIndex  = " << vn.parentIndex << "\n";
+        file << "localPosX    = " << vn.localPos.x << "\n";
+        file << "localPosY    = " << vn.localPos.y << "\n";
+        file << "localPosZ    = " << vn.localPos.z << "\n";
+        file << "localNormalX = " << vn.localNormal.x << "\n";
+        file << "localNormalY = " << vn.localNormal.y << "\n";
+        file << "localNormalZ = " << vn.localNormal.z << "\n";
+    }
+
+    // -- [ejector.N] ---------------------------------------------------------
+    // Just the world-space point — no normal (snap surfaces don't share a
+    // normal concept) and no parent fields (sticky-placement isn't wired up
+    // for ejectors yet). Older parsers will ignore unknown sections via the
+    // Section::None fallback in the reader, so adding this is safe.
+    for (int i = 0; i < (int)data.ejectors.size(); ++i)
+    {
+        const auto& ej = data.ejectors[i];
+        file << "\n[ejector." << i << "]\n";
+        file << "posX = " << ej.point.x << "\n";
+        file << "posY = " << ej.point.y << "\n";
+        file << "posZ = " << ej.point.z << "\n";
     }
 
     return true;
@@ -208,22 +246,24 @@ bool ProjectFile::Load(const std::string& path,
 
     // Section tracking
     enum class Section {
-        None, Project, Parameters, Object, Sprue, Runner, Gate, Vent
+        None, Project, Parameters, Object, Sprue, Runner, Gate, Vent, Ejector
     };
     Section currentSection = Section::None;
 
     // Pending items for numbered sections
-    ProjectObjectData pendingObj;   bool hasObj = false;
-    ProjectRunnerData pendingRun;   bool hasRun = false;
-    ProjectGateData   pendingGate;  bool hasGate = false;
-    ProjectVentData   pendingVent;  bool hasVent = false;
+    ProjectObjectData  pendingObj;     bool hasObj = false;
+    ProjectRunnerData  pendingRun;     bool hasRun = false;
+    ProjectGateData    pendingGate;    bool hasGate = false;
+    ProjectVentData    pendingVent;    bool hasVent = false;
+    ProjectEjectorData pendingEjector; bool hasEjector = false;
 
     auto commitPending = [&]()
         {
-            if (hasObj) { out.objects.push_back(pendingObj);  pendingObj = {}; hasObj = false; }
-            if (hasRun) { out.runners.push_back(pendingRun);  pendingRun = {}; hasRun = false; }
-            if (hasGate) { out.gates.push_back(pendingGate);   pendingGate = {}; hasGate = false; }
-            if (hasVent) { out.vents.push_back(pendingVent);   pendingVent = {}; hasVent = false; }
+            if (hasObj) { out.objects.push_back(pendingObj);      pendingObj = {};     hasObj = false; }
+            if (hasRun) { out.runners.push_back(pendingRun);      pendingRun = {};     hasRun = false; }
+            if (hasGate) { out.gates.push_back(pendingGate);       pendingGate = {};    hasGate = false; }
+            if (hasVent) { out.vents.push_back(pendingVent);       pendingVent = {};    hasVent = false; }
+            if (hasEjector) { out.ejectors.push_back(pendingEjector); pendingEjector = {}; hasEjector = false; }
         };
 
     std::string line;
@@ -246,6 +286,7 @@ bool ProjectFile::Load(const std::string& path,
             else if (sec.rfind("runner.", 0) == 0) { currentSection = Section::Runner; hasRun = true; }
             else if (sec.rfind("gate.", 0) == 0) { currentSection = Section::Gate;   hasGate = true; }
             else if (sec.rfind("vent.", 0) == 0) { currentSection = Section::Vent;   hasVent = true; }
+            else if (sec.rfind("ejector.", 0) == 0) { currentSection = Section::Ejector; hasEjector = true; }
             else                                       currentSection = Section::None;
 
             continue;
@@ -281,6 +322,8 @@ bool ProjectFile::Load(const std::string& path,
             else if (key == "gateDiameter")      p.gateDiameter = ParseFloat(val, p.gateDiameter);
             else if (key == "gateDraftAngle")    p.gateDraftAngle = ParseFloat(val, p.gateDraftAngle);
             else if (key == "subRunnerDiameter") p.subRunnerDiameter = ParseFloat(val, p.subRunnerDiameter);
+            else if (key == "ejectorDiameter")   p.ejectorDiameter = ParseFloat(val, p.ejectorDiameter);
+            else if (key == "ejectorLength")     p.ejectorLength = ParseFloat(val, p.ejectorLength);
             break;
         }
 
@@ -293,6 +336,8 @@ bool ProjectFile::Load(const std::string& path,
             else if (key == "pitch") pendingObj.pitchDeg = ParseFloat(val, 0.0f);
             else if (key == "roll")  pendingObj.rollDeg = ParseFloat(val, 0.0f);
             else if (key == "scale") pendingObj.scale = ParseFloat(val, 1.0f);
+            else if (key == "mirrorX") pendingObj.mirrorX = ParseBool(val);
+            else if (key == "mirrorZ") pendingObj.mirrorZ = ParseBool(val);
             break;
 
         case Section::Sprue:
@@ -336,6 +381,16 @@ bool ProjectFile::Load(const std::string& path,
             else if (key == "normalX") pendingGate.normal.x = ParseFloat(val, 0.0f);
             else if (key == "normalY") pendingGate.normal.y = ParseFloat(val, 1.0f);
             else if (key == "normalZ") pendingGate.normal.z = ParseFloat(val, 0.0f);
+            // v2 sticky-placement keys. Missing in v1 files; defaults on
+            // the struct (-1 / zero / +Z) preserve the old "world-anchored"
+            // behaviour for those.
+            else if (key == "parentIndex")  pendingGate.parentIndex = ParseInt(val, -1);
+            else if (key == "localPosX")    pendingGate.localPos.x = ParseFloat(val, 0.0f);
+            else if (key == "localPosY")    pendingGate.localPos.y = ParseFloat(val, 0.0f);
+            else if (key == "localPosZ")    pendingGate.localPos.z = ParseFloat(val, 0.0f);
+            else if (key == "localNormalX") pendingGate.localNormal.x = ParseFloat(val, 0.0f);
+            else if (key == "localNormalY") pendingGate.localNormal.y = ParseFloat(val, 0.0f);
+            else if (key == "localNormalZ") pendingGate.localNormal.z = ParseFloat(val, 1.0f);
             break;
 
         case Section::Vent:
@@ -345,6 +400,23 @@ bool ProjectFile::Load(const std::string& path,
             else if (key == "normalX") pendingVent.normal.x = ParseFloat(val, 0.0f);
             else if (key == "normalY") pendingVent.normal.y = ParseFloat(val, 1.0f);
             else if (key == "normalZ") pendingVent.normal.z = ParseFloat(val, 0.0f);
+            // v2 sticky-placement keys.
+            else if (key == "parentIndex")  pendingVent.parentIndex = ParseInt(val, -1);
+            else if (key == "localPosX")    pendingVent.localPos.x = ParseFloat(val, 0.0f);
+            else if (key == "localPosY")    pendingVent.localPos.y = ParseFloat(val, 0.0f);
+            else if (key == "localPosZ")    pendingVent.localPos.z = ParseFloat(val, 0.0f);
+            else if (key == "localNormalX") pendingVent.localNormal.x = ParseFloat(val, 0.0f);
+            else if (key == "localNormalY") pendingVent.localNormal.y = ParseFloat(val, 0.0f);
+            else if (key == "localNormalZ") pendingVent.localNormal.z = ParseFloat(val, 1.0f);
+            break;
+
+        case Section::Ejector:
+            // Just the world point. New keys (parent / local placement) can
+            // slot in here later if sticky-placement is added; defaults on
+            // the struct will preserve current behaviour for older files.
+            if (key == "posX")    pendingEjector.point.x = ParseFloat(val, 0.0f);
+            else if (key == "posY") pendingEjector.point.y = ParseFloat(val, 0.0f);
+            else if (key == "posZ") pendingEjector.point.z = ParseFloat(val, 0.0f);
             break;
 
         default:

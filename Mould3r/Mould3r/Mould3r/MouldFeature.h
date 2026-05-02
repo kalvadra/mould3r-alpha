@@ -92,6 +92,23 @@ struct VentInstance
     VentCrossSection crossSection;
     SolidMesh        solid;
 
+    // Parent-object association for sticky placement.
+    //   -1                   — unparented (placed without an object snap, or
+    //                          loaded from a pre-v2 project file).  World
+    //                          position is the source of truth, transforms
+    //                          on objects do not affect the vent.
+    //   >= 0                 — index into GLCanvas::m_objects.  localPos
+    //                          and localNormal are valid and ARE the source
+    //                          of truth: world position is re-derived from
+    //                          parent.BuildModelMatrix() * localPos whenever
+    //                          the parent is transformed (move / rotate /
+    //                          scale, mirroring during grid pattern, etc.).
+    //                          Patterning clones the parented vent onto each
+    //                          new clone object with the same local data.
+    int       parentIndex = -1;
+    glm::vec3 localPos{ 0.0f, 0.0f, 0.0f };
+    glm::vec3 localNormal{ 0.0f, 0.0f, 1.0f };
+
     void Destroy() { solid.Destroy(); }
 };
 
@@ -125,7 +142,37 @@ struct GateFeature
     glm::vec3 pathEnd{ 0.0f };
     bool      hasPath = false;
 
+    // Parent-object association — same semantics as VentInstance.
+    int       parentIndex = -1;
+    glm::vec3 localPos{ 0.0f, 0.0f, 0.0f };
+    glm::vec3 localNormal{ 0.0f, 0.0f, 1.0f };
+
     void Destroy() { solid.Destroy(); subRunnerSolid.Destroy(); }
+};
+
+// ---------------------------------------------------------------------------
+// EjectorFeature — placement point for an ejector pin plus its preview
+// geometry.
+//
+// Geometry: a straight cylinder extruded in the -Y direction (toward the B
+// mould half) starting at `point`, with diameter and length read from the
+// MainFrame UI at rebuild time. Built in RebuildEjectorSolids on GLCanvas.
+//
+// Snapping target sources (handled in GLCanvas, not here): sprue parting
+// point, any runner segment, any gate segment, or any object surface. The
+// chosen world-space hit lands in `point`. There is no normal because the
+// snap surfaces don't share a normal concept — a runner segment is a line,
+// a gate path is a line, an object face has a normal but the sprue parting
+// point has none. For now the geometry is always extruded -Y regardless of
+// what surface was snapped; surface-aligned ejectors can come later if
+// needed.
+// ---------------------------------------------------------------------------
+struct EjectorFeature
+{
+    glm::vec3 point{ 0.0f };
+    SolidMesh solid;
+
+    void Destroy() { solid.Destroy(); }
 };
 
 // ---------------------------------------------------------------------------

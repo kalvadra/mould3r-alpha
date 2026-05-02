@@ -4,6 +4,7 @@
 #include "RotateDialog.h"
 #include "TranslateDialog.h"
 #include "ScaleDialog.h"
+#include "PatternDialog.h"
 #include "StartupDialog.h"
 #include <wx/textctrl.h>
 #include "FixtureFile.h"
@@ -11,9 +12,12 @@
 #include "StartupDialog.h"
 #include "ProjectFile.h"
 
+#include <functional>
+#include <unordered_map>
+
 class GLCanvas;
 
-enum class TransformMode { Select, Translate, Rotate, Scale, PlaceVent, PlaceRunner, PlaceGate, RemoveVent, RemoveRunner, RemoveGate, RemoveSprue, EditVent, EditRunner, EditGate, SelectInjectionPoint };
+enum class TransformMode { Select, Translate, Rotate, Scale, Pattern, PlaceVent, PlaceRunner, PlaceGate, PlaceEjector, RemoveVent, RemoveRunner, RemoveGate, RemoveSprue, RemoveEjector, EditVent, EditRunner, EditGate, EditEjector, SelectInjectionPoint, AlignFace, AlignMidplane };
 
 class MainFrame : public wxFrame
 {
@@ -43,6 +47,9 @@ public:
     float GetGateDraftAngle() const;
     float GetSubRunnerDiameter() const;
 
+    float GetEjectorDiameter() const;
+    float GetEjectorLength() const;
+
     // Project save/load support
     const FixtureDefinition& GetFixtureDefinition() const { return m_fixtureDef; }
     GLCanvas* GetCanvas() const { return m_canvas; }
@@ -70,7 +77,10 @@ private:
     void OnToolTranslate(wxCommandEvent& evt);
     void OnToolRotate(wxCommandEvent& evt);
     void OnToolScale(wxCommandEvent& evt);
+    void OnToolPattern(wxCommandEvent& evt);
     void OnToolCenter(wxCommandEvent& evt);
+    void OnToolAlignFace(wxCommandEvent& evt);
+    void OnToolAlignMidplane(wxCommandEvent& evt);
     void OnToolPlaceVent(wxCommandEvent& evt);
 
     void OnPlaceSprue(wxCommandEvent&);
@@ -82,15 +92,25 @@ private:
     void OnPlaceGate(wxCommandEvent& evt);
     void OnClearGates(wxCommandEvent&);
 
+    // Ejectors. Place toggles between Select and PlaceEjector; Clear wipes
+    // every ejector via the canvas helper. Remove / Edit toggle into their
+    // respective transient picking modes the same way the other features do.
+    // The canvas-side TransformMode handlers and ClearEjectors() are placeholder
+    // hooks for now — see comments in MainFrame.cpp / GLCanvas.cpp.
+    void OnPlaceEjector(wxCommandEvent& evt);
+    void OnClearEjectors(wxCommandEvent&);
+
     void OnRemoveVent(wxCommandEvent&);
     void OnRemoveSprue(wxCommandEvent&);
     void OnRemoveRunner(wxCommandEvent&);
     void OnRemoveGate(wxCommandEvent&);
+    void OnRemoveEjector(wxCommandEvent&);
 
     void OnEditVent(wxCommandEvent&);
     void OnEditRunner(wxCommandEvent&);
     void OnEditGate(wxCommandEvent&);
     void OnEditSprue(wxCommandEvent&);
+    void OnEditEjector(wxCommandEvent&);
 
     void OnSetMetric(wxCommandEvent&);
     void OnSetImperial(wxCommandEvent&);
@@ -108,6 +128,14 @@ private:
     wxPanel* CreateSpruesContent(wxWindow* parent);
     wxPanel* CreateRunnersContent(wxWindow* parent);
     wxPanel* CreateGatesContent(wxWindow* parent);
+    wxPanel* CreateEjectorsContent(wxWindow* parent);
+
+    // Builds a "Place …" toggle button with the standard side-panel styling
+    // and registers a setter into m_toolBtnSetters so SetActiveTool can
+    // drive its visual state externally (button click, Escape, canvas-
+    // internal mode transitions).
+    wxToggleButton* MakePlaceButton(wxWindow* parent, int id,
+        const wxString& label);
 
     // Vent field members
     wxChoice* m_ventTypeChoice = nullptr;
@@ -138,6 +166,14 @@ private:
     wxChoice* m_subRunnerTypeChoice = nullptr;
     wxTextCtrl* m_subRunnerDiameter = nullptr;
 
+    // Ejector field members. Type dropdown drives which dimension panel is
+    // visible — same pattern as the Gate "Tapered Cylinder" branch. Currently
+    // only "Cylindrical" is offered; new geometries plug in by appending to
+    // the wxChoice and adding a Show() branch in CreateEjectorsContent.
+    wxChoice* m_ejectorTypeChoice = nullptr;
+    wxTextCtrl* m_ejectorDiameter = nullptr;
+    wxTextCtrl* m_ejectorLength = nullptr;
+
     // Creates the top ribbon panel
     wxPanel* CreateRibbon(wxWindow* parent);
 
@@ -153,23 +189,16 @@ private:
     bool m_imperial = false;
     std::vector<wxStaticText*> m_mmUnitLabels;  // labels that switch "mm"↔"in"
 
-    // Transform tool buttons
-    wxToggleButton* m_btnTranslate = nullptr;
-    wxToggleButton* m_btnRotate = nullptr;
-    wxToggleButton* m_btnScale = nullptr;
-    wxButton* m_btnCenter = nullptr;
-
-    // Vent tool button (ribbon — Vents group)
-    wxToggleButton* m_btnPlaceVent = nullptr;
-
-    // Sprue tool buttons (ribbon — Sprues group)
-    wxButton* m_btnPlaceSprue = nullptr;
-
-    // Runner tool button (ribbon — Runners group)
-    wxToggleButton* m_btnPlaceRunner = nullptr;
-
-    // Gate tool button (ribbon — Gates group)
-    wxToggleButton* m_btnPlaceGate = nullptr;
+    // Toggle-button setter registry. Each entry is (command-id → set-active(bool)).
+    // makeToolBtn registers a setter for each toggle-style ribbon button so that
+    // SetActiveTool can drive the visuals from the canonical TransformMode,
+    // regardless of how the mode was changed (button click, Escape key,
+    // mode-completion in the canvas, programmatic, ...).
+    //
+    // Replaces the previous wxToggleButton* member pointers, which were never
+    // assigned because the actual ribbon buttons are custom wxPanel-based
+    // controls built inside makeToolBtn rather than native wxToggleButton.
+    std::unordered_map<int, std::function<void(bool)>> m_toolBtnSetters;
 
     wxPanel* m_sidePanel = nullptr;
     wxTextCtrl* m_exportPath = nullptr;
@@ -187,7 +216,10 @@ private:
         ID_ToolTranslate,
         ID_ToolRotate,
         ID_ToolScale,
+        ID_ToolPattern,
         ID_ToolCenter,
+        ID_ToolAlignFace,
+        ID_ToolAlignMidplane,
         ID_ToolPlaceVent,
         ID_BrowseExport,
         ID_Export,
@@ -200,14 +232,18 @@ private:
         ID_ClearRunners,
         ID_PlaceGate,
         ID_ClearGates,
+        ID_PlaceEjector,
+        ID_ClearEjectors,
         ID_RemoveVent,
         ID_RemoveSprue,
         ID_RemoveRunner,
         ID_RemoveGate,
+        ID_RemoveEjector,
         ID_EditVent,
         ID_EditRunner,
         ID_EditGate,
         ID_EditSprue,
+        ID_EditEjector,
         ID_SaveProject,
         ID_LoadProject,
         ID_NewProject,

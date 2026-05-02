@@ -6,6 +6,9 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
 
+#include <unordered_map>
+#include <set>
+
 #include "GLCanvas.h"
 #include <wx/dcclient.h>
 #include <wx/log.h>
@@ -52,6 +55,12 @@ static constexpr float kVentMarkerRadius = 1.5f;
 // How close (world units) the cursor's parting-plane hit must be to a parting
 // segment before it snaps — gives a generous click target on the parting line.
 static constexpr float kVentSnapRadius = 8.0f;
+
+// Pixel radius for ejector snap pick. Screen-space rather than world-space:
+// path candidates (sprue / runner / gate segments) are evaluated by their
+// projected screen distance to the cursor, so the snap feel is consistent
+// at every zoom level. See RayCastEjectorSnap for the full algorithm.
+static constexpr float kEjectorSnapRadiusPx = 12.0f;
 
 // ---------------------------------------------------------------------------
 // Shader helpers
@@ -167,6 +176,32 @@ void GLCanvas::SetTransformMode(TransformMode mode)
         m_editNeedsUpdate = false;
     }
 
+    // Clear AlignFace hover state and highlight VBO when leaving AlignFace.
+    // The VBO itself is kept (just zeroed via vertex count) so we don't
+    // re-create GL objects on every mode switch.
+    if (m_transformMode == TransformMode::AlignFace && mode != TransformMode::AlignFace)
+    {
+        m_alignHoverObject = -1;
+        m_alignSeedTri = -1;
+        m_alignFaceTris.clear();
+        m_alignHighlightVertexCount = 0;
+    }
+
+    // Clear AlignMidplane state when leaving the mode. Hover state is shared
+    // with AlignFace and cleared above; this drops the locked-face data.
+    if (m_transformMode == TransformMode::AlignMidplane && mode != TransformMode::AlignMidplane)
+    {
+        m_alignHoverObject = -1;
+        m_alignSeedTri = -1;
+        m_alignFaceTris.clear();
+        m_alignHighlightVertexCount = 0;
+
+        m_midplaneFaceLocked = false;
+        m_midplaneFaceObject = -1;
+        m_midplaneFaceTris.clear();
+        m_midplaneLockedVertexCount = 0;
+    }
+
     m_transformMode = mode;
     switch (mode)
     {
@@ -184,16 +219,24 @@ void GLCanvas::SetTransformMode(TransformMode mode)
         SetCursor(wxCursor(wxCURSOR_CROSS));    break;
     case TransformMode::PlaceGate:
         SetCursor(wxCursor(wxCURSOR_CROSS));    break;
+    case TransformMode::PlaceEjector:
+        SetCursor(wxCursor(wxCURSOR_CROSS));    break;
     case TransformMode::RemoveVent:
     case TransformMode::RemoveRunner:
     case TransformMode::RemoveGate:
     case TransformMode::RemoveSprue:
+    case TransformMode::RemoveEjector:
         SetCursor(wxCursor(wxCURSOR_HAND));     break;
     case TransformMode::EditVent:
     case TransformMode::EditRunner:
     case TransformMode::EditGate:
+    case TransformMode::EditEjector:
         SetCursor(wxCursor(wxCURSOR_HAND));     break;
     case TransformMode::SelectInjectionPoint:
+        SetCursor(wxCursor(wxCURSOR_HAND));     break;
+    case TransformMode::AlignFace:
+        SetCursor(wxCursor(wxCURSOR_HAND));     break;
+    case TransformMode::AlignMidplane:
         SetCursor(wxCursor(wxCURSOR_HAND));     break;
     }
 
@@ -206,35 +249,465 @@ void GLCanvas::SetTransformMode(TransformMode mode)
 void GLCanvas::ApplyRotation(float xDeg, float yDeg, float zDeg)
 {
     if (!HasSelection()) return;
-    m_objects[m_selectedIndex].pitchDeg += xDeg;
-    m_objects[m_selectedIndex].yawDeg += yDeg;
-    m_objects[m_selectedIndex].rollDeg += zDeg;
-    for (auto& v : m_vents) v.Destroy(); m_vents.clear(); RebuildPathVBO(); RebuildCrossSectionVBO();
+    for (int idx : m_selectedIndices)
+    {
+        if (idx < 0 || idx >= (int)m_objects.size()) continue;
+        m_objects[idx].pitchDeg += xDeg;
+        m_objects[idx].yawDeg += yDeg;
+        m_objects[idx].rollDeg += zDeg;
+    }
+    // Parented vents/gates ride along with their parent; unparented features
+    // are independent of object transforms and are left alone.
+    ReanchorFeaturesForObjects(m_selectedIndices);
     Refresh(false);
 }
 
 void GLCanvas::ApplyTranslation(float x, float y, float z)
 {
     if (!HasSelection()) return;
-    m_objects[m_selectedIndex].pos += glm::vec3(x, y, z);
-    for (auto& v : m_vents) v.Destroy(); m_vents.clear(); RebuildPathVBO(); RebuildCrossSectionVBO();
+    const glm::vec3 d(x, y, z);
+    for (int idx : m_selectedIndices)
+    {
+        if (idx < 0 || idx >= (int)m_objects.size()) continue;
+        m_objects[idx].pos += d;
+    }
+    ReanchorFeaturesForObjects(m_selectedIndices);
     Refresh(false);
 }
 
 void GLCanvas::ApplyScale(float factor)
 {
     if (!HasSelection()) return;
-    m_objects[m_selectedIndex].scale =
-        std::max(0.001f, m_objects[m_selectedIndex].scale * factor);
-    for (auto& v : m_vents) v.Destroy(); m_vents.clear(); RebuildPathVBO(); RebuildCrossSectionVBO();
+    for (int idx : m_selectedIndices)
+    {
+        if (idx < 0 || idx >= (int)m_objects.size()) continue;
+        m_objects[idx].scale = std::max(0.001f, m_objects[idx].scale * factor);
+    }
+    ReanchorFeaturesForObjects(m_selectedIndices);
     Refresh(false);
 }
 
 void GLCanvas::CenterSelectedObject()
 {
     if (!HasSelection()) return;
-    m_objects[m_selectedIndex].pos = glm::vec3(0.0f);
-    for (auto& v : m_vents) v.Destroy(); m_vents.clear(); RebuildPathVBO(); RebuildCrossSectionVBO();
+
+    // Translate the whole selection so the centroid of its members'
+    // positions lands at the world origin. Preserves relative arrangement
+    // (single-selection degenerates to "set pos = (0,0,0)" as before).
+    glm::vec3 centroid(0.0f);
+    int n = 0;
+    for (int idx : m_selectedIndices)
+    {
+        if (idx < 0 || idx >= (int)m_objects.size()) continue;
+        centroid += m_objects[idx].pos;
+        ++n;
+    }
+    if (n == 0) return;
+    centroid /= static_cast<float>(n);
+
+    for (int idx : m_selectedIndices)
+    {
+        if (idx < 0 || idx >= (int)m_objects.size()) continue;
+        m_objects[idx].pos -= centroid;
+    }
+    ReanchorFeaturesForObjects(m_selectedIndices);
+    Refresh(false);
+}
+
+// ---------------------------------------------------------------------------
+// Circular pattern around the world origin in the XZ plane.
+//
+// The original keeps its existing pose; (count - 1) clones are placed at
+// equally-spaced angular offsets around (0, *, 0). Each clone shares the
+// original's Y, scale, and rotation — only its XZ position changes.
+//
+// Cloning approach: we re-build the GPU mesh per instance from the cached
+// CPU position-only buffer (cpuVerts/cpuIndices), reusing the importer's
+// normal-computation and crease-split helpers. This avoids re-running the
+// full file import (no progress dialog, no BuildFacetedShape, no file I/O)
+// while keeping each clone's GPU buffers independently owned, so the
+// existing per-object Destroy() lifetime model still works.
+//
+// OpenCascade TopoDS_Shape uses value semantics with shared internal data,
+// so plain copy-by-assignment of sourceShape is safe and cheap.
+// ---------------------------------------------------------------------------
+void GLCanvas::ApplyCircularPattern(int count, bool overrideRadius, float radius,
+    bool rotateCopies)
+{
+    if (!HasSelection()) return;
+    if (m_selectedIndices.size() != 1)
+    {
+        // Pattern is inherently a single-seed operation. Refuse to run on
+        // a multi-selection rather than guessing which object should be the
+        // anchor (or stamping overlapping patterns from each).
+        wxMessageBox("Pattern requires exactly one object to be selected.",
+            "Circular Pattern", wxOK | wxICON_INFORMATION, this);
+        return;
+    }
+    if (count <= 1)      return;     // a "pattern" of one is just the original
+
+    const int seedIndex = m_selectedIndices.front();
+
+    SetCurrent(*m_context);
+    InitGLOnce();
+
+    // Take a copy of the original by value — m_objects may reallocate when we
+    // emplace_back the clones below, invalidating any reference we held.
+    const SceneObject orig = m_objects[seedIndex];
+
+    // Determine each clone's radius and starting angle in the XZ plane.
+    // The original's angle is preserved so it remains part of the pattern.
+    const float origRadius = std::sqrt(orig.pos.x * orig.pos.x +
+        orig.pos.z * orig.pos.z);
+    const float r = overrideRadius ? radius : origRadius;
+
+    // If the original sits exactly on the Y axis (radius == 0), there's no
+    // meaningful angular reference, so anchor at angle 0. Otherwise use the
+    // original's existing direction so it remains the k=0 instance.
+    const float theta0 = (origRadius > 1e-6f)
+        ? std::atan2(orig.pos.z, orig.pos.x)
+        : 0.0f;
+    const float dtheta = 2.0f * 3.14159265358979323846f / static_cast<float>(count);
+
+    for (int k = 1; k < count; ++k)
+    {
+        const float theta = theta0 + dtheta * static_cast<float>(k);
+
+        m_objects.emplace_back();
+        SceneObject& clone = m_objects.back();
+
+        // Copy non-GPU, non-mould state. mouldShape is intentionally left
+        // unset — the user re-generates the mould after patterning.
+        clone.role = orig.role;
+        clone.sourcePath = orig.sourcePath;
+        clone.sourceShape = orig.sourceShape;
+        clone.hasSourceShape = orig.hasSourceShape;
+        clone.cpuVerts = orig.cpuVerts;
+        clone.cpuIndices = orig.cpuIndices;
+        // triNeighbors / adjacencyBuilt deliberately left at defaults — they
+        // depend only on local mesh topology and will be rebuilt lazily on
+        // first use, identically to the original.
+
+        // Pose: same Y, scale, pitch, roll. XZ from polar coords. Yaw
+        // depends on rotateCopies:
+        //   off -> clone keeps the original's local rotation verbatim
+        //   on  -> clone's yaw is offset by its angular position so it
+        //          "faces outward" like the original (gear-tooth style).
+        //
+        // Sign note: glm::rotate around +Y by positive yawDeg sends +X to -Z,
+        // whereas our position formula (r cos theta, _, r sin theta) sends
+        // +X to +Z as theta increases. The two rotations have opposite signs
+        // in this convention, so the yaw offset is *negative* k * dtheta to
+        // match the angular position rotation.
+        clone.pos = glm::vec3(r * std::cos(theta), orig.pos.y,
+            r * std::sin(theta));
+        clone.yawDeg = orig.yawDeg
+            + (rotateCopies
+                ? -static_cast<float>(k) * (360.0f / static_cast<float>(count))
+                : 0.0f);
+        clone.pitchDeg = orig.pitchDeg;
+        clone.rollDeg = orig.rollDeg;
+        clone.scale = orig.scale;
+
+        // Build the GPU mesh from the cached CPU vertices, mirroring the
+        // post-import pipeline in ImportFile().
+        FileImporter::MeshData md;
+        md.vertices = orig.cpuVerts;
+        md.indices = orig.cpuIndices;
+        ComputeVertexNormals_Pos3(md.vertices, md.indices, md.posNorm);
+        auto split = SplitByCreaseAngle_Pos3(md.vertices, md.indices, 35.0f);
+        md.posNorm = std::move(split.posNorm);
+        md.indices = std::move(split.indices);
+        UploadMeshToGPU(md, clone);
+    }
+
+    // Apply the override radius to the original too, if requested. We do this
+    // *after* the clone loop so the original's old position is preserved as
+    // the angular anchor (theta0) — moving it earlier would re-anchor the
+    // whole pattern.
+    if (overrideRadius && origRadius > 1e-6f)
+    {
+        SceneObject& origRef = m_objects[seedIndex];
+        origRef.pos.x = r * std::cos(theta0);
+        origRef.pos.z = r * std::sin(theta0);
+    }
+
+    // Clone the seed's parented vents/gates onto each new clone object so
+    // patterning carries placement context (sticky-placement). For each
+    // feature parented to the seed, push a fresh feature carrying the same
+    // local-space placement but parented to the clone's m_objects index;
+    // ReanchorVent / ReanchorGate then materialise its world data + GPU
+    // resources from the clone's transform.
+    //
+    // Clones were just appended to the tail of m_objects in k=1..count-1
+    // order, so their indices are firstCloneIdx + 0, +1, ... +(count-2).
+    const int firstCloneIdx = (int)m_objects.size() - (count - 1);
+
+    // Snapshot local placements of seed-parented features. Reading m_vents
+    // / m_gates while we push to them would loop indefinitely, so we
+    // snapshot first, then push.
+    struct LocalPlacement { glm::vec3 pos; glm::vec3 normal; };
+    std::vector<LocalPlacement> seedVentPlacements;
+    std::vector<LocalPlacement> seedGatePlacements;
+    for (const auto& vi : m_vents)
+        if (vi.parentIndex == seedIndex)
+            seedVentPlacements.push_back({ vi.localPos, vi.localNormal });
+    for (const auto& gf : m_gates)
+        if (gf.parentIndex == seedIndex)
+            seedGatePlacements.push_back({ gf.localPos, gf.localNormal });
+
+    std::vector<int> reanchorTargets;
+    reanchorTargets.reserve(count);
+    reanchorTargets.push_back(seedIndex);   // seed's pos may have shifted
+
+    for (int k = 0; k < count - 1; ++k)
+    {
+        const int cloneIdx = firstCloneIdx + k;
+        reanchorTargets.push_back(cloneIdx);
+
+        for (const auto& lp : seedVentPlacements)
+        {
+            VentInstance vi;
+            vi.parentIndex = cloneIdx;
+            vi.localPos = lp.pos;
+            vi.localNormal = lp.normal;
+            // World point + GPU mesh built by ReanchorVent below.
+            m_vents.push_back(std::move(vi));
+        }
+        for (const auto& lp : seedGatePlacements)
+        {
+            GateFeature gf;
+            gf.parentIndex = cloneIdx;
+            gf.localPos = lp.pos;
+            gf.localNormal = lp.normal;
+            // World point + path + solid built by ReanchorGate +
+            // RebuildGatePathVBO/Solids below.
+            m_gates.push_back(std::move(gf));
+        }
+    }
+
+    // Single batch reanchor for the seed (in case override-radius moved it)
+    // and every new clone. Also handles RebuildPathVBO / RebuildGatePathVBO
+    // / RebuildGateSolids internally if either feature list was touched.
+    ReanchorFeaturesForObjects(reanchorTargets);
+    Refresh(false);
+}
+
+// ---------------------------------------------------------------------------
+// ApplyGridPattern — duplicates the selected object into a 2-D grid that is
+// CENTRED on the world origin, in the y=0 plane.
+//
+// The grid spans [-halfX, +halfX] x [-halfZ, +halfZ] with numH x numV cells
+// linearly spaced across each axis. (halfX, halfZ) is derived as:
+//   default     : (|orig.x|, |orig.z|) - the original's (x,z) is treated as
+//                 HALF the full grid extent, so the model already sits at
+//                 a corner of the centred grid.
+//   override on : (length/2, width/2) - the override fields specify the
+//                 FULL grid extents, so we halve them. The original is
+//                 moved to the corner that matches its current XZ-quadrant.
+//
+// The "anchor" cell is the corner indexed by the sign of the original's
+// XZ-quadrant: (numH-1, numV-1) for the (+,+) quadrant, (0, numV-1) for
+// (-,+), etc. The original ends up at this corner; the remaining
+// (numH*numV - 1) cells are filled with clones. With override off, the
+// anchor naturally coincides with the original's existing position so no
+// movement happens; with override on, the original is repositioned to the
+// new corner.
+//
+// Mirror flags:
+//   mirrorH - if true, every clone whose cell X coordinate sits on the
+//             opposite side of x=0 from the original has its mesh
+//             reflected about the local YZ plane (clone.mirrorX = true).
+//   mirrorV - same for Z (reflection about local XY plane).
+// Cells that lie exactly on an axis (cell.x == 0 or cell.z == 0, possible
+// with odd grid counts) are not flipped on that axis - they're on the
+// boundary, not on the other side. With both flags set, a clone in the
+// diagonally-opposite quadrant gets reflected on both axes (parity
+// preserved overall).
+//
+// Edge cases:
+//   numH == 1 (or numV == 1): that axis collapses to a single position at
+//     0, so the grid degenerates to a column (or row) on the perpendicular
+//     axis. The anchor index on the collapsed axis is always 0.
+//   On-axis original (x == 0 or z == 0): sign defaults to positive so
+//     override has a deterministic landing corner.
+//   On-origin original with override off: half-extents are zero and all
+//     cells overlap at origin - degenerate but not a crash.
+//
+// Cloning approach mirrors ApplyCircularPattern: each clone re-builds its
+// GPU mesh from the cached CPU position-only buffer, sharing the source
+// shape and CPU mesh data with the original. Vents and the cached mould
+// are invalidated as with other Apply* transforms.
+// ---------------------------------------------------------------------------
+void GLCanvas::ApplyGridPattern(int numH, int numV, bool mirrorH, bool mirrorV,
+    bool overrideLengthWidth, float length, float width)
+{
+    if (!HasSelection())   return;
+    if (m_selectedIndices.size() != 1)
+    {
+        // Same single-seed restriction as ApplyCircularPattern.
+        wxMessageBox("Pattern requires exactly one object to be selected.",
+            "Grid Pattern", wxOK | wxICON_INFORMATION, this);
+        return;
+    }
+    if (numH <= 0)         return;
+    if (numV <= 0)         return;
+    if (numH * numV <= 1)  return;     // 1x1 has no clones to make
+
+    const int seedIndex = m_selectedIndices.front();
+
+    SetCurrent(*m_context);
+    InitGLOnce();
+
+    // Take a copy of the original by value - m_objects may reallocate when
+    // we emplace_back the clones below, invalidating any reference we held.
+    const SceneObject orig = m_objects[seedIndex];
+
+    // Half-extents of the centred grid. See header comment for the rules.
+    const float halfX = overrideLengthWidth
+        ? length * 0.5f
+        : std::abs(orig.pos.x);
+    const float halfZ = overrideLengthWidth
+        ? width * 0.5f
+        : std::abs(orig.pos.z);
+
+    // Sign of the original's XZ-quadrant. Used to choose which corner of
+    // the centred grid the original anchors. Zero defaults to positive so
+    // an on-axis original gets a deterministic corner when the override
+    // moves it off-axis.
+    const float signX = (orig.pos.x >= 0.0f) ? 1.0f : -1.0f;
+    const float signZ = (orig.pos.z >= 0.0f) ? 1.0f : -1.0f;
+
+    // Anchor cell index. With numH==1 (numV==1) the corresponding axis has
+    // only one valid index (0) regardless of sign.
+    const int anchorI = (signX > 0.0f && numH > 1) ? (numH - 1) : 0;
+    const int anchorJ = (signZ > 0.0f && numV > 1) ? (numV - 1) : 0;
+
+    // Cell-centre coordinates for indices (i, j). Linear interpolation from
+    // -halfX..+halfX (or just 0 when numH == 1); same for Z.
+    auto cellPos = [&](int i, int j) -> glm::vec3
+        {
+            const float cx = (numH == 1) ? 0.0f
+                : -halfX + static_cast<float>(i) * (2.0f * halfX) /
+                static_cast<float>(numH - 1);
+            const float cz = (numV == 1) ? 0.0f
+                : -halfZ + static_cast<float>(j) * (2.0f * halfZ) /
+                static_cast<float>(numV - 1);
+            return glm::vec3(cx, orig.pos.y, cz);
+        };
+
+    for (int i = 0; i < numH; ++i)
+    {
+        for (int j = 0; j < numV; ++j)
+        {
+            if (i == anchorI && j == anchorJ) continue;     // original sits here
+
+            const glm::vec3 cell = cellPos(i, j);
+
+            // "Other side of x=0" iff cell.x and signX have opposite signs
+            // (product < 0). On-axis cells (cell.x == 0) have product 0
+            // and are treated as boundary - no flip. signX/signZ are always
+            // +/-1 so the product test is unambiguous. Same logic for Z.
+            const bool flipX = mirrorH && (cell.x * signX < 0.0f);
+            const bool flipZ = mirrorV && (cell.z * signZ < 0.0f);
+
+            m_objects.emplace_back();
+            SceneObject& clone = m_objects.back();
+
+            // Copy non-GPU, non-mould state. mouldShape is intentionally
+            // left unset - the user re-generates the mould after patterning.
+            clone.role = orig.role;
+            clone.sourcePath = orig.sourcePath;
+            clone.sourceShape = orig.sourceShape;
+            clone.hasSourceShape = orig.hasSourceShape;
+            clone.cpuVerts = orig.cpuVerts;
+            clone.cpuIndices = orig.cpuIndices;
+            // triNeighbors / adjacencyBuilt deliberately left at defaults -
+            // they depend only on local mesh topology and will be rebuilt
+            // lazily on first use, identically to the original.
+
+            // Pose: same Y, scale and full rotation. Position from cell
+            // grid; mirror flags from the cross-axis test above.
+            clone.pos = cell;
+            clone.yawDeg = orig.yawDeg;
+            clone.pitchDeg = orig.pitchDeg;
+            clone.rollDeg = orig.rollDeg;
+            clone.scale = orig.scale;
+            clone.mirrorX = flipX;
+            clone.mirrorZ = flipZ;
+
+            // Build the GPU mesh from the cached CPU vertices, mirroring
+            // the post-import pipeline in ImportFile() (same pipeline used
+            // by ApplyCircularPattern).
+            FileImporter::MeshData md;
+            md.vertices = orig.cpuVerts;
+            md.indices = orig.cpuIndices;
+            ComputeVertexNormals_Pos3(md.vertices, md.indices, md.posNorm);
+            auto split = SplitByCreaseAngle_Pos3(md.vertices, md.indices, 35.0f);
+            md.posNorm = std::move(split.posNorm);
+            md.indices = std::move(split.indices);
+            UploadMeshToGPU(md, clone);
+        }
+    }
+
+    // Move the original to its anchor cell. With override off this is
+    // typically a no-op (orig was already at this corner, since the grid
+    // was sized to put it there); with override on, the original moves to
+    // the matching corner of the new grid extents.
+    {
+        SceneObject& origRef = m_objects[seedIndex];
+        const glm::vec3 anchorPos = cellPos(anchorI, anchorJ);
+        origRef.pos.x = anchorPos.x;
+        origRef.pos.z = anchorPos.z;
+    }
+
+    // Clone the seed's parented vents/gates onto each new clone object so
+    // patterning carries placement context (sticky-placement). Mirrored
+    // clones (mirrorX / mirrorZ) get correctly-mirrored feature placements
+    // for free because BuildModelMatrix encodes the negative scale and
+    // ReanchorVent / ReanchorGate go through it. See ApplyCircularPattern
+    // for the symmetric explanation.
+    const int numClones = numH * numV - 1;
+    const int firstCloneIdx = (int)m_objects.size() - numClones;
+
+    struct LocalPlacement { glm::vec3 pos; glm::vec3 normal; };
+    std::vector<LocalPlacement> seedVentPlacements;
+    std::vector<LocalPlacement> seedGatePlacements;
+    for (const auto& vi : m_vents)
+        if (vi.parentIndex == seedIndex)
+            seedVentPlacements.push_back({ vi.localPos, vi.localNormal });
+    for (const auto& gf : m_gates)
+        if (gf.parentIndex == seedIndex)
+            seedGatePlacements.push_back({ gf.localPos, gf.localNormal });
+
+    std::vector<int> reanchorTargets;
+    reanchorTargets.reserve(numClones + 1);
+    reanchorTargets.push_back(seedIndex);   // seed's pos may have shifted
+
+    for (int k = 0; k < numClones; ++k)
+    {
+        const int cloneIdx = firstCloneIdx + k;
+        reanchorTargets.push_back(cloneIdx);
+
+        for (const auto& lp : seedVentPlacements)
+        {
+            VentInstance vi;
+            vi.parentIndex = cloneIdx;
+            vi.localPos = lp.pos;
+            vi.localNormal = lp.normal;
+            m_vents.push_back(std::move(vi));
+        }
+        for (const auto& lp : seedGatePlacements)
+        {
+            GateFeature gf;
+            gf.parentIndex = cloneIdx;
+            gf.localPos = lp.pos;
+            gf.localNormal = lp.normal;
+            m_gates.push_back(std::move(gf));
+        }
+    }
+
+    ReanchorFeaturesForObjects(reanchorTargets);
     Refresh(false);
 }
 
@@ -470,7 +943,44 @@ void GLCanvas::RebuildGateSolids()
 }
 
 // ---------------------------------------------------------------------------
-// RebuildGatePathVBO — for each placed gate, finds the nearest point on any
+// RebuildEjectorSolids — builds a straight cylinder for every placed ejector,
+// extruded from the ejector's snap point in the -Y direction (toward the B
+// mould half). Diameter and length come from the MainFrame UI at call time.
+//
+// No taper / draft is applied: the UI exposes only diameter and length, so
+// BuildCylinderMesh is invoked with draftAngleDeg = 0. If a tapered ejector
+// type is added later (e.g. shoulder pin), branch on the type dropdown the
+// same way RebuildGateSolids handles its frustum / sub-runner split.
+//
+// Ejectors snapped onto an object face start above y=0 — the geometry
+// passes through the parting plane as a single straight cylinder. That's
+// fine for the preview; the eventual mould-cut step will be responsible
+// for clipping to the B half.
+// ---------------------------------------------------------------------------
+void GLCanvas::RebuildEjectorSolids()
+{
+    for (auto& ef : m_ejectors) ef.solid.Destroy();
+    if (m_ejectors.empty()) return;
+
+    float ejectorRadius = 1.5f;
+    float ejectorLength = 25.0f;
+    if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+    {
+        ejectorRadius = frame->GetEjectorDiameter() * 0.5f;
+        ejectorLength = frame->GetEjectorLength();
+    }
+
+    // Defensive: degenerate dimensions would produce an invalid SolidMesh,
+    // which is harmless but pointless to send to the GPU.
+    if (ejectorRadius < 1e-4f || ejectorLength < 1e-4f) return;
+
+    for (EjectorFeature& ef : m_ejectors)
+    {
+        const glm::vec3 start = ef.point;
+        const glm::vec3 end = start + glm::vec3(0.0f, -ejectorLength, 0.0f);
+        ef.solid = BuildCylinderMesh(start, end, ejectorRadius, 0.0f);
+    }
+}
 // feed-network segment (sprue parting point, or any point along a runner path)
 // in XZ, stores the result on the GateFeature, then uploads one GL_LINES pair
 // per gate.  Runner paths are treated as full segments (sprue parting pt →
@@ -783,8 +1293,8 @@ void GLCanvas::GenerateMould()
         return;
     }
 
-    // Steps per fixture: 1 read + 1 transform + (1 per object subtract) + (1 per vent subtract) + (1 per runner subtract) + 1 sprue + 1 tessellate + 1 upload
-    const int stepsPerFixture = 4 + (int)m_objects.size() + (int)m_vents.size() + (int)m_runners.size() + (int)m_gates.size();
+    // Steps per fixture: 1 read + 1 transform + (1 per object subtract) + (1 per vent subtract) + (1 per runner subtract) + (1 per gate subtract) + (1 per ejector subtract) + 1 sprue + 1 tessellate + 1 upload
+    const int stepsPerFixture = 4 + (int)m_objects.size() + (int)m_vents.size() + (int)m_runners.size() + (int)m_gates.size() + (int)m_ejectors.size();
     const int totalSteps = stepsPerFixture * (int)m_fixtures.size();
 
     wxProgressDialog progress(
@@ -1174,6 +1684,66 @@ void GLCanvas::GenerateMould()
             }
         }
 
+        // Step: subtract ejector pins
+        //
+        // Each ejector is a straight cylinder extruded in -Y from the snap
+        // point. The cylinder is overrun by kCutEps on BOTH ends — past the
+        // snap point and past the nominal endpoint — so that it punches
+        // cleanly through whatever parting / exit faces it crosses, rather
+        // than leaving sealed pockets. OCC's cut handles this gracefully:
+        // a fixture that doesn't intersect the cylinder is unchanged, so we
+        // can apply the same cut to every fixture without per-half logic
+        // (an ejector that snapped to y=0 only crosses the B half; one
+        // snapped to a face high in the A half cuts through both halves on
+        // its way down — both are correct for ejector geometry).
+        float ejectorRadius = 1.5f;
+        float ejectorLen = 25.0f;
+        if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+        {
+            ejectorRadius = frame->GetEjectorDiameter() * 0.5f;
+            ejectorLen = frame->GetEjectorLength();
+        }
+        if (!m_ejectors.empty() && ejectorRadius > 1e-6f && ejectorLen > 1e-6f)
+        {
+            for (int ei = 0; ei < (int)m_ejectors.size(); ++ei)
+            {
+                progress.Update(step++,
+                    fixLabel + ": cutting ejector " +
+                    std::to_string(ei + 1) + " of " +
+                    std::to_string((int)m_ejectors.size()) + "...");
+
+                static constexpr float kCutEps = 0.1f;
+                const glm::vec3 epPt = m_ejectors[ei].point;
+                // Origin lifted by kCutEps in +Y so the cylinder protrudes
+                // above the snap point; total length includes that overrun
+                // plus an equal amount past the bottom.
+                const gp_Ax2 ejAx(
+                    gp_Pnt(epPt.x, epPt.y + kCutEps, epPt.z),
+                    gp_Dir(0.0, -1.0, 0.0)
+                );
+                BRepPrimAPI_MakeCylinder ejCyl(ejAx, ejectorRadius,
+                    ejectorLen + 2.0f * kCutEps);
+                ejCyl.Build();
+                if (!ejCyl.IsDone() || ejCyl.Shape().IsNull()) continue;
+
+                BRepAlgoAPI_Cut ejCut(result, ejCyl.Shape());
+                ejCut.Build();
+                if (!ejCut.IsDone() || ejCut.Shape().IsNull())
+                {
+                    wxMessageBox("Ejector cut failed for ejector " + std::to_string(ei + 1),
+                        "Generate Mould", wxOK | wxICON_WARNING, this);
+                    continue;
+                }
+                result = ejCut.Shape();
+            }
+        }
+        else
+        {
+            // No ejectors / degenerate dimensions — advance progress
+            // counter so the bar stays in step with the loop accounting.
+            step += (int)m_ejectors.size();
+        }
+
         // Step: subtract sprue (frustum + cold slug)
         progress.Update(step++, fixLabel + ": cutting sprue...");
 
@@ -1542,6 +2112,587 @@ bool GLCanvas::RayCastWorldRay(const glm::vec3& origin, const glm::vec3& dir,
     return hit;
 }
 
+// ===========================================================================
+// Align Face — face-region picking and alignment math.
+// ===========================================================================
+//
+// RayCastFacePick — like RayCastObjects but returns which object and which
+// triangle was hit, without computing the surface normal (the BFS does that
+// once it knows the triangle). Manual unprojection rather than reusing
+// RayCastObjects because we need the triangle index, not just the position.
+// ---------------------------------------------------------------------------
+bool GLCanvas::RayCastFacePick(int mouseX, int mouseY, int& outObj, int& outTri)
+{
+    outObj = -1;
+    outTri = -1;
+
+    const wxSize sz = GetClientSize();
+    const int    w = std::max(1, sz.x);
+    const int    h = std::max(1, sz.y);
+
+    const float ndcX = (2.0f * float(mouseX)) / float(w) - 1.0f;
+    const float ndcY = 1.0f - (2.0f * float(mouseY)) / float(h);
+
+    m_camera.SetAspect(float(w) / float(h));
+    const glm::mat4 view = m_camera.View();
+    const glm::mat4 proj = m_camera.Projection();
+    const glm::mat4 invVP = glm::inverse(proj * view);
+
+    glm::vec4 nearH = invVP * glm::vec4(ndcX, ndcY, -1.0f, 1.0f);
+    glm::vec4 farH = invVP * glm::vec4(ndcX, ndcY, 1.0f, 1.0f);
+    nearH /= nearH.w;
+    farH /= farH.w;
+
+    const glm::vec3 rayOrig = glm::vec3(nearH);
+    const glm::vec3 rayDir = glm::normalize(glm::vec3(farH) - glm::vec3(nearH));
+
+    float bestWorldT = std::numeric_limits<float>::max();
+
+    for (int oi = 0; oi < (int)m_objects.size(); ++oi)
+    {
+        const SceneObject& obj = m_objects[oi];
+        if (obj.cpuVerts.empty() || obj.cpuIndices.empty()) continue;
+
+        const glm::mat4 model = obj.BuildModelMatrix();
+        const glm::mat4 invModel = glm::inverse(model);
+
+        const glm::vec3 localOrig = glm::vec3(invModel * glm::vec4(rayOrig, 1.0f));
+        const glm::vec3 localDir = glm::normalize(glm::vec3(invModel * glm::vec4(rayDir, 0.0f)));
+
+        const size_t triCount = obj.cpuIndices.size() / 3;
+        for (size_t t = 0; t < triCount; ++t)
+        {
+            const uint32_t i0 = obj.cpuIndices[3 * t + 0];
+            const uint32_t i1 = obj.cpuIndices[3 * t + 1];
+            const uint32_t i2 = obj.cpuIndices[3 * t + 2];
+
+            const glm::vec3 v0(obj.cpuVerts[i0 * 3], obj.cpuVerts[i0 * 3 + 1], obj.cpuVerts[i0 * 3 + 2]);
+            const glm::vec3 v1(obj.cpuVerts[i1 * 3], obj.cpuVerts[i1 * 3 + 1], obj.cpuVerts[i1 * 3 + 2]);
+            const glm::vec3 v2(obj.cpuVerts[i2 * 3], obj.cpuVerts[i2 * 3 + 1], obj.cpuVerts[i2 * 3 + 2]);
+
+            float localT = 0.0f;
+            if (!RayTriangle(localOrig, localDir, v0, v1, v2, localT)) continue;
+
+            const glm::vec3 localHit = localOrig + localDir * localT;
+            const glm::vec3 worldHit = glm::vec3(model * glm::vec4(localHit, 1.0f));
+            const float     worldT = glm::length(worldHit - rayOrig);
+
+            if (worldT < bestWorldT)
+            {
+                bestWorldT = worldT;
+                outObj = oi;
+                outTri = (int)t;
+            }
+        }
+    }
+
+    return outObj >= 0;
+}
+
+// ---------------------------------------------------------------------------
+// EnsureTriAdjacency — build edge → neighbour-triangle map for one object.
+// Manifold edges (exactly 2 triangles) link both ways. Non-manifold edges
+// (3+ triangles meeting) are robust but degraded: extras are left unlinked
+// rather than overwriting an existing pairing, so BFS may miss some tris on
+// truly non-manifold geometry. Acceptable for a UI feature; revisit if it
+// hurts.
+// ---------------------------------------------------------------------------
+void GLCanvas::EnsureTriAdjacency(SceneObject& obj)
+{
+    if (obj.adjacencyBuilt) return;
+
+    const size_t triCount = obj.cpuIndices.size() / 3;
+    obj.triNeighbors.assign(triCount, std::array<int, 3>{ -1, -1, -1 });
+
+    // Sentinel "already paired" value stored in the temporary edge map so a
+    // 3rd triangle on the same edge gets ignored rather than corrupting the
+    // existing pairing.
+    constexpr int kPaired = -2;
+
+    // Pack (a,b) into a 64-bit key with min-first canonical ordering.
+    auto pack = [](uint32_t a, uint32_t b) -> uint64_t {
+        if (a > b) std::swap(a, b);
+        return (uint64_t(a) << 32) | uint64_t(b);
+        };
+
+    std::unordered_map<uint64_t, std::pair<int, int>> edgeMap;
+    edgeMap.reserve(triCount * 3);
+
+    for (size_t t = 0; t < triCount; ++t)
+    {
+        const uint32_t verts[3] = {
+            obj.cpuIndices[3 * t + 0],
+            obj.cpuIndices[3 * t + 1],
+            obj.cpuIndices[3 * t + 2]
+        };
+        for (int s = 0; s < 3; ++s)
+        {
+            const uint64_t key = pack(verts[s], verts[(s + 1) % 3]);
+            auto it = edgeMap.find(key);
+            if (it == edgeMap.end())
+            {
+                edgeMap.emplace(key, std::make_pair((int)t, s));
+            }
+            else if (it->second.first != kPaired)
+            {
+                const int otherT = it->second.first;
+                const int otherS = it->second.second;
+                obj.triNeighbors[t][s] = otherT;
+                obj.triNeighbors[otherT][otherS] = (int)t;
+                it->second.first = kPaired;  // prevent 3rd-tri corruption
+            }
+            // else: edge already had its pair — leave the 3rd+ tri unlinked.
+        }
+    }
+
+    obj.adjacencyBuilt = true;
+}
+
+// ---------------------------------------------------------------------------
+// GrowCoplanarFace — BFS from a seed triangle across edge-shared neighbours
+// whose normal is within ~1° of the seed's normal. Uses dot > cos(1°), so
+// only same-side coplanar tris are merged (anti-parallel back-faces are
+// excluded — important for thin shells where front and back faces are
+// geometrically coplanar but logically distinct).
+// ---------------------------------------------------------------------------
+void GLCanvas::GrowCoplanarFace(const SceneObject& obj, int seedTri,
+    std::vector<uint32_t>& outTris, glm::vec3& outNormalLocal)
+{
+    outTris.clear();
+    outNormalLocal = glm::vec3(0.0f);
+    if (seedTri < 0 || seedTri >= (int)obj.triNeighbors.size()) return;
+
+    auto triNormal = [&](int t) -> glm::vec3 {
+        const uint32_t i0 = obj.cpuIndices[3 * t + 0];
+        const uint32_t i1 = obj.cpuIndices[3 * t + 1];
+        const uint32_t i2 = obj.cpuIndices[3 * t + 2];
+        const glm::vec3 v0(obj.cpuVerts[i0 * 3], obj.cpuVerts[i0 * 3 + 1], obj.cpuVerts[i0 * 3 + 2]);
+        const glm::vec3 v1(obj.cpuVerts[i1 * 3], obj.cpuVerts[i1 * 3 + 1], obj.cpuVerts[i1 * 3 + 2]);
+        const glm::vec3 v2(obj.cpuVerts[i2 * 3], obj.cpuVerts[i2 * 3 + 1], obj.cpuVerts[i2 * 3 + 2]);
+        const glm::vec3 n = glm::cross(v1 - v0, v2 - v0);
+        const float     len = glm::length(n);
+        return (len > 1e-12f) ? (n / len) : glm::vec3(0.0f, 1.0f, 0.0f);
+        };
+
+    const glm::vec3 seedNormal = triNormal(seedTri);
+    outNormalLocal = seedNormal;
+    constexpr float kCosTol = 0.99985f;  // cos(~1°)
+
+    const size_t triCount = obj.triNeighbors.size();
+    std::vector<uint8_t> visited(triCount, 0);
+    std::vector<int>     stack;
+    stack.reserve(64);
+
+    visited[seedTri] = 1;
+    stack.push_back(seedTri);
+    outTris.push_back((uint32_t)seedTri);
+
+    while (!stack.empty())
+    {
+        const int t = stack.back();
+        stack.pop_back();
+        for (int s = 0; s < 3; ++s)
+        {
+            const int nb = obj.triNeighbors[t][s];
+            if (nb < 0 || visited[nb]) continue;
+
+            const glm::vec3 nNb = triNormal(nb);
+            // dot > kCosTol enforces both "near-parallel" and "same-side".
+            if (glm::dot(nNb, seedNormal) > kCosTol)
+            {
+                visited[nb] = 1;
+                stack.push_back(nb);
+                outTris.push_back((uint32_t)nb);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RebuildAlignHighlightVBO — upload the highlighted face's triangles in
+// world space (model matrix baked in here on the CPU). Lazily creates the
+// VAO/VBO on first use; reuses them on subsequent calls.
+// ---------------------------------------------------------------------------
+void GLCanvas::RebuildAlignHighlightVBO(const SceneObject& obj,
+    const std::vector<uint32_t>& tris)
+{
+    if (tris.empty())
+    {
+        m_alignHighlightVertexCount = 0;
+        return;
+    }
+
+    const glm::mat4 model = obj.BuildModelMatrix();
+
+    std::vector<float> verts;
+    verts.reserve(tris.size() * 9);
+
+    for (uint32_t t : tris)
+    {
+        for (int k = 0; k < 3; ++k)
+        {
+            const uint32_t vi = obj.cpuIndices[3 * t + k];
+            const glm::vec3 vL(obj.cpuVerts[vi * 3],
+                obj.cpuVerts[vi * 3 + 1],
+                obj.cpuVerts[vi * 3 + 2]);
+            const glm::vec3 vW = glm::vec3(model * glm::vec4(vL, 1.0f));
+            verts.push_back(vW.x);
+            verts.push_back(vW.y);
+            verts.push_back(vW.z);
+        }
+    }
+
+    if (m_alignHighlightVAO == 0)
+    {
+        glGenVertexArrays(1, &m_alignHighlightVAO);
+        glGenBuffers(1, &m_alignHighlightVBO);
+        glBindVertexArray(m_alignHighlightVAO);
+        glBindBuffer(GL_ARRAY_BUFFER, m_alignHighlightVBO);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+        glBindVertexArray(0);
+    }
+
+    glBindBuffer(GL_ARRAY_BUFFER, m_alignHighlightVBO);
+    glBufferData(GL_ARRAY_BUFFER, verts.size() * sizeof(float),
+        verts.data(), GL_DYNAMIC_DRAW);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+    m_alignHighlightVertexCount = (GLsizei)(verts.size() / 3);
+}
+
+// ---------------------------------------------------------------------------
+// DecomposeYXZ — extract YXZ Euler angles from a rotation matrix R that was
+// constructed as Ry(yaw) * Rx(pitch) * Rz(roll). Returns degrees.
+//
+// Derivation: with the YXZ convention and column-major glm storage,
+//     R[2][1] = -sin(pitch)
+//     R[2][0] =  sin(yaw)*cos(pitch)
+//     R[2][2] =  cos(yaw)*cos(pitch)
+//     R[0][1] =  cos(pitch)*sin(roll)
+//     R[1][1] =  cos(pitch)*cos(roll)
+// When |cos(pitch)| ≈ 0 (gimbal lock at pitch = ±90°), yaw and roll are
+// indistinguishable along one axis. Convention here: lock roll = 0 and put
+// the rotation into yaw using R[0][0] = cos(yaw) and R[0][2] = -sin(yaw).
+// ---------------------------------------------------------------------------
+void GLCanvas::DecomposeYXZ(const glm::mat3& R,
+    float& yawDeg, float& pitchDeg, float& rollDeg)
+{
+    constexpr float kGimbalEps = 1.0e-5f;
+
+    const float sinPitch = -R[2][1];
+    const float pitch = std::asin(glm::clamp(sinPitch, -1.0f, 1.0f));
+    const float cosPitch = std::cos(pitch);
+
+    float yaw, roll;
+    if (std::abs(cosPitch) > kGimbalEps)
+    {
+        yaw = std::atan2(R[2][0], R[2][2]);
+        roll = std::atan2(R[0][1], R[1][1]);
+    }
+    else
+    {
+        // Gimbal-locked: pin roll to 0 and recover yaw from the X column.
+        roll = 0.0f;
+        yaw = std::atan2(-R[0][2], R[0][0]);
+    }
+
+    yawDeg = glm::degrees(yaw);
+    pitchDeg = glm::degrees(pitch);
+    rollDeg = glm::degrees(roll);
+}
+
+// ---------------------------------------------------------------------------
+// ApplyPlaneAlignmentToObject — core math shared by AlignFace and AlignMidplane.
+//
+// Snaps the local-space plane (planeNormalLocal, anchorLocal) onto world Y=0.
+// The anchor is held fixed laterally (X/Z stays put in world), only Y and the
+// rotation change.
+//
+// Strategy:
+//   1. Map the local plane normal to world space using R_old (object rotation
+//      without scale). Uniform scale doesn't affect normal direction.
+//   2. Pick the target axis as whichever of ±Y is closer to n_w — smallest
+//      rotation, so the user's existing orientation is respected.
+//   3. Build R_delta as the smallest rotation from n_w to the target axis.
+//   4. Compose: R_new = R_delta * R_old, decompose back to YXZ Euler.
+//   5. Solve for the new translation so the anchor stays in place laterally
+//      and lands exactly on Y=0.
+// ---------------------------------------------------------------------------
+void GLCanvas::ApplyPlaneAlignmentToObject(int objIdx,
+    const glm::vec3& planeNormalLocal,
+    const glm::vec3& anchorLocal)
+{
+    if (objIdx < 0 || objIdx >= (int)m_objects.size()) return;
+
+    SceneObject& obj = m_objects[objIdx];
+
+    // ---- 1. Rotation pieces -------------------------------------------------
+    // R_old is the existing object rotation (YXZ). Strip uniform scale from
+    // the model matrix's 3x3 block to get pure rotation.
+    const glm::mat4 modelOld = obj.BuildModelMatrix();
+    glm::mat3 R_old(modelOld);
+    if (obj.scale > 1e-12f)
+        R_old /= obj.scale;
+
+    const glm::vec3 nLocalUnit = glm::normalize(planeNormalLocal);
+    const glm::vec3 nWorld = glm::normalize(R_old * nLocalUnit);
+
+    // ---- 2. Smallest-rotation target on ±Y ---------------------------------
+    const glm::vec3 targetY =
+        (nWorld.y >= 0.0f) ? glm::vec3(0, 1, 0) : glm::vec3(0, -1, 0);
+
+    // ---- 3. R_delta from nWorld to targetY ---------------------------------
+    glm::mat3 R_delta(1.0f);  // identity
+    const float d = glm::clamp(glm::dot(nWorld, targetY), -1.0f, 1.0f);
+    if (d < 0.99999f)
+    {
+        if (d < -0.99999f)
+        {
+            // Anti-parallel: 180° rotation about any axis perpendicular to nWorld.
+            // Pick the world axis least parallel to nWorld for numerical stability.
+            const glm::vec3 candidate =
+                (std::abs(nWorld.x) < 0.9f) ? glm::vec3(1, 0, 0) : glm::vec3(0, 0, 1);
+            const glm::vec3 axis = glm::normalize(glm::cross(nWorld, candidate));
+            R_delta = glm::mat3(glm::rotate(glm::mat4(1.0f),
+                glm::radians(180.0f), axis));
+        }
+        else
+        {
+            const glm::vec3 axis = glm::normalize(glm::cross(nWorld, targetY));
+            const float     angle = std::acos(d);
+            R_delta = glm::mat3(glm::rotate(glm::mat4(1.0f), angle, axis));
+        }
+    }
+
+    // ---- 4. Compose and decompose ------------------------------------------
+    const glm::mat3 R_new = R_delta * R_old;
+    DecomposeYXZ(R_new, obj.yawDeg, obj.pitchDeg, obj.rollDeg);
+
+    // ---- 5. Solve translation ----------------------------------------------
+    // Anchor world position before the rotation:
+    //     a_w = pos_old + R_old * (s * a_local)
+    // After: a_w' = pos_new + R_new * (s * a_local) = pos_new + R_delta * (a_w - pos_old)
+    // We want a_w'.y = 0 and a_w'.xz = a_w.xz (anchor stays put laterally).
+    const glm::vec3 v_old = R_old * (obj.scale * anchorLocal);
+    const glm::vec3 a_w = obj.pos + v_old;
+    const glm::vec3 v_new = R_delta * v_old;
+
+    obj.pos.x = a_w.x - v_new.x;
+    obj.pos.y = -v_new.y;
+    obj.pos.z = a_w.z - v_new.z;
+}
+
+// ---------------------------------------------------------------------------
+// ApplyAlignFaceToObject — thin wrapper. Computes face centroid in local
+// space and delegates to the shared aligner using the face's own normal.
+// ---------------------------------------------------------------------------
+void GLCanvas::ApplyAlignFaceToObject(int objIdx, const glm::vec3& nLocal,
+    const std::vector<uint32_t>& faceTris)
+{
+    if (objIdx < 0 || objIdx >= (int)m_objects.size()) return;
+    if (faceTris.empty()) return;
+
+    const SceneObject& obj = m_objects[objIdx];
+
+    glm::vec3 centroidLocal(0.0f);
+    int       triCounted = 0;
+    for (uint32_t t : faceTris)
+    {
+        const uint32_t i0 = obj.cpuIndices[3 * t + 0];
+        const uint32_t i1 = obj.cpuIndices[3 * t + 1];
+        const uint32_t i2 = obj.cpuIndices[3 * t + 2];
+        const glm::vec3 v0(obj.cpuVerts[i0 * 3], obj.cpuVerts[i0 * 3 + 1], obj.cpuVerts[i0 * 3 + 2]);
+        const glm::vec3 v1(obj.cpuVerts[i1 * 3], obj.cpuVerts[i1 * 3 + 1], obj.cpuVerts[i1 * 3 + 2]);
+        const glm::vec3 v2(obj.cpuVerts[i2 * 3], obj.cpuVerts[i2 * 3 + 1], obj.cpuVerts[i2 * 3 + 2]);
+        centroidLocal += (v0 + v1 + v2) * (1.0f / 3.0f);
+        ++triCounted;
+    }
+    centroidLocal /= float(triCounted);
+
+    ApplyPlaneAlignmentToObject(objIdx, nLocal, centroidLocal);
+}
+
+// ---------------------------------------------------------------------------
+// ApplyAlignMidplaneToObject — combine the locked first face with the
+// freshly-picked second face to derive a midplane, then align that midplane
+// to Y=0.
+//
+// Bisector selection rule: there are two valid bisector planes. We pick the
+// one that *separates the two centroids* — that's bisector B, with normal
+// (n1 - n2), when c1 and c2 lie on opposite sides of it. Otherwise we use
+// bisector A with normal (n1 + n2). This handles both common cases:
+//   • Parallel slab (top + bottom face, n1·n2 ≈ -1): bisector B, parallel to
+//     both faces, halfway between.
+//   • V-shape / wedge (two angled walls): bisector B, the axis-of-symmetry
+//     plane.
+//   • Two parallel same-normal faces (rare; n1·n2 ≈ +1): bisector A.
+//
+// Anchor: midpoint of the two centroids, then projected onto the midplane
+// for numerical cleanliness (the midpoint is already on the midplane in
+// exact arithmetic, but the projection costs one dot product and avoids
+// accumulating any drift).
+// ---------------------------------------------------------------------------
+void GLCanvas::ApplyAlignMidplaneToObject(int objIdx,
+    const glm::vec3& n2Local,
+    const std::vector<uint32_t>& faceTris2)
+{
+    if (objIdx < 0 || objIdx >= (int)m_objects.size()) return;
+    if (faceTris2.empty()) return;
+    if (!m_midplaneFaceLocked || m_midplaneFaceObject != objIdx) return;
+
+    const SceneObject& obj = m_objects[objIdx];
+
+    // ---- Centroid of face 2 (local) ----------------------------------------
+    glm::vec3 c2(0.0f);
+    int       triCounted = 0;
+    for (uint32_t t : faceTris2)
+    {
+        const uint32_t i0 = obj.cpuIndices[3 * t + 0];
+        const uint32_t i1 = obj.cpuIndices[3 * t + 1];
+        const uint32_t i2 = obj.cpuIndices[3 * t + 2];
+        const glm::vec3 v0(obj.cpuVerts[i0 * 3], obj.cpuVerts[i0 * 3 + 1], obj.cpuVerts[i0 * 3 + 2]);
+        const glm::vec3 v1(obj.cpuVerts[i1 * 3], obj.cpuVerts[i1 * 3 + 1], obj.cpuVerts[i1 * 3 + 2]);
+        const glm::vec3 v2(obj.cpuVerts[i2 * 3], obj.cpuVerts[i2 * 3 + 1], obj.cpuVerts[i2 * 3 + 2]);
+        c2 += (v0 + v1 + v2) * (1.0f / 3.0f);
+        ++triCounted;
+    }
+    c2 /= float(triCounted);
+
+    const glm::vec3 n1 = glm::normalize(m_midplaneFaceNormalLocal);
+    const glm::vec3 n2 = glm::normalize(n2Local);
+    const glm::vec3 c1 = m_midplaneFaceCentroidLocal;
+
+    // ---- Bisector selection ------------------------------------------------
+    // Two bisector planes exist between the two face planes:
+    //   A: normal nA = n1 - n2, offset dA = n1·c1 - n2·c2
+    //   B: normal nB = n1 + n2, offset dB = n1·c1 + n2·c2
+    //
+    // We want the bisector that *separates the two centroids* — that's the
+    // one threading between the faces rather than running parallel to both
+    // far away from them.
+    //
+    // Signed distances of c1, c2 from bisector A simplify to:
+    //   sd(c1) = n2 · (c2 - c1)
+    //   sd(c2) = n1 · (c2 - c1)
+    // A separates c1 and c2 iff these have opposite signs (product < 0).
+    //
+    // Worked examples:
+    //   • Parallel slab (n1=+Y, n2=-Y, c1 above, c2 below):
+    //       sd(c1) = -2h, sd(c2) = +2h, opposite signs → A wins, plane y=0. ✓
+    //   • V-wedge (two angled walls, c1 left, c2 right):
+    //       sd(c1) and sd(c2) opposite signs → A wins, plane x=0. ✓
+    //   • Two parallel same-normal stairs (n1 ≈ n2):
+    //       sd(c1)·sd(c2) > 0 → fall through to B, which is the midline
+    //       parallel to both faces. ✓
+    //
+    // The chosen bisector's *unnormalized* normal and offset are kept in
+    // (nRaw, dRaw) so anchor projection below can use the matching sign
+    // pair — picking the right normal but the wrong offset would give the
+    // wrong plane.
+    glm::vec3 nRaw;
+    float     dRaw;
+    {
+        const glm::vec3 nA = n1 - n2;
+        const glm::vec3 nB_vec = n1 + n2;
+        const float     dA = glm::dot(n1, c1) - glm::dot(n2, c2);
+        const float     dB = glm::dot(n1, c1) + glm::dot(n2, c2);
+
+        const float aLen2 = glm::dot(nA, nA);
+        const float bLen2 = glm::dot(nB_vec, nB_vec);
+
+        const glm::vec3 dC = c2 - c1;
+        const float sd1 = glm::dot(n2, dC);
+        const float sd2 = glm::dot(n1, dC);
+
+        if (aLen2 < 1e-10f)
+        {
+            // n1 ≈ n2 (parallel same-normal): A is degenerate, must use B.
+            nRaw = nB_vec;  dRaw = dB;
+        }
+        else if (bLen2 < 1e-10f)
+        {
+            // n1 ≈ -n2 (anti-parallel): B is degenerate, must use A.
+            nRaw = nA;      dRaw = dA;
+        }
+        else if (sd1 * sd2 < 0.0f)
+        {
+            // A separates the centroids — preferred case for slab and wedge.
+            nRaw = nA;      dRaw = dA;
+        }
+        else
+        {
+            // A doesn't separate — fall back to B.
+            nRaw = nB_vec;  dRaw = dB;
+        }
+    }
+
+    const float     rawLen = glm::length(nRaw);
+    const glm::vec3 nMid = nRaw / rawLen;
+    const float     dMid = dRaw / rawLen;
+
+    // ---- Anchor: midpoint of centroids, projected onto the midplane --------
+    // (mid is generally NOT on either bisector — projection is a real step,
+    // not a no-op.)
+    const glm::vec3 mid = 0.5f * (c1 + c2);
+    const glm::vec3 anchorLocal = mid - (glm::dot(nMid, mid) - dMid) * nMid;
+
+    ApplyPlaneAlignmentToObject(objIdx, nMid, anchorLocal);
+}
+
+// ---------------------------------------------------------------------------
+// RebuildMidplaneLockedVBO — twin of RebuildAlignHighlightVBO for the
+// persistent locked-face overlay shown after the user picks face 1 in
+// midplane mode.
+// ---------------------------------------------------------------------------
+void GLCanvas::RebuildMidplaneLockedVBO(const SceneObject& obj,
+    const std::vector<uint32_t>& tris)
+{
+    if (tris.empty())
+    {
+        m_midplaneLockedVertexCount = 0;
+        return;
+    }
+
+    const glm::mat4 model = obj.BuildModelMatrix();
+
+    std::vector<float> verts;
+    verts.reserve(tris.size() * 9);
+
+    for (uint32_t t : tris)
+    {
+        for (int k = 0; k < 3; ++k)
+        {
+            const uint32_t vi = obj.cpuIndices[3 * t + k];
+            const glm::vec3 vL(obj.cpuVerts[vi * 3],
+                obj.cpuVerts[vi * 3 + 1],
+                obj.cpuVerts[vi * 3 + 2]);
+            const glm::vec3 vW = glm::vec3(model * glm::vec4(vL, 1.0f));
+            verts.push_back(vW.x);
+            verts.push_back(vW.y);
+            verts.push_back(vW.z);
+        }
+    }
+
+    if (m_midplaneLockedVAO == 0)
+    {
+        glGenVertexArrays(1, &m_midplaneLockedVAO);
+        glGenBuffers(1, &m_midplaneLockedVBO);
+        glBindVertexArray(m_midplaneLockedVAO);
+        glBindBuffer(GL_ARRAY_BUFFER, m_midplaneLockedVBO);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+        glBindVertexArray(0);
+    }
+
+    glBindBuffer(GL_ARRAY_BUFFER, m_midplaneLockedVBO);
+    glBufferData(GL_ARRAY_BUFFER, verts.size() * sizeof(float),
+        verts.data(), GL_DYNAMIC_DRAW);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+    m_midplaneLockedVertexCount = (GLsizei)(verts.size() / 3);
+}
+
 // ---------------------------------------------------------------------------
 // RayCastParting — snaps to the nearest point on the mesh's parting line.
 //
@@ -1566,7 +2717,8 @@ static glm::vec3 ClosestPointOnSegment(const glm::vec3& a, const glm::vec3& b, c
 }
 
 bool GLCanvas::RayCastParting(int mouseX, int mouseY,
-    glm::vec3& outPos, glm::vec3& outNormal)
+    glm::vec3& outPos, glm::vec3& outNormal,
+    int* outObjectIndex)
 {
     const wxSize sz = GetClientSize();
     const int    w = std::max(1, sz.x);
@@ -1596,10 +2748,12 @@ bool GLCanvas::RayCastParting(int mouseX, int mouseY,
     float     bestDist = kVentSnapRadius;
     glm::vec3 bestPos(0.0f);
     glm::vec3 bestNormal(0.0f, 1.0f, 0.0f);
+    int       bestObj = -1;
     bool      found = false;
 
-    for (const auto& obj : m_objects)
+    for (int objIdx = 0; objIdx < (int)m_objects.size(); ++objIdx)
     {
+        const auto& obj = m_objects[objIdx];
         if (obj.cpuVerts.empty() || obj.cpuIndices.empty()) continue;
 
         const glm::mat4 model = obj.BuildModelMatrix();
@@ -1668,6 +2822,7 @@ bool GLCanvas::RayCastParting(int mouseX, int mouseY,
                 worldFaceN.y = 0.0f;
                 const float nlen = glm::length(worldFaceN);
                 bestNormal = (nlen > 1e-4f) ? worldFaceN / nlen : glm::vec3(0.0f, 0.0f, 1.0f);
+                bestObj = objIdx;
                 found = true;
             }
         }
@@ -1678,6 +2833,7 @@ bool GLCanvas::RayCastParting(int mouseX, int mouseY,
         outPos = bestPos;
         outNormal = bestNormal;
     }
+    if (outObjectIndex) *outObjectIndex = found ? bestObj : -1;
     return found;
 }
 
@@ -1714,6 +2870,159 @@ bool GLCanvas::RayCastToPartingPlane(int mouseX, int mouseY, glm::vec3& outPos)
 }
 
 // ---------------------------------------------------------------------------
+// RayCastEjectorSnap — pick helper for ejector placement.
+//
+// Considers four candidate sources, picks the one closest to the cursor in
+// SCREEN SPACE (pixels), and returns its world-space position. Screen-space
+// is the right metric for "snap feel" — feature spacing in 3D varies wildly
+// with camera distance, but a fixed pixel radius behaves consistently at
+// every zoom level (it's what the user actually sees).
+//
+// Candidate sources (only those currently valid in the scene):
+//   1. Sprue parting point      — m_sprue.partingPos (degenerate "segment")
+//   2. Each runner segment      — m_sprue.partingPos -> rf.point, on y=0
+//   3. Each gate segment        — gf.point.worldPos -> gf.pathEnd
+//   4. Object surfaces          — full mesh ray-cast via RayCastObjects
+//
+// Resolution rule:
+//   - Path snap (1/2/3) wins if any candidate is within kEjectorSnapRadiusPx
+//     of the cursor in pixels. Otherwise fall through to the face ray-cast.
+//   - This priority ordering is deliberate: hovering over a face that a gate
+//     path crosses should still let the user snap to the path, not always
+//     win on the face. Outside the snap radius, faces take over.
+//
+// The "closest 3D point on segment AB to the picking ray" is the foot of the
+// common perpendicular between the two lines, clamped to AB's [0,1] range.
+// For the sprue parting point (a single point) and for object surfaces (a
+// definite hit) the screen-space test is straightforward.
+// ---------------------------------------------------------------------------
+bool GLCanvas::RayCastEjectorSnap(int mouseX, int mouseY, glm::vec3& outPos)
+{
+    const wxSize sz = GetClientSize();
+    const int    w = std::max(1, sz.x);
+    const int    h = std::max(1, sz.y);
+
+    m_camera.SetAspect(float(w) / float(h));
+    const glm::mat4 view = m_camera.View();
+    const glm::mat4 proj = m_camera.Projection();
+    const glm::mat4 viewProj = proj * view;
+
+    // Build the same world-space ray we'd use elsewhere (mirrors
+    // RayCastObjects / RayCastToPartingPlane setup).
+    const float ndcX = (2.0f * float(mouseX)) / float(w) - 1.0f;
+    const float ndcY = 1.0f - (2.0f * float(mouseY)) / float(h);
+    const glm::mat4 invVP = glm::inverse(viewProj);
+    glm::vec4 nearH = invVP * glm::vec4(ndcX, ndcY, -1.0f, 1.0f);
+    glm::vec4 farH = invVP * glm::vec4(ndcX, ndcY, 1.0f, 1.0f);
+    nearH /= nearH.w;
+    farH /= farH.w;
+    const glm::vec3 rayOrig = glm::vec3(nearH);
+    const glm::vec3 rayDir = glm::normalize(glm::vec3(farH) - glm::vec3(nearH));
+
+    // Cursor in pixel coords (captured by lambdas below). Brace init is
+    // mandatory here: 'glm::vec2 cursorPx(float(mouseX), float(mouseY))' is
+    // interpreted by MSVC as a function declaration (the "most vexing
+    // parse"), which then causes confusing cascade errors at every use site.
+    const glm::vec2 cursorPx{ float(mouseX), float(mouseY) };
+
+    // Helper: project a world-space point to screen pixels. Returns false if
+    // the point is behind the camera (clip-space w <= 0). Explicit return
+    // type kept off the trailing position to avoid a known MSVC parser
+    // quirk where trailing-return lambdas in tight succession can confuse
+    // the parser of a following statement; both helpers are written as
+    // void/bool returners with the type in front via the declared return.
+    auto worldToScreen = [&](const glm::vec3& world, glm::vec2& outPx)
+        {
+            const glm::vec4 clip = viewProj * glm::vec4(world, 1.0f);
+            if (clip.w <= 1e-6f) return false;
+            const glm::vec3 ndc(clip.x / clip.w, clip.y / clip.w, clip.z / clip.w);
+            outPx.x = (ndc.x * 0.5f + 0.5f) * float(w);
+            outPx.y = (1.0f - (ndc.y * 0.5f + 0.5f)) * float(h);
+            return true;
+        };
+
+    // Helper: closest point on segment AB to the picking ray. Computes the
+    // common perpendicular's foot on AB and clamps to [0,1]. Degenerate
+    // segments collapse to A.
+    auto closestOnSegment = [&](const glm::vec3& A, const glm::vec3& B)
+        {
+            const glm::vec3 AB = B - A;
+            const float lenAB2 = glm::dot(AB, AB);
+            if (lenAB2 < 1e-10f) return A;
+
+            const glm::vec3 w0 = A - rayOrig;
+            const float aSq = lenAB2;
+            const float bDot = glm::dot(AB, rayDir);
+            const float cSq = glm::dot(rayDir, rayDir);   // == 1 (rayDir is normalised)
+            const float dDot = glm::dot(AB, w0);
+            const float eDot = glm::dot(rayDir, w0);
+            const float denom = aSq * cSq - bDot * bDot;  // 0 iff AB || ray
+
+            float tSeg = 0.0f;
+            if (denom >= 1e-10f)
+                tSeg = (bDot * eDot - cSq * dDot) / denom;
+            tSeg = glm::clamp(tSeg, 0.0f, 1.0f);
+            return A + AB * tSeg;
+        };
+
+    float     bestPx = kEjectorSnapRadiusPx;
+    glm::vec3 bestWorld(0.0f);
+    bool      hit = false;
+
+    // Inlined snap test rather than a third lambda — keeps the math local
+    // to each candidate and avoids any chance of parser confusion from
+    // back-to-back captured lambdas.
+    auto consider = [&](const glm::vec3& candidate)
+        {
+            glm::vec2 px;
+            if (!worldToScreen(candidate, px)) return;
+            const glm::vec2 delta = px - cursorPx;
+            const float distPx = glm::length(delta);
+            if (distPx < bestPx)
+            {
+                bestPx = distPx;
+                bestWorld = candidate;
+                hit = true;
+            }
+        };
+
+    // 1. Sprue parting point (single-point candidate).
+    if (m_sprue.hasPartingPoint)
+        consider(m_sprue.partingPos);
+
+    // 2. Runner segments (sprue parting -> runner pt, on y=0).
+    if (m_sprue.hasPartingPoint)
+        for (const RunnerFeature& rf : m_runners)
+            consider(closestOnSegment(m_sprue.partingPos, rf.point));
+
+    // 3. Gate segments (gate worldPos -> gate.pathEnd). pathEnd is only
+    //    valid when hasPath is true (computed by RebuildGatePathVBO).
+    for (const GateFeature& gf : m_gates)
+    {
+        if (!gf.hasPath) continue;
+        consider(closestOnSegment(gf.point.worldPos, gf.pathEnd));
+    }
+
+    if (hit)
+    {
+        outPos = bestWorld;
+        return true;
+    }
+
+    // 4. Fall through to object surfaces. RayCastObjects does the full
+    //    Möller-Trumbore mesh test and returns the world-space hit; we
+    //    discard the normal (ejectors don't store one).
+    glm::vec3 faceHit, faceNormal;
+    if (RayCastObjects(mouseX, mouseY, faceHit, faceNormal))
+    {
+        outPos = faceHit;
+        return true;
+    }
+
+    return false;
+}
+
+// ---------------------------------------------------------------------------
 // ClearRunnerPoints
 // ---------------------------------------------------------------------------
 void GLCanvas::ClearRunnerPoints()
@@ -1733,6 +3042,19 @@ void GLCanvas::ClearGatePoints()
     m_gateGhostActive = false;
     RebuildGatePathVBO();
     RebuildGateSolids();
+    Refresh(false);
+}
+
+void GLCanvas::ClearEjectors()
+{
+    // Mirrors ClearGatePoints — destroys GPU resources, clears the vector,
+    // resets the ghost preview, and refreshes. No path VBO equivalent for
+    // ejectors (they're standalone cylinders, not connected to a feed
+    // network), so RebuildEjectorSolids() is the only rebuild needed; with
+    // an empty vector it falls through its early-out cleanly.
+    for (auto& ef : m_ejectors) ef.Destroy();
+    m_ejectors.clear();
+    m_ejectorGhostActive = false;
     Refresh(false);
 }
 
@@ -1878,6 +3200,41 @@ void GLCanvas::RemoveGateAtMouse(int mouseX, int mouseY)
 
     RebuildGatePathVBO();
     RebuildGateSolids();
+    Refresh(false);
+}
+
+// ---------------------------------------------------------------------------
+// RemoveEjectorAtMouse — removes the ejector whose marker is closest to the
+// ray. Mirrors RemoveGateAtMouse but operates on m_ejectors and only needs
+// to rebuild the ejector solids (no path VBO).
+// ---------------------------------------------------------------------------
+void GLCanvas::RemoveEjectorAtMouse(int mouseX, int mouseY)
+{
+    if (m_ejectors.empty()) return;
+
+    glm::vec3 rayOrig, rayDir;
+    BuildMouseRay(mouseX, mouseY, rayOrig, rayDir);
+
+    const float hitRadius = kVentMarkerRadius * 2.0f;
+    float bestDist = hitRadius;
+    int   bestIdx = -1;
+
+    for (int i = 0; i < (int)m_ejectors.size(); ++i)
+    {
+        const float d = PointRayDistance(m_ejectors[i].point, rayOrig, rayDir);
+        if (d < bestDist)
+        {
+            bestDist = d;
+            bestIdx = i;
+        }
+    }
+
+    if (bestIdx < 0) return;
+
+    m_ejectors[bestIdx].Destroy();
+    m_ejectors.erase(m_ejectors.begin() + bestIdx);
+
+    RebuildEjectorSolids();
     Refresh(false);
 }
 
@@ -2370,6 +3727,12 @@ void GLCanvas::DestroyGL()
     if (m_runnerPathVAO) { glDeleteVertexArrays(1, &m_runnerPathVAO);    m_runnerPathVAO = 0; }
     if (m_gatePathVBO) { glDeleteBuffers(1, &m_gatePathVBO);           m_gatePathVBO = 0; }
     if (m_gatePathVAO) { glDeleteVertexArrays(1, &m_gatePathVAO);      m_gatePathVAO = 0; }
+    if (m_alignHighlightVBO) { glDeleteBuffers(1, &m_alignHighlightVBO);     m_alignHighlightVBO = 0; }
+    if (m_alignHighlightVAO) { glDeleteVertexArrays(1, &m_alignHighlightVAO); m_alignHighlightVAO = 0; }
+    m_alignHighlightVertexCount = 0;
+    if (m_midplaneLockedVBO) { glDeleteBuffers(1, &m_midplaneLockedVBO);     m_midplaneLockedVBO = 0; }
+    if (m_midplaneLockedVAO) { glDeleteVertexArrays(1, &m_midplaneLockedVAO); m_midplaneLockedVAO = 0; }
+    m_midplaneLockedVertexCount = 0;
     if (m_sphereEBO) { glDeleteBuffers(1, &m_sphereEBO);          m_sphereEBO = 0; }
     if (m_sphereVBO) { glDeleteBuffers(1, &m_sphereVBO);          m_sphereVBO = 0; }
     if (m_sphereVAO) { glDeleteVertexArrays(1, &m_sphereVAO);     m_sphereVAO = 0; }
@@ -2733,6 +4096,92 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         glBindVertexArray(0);
     }
 
+    // ---- AlignFace hover highlight -----------------------------------------
+    // Deferred ray-cast pass: runs once per rendered frame regardless of how
+    // many mouse-motion events have queued up. Detects whether the hover has
+    // moved to a new face/object and rebuilds the highlight VBO only on change.
+    if (m_transformMode == TransformMode::AlignFace ||
+        m_transformMode == TransformMode::AlignMidplane)
+    {
+        int hoverObj = -1, hoverTri = -1;
+        const bool hovered = RayCastFacePick(m_alignMousePos.x,
+            m_alignMousePos.y, hoverObj, hoverTri);
+
+        if (!hovered)
+        {
+            if (m_alignHoverObject != -1 || m_alignSeedTri != -1)
+            {
+                m_alignHoverObject = -1;
+                m_alignSeedTri = -1;
+                m_alignFaceTris.clear();
+                m_alignHighlightVertexCount = 0;
+            }
+        }
+        else if (hoverObj != m_alignHoverObject || hoverTri != m_alignSeedTri)
+        {
+            // New face hovered: grow region and rebuild VBO.
+            EnsureTriAdjacency(m_objects[hoverObj]);
+            GrowCoplanarFace(m_objects[hoverObj], hoverTri,
+                m_alignFaceTris, m_alignFaceNormalLocal);
+            RebuildAlignHighlightVBO(m_objects[hoverObj], m_alignFaceTris);
+            m_alignHoverObject = hoverObj;
+            m_alignSeedTri = hoverTri;
+        }
+
+        // Two render passes share the same flat-shader setup. The locked
+        // face (AlignMidplane only) draws first in selection-outline yellow,
+        // then the dark-grey hover highlight on top — so when the cursor is
+        // hovering over the locked face the hover colour wins, giving the
+        // user clear feedback that re-clicking the same face is possible.
+        // Both passes use glPolygonOffset to win the depth fight against
+        // the underlying object surface.
+        const bool drawLocked =
+            (m_transformMode == TransformMode::AlignMidplane) &&
+            m_midplaneFaceLocked &&
+            m_midplaneLockedVAO != 0 &&
+            m_midplaneLockedVertexCount > 0;
+        const bool drawHover =
+            (m_alignHighlightVAO != 0) &&
+            (m_alignHighlightVertexCount > 0);
+
+        if (m_flatProgram && (drawLocked || drawHover))
+        {
+            glEnable(GL_DEPTH_TEST);
+            glDepthFunc(GL_LEQUAL);
+            glEnable(GL_POLYGON_OFFSET_FILL);
+            glPolygonOffset(-1.0f, -1.0f);
+
+            glUseProgram(m_flatProgram);
+            const glm::mat4 VP = proj * view;
+            glUniformMatrix4fv(m_flat_uVP, 1, GL_FALSE, &VP[0][0]);
+
+            if (drawLocked)
+            {
+                // Selection-outline yellow (matches fsOutline shader).
+                const glm::vec4 lockedColor(1.0f, 0.75f, 0.2f, 1.0f);
+                glUniform4fv(m_flat_uColor, 1, &lockedColor[0]);
+                glBindVertexArray(m_midplaneLockedVAO);
+                glDrawArrays(GL_TRIANGLES, 0, m_midplaneLockedVertexCount);
+                glBindVertexArray(0);
+            }
+
+            if (drawHover)
+            {
+                const glm::vec4 hoverColor(0.18f, 0.18f, 0.18f, 1.0f);
+                glUniform4fv(m_flat_uColor, 1, &hoverColor[0]);
+                glBindVertexArray(m_alignHighlightVAO);
+                glDrawArrays(GL_TRIANGLES, 0, m_alignHighlightVertexCount);
+                glBindVertexArray(0);
+            }
+
+            glDisable(GL_POLYGON_OFFSET_FILL);
+            glDepthFunc(GL_LESS);
+
+            // Restore the lit shader for any subsequent passes that expect it.
+            glUseProgram(m_program);
+        }
+    }
+
     // Determine which fixture is transparent this frame
 // Above grid: A (index 0) is transparent. Below grid: B (index 1) is transparent.
     const int transparentIndex = cameraAboveGrid ? 0 : 1;
@@ -2758,6 +4207,15 @@ void GLCanvas::OnPaint(wxPaintEvent&)
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glDepthMask(GL_FALSE);   // don't write depth — keeps vent markers visible through the tint
 
+    // Nudge the transparent half's fragments back in depth-buffer space so
+    // its parting face (coplanar with the opaque half's parting face at y=0)
+    // loses the depth test cleanly instead of z-fighting against it. Without
+    // this, fragments on both faces share the same post-projection depth and
+    // floating-point rounding flips individual pixels frame-to-frame, which
+    // shows up as flicker along the parting line.
+    glEnable(GL_POLYGON_OFFSET_FILL);
+    glPolygonOffset(1.0f, 1.0f);
+
     if (transparentIndex < (int)m_fixtures.size())
     {
         const SceneObject& obj = m_fixtures[transparentIndex];
@@ -2772,6 +4230,9 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         }
     }
 
+    glPolygonOffset(0.0f, 0.0f);
+    glDisable(GL_POLYGON_OFFSET_FILL);
+
     glDepthMask(GL_TRUE);
     glDisable(GL_BLEND);
 
@@ -2784,7 +4245,7 @@ void GLCanvas::OnPaint(wxPaintEvent&)
     m_grid.Draw(view, proj);
 
     // Outline for selected object
-    if (m_selectedIndex >= 0 && m_selectedIndex < (int)m_objects.size())
+    if (!m_selectedIndices.empty())
     {
         RenderPickPass_NoRead(w, h);
 
@@ -2800,15 +4261,26 @@ void GLCanvas::OnPaint(wxPaintEvent&)
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, m_pickColorTex);
 
-            const uint32_t targetId = (uint32_t)(m_selectedIndex + 1);
+            // Per-pass-invariant uniforms set once.
             glUniform1i(m_outline_uIdTex, 0);
-            glUniform1ui(m_outline_uTargetId, targetId);
             glUniform2i(m_outline_uTexSize, m_pickW, m_pickH);
             glUniform1f(m_outline_uAlpha, 0.9f);
             glUniform1i(m_outline_uThickness, 2);
 
             glBindVertexArray(m_fullscreenVAO);
-            glDrawArrays(GL_TRIANGLES, 0, 3);
+
+            // The outline shader takes a single uTargetId and detects edges
+            // between that ID and everything else in the pick texture, so we
+            // do one fullscreen pass per selected object. The pick texture
+            // is shared across passes — only uTargetId varies.
+            for (int idx : m_selectedIndices)
+            {
+                if (idx < 0 || idx >= (int)m_objects.size()) continue;
+                const uint32_t targetId = (uint32_t)(idx + 1);
+                glUniform1ui(m_outline_uTargetId, targetId);
+                glDrawArrays(GL_TRIANGLES, 0, 3);
+            }
+
             glBindVertexArray(0);
             glBindTexture(GL_TEXTURE_2D, 0);
             glUseProgram(0);
@@ -2828,11 +4300,31 @@ void GLCanvas::OnPaint(wxPaintEvent&)
             m_editFeatureIndex >= 0 && m_editFeatureIndex < (int)m_vents.size())
         {
             glm::vec3 hitPos, hitNormal;
-            if (RayCastParting(m_editMousePos.x, m_editMousePos.y, hitPos, hitNormal))
+            int       hitObj = -1;
+            if (RayCastParting(m_editMousePos.x, m_editMousePos.y, hitPos, hitNormal, &hitObj))
             {
                 VentInstance& vi = m_vents[m_editFeatureIndex];
                 vi.Destroy();
                 vi.point = VentPoint{ hitPos, hitNormal };
+
+                // Edit-drag re-captures parent association: if the user drags
+                // a vent onto a different object's surface, the new object
+                // becomes its parent. Snapping to no object resets to
+                // unparented (vent stops following any object).
+                if (hitObj >= 0 && hitObj < (int)m_objects.size())
+                {
+                    const glm::mat4 m = m_objects[hitObj].BuildModelMatrix();
+                    const glm::mat4 invM = glm::inverse(m);
+                    vi.parentIndex = hitObj;
+                    vi.localPos = glm::vec3(invM * glm::vec4(hitPos, 1.0f));
+                    glm::vec3 ln = glm::transpose(glm::mat3(m)) * hitNormal;
+                    const float lnLen = glm::length(ln);
+                    vi.localNormal = (lnLen > 1e-6f) ? ln / lnLen : glm::vec3(0, 0, 1);
+                }
+                else
+                {
+                    vi.parentIndex = -1;
+                }
 
                 float ventLength = 5.0f, ventWidth = 2.0f,
                     ventOverrunStart = 0.5f, ventOverrunEnd = 0.5f;
@@ -2875,14 +4367,48 @@ void GLCanvas::OnPaint(wxPaintEvent&)
             m_editFeatureIndex >= 0 && m_editFeatureIndex < (int)m_gates.size())
         {
             glm::vec3 hitPos, hitNormal;
-            if (RayCastParting(m_editMousePos.x, m_editMousePos.y, hitPos, hitNormal))
+            int       hitObj = -1;
+            if (RayCastParting(m_editMousePos.x, m_editMousePos.y, hitPos, hitNormal, &hitObj))
             {
                 GateFeature& gf = m_gates[m_editFeatureIndex];
                 gf.Destroy();
                 gf.point = VentPoint{ hitPos, hitNormal };
 
+                // Edit-drag re-captures parent association — see the EditVent
+                // branch above for the rationale.
+                if (hitObj >= 0 && hitObj < (int)m_objects.size())
+                {
+                    const glm::mat4 m = m_objects[hitObj].BuildModelMatrix();
+                    const glm::mat4 invM = glm::inverse(m);
+                    gf.parentIndex = hitObj;
+                    gf.localPos = glm::vec3(invM * glm::vec4(hitPos, 1.0f));
+                    glm::vec3 ln = glm::transpose(glm::mat3(m)) * hitNormal;
+                    const float lnLen = glm::length(ln);
+                    gf.localNormal = (lnLen > 1e-6f) ? ln / lnLen : glm::vec3(0, 0, 1);
+                }
+                else
+                {
+                    gf.parentIndex = -1;
+                }
+
                 RebuildGatePathVBO();
                 RebuildGateSolids();
+            }
+        }
+        else if (m_transformMode == TransformMode::EditEjector &&
+            m_editFeatureIndex >= 0 && m_editFeatureIndex < (int)m_ejectors.size())
+        {
+            // Re-snap the dragged ejector with the same picker used at
+            // initial placement (RayCastEjectorSnap), so dragging onto a
+            // runner / gate / sprue parting / object face all behave
+            // exactly like placing a new ejector. RebuildEjectorSolids
+            // reconstructs the cylinder from the new point + current UI
+            // dimensions, mirroring the EditGate convention.
+            glm::vec3 hitPos;
+            if (RayCastEjectorSnap(m_editMousePos.x, m_editMousePos.y, hitPos))
+            {
+                m_ejectors[m_editFeatureIndex].point = hitPos;
+                RebuildEjectorSolids();
             }
         }
     }
@@ -3143,6 +4669,101 @@ void GLCanvas::OnPaint(wxPaintEvent&)
             for (int i = 0; i < (int)m_gates.size(); ++i)
             {
                 glm::mat4 model = glm::translate(glm::mat4(1.0f), m_gates[i].point.worldPos);
+                model = glm::scale(model, glm::vec3(kVentMarkerRadius));
+                glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &model[0][0]);
+                glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
+            }
+        }
+
+        glBindVertexArray(0);
+        glUseProgram(0);
+    }
+
+    // ---- Ejector point markers (cyan spheres) ------------------------------
+    // Mirrors the vent / gate marker pattern, but with an extended snap pick
+    // (RayCastEjectorSnap) instead of the parting-line snap. The ghost
+    // tracks whichever candidate currently wins (sprue parting pt / runner
+    // segment / gate segment / object face).
+    if (m_transformMode == TransformMode::PlaceEjector)
+    {
+        glm::vec3 hitPos;
+        m_ejectorGhostActive = RayCastEjectorSnap(m_ejectorGhostMousePos.x,
+            m_ejectorGhostMousePos.y, hitPos);
+        m_ejectorGhostPos = hitPos;
+    }
+    if (m_program && m_sphereVAO && m_sphereIndexCount > 0 &&
+        (!m_ejectors.empty() || m_ejectorGhostActive))
+    {
+        glEnable(GL_DEPTH_TEST);
+        glUseProgram(m_program);
+
+        glUniform3fv(glGetUniformLocation(m_program, "uCameraPos"), 1, &camPos[0]);
+        glUniform3fv(glGetUniformLocation(m_program, "uLightDir"), 1, &lightDir[0]);
+        glUniform3fv(glGetUniformLocation(m_program, "uLightColor"), 1, &lightColor[0]);
+        glUniform1f(glGetUniformLocation(m_program, "uAmbient"), 0.35f);
+        glUniform1f(glGetUniformLocation(m_program, "uDiffuse"), 0.75f);
+        glUniform1f(glGetUniformLocation(m_program, "uSpecular"), 0.60f);
+        glUniform1f(glGetUniformLocation(m_program, "uShininess"), 48.0f);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uView"), 1, GL_FALSE, &view[0][0]);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uProj"), 1, GL_FALSE, &proj[0][0]);
+
+        glBindVertexArray(m_sphereVAO);
+
+        // Ghost preview — translucent cyan, slightly oversized to read against
+        // a runner / gate line that already lives at the same world location.
+        if (m_ejectorGhostActive)
+        {
+            const glm::vec3 ghostColor(0.20f, 0.85f, 0.95f);   // cyan
+            glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &ghostColor[0]);
+            glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 0.45f);
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glDepthMask(GL_FALSE);
+
+            glm::mat4 model = glm::translate(glm::mat4(1.0f), m_ejectorGhostPos);
+            model = glm::scale(model, glm::vec3(kVentMarkerRadius * 1.15f));
+            glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &model[0][0]);
+            glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
+
+            glDepthMask(GL_TRUE);
+            glDisable(GL_BLEND);
+        }
+
+        // Confirmed ejector points — halo pass (edit mode) then markers.
+        if (!m_ejectors.empty())
+        {
+            // Pass 1: highlight halo for the selected marker (drawn behind
+            // via the depth-mask-off blend, same convention as gates).
+            // Orange against cyan markers — matches the gate halo so the
+            // edit-mode visual idiom is consistent across feature types.
+            if (m_transformMode == TransformMode::EditEjector &&
+                m_editFeatureIndex >= 0 && m_editFeatureIndex < (int)m_ejectors.size())
+            {
+                const glm::vec3 haloColor(1.0f, 0.55f, 0.0f);
+                glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &haloColor[0]);
+                glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 0.55f);
+                glEnable(GL_BLEND);
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                glDepthMask(GL_FALSE);
+
+                glm::mat4 model = glm::translate(glm::mat4(1.0f),
+                    m_ejectors[m_editFeatureIndex].point);
+                model = glm::scale(model, glm::vec3(kVentMarkerRadius * 1.8f));
+                glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &model[0][0]);
+                glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
+
+                glDepthMask(GL_TRUE);
+                glDisable(GL_BLEND);
+            }
+
+            // Pass 2: normal markers.
+            const glm::vec3 ejectorColor(0.20f, 0.85f, 0.95f);
+            glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &ejectorColor[0]);
+            glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 1.0f);
+
+            for (const EjectorFeature& ef : m_ejectors)
+            {
+                glm::mat4 model = glm::translate(glm::mat4(1.0f), ef.point);
                 model = glm::scale(model, glm::vec3(kVentMarkerRadius));
                 glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &model[0][0]);
                 glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
@@ -3517,6 +5138,47 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         glDisable(GL_BLEND);
     }
 
+    // ---- Ejector solids (lit, semi-transparent cyan) -----------------------
+    // Mirrors the gate-solid block exactly: same lighting setup, same blend
+    // / depth-mask convention, only the colour and the source vector differ.
+    // The cyan matches the ejector marker spheres so the geometry visually
+    // groups with its placement point.
+    if (m_program && !m_ejectors.empty())
+    {
+        glEnable(GL_DEPTH_TEST);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glDepthMask(GL_FALSE);
+        glUseProgram(m_program);
+
+        const glm::mat4 identity(1.0f);
+        glUniform3fv(glGetUniformLocation(m_program, "uCameraPos"), 1, &camPos[0]);
+        glUniform3fv(glGetUniformLocation(m_program, "uLightDir"), 1, &lightDir[0]);
+        glUniform3fv(glGetUniformLocation(m_program, "uLightColor"), 1, &lightColor[0]);
+        glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 0.55f);
+        glUniform1f(glGetUniformLocation(m_program, "uAmbient"), 0.30f);
+        glUniform1f(glGetUniformLocation(m_program, "uDiffuse"), 0.80f);
+        glUniform1f(glGetUniformLocation(m_program, "uSpecular"), 0.40f);
+        glUniform1f(glGetUniformLocation(m_program, "uShininess"), 32.0f);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uView"), 1, GL_FALSE, &view[0][0]);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uProj"), 1, GL_FALSE, &proj[0][0]);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &identity[0][0]);
+
+        const glm::vec3 ejectorColor(0.20f, 0.85f, 0.95f);   // cyan
+        glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &ejectorColor[0]);
+        for (const EjectorFeature& ef : m_ejectors)
+        {
+            if (!ef.solid.valid || ef.solid.vao == 0) continue;
+            glBindVertexArray(ef.solid.vao);
+            glDrawElements(GL_TRIANGLES, ef.solid.indexCount, GL_UNSIGNED_INT, 0);
+        }
+
+        glBindVertexArray(0);
+        glUseProgram(0);
+        glDepthMask(GL_TRUE);
+        glDisable(GL_BLEND);
+    }
+
     // ---- Sprue solid (lit, semi-transparent purple) ------------------------
     if (m_program && m_sprue.solid.valid && m_sprue.solid.vao != 0)
     {
@@ -3647,17 +5309,77 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
         if (m_transformMode == TransformMode::Select)
         {
             const wxPoint p = evt.GetPosition();
-            m_selectedIndex = PickObjectAt(p.x, p.y);
+            const int hit = PickObjectAt(p.x, p.y);
+            const bool ctrl = evt.ControlDown();
+
+            if (ctrl)
+            {
+                // Ctrl+LMB: toggle the hit object in the selection. A miss
+                // is a no-op so users can drift the cursor mid-modifier
+                // without losing selection.
+                if (hit >= 0)
+                {
+                    auto it = std::find(m_selectedIndices.begin(),
+                        m_selectedIndices.end(), hit);
+                    if (it != m_selectedIndices.end())
+                        m_selectedIndices.erase(it);
+                    else
+                        m_selectedIndices.push_back(hit);
+                }
+            }
+            else
+            {
+                // Plain LMB:
+                //   miss          -> clear selection
+                //   hit unselected -> replace selection with {hit}
+                //   hit already-selected -> leave the vector alone, so the
+                //     follow-up drag in OnMotion moves the whole group as
+                //     a rigid unit (without this, clicking any member of a
+                //     multi-selection would collapse it to that one object).
+                if (hit < 0)
+                {
+                    m_selectedIndices.clear();
+                }
+                else
+                {
+                    const bool already = std::find(m_selectedIndices.begin(),
+                        m_selectedIndices.end(), hit) != m_selectedIndices.end();
+                    if (!already)
+                    {
+                        m_selectedIndices.clear();
+                        m_selectedIndices.push_back(hit);
+                    }
+                }
+            }
             Refresh(false);
         }
         else if (m_transformMode == TransformMode::PlaceVent)
         {
             const wxPoint p = evt.GetPosition();
             glm::vec3 hitPos, hitNormal;
-            if (RayCastParting(p.x, p.y, hitPos, hitNormal))
+            int       hitObj = -1;
+            if (RayCastParting(p.x, p.y, hitPos, hitNormal, &hitObj))
             {
                 VentInstance vi;
                 vi.point = VentPoint{ hitPos, hitNormal };
+
+                // Capture parent association so the vent travels with its
+                // object on subsequent transforms / patterning. localPos /
+                // localNormal are computed from the parent's current model
+                // matrix; transpose(model3x3) applied to a world normal
+                // produces the matching local normal because the inverse
+                // and transpose-inverse are themselves transposes for
+                // rotations (and the magnitude is renormalised below).
+                if (hitObj >= 0 && hitObj < (int)m_objects.size())
+                {
+                    const glm::mat4 m = m_objects[hitObj].BuildModelMatrix();
+                    const glm::mat4 invM = glm::inverse(m);
+                    vi.parentIndex = hitObj;
+                    vi.localPos = glm::vec3(invM * glm::vec4(hitPos, 1.0f));
+                    glm::vec3 ln = glm::transpose(glm::mat3(m)) * hitNormal;
+                    const float lnLen = glm::length(ln);
+                    vi.localNormal = (lnLen > 1e-6f) ? ln / lnLen : glm::vec3(0, 0, 1);
+                }
 
                 // Read dimensions from the left-panel UI
                 float ventLength = 5.0f, ventWidth = 2.0f,
@@ -3706,13 +5428,50 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
         {
             const wxPoint p = evt.GetPosition();
             glm::vec3 hitPos, hitNormal;
-            if (RayCastParting(p.x, p.y, hitPos, hitNormal))
+            int       hitObj = -1;
+            if (RayCastParting(p.x, p.y, hitPos, hitNormal, &hitObj))
             {
                 GateFeature gf;
                 gf.point = VentPoint{ hitPos, hitNormal };
+
+                // Capture parent association — see PlaceVent for the rationale
+                // behind the transpose(model3x3) used to take a world normal
+                // back into local space.
+                if (hitObj >= 0 && hitObj < (int)m_objects.size())
+                {
+                    const glm::mat4 m = m_objects[hitObj].BuildModelMatrix();
+                    const glm::mat4 invM = glm::inverse(m);
+                    gf.parentIndex = hitObj;
+                    gf.localPos = glm::vec3(invM * glm::vec4(hitPos, 1.0f));
+                    glm::vec3 ln = glm::transpose(glm::mat3(m)) * hitNormal;
+                    const float lnLen = glm::length(ln);
+                    gf.localNormal = (lnLen > 1e-6f) ? ln / lnLen : glm::vec3(0, 0, 1);
+                }
+
                 m_gates.push_back(std::move(gf));
                 RebuildGatePathVBO();
                 RebuildGateSolids();
+                Refresh(false);
+            }
+        }
+        else if (m_transformMode == TransformMode::PlaceEjector)
+        {
+            // Snap to the closest of: sprue parting point, any runner
+            // segment, any gate segment, or any object face. Falls through
+            // silently if none are in range — matching the other Place*
+            // modes' behaviour for an out-of-bounds click.
+            const wxPoint p = evt.GetPosition();
+            glm::vec3 hitPos;
+            if (RayCastEjectorSnap(p.x, p.y, hitPos))
+            {
+                EjectorFeature ef;
+                ef.point = hitPos;
+                m_ejectors.push_back(std::move(ef));
+                // Rebuild every ejector's cylinder. Cheap with the small
+                // counts we deal with here, and matches the all-at-once
+                // pattern RebuildGateSolids uses (which lets a future
+                // "live update on UI change" feature plug in cleanly).
+                RebuildEjectorSolids();
                 Refresh(false);
             }
         }
@@ -3735,6 +5494,110 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
         {
             const wxPoint p = evt.GetPosition();
             RemoveSprueAtMouse(p.x, p.y);
+        }
+        else if (m_transformMode == TransformMode::RemoveEjector)
+        {
+            const wxPoint p = evt.GetPosition();
+            RemoveEjectorAtMouse(p.x, p.y);
+        }
+        else if (m_transformMode == TransformMode::AlignFace)
+        {
+            // Click commits whatever face is currently highlighted under the
+            // cursor. We re-run the cast here rather than trusting the cached
+            // hover state, in case a click arrives before OnPaint refreshes.
+            const wxPoint p = evt.GetPosition();
+            int objIdx = -1, triIdx = -1;
+            if (RayCastFacePick(p.x, p.y, objIdx, triIdx))
+            {
+                std::vector<uint32_t> faceTris;
+                glm::vec3 nLocal(0.0f);
+                EnsureTriAdjacency(m_objects[objIdx]);
+                GrowCoplanarFace(m_objects[objIdx], triIdx, faceTris, nLocal);
+                if (!faceTris.empty())
+                {
+                    ApplyAlignFaceToObject(objIdx, nLocal, faceTris);
+
+                    // After applying, the cached world-space triangles are
+                    // stale and the new pose may not project under the cursor
+                    // anymore — drop the highlight so OnPaint regenerates it
+                    // from the next motion event.
+                    m_alignHoverObject = -1;
+                    m_alignSeedTri = -1;
+                    m_alignFaceTris.clear();
+                    m_alignHighlightVertexCount = 0;
+                    Refresh(false);
+                }
+            }
+        }
+        else if (m_transformMode == TransformMode::AlignMidplane)
+        {
+            // Two-click flow:
+            //   • No face locked yet → first click locks face 1.
+            //   • Face 1 locked → second click computes the midplane between
+            //     face 1 and the picked face 2, applies the alignment, and
+            //     resets to "no lock" so the user can do another midplane
+            //     alignment without leaving the mode.
+            //   • Second click on a different object than face 1 is silently
+            //     ignored (alignment only makes sense within one object).
+            const wxPoint p = evt.GetPosition();
+            int objIdx = -1, triIdx = -1;
+            if (RayCastFacePick(p.x, p.y, objIdx, triIdx))
+            {
+                std::vector<uint32_t> faceTris;
+                glm::vec3 nLocal(0.0f);
+                EnsureTriAdjacency(m_objects[objIdx]);
+                GrowCoplanarFace(m_objects[objIdx], triIdx, faceTris, nLocal);
+                if (!faceTris.empty())
+                {
+                    if (!m_midplaneFaceLocked)
+                    {
+                        // First click: lock the face. Compute its centroid in
+                        // local space now so we don't need the tri list later.
+                        const SceneObject& obj = m_objects[objIdx];
+                        glm::vec3 c1Local(0.0f);
+                        for (uint32_t t : faceTris)
+                        {
+                            const uint32_t i0 = obj.cpuIndices[3 * t + 0];
+                            const uint32_t i1 = obj.cpuIndices[3 * t + 1];
+                            const uint32_t i2 = obj.cpuIndices[3 * t + 2];
+                            const glm::vec3 v0(obj.cpuVerts[i0 * 3], obj.cpuVerts[i0 * 3 + 1], obj.cpuVerts[i0 * 3 + 2]);
+                            const glm::vec3 v1(obj.cpuVerts[i1 * 3], obj.cpuVerts[i1 * 3 + 1], obj.cpuVerts[i1 * 3 + 2]);
+                            const glm::vec3 v2(obj.cpuVerts[i2 * 3], obj.cpuVerts[i2 * 3 + 1], obj.cpuVerts[i2 * 3 + 2]);
+                            c1Local += (v0 + v1 + v2) * (1.0f / 3.0f);
+                        }
+                        c1Local /= float(faceTris.size());
+
+                        m_midplaneFaceLocked = true;
+                        m_midplaneFaceObject = objIdx;
+                        m_midplaneFaceTris = faceTris;
+                        m_midplaneFaceNormalLocal = nLocal;
+                        m_midplaneFaceCentroidLocal = c1Local;
+
+                        RebuildMidplaneLockedVBO(obj, faceTris);
+                        Refresh(false);
+                    }
+                    else if (objIdx == m_midplaneFaceObject)
+                    {
+                        // Second click on the same object: apply midplane alignment.
+                        ApplyAlignMidplaneToObject(objIdx, nLocal, faceTris);
+
+                        // Reset to "no lock" so the user can do another pair.
+                        // Highlight state is also cleared since the object
+                        // moved and the cached world-space tris are stale.
+                        m_midplaneFaceLocked = false;
+                        m_midplaneFaceObject = -1;
+                        m_midplaneFaceTris.clear();
+                        m_midplaneLockedVertexCount = 0;
+
+                        m_alignHoverObject = -1;
+                        m_alignSeedTri = -1;
+                        m_alignFaceTris.clear();
+                        m_alignHighlightVertexCount = 0;
+                        Refresh(false);
+                    }
+                    // else: second click was on a different object — ignored.
+                }
+            }
         }
         else if (m_transformMode == TransformMode::SelectInjectionPoint)
         {
@@ -3825,6 +5688,25 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
             m_editFeatureIndex = bestIdx;
             Refresh(false);
         }
+        else if (m_transformMode == TransformMode::EditEjector)
+        {
+            // Same pick pattern as EditGate — closest marker within
+            // 2× the marker radius wins, -1 if no marker is in range.
+            const wxPoint p = evt.GetPosition();
+            glm::vec3 rayOrig, rayDir;
+            BuildMouseRay(p.x, p.y, rayOrig, rayDir);
+
+            const float hitRadius = kVentMarkerRadius * 2.0f;
+            float bestDist = hitRadius;
+            int   bestIdx = -1;
+            for (int i = 0; i < (int)m_ejectors.size(); ++i)
+            {
+                const float d = PointRayDistance(m_ejectors[i].point, rayOrig, rayDir);
+                if (d < bestDist) { bestDist = d; bestIdx = i; }
+            }
+            m_editFeatureIndex = bestIdx;
+            Refresh(false);
+        }
     }
 
     if (evt.LeftUp()) { m_lmb = false; if (HasCapture()) ReleaseMouse(); }
@@ -3832,6 +5714,20 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
     if (evt.MiddleUp()) { m_mmb = false; if (HasCapture()) ReleaseMouse(); }
     if (evt.RightDown()) { m_rmb = true;  m_hasLast = false; CaptureMouse(); }
     if (evt.RightUp()) { m_rmb = false; if (HasCapture()) ReleaseMouse(); }
+
+    // RMB cancels the locked first face in AlignMidplane mode (without
+    // leaving the mode). Mirrors the click-to-cancel idiom used elsewhere
+    // for partial selections.
+    if (evt.RightDown() &&
+        m_transformMode == TransformMode::AlignMidplane &&
+        m_midplaneFaceLocked)
+    {
+        m_midplaneFaceLocked = false;
+        m_midplaneFaceObject = -1;
+        m_midplaneFaceTris.clear();
+        m_midplaneLockedVertexCount = 0;
+        Refresh(false);
+    }
 
     if (evt.Dragging() && m_lmb && !HasCapture())
         CaptureMouse();
@@ -3858,6 +5754,17 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
             m_gateGhostMousePos = pos;
             Refresh(false);
         }
+        if (m_transformMode == TransformMode::PlaceEjector)
+        {
+            m_ejectorGhostMousePos = pos;
+            Refresh(false);
+        }
+        if (m_transformMode == TransformMode::AlignFace ||
+            m_transformMode == TransformMode::AlignMidplane)
+        {
+            m_alignMousePos = pos;
+            Refresh(false);
+        }
         evt.Skip();
         return;
     }
@@ -3880,7 +5787,7 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
     }
     else if (m_lmb && m_transformMode == TransformMode::Select)
     {
-        if (m_selectedIndex >= 0)
+        if (!m_selectedIndices.empty())
         {
             const float dist = m_camera.GetDistance();
             const float unitsPerPx = dist * 0.0015f;
@@ -3896,10 +5803,18 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
             // Flip dy when camera is below the grid to keep drag direction consistent
             const float dyAdjusted = (m_camera.Position().y < 0.0f) ? -dy : dy;
 
-            m_objects[m_selectedIndex].pos += right * (dx * unitsPerPx);
-            m_objects[m_selectedIndex].pos += forward * (-dyAdjusted * unitsPerPx);
-            for (auto& v : m_vents) v.Destroy(); m_vents.clear(); RebuildPathVBO(); RebuildCrossSectionVBO();
-            for (auto& gf : m_gates) gf.Destroy(); m_gates.clear(); RebuildGatePathVBO();
+            // Same delta applied to every selected object so they move as a
+            // rigid group, preserving relative positions.
+            const glm::vec3 delta = right * (dx * unitsPerPx)
+                + forward * (-dyAdjusted * unitsPerPx);
+            for (int idx : m_selectedIndices)
+            {
+                if (idx < 0 || idx >= (int)m_objects.size()) continue;
+                m_objects[idx].pos += delta;
+            }
+            // Parented vents/gates ride along with their parents; unparented
+            // features are independent and left alone.
+            ReanchorFeaturesForObjects(m_selectedIndices);
             Refresh(false);
         }
         else
@@ -3963,7 +5878,8 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
     }
     else if (m_lmb && (m_transformMode == TransformMode::EditVent ||
         m_transformMode == TransformMode::EditRunner ||
-        m_transformMode == TransformMode::EditGate))
+        m_transformMode == TransformMode::EditGate ||
+        m_transformMode == TransformMode::EditEjector))
     {
         if (m_editFeatureIndex >= 0)
         {
@@ -3981,6 +5897,18 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
             else m_camera.Orbit(dx, dy);
             Refresh(false);
         }
+    }
+    else if (m_lmb && (m_transformMode == TransformMode::AlignFace ||
+        m_transformMode == TransformMode::AlignMidplane))
+    {
+        // Orbit while holding LMB in alignment modes (matches Place* modes).
+        if (shift)
+            m_camera.Pan(dx, -dy);
+        else if (ctrl)
+            m_camera.Dolly(dy * 0.05f);
+        else
+            m_camera.Orbit(dx, dy);
+        Refresh(false);
     }
 
     // Update ghost preview whenever the mouse moves in PlaceVent mode.
@@ -4001,11 +5929,25 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
         m_gateGhostMousePos = evt.GetPosition();
         Refresh(false);
     }
-    else if (m_ventGhostActive || m_runnerGhostActive || m_gateGhostActive)
+    else if (m_transformMode == TransformMode::PlaceEjector)
+    {
+        m_ejectorGhostMousePos = evt.GetPosition();
+        Refresh(false);
+    }
+    else if (m_transformMode == TransformMode::AlignFace ||
+        m_transformMode == TransformMode::AlignMidplane)
+    {
+        // Same deferred-cast pattern as Place* ghosts: store mouse, defer to OnPaint.
+        m_alignMousePos = evt.GetPosition();
+        Refresh(false);
+    }
+    else if (m_ventGhostActive || m_runnerGhostActive || m_gateGhostActive ||
+        m_ejectorGhostActive)
     {
         m_ventGhostActive = false;
         m_runnerGhostActive = false;
         m_gateGhostActive = false;
+        m_ejectorGhostActive = false;
         Refresh(false);
     }
 
@@ -4030,16 +5972,65 @@ void GLCanvas::OnKeyDown(wxKeyEvent& evt)
             m_ventGhostActive = false;
             m_runnerGhostActive = false;
             m_gateGhostActive = false;
+            m_ejectorGhostActive = false;
             SetTransformMode(TransformMode::Select);
             if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
                 frame->SetActiveTool(TransformMode::Select);
         }
     }
-    else if (evt.GetKeyCode() == WXK_DELETE && m_selectedIndex >= 0)
+    else if (evt.GetKeyCode() == 'A' && evt.ControlDown()
+        && m_transformMode == TransformMode::Select)
     {
-        m_objects[m_selectedIndex].mesh.Destroy();
-        m_objects.erase(m_objects.begin() + m_selectedIndex);
-        m_selectedIndex = -1;
+        // Ctrl+A: select every imported object. Restricted to Select mode
+        // so it doesn't fire while the user is mid-placement (vents,
+        // runners, gates, etc.) — those modes shouldn't surface a
+        // selection state at all.
+        m_selectedIndices.clear();
+        m_selectedIndices.reserve(m_objects.size());
+        for (int i = 0; i < (int)m_objects.size(); ++i)
+            m_selectedIndices.push_back(i);
+        Refresh(false);
+    }
+    else if (evt.GetKeyCode() == WXK_DELETE && !m_selectedIndices.empty())
+    {
+        // Sort selection in descending order so erasing each entry doesn't
+        // shift the indices we still need to delete.
+        std::vector<int> toDelete = m_selectedIndices;
+        std::sort(toDelete.begin(), toDelete.end(), std::greater<int>());
+        for (int idx : toDelete)
+        {
+            if (idx < 0 || idx >= (int)m_objects.size()) continue;
+
+            // Drop any vents/gates parented to this object, then decrement
+            // parentIndex on every surviving feature whose parent index is
+            // above idx (those parents just shifted down by one). Doing this
+            // inside the descending loop keeps the renumbering local — by
+            // the time we reach a smaller idx, indices we already processed
+            // (which were higher) have all been erased, so any remaining
+            // parentIndex > idx is still valid in the now-shrunk m_objects.
+            m_vents.erase(std::remove_if(m_vents.begin(), m_vents.end(),
+                [idx](VentInstance& vi) {
+                    if (vi.parentIndex == idx) { vi.Destroy(); return true; }
+                    return false;
+                }), m_vents.end());
+            m_gates.erase(std::remove_if(m_gates.begin(), m_gates.end(),
+                [idx](GateFeature& gf) {
+                    if (gf.parentIndex == idx) { gf.Destroy(); return true; }
+                    return false;
+                }), m_gates.end());
+            for (auto& vi : m_vents) if (vi.parentIndex > idx) --vi.parentIndex;
+            for (auto& gf : m_gates) if (gf.parentIndex > idx) --gf.parentIndex;
+
+            m_objects[idx].mesh.Destroy();
+            m_objects.erase(m_objects.begin() + idx);
+        }
+        m_selectedIndices.clear();
+        // VBOs that aggregate vent / gate state need refreshing in case
+        // we deleted any.
+        RebuildPathVBO();
+        RebuildCrossSectionVBO();
+        RebuildGatePathVBO();
+        RebuildGateSolids();
         Refresh(false);
     }
     else
@@ -4229,7 +6220,7 @@ void GLCanvas::ClearAll()
     // Objects
     for (auto& obj : m_objects) obj.mesh.Destroy();
     m_objects.clear();
-    m_selectedIndex = -1;
+    m_selectedIndices.clear();
 
     // Vents
     for (auto& v : m_vents) v.Destroy();
@@ -4243,6 +6234,10 @@ void GLCanvas::ClearAll()
     for (auto& gf : m_gates) gf.Destroy();
     m_gates.clear();
 
+    // Ejectors
+    for (auto& ef : m_ejectors) ef.Destroy();
+    m_ejectors.clear();
+
     // Sprue
     m_sprue.Clear();
     m_sprue.DestroyGL();
@@ -4253,6 +6248,7 @@ void GLCanvas::ClearAll()
     m_ventGhostActive = false;
     m_runnerGhostActive = false;
     m_gateGhostActive = false;
+    m_ejectorGhostActive = false;
     m_editFeatureIndex = -1;
 
     // Rebuild all path/cross-section VBOs so stale highlights are cleared
@@ -4267,7 +6263,8 @@ void GLCanvas::ClearAll()
 }
 
 void GLCanvas::RestoreObject(const std::string& path, const glm::vec3& pos,
-    float yaw, float pitch, float roll, float scl)
+    float yaw, float pitch, float roll, float scl,
+    bool mirrorX, bool mirrorZ)
 {
     // Import the model normally (dispatches on extension, uploads GPU mesh)
     ImportFile(path);
@@ -4281,6 +6278,8 @@ void GLCanvas::RestoreObject(const std::string& path, const glm::vec3& pos,
         obj.pitchDeg = pitch;
         obj.rollDeg = roll;
         obj.scale = scl;
+        obj.mirrorX = mirrorX;
+        obj.mirrorZ = mirrorZ;
     }
 }
 
@@ -4329,16 +6328,25 @@ void GLCanvas::RestoreRunner(const glm::vec3& point)
     m_runners.push_back(RunnerFeature{ point, {}, {} });
 }
 
-void GLCanvas::RestoreGate(const glm::vec3& pos, const glm::vec3& normal)
+void GLCanvas::RestoreGate(const glm::vec3& pos, const glm::vec3& normal,
+    int parentIndex,
+    const glm::vec3& localPos,
+    const glm::vec3& localNormal)
 {
     GateFeature gf;
     gf.point = VentPoint{ pos, normal };
+    gf.parentIndex = parentIndex;
+    gf.localPos = localPos;
+    gf.localNormal = localNormal;
     m_gates.push_back(std::move(gf));
 }
 
 void GLCanvas::RestoreVent(const glm::vec3& pos, const glm::vec3& normal,
     float ventWidth, float ventLength,
-    float overrunStart, float overrunEnd)
+    float overrunStart, float overrunEnd,
+    int parentIndex,
+    const glm::vec3& localPos,
+    const glm::vec3& localNormal)
 {
     SetCurrent(*m_context);
 
@@ -4350,7 +6358,133 @@ void GLCanvas::RestoreVent(const glm::vec3& pos, const glm::vec3& normal,
     vi.crossSection = BuildVentCrossSection(vi.path, ventWidth, ventLength);
     vi.solid = BuildBoxSweepMesh(vi.path, ventWidth, ventLength,
         overrunStart, overrunEnd);
+    vi.parentIndex = parentIndex;
+    vi.localPos = localPos;
+    vi.localNormal = localNormal;
     m_vents.push_back(std::move(vi));
+}
+
+void GLCanvas::RestoreEjector(const glm::vec3& point)
+{
+    // Programmatic placement during project load. Mirrors RestoreGate /
+    // RestoreVent — no rebuild here; the caller batches a single
+    // RebuildAllFeatures() at the end of the load.
+    EjectorFeature ef;
+    ef.point = point;
+    m_ejectors.push_back(std::move(ef));
+}
+
+// ---------------------------------------------------------------------------
+// ReanchorVent / ReanchorGate — re-derive a parented feature's world-space
+// data from its parent object's current transform plus its stored local
+// placement, then rebuild GPU geometry.  No-op when parentIndex is out of
+// range (the feature is unparented or its parent has been deleted).
+//
+// This is what makes vents/gates "stick" to their parent objects:
+//   - Apply* transforms call ReanchorFeaturesForObjects on the affected
+//     selection, so moving an object drags its features along.
+//   - Patterning clones the parented features onto each new clone object
+//     and then reanchors so the clone's features land on the clone's
+//     surface (mirrored / rotated as appropriate).
+//
+// Vent geometry is rebuilt with current UI dimensions, matching the
+// existing edit-drag convention.  Gate geometry is rebuilt by the global
+// RebuildGateSolids pass invoked by callers; this helper only refreshes
+// the gate's world point + the gate-path VBO seed.
+// ---------------------------------------------------------------------------
+void GLCanvas::ReanchorVent(VentInstance& vi)
+{
+    if (vi.parentIndex < 0 || vi.parentIndex >= (int)m_objects.size())
+        return;
+
+    const SceneObject& parent = m_objects[vi.parentIndex];
+    const glm::mat4 m = parent.BuildModelMatrix();
+    const glm::mat3 normMat = glm::transpose(glm::inverse(glm::mat3(m)));
+
+    // World point + normal from the stored local placement.  Normal is
+    // re-normalised because non-uniform scaling (or reflection) could
+    // alter its magnitude.
+    vi.point.worldPos = glm::vec3(m * glm::vec4(vi.localPos, 1.0f));
+    glm::vec3 wn = normMat * vi.localNormal;
+    const float wnLen = glm::length(wn);
+    vi.point.worldNormal = (wnLen > 1e-6f) ? wn / wnLen : glm::vec3(0, 1, 0);
+
+    // Read current UI dimensions, same convention as edit-drag.
+    float ventLength = 5.0f, ventWidth = 2.0f,
+        ventOverrunStart = vi.path.overrunStart,
+        ventOverrunEnd = vi.path.overrunEnd;
+    if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+        frame->GetVentDimensions(ventLength, ventWidth,
+            ventOverrunStart, ventOverrunEnd);
+
+    // Destroy and rebuild the GPU mesh — vi.solid currently references the
+    // pre-reanchor geometry which is now stale.
+    vi.Destroy();
+    vi.path = ComputeVentPath(vi.point);
+    vi.path.overrunStart = ventOverrunStart;
+    vi.path.overrunEnd = ventOverrunEnd;
+    vi.crossSection = BuildVentCrossSection(vi.path, ventWidth, ventLength);
+    vi.solid = BuildBoxSweepMesh(vi.path, ventWidth, ventLength,
+        ventOverrunStart, ventOverrunEnd);
+}
+
+void GLCanvas::ReanchorGate(GateFeature& gf)
+{
+    if (gf.parentIndex < 0 || gf.parentIndex >= (int)m_objects.size())
+        return;
+
+    const SceneObject& parent = m_objects[gf.parentIndex];
+    const glm::mat4 m = parent.BuildModelMatrix();
+    const glm::mat3 normMat = glm::transpose(glm::inverse(glm::mat3(m)));
+
+    gf.point.worldPos = glm::vec3(m * glm::vec4(gf.localPos, 1.0f));
+    glm::vec3 wn = normMat * gf.localNormal;
+    const float wnLen = glm::length(wn);
+    gf.point.worldNormal = (wnLen > 1e-6f) ? wn / wnLen : glm::vec3(0, 1, 0);
+
+    // Gate solids are rebuilt globally by RebuildGateSolids() (it always
+    // reads current UI dimensions and processes every gate), so we just
+    // refresh the world point here. Callers invoke RebuildGatePathVBO()
+    // and RebuildGateSolids() once after the batch reanchor finishes.
+}
+
+void GLCanvas::ReanchorFeaturesForObjects(const std::vector<int>& objIndices)
+{
+    if (objIndices.empty()) return;
+
+    // Quick membership lookup. Selection sizes are tiny in practice, but a
+    // set keeps the per-feature check O(log n) and avoids surprises if the
+    // caller passes a large selection (e.g. after Ctrl+A).
+    std::set<int> affected(objIndices.begin(), objIndices.end());
+
+    bool touchedVent = false;
+    bool touchedGate = false;
+
+    for (auto& vi : m_vents)
+    {
+        if (vi.parentIndex < 0) continue;
+        if (affected.find(vi.parentIndex) == affected.end()) continue;
+        ReanchorVent(vi);
+        touchedVent = true;
+    }
+    for (auto& gf : m_gates)
+    {
+        if (gf.parentIndex < 0) continue;
+        if (affected.find(gf.parentIndex) == affected.end()) continue;
+        ReanchorGate(gf);
+        touchedGate = true;
+    }
+
+    if (touchedVent)
+    {
+        RebuildPathVBO();
+        RebuildCrossSectionVBO();
+    }
+    if (touchedGate)
+    {
+        RebuildGatePathVBO();
+        RebuildGateSolids();
+    }
 }
 
 void GLCanvas::RebuildAllFeatures()
@@ -4365,5 +6499,6 @@ void GLCanvas::RebuildAllFeatures()
     RebuildRunnerSolids();
     RebuildGatePathVBO();
     RebuildGateSolids();
+    RebuildEjectorSolids();
     Refresh(false);
 }

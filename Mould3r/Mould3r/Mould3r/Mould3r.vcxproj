@@ -152,6 +152,7 @@
     <ClCompile Include="Mould3r.cpp" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="MouldFeature.cpp" />
+    <ClCompile Include="PatternDialog.cpp" />
     <ClCompile Include="ProjectFile.cpp" />
     <ClCompile Include="RotateDialog.cpp" />
     <ClCompile Include="ScaleDialog.cpp" />
@@ -174,6 +175,7 @@
     <ClInclude Include="MeshUtils.h" />
     <ClInclude Include="Mould3r.h" />
     <ClInclude Include="MouldFeature.h" />
+    <ClInclude Include="PatternDialog.h" />
     <ClInclude Include="ProjectFile.h" />
     <ClInclude Include="RotateDialog.h" />
     <ClInclude Include="ScaleDialog.h" />
