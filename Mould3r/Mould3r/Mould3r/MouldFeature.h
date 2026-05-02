@@ -151,6 +151,31 @@ struct GateFeature
 };
 
 // ---------------------------------------------------------------------------
+// EjectorFeature — placement point for an ejector pin plus its preview
+// geometry.
+//
+// Geometry: a straight cylinder extruded in the -Y direction (toward the B
+// mould half) starting at `point`, with diameter and length read from the
+// MainFrame UI at rebuild time. Built in RebuildEjectorSolids on GLCanvas.
+//
+// Snapping target sources (handled in GLCanvas, not here): sprue parting
+// point, any runner segment, any gate segment, or any object surface. The
+// chosen world-space hit lands in `point`. There is no normal because the
+// snap surfaces don't share a normal concept — a runner segment is a line,
+// a gate path is a line, an object face has a normal but the sprue parting
+// point has none. For now the geometry is always extruded -Y regardless of
+// what surface was snapped; surface-aligned ejectors can come later if
+// needed.
+// ---------------------------------------------------------------------------
+struct EjectorFeature
+{
+    glm::vec3 point{ 0.0f };
+    SolidMesh solid;
+
+    void Destroy() { solid.Destroy(); }
+};
+
+// ---------------------------------------------------------------------------
 // SprueFeature — all sprue state consolidated into one struct.
 //                Replaces ~15 scattered m_sprue* members in GLCanvas.
 // ---------------------------------------------------------------------------

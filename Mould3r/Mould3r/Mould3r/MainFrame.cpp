@@ -371,13 +371,17 @@ wxPanel* MainFrame::CreateRibbon(wxWindow* parent)
     Bind(wxEVT_BUTTON, &MainFrame::OnClearRunners, this, ID_ClearRunners);
     Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnPlaceGate, this, ID_PlaceGate);
     Bind(wxEVT_BUTTON, &MainFrame::OnClearGates, this, ID_ClearGates);
+    Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnPlaceEjector, this, ID_PlaceEjector);
+    Bind(wxEVT_BUTTON, &MainFrame::OnClearEjectors, this, ID_ClearEjectors);
     Bind(wxEVT_BUTTON, &MainFrame::OnRemoveVent, this, ID_RemoveVent);
     Bind(wxEVT_BUTTON, &MainFrame::OnRemoveSprue, this, ID_RemoveSprue);
     Bind(wxEVT_BUTTON, &MainFrame::OnRemoveRunner, this, ID_RemoveRunner);
     Bind(wxEVT_BUTTON, &MainFrame::OnRemoveGate, this, ID_RemoveGate);
+    Bind(wxEVT_BUTTON, &MainFrame::OnRemoveEjector, this, ID_RemoveEjector);
     Bind(wxEVT_BUTTON, &MainFrame::OnEditVent, this, ID_EditVent);
     Bind(wxEVT_BUTTON, &MainFrame::OnEditRunner, this, ID_EditRunner);
     Bind(wxEVT_BUTTON, &MainFrame::OnEditGate, this, ID_EditGate);
+    Bind(wxEVT_BUTTON, &MainFrame::OnEditEjector, this, ID_EditEjector);
     Bind(wxEVT_BUTTON, &MainFrame::OnGenerateMould, this, ID_GenerateMould);
     Bind(wxEVT_BUTTON, &MainFrame::OnExport, this, ID_Export);
 
@@ -466,6 +470,7 @@ void MainFrame::SetActiveTool(TransformMode mode)
     case TransformMode::PlaceVent:     activeId = ID_ToolPlaceVent;     break;
     case TransformMode::PlaceRunner:   activeId = ID_PlaceRunner;       break;
     case TransformMode::PlaceGate:     activeId = ID_PlaceGate;         break;
+    case TransformMode::PlaceEjector:  activeId = ID_PlaceEjector;      break;
     case TransformMode::AlignFace:     activeId = ID_ToolAlignFace;     break;
     case TransformMode::AlignMidplane: activeId = ID_ToolAlignMidplane; break;
     default:                                                            break;
@@ -732,6 +737,48 @@ void MainFrame::OnEditGate(wxCommandEvent&)
         SetActiveTool(TransformMode::EditGate);
 }
 
+// ---------------------------------------------------------------------------
+// Ejector handlers — UI scaffolding only.
+//
+// PlaceEjector / RemoveEjector / EditEjector toggle into their respective
+// modes via SetActiveTool; the canvas-side mode-change handlers are
+// placeholders right now (see GLCanvas.cpp), so clicking these buttons
+// activates the toggle visually and switches mode but does not yet perform
+// any geometry. ClearEjectors routes through the canvas helper, which
+// likewise no-ops until ejector storage is wired up. These hooks let the
+// UI ship now and let the canvas-side implementation drop in later
+// without touching MainFrame.
+// ---------------------------------------------------------------------------
+void MainFrame::OnPlaceEjector(wxCommandEvent&)
+{
+    if (m_canvas && m_canvas->GetTransformMode() == TransformMode::PlaceEjector)
+        SetActiveTool(TransformMode::Select);
+    else
+        SetActiveTool(TransformMode::PlaceEjector);
+}
+
+void MainFrame::OnClearEjectors(wxCommandEvent&)
+{
+    if (m_canvas)
+        m_canvas->ClearEjectors();
+}
+
+void MainFrame::OnRemoveEjector(wxCommandEvent&)
+{
+    if (m_canvas && m_canvas->GetTransformMode() == TransformMode::RemoveEjector)
+        SetActiveTool(TransformMode::Select);
+    else
+        SetActiveTool(TransformMode::RemoveEjector);
+}
+
+void MainFrame::OnEditEjector(wxCommandEvent&)
+{
+    if (m_canvas && m_canvas->GetTransformMode() == TransformMode::EditEjector)
+        SetActiveTool(TransformMode::Select);
+    else
+        SetActiveTool(TransformMode::EditEjector);
+}
+
 void MainFrame::OnEditSprue(wxCommandEvent&)
 {
     if (m_fixtureDef.injectionPoints.size() <= 1) return;  // nothing to choose
@@ -895,6 +942,28 @@ float MainFrame::GetSubRunnerDiameter() const
     double v = 5.0;
     if (!m_subRunnerDiameter->GetValue().ToDouble(&v)) return 5.0f;
     if (v <= 0.0) v = 5.0;
+    return static_cast<float>(v) * (m_imperial ? 25.4f : 1.0f);
+}
+
+// Ejector dimension accessors. Returns mm regardless of the active unit
+// system, matching the convention used by the other Get*Dimension getters.
+// Defaults are returned when the field hasn't been built yet (early calls)
+// or contains an unparseable value, so callers never get NaN.
+float MainFrame::GetEjectorDiameter() const
+{
+    if (!m_ejectorDiameter) return 3.0f;
+    double v = 3.0;
+    if (!m_ejectorDiameter->GetValue().ToDouble(&v)) return 3.0f;
+    if (v <= 0.0) v = 3.0;
+    return static_cast<float>(v) * (m_imperial ? 25.4f : 1.0f);
+}
+
+float MainFrame::GetEjectorLength() const
+{
+    if (!m_ejectorLength) return 25.0f;
+    double v = 25.0;
+    if (!m_ejectorLength->GetValue().ToDouble(&v)) return 25.0f;
+    if (v <= 0.0) v = 25.0;
     return static_cast<float>(v) * (m_imperial ? 25.4f : 1.0f);
 }
 
@@ -1099,6 +1168,8 @@ void MainFrame::OnSaveProject(wxCommandEvent&)
         p.gateDiameter = GetGateDiameter();
         p.gateDraftAngle = GetGateDraftAngle();
         p.subRunnerDiameter = GetSubRunnerDiameter();
+        p.ejectorDiameter = GetEjectorDiameter();
+        p.ejectorLength = GetEjectorLength();
     }
 
     // Sprue
@@ -1146,6 +1217,16 @@ void MainFrame::OnSaveProject(wxCommandEvent&)
         pv.localPos = vi.localPos;
         pv.localNormal = vi.localNormal;
         data.vents.push_back(pv);
+    }
+
+    // Ejectors — just the world-space placement point. Sticky-placement
+    // (parent tracking) isn't wired up for ejectors yet; if it's added
+    // later the corresponding fields will be populated on ProjectEjectorData.
+    for (const auto& ef : m_canvas->GetEjectors())
+    {
+        ProjectEjectorData pe;
+        pe.point = ef.point;
+        data.ejectors.push_back(pe);
     }
 
     std::string error;
@@ -1253,6 +1334,13 @@ void MainFrame::OnLoadProject(wxCommandEvent&)
             vn.parentIndex, vn.localPos, vn.localNormal);
     }
 
+    // ---- Restore ejectors --------------------------------------------------
+    // Diameter and length come from data.params and are applied by
+    // RebuildEjectorSolids (called via RebuildAllFeatures below) which
+    // reads them out of the now-populated UI fields.
+    for (const auto& ej : data.ejectors)
+        m_canvas->RestoreEjector(ej.point);
+
     // ---- Rebuild all derived GPU geometry -----------------------------------
     m_canvas->RebuildAllFeatures();
 
@@ -1287,6 +1375,8 @@ void MainFrame::SetParameterFields(const ProjectParameters& p)
     setField(m_gateDiameter, p.gateDiameter * conv);
     setField(m_gateDraftAngle, p.gateDraftAngle);           // degrees — no conversion
     setField(m_subRunnerDiameter, p.subRunnerDiameter * conv);
+    setField(m_ejectorDiameter, p.ejectorDiameter * conv);
+    setField(m_ejectorLength, p.ejectorLength * conv);
 }
 
 void MainFrame::OnBrowseExport(wxCommandEvent&)
@@ -2047,6 +2137,164 @@ wxPanel* MainFrame::CreateGatesContent(wxWindow* parent)
     return panel;
 }
 
+// ---------------------------------------------------------------------------
+// CreateEjectorsContent — left-panel "Ejectors" feature card.
+//
+// Mirrors CreateGatesContent's layout (title, Place button, three small
+// action buttons, collapsible Settings panel with a type dropdown and
+// dimension rows). Currently UI-only: the Place / Edit / Remove / Clear
+// buttons fire the corresponding TransformMode handlers, but the canvas-
+// side mode behaviour is a placeholder pending the geometry implementation.
+//
+// The Type dropdown is wired the same way as the Gates card's "Tapered
+// Cylinder" branch: changing the dropdown shows / hides the Cylindrical
+// dimension panel. To add a new ejector geometry later, append the type
+// to m_ejectorTypeChoice and add a parallel dimension panel + Show()
+// branch in the EVT_CHOICE handler — no other plumbing required.
+// ---------------------------------------------------------------------------
+wxPanel* MainFrame::CreateEjectorsContent(wxWindow* parent)
+{
+    auto* panel = new wxPanel(parent, wxID_ANY);
+    panel->SetBackgroundColour(Style::CardBg);
+    auto* sizer = new wxBoxSizer(wxVERTICAL);
+
+    auto* titleLabel = new wxStaticText(panel, wxID_ANY, "Ejectors");
+    titleLabel->SetForegroundColour(*wxWHITE);
+    titleLabel->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_BOLD, false, "Segoe UI"));
+    sizer->Add(titleLabel, 0, wxLEFT | wxTOP, 12);
+    sizer->AddSpacer(6);
+
+    auto* btnPlace = MakePlaceButton(panel, ID_PlaceEjector, "Place Ejector");
+    sizer->Add(btnPlace, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
+    sizer->AddSpacer(6);
+
+    auto* actionGrid = new wxGridSizer(1, 3, 0, 4);
+    auto makeSmallBtn = [&](const wxString& label) -> wxButton* {
+        auto* btn = new wxButton(panel, wxID_ANY, label,
+            wxDefaultPosition, wxSize(-1, 26), wxBORDER_NONE);
+        btn->SetBackgroundColour(Style::BtnSmall);
+        btn->SetForegroundColour(Style::TextPrimary);
+        btn->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+        return btn;
+        };
+    auto* btnEdit = makeSmallBtn("Edit");
+    btnEdit->SetId(ID_EditEjector);
+    auto* btnRemove = makeSmallBtn("Remove");
+    btnRemove->SetId(ID_RemoveEjector);
+    auto* btnClearAll = makeSmallBtn("Clear all");
+    btnClearAll->SetId(ID_ClearEjectors);
+    actionGrid->Add(btnEdit, 0, wxEXPAND);
+    actionGrid->Add(btnRemove, 0, wxEXPAND);
+    actionGrid->Add(btnClearAll, 0, wxEXPAND);
+    sizer->Add(actionGrid, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
+    sizer->AddSpacer(8);
+
+    // Collapsible Settings — same chevron / debounce pattern as the other cards.
+    auto* settingsBtn = new wxToggleButton(panel, wxID_ANY,
+        "Settings",
+        wxDefaultPosition, wxSize(-1, 22), wxBU_LEFT | wxBORDER_NONE);
+    settingsBtn->SetValue(false);
+    settingsBtn->SetBackgroundColour(Style::CardBg);
+    settingsBtn->SetForegroundColour(Style::TextSubtle);
+    settingsBtn->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+    settingsBtn->SetBitmap(LoadSvgBundle(kChevronRightSvg, wxSize(12, 12), true));
+    settingsBtn->SetBitmapPosition(wxRIGHT);
+    sizer->Add(settingsBtn, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
+
+    auto* settingsPanel = new wxPanel(panel, wxID_ANY);
+    settingsPanel->SetBackgroundColour(Style::CardBg);
+    auto* settingsSizer = new wxBoxSizer(wxVERTICAL);
+
+    // Dimension-row helper — identical to the one used in CreateGatesContent.
+    auto addRow = [&](wxWindow* parent_, wxSizer* parentSz,
+        const wxString& label, wxTextCtrl*& ctrl,
+        const wxString& defVal, const wxString& unitStr, int /*lblW*/ = 60)
+        {
+            auto* row = new wxBoxSizer(wxHORIZONTAL);
+            auto* lbl = new wxStaticText(parent_, wxID_ANY, label);
+            lbl->SetForegroundColour(Style::TextMuted);
+            lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+            ctrl = new wxTextCtrl(parent_, wxID_ANY, defVal, wxDefaultPosition, wxSize(kFieldWidth, 22));
+            ctrl->SetBackgroundColour(Style::BtnSmall); ctrl->SetForegroundColour(kTextDefault);
+            auto* u = new wxStaticText(parent_, wxID_ANY, unitStr);
+            if (unitStr == "mm") m_mmUnitLabels.push_back(u);
+            u->SetForegroundColour(Style::TextSubtle);
+            u->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+            u->SetMinSize(wxSize(kUnitWidth, -1));
+            row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL);
+            row->AddStretchSpacer(1);
+            row->Add(ctrl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, kFieldGap);
+            row->Add(u, 0, wxALIGN_CENTER_VERTICAL);
+            parentSz->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
+        };
+
+    // ---- Ejector type dropdown (inline with label) ------------------------
+    auto* typeRow = new wxBoxSizer(wxHORIZONTAL);
+    auto* typeLabel = new wxStaticText(settingsPanel, wxID_ANY, "Ejector type:");
+    typeLabel->SetForegroundColour(Style::TextMuted);
+    typeLabel->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+
+    m_ejectorTypeChoice = new wxChoice(settingsPanel, wxID_ANY,
+        wxDefaultPosition, wxSize(kCtrlColWidth, -1));
+    m_ejectorTypeChoice->SetBackgroundColour(Style::BtnSmall);
+    m_ejectorTypeChoice->SetForegroundColour(Style::TextMuted);
+    m_ejectorTypeChoice->Append("Cylindrical");
+    m_ejectorTypeChoice->SetSelection(0);
+    typeRow->Add(typeLabel, 0, wxALIGN_CENTER_VERTICAL);
+    typeRow->AddStretchSpacer(1);
+    typeRow->Add(m_ejectorTypeChoice, 0, wxALIGN_CENTER_VERTICAL);
+    settingsSizer->Add(typeRow, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
+
+    // Cylindrical dimensions. When a second geometry is added later, build
+    // a parallel dimension panel and toggle visibility in the EVT_CHOICE
+    // handler below — same structure as the gate card's tapered-cylinder
+    // branch.
+    auto* dimsPanel = new wxPanel(settingsPanel, wxID_ANY);
+    dimsPanel->SetBackgroundColour(Style::CardBg);
+    auto* dimsSizer = new wxBoxSizer(wxVERTICAL);
+    addRow(dimsPanel, dimsSizer, "Diameter:", m_ejectorDiameter, "3.0", "mm");
+    addRow(dimsPanel, dimsSizer, "Length:", m_ejectorLength, "25.0", "mm");
+    dimsPanel->SetSizer(dimsSizer);
+    settingsSizer->Add(dimsPanel, 0, wxEXPAND | wxBOTTOM, 10);
+
+    settingsPanel->SetSizer(settingsSizer);
+    settingsPanel->Show(false);
+    sizer->Add(settingsPanel, 0, wxEXPAND);
+
+    m_ejectorTypeChoice->Bind(wxEVT_CHOICE, [dimsPanel, this](wxCommandEvent&) {
+        // Currently only one type — left as a Show() toggle so additional
+        // types can be added by appending an else-if without restructuring.
+        dimsPanel->Show(m_ejectorTypeChoice->GetStringSelection() == "Cylindrical");
+        dimsPanel->GetParent()->Layout();
+        dimsPanel->GetParent()->GetParent()->Layout();
+        dimsPanel->GetParent()->GetParent()->GetParent()->Layout();
+        });
+
+    settingsBtn->Bind(wxEVT_TOGGLEBUTTON, [settingsBtn, settingsPanel, panel](wxCommandEvent&) {
+        // Same 200ms debounce as the other settings togglers — mid-frame
+        // double-clicks (often from a touchpad tap) otherwise re-collapse
+        // the panel before the layout finishes.
+        static wxLongLong lastToggleMs = 0;
+        wxLongLong now = wxGetLocalTimeMillis();
+        if ((now - lastToggleMs).GetValue() < 200) { settingsBtn->SetValue(!settingsBtn->GetValue()); return; }
+        lastToggleMs = now;
+        const bool expanded = settingsBtn->GetValue();
+        settingsBtn->SetBitmap(LoadSvgBundle(
+            expanded ? kChevronDownSvg : kChevronRightSvg,
+            wxSize(12, 12), true));
+        settingsBtn->SetBitmapPosition(wxRIGHT);
+        settingsPanel->Show(expanded);
+        panel->Layout(); panel->GetParent()->Layout(); panel->GetParent()->GetParent()->Layout();
+        });
+
+    panel->SetSizer(sizer);
+    return panel;
+}
+
 wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
 {
     // Outer container: content column + right border
@@ -2081,7 +2329,7 @@ wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
 
         toolsSizer->AddSpacer(8);
 
-        auto* grid = new wxGridSizer(4, 2, 4, 4);
+        auto* grid = new wxGridSizer(3, 2, 4, 4);
 
         // ---- SVG icon paths for model tool buttons --------------------------------
         // Fill in the path to each SVG file (relative to the executable, or absolute).
@@ -2291,6 +2539,9 @@ wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
 
     wxPanel* ventsContent = CreateVentsContent(scrollWin);
     sizer->Add(ventsContent, 0, wxEXPAND | wxTOP, 8);
+
+    wxPanel* ejectorsContent = CreateEjectorsContent(scrollWin);
+    sizer->Add(ejectorsContent, 0, wxEXPAND | wxTOP, 8);
 
     sizer->AddSpacer(12);
 

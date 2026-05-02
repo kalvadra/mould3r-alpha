@@ -56,6 +56,12 @@ static constexpr float kVentMarkerRadius = 1.5f;
 // segment before it snaps — gives a generous click target on the parting line.
 static constexpr float kVentSnapRadius = 8.0f;
 
+// Pixel radius for ejector snap pick. Screen-space rather than world-space:
+// path candidates (sprue / runner / gate segments) are evaluated by their
+// projected screen distance to the cursor, so the snap feel is consistent
+// at every zoom level. See RayCastEjectorSnap for the full algorithm.
+static constexpr float kEjectorSnapRadiusPx = 12.0f;
+
 // ---------------------------------------------------------------------------
 // Shader helpers
 // ---------------------------------------------------------------------------
@@ -213,14 +219,18 @@ void GLCanvas::SetTransformMode(TransformMode mode)
         SetCursor(wxCursor(wxCURSOR_CROSS));    break;
     case TransformMode::PlaceGate:
         SetCursor(wxCursor(wxCURSOR_CROSS));    break;
+    case TransformMode::PlaceEjector:
+        SetCursor(wxCursor(wxCURSOR_CROSS));    break;
     case TransformMode::RemoveVent:
     case TransformMode::RemoveRunner:
     case TransformMode::RemoveGate:
     case TransformMode::RemoveSprue:
+    case TransformMode::RemoveEjector:
         SetCursor(wxCursor(wxCURSOR_HAND));     break;
     case TransformMode::EditVent:
     case TransformMode::EditRunner:
     case TransformMode::EditGate:
+    case TransformMode::EditEjector:
         SetCursor(wxCursor(wxCURSOR_HAND));     break;
     case TransformMode::SelectInjectionPoint:
         SetCursor(wxCursor(wxCURSOR_HAND));     break;
@@ -933,7 +943,44 @@ void GLCanvas::RebuildGateSolids()
 }
 
 // ---------------------------------------------------------------------------
-// RebuildGatePathVBO — for each placed gate, finds the nearest point on any
+// RebuildEjectorSolids — builds a straight cylinder for every placed ejector,
+// extruded from the ejector's snap point in the -Y direction (toward the B
+// mould half). Diameter and length come from the MainFrame UI at call time.
+//
+// No taper / draft is applied: the UI exposes only diameter and length, so
+// BuildCylinderMesh is invoked with draftAngleDeg = 0. If a tapered ejector
+// type is added later (e.g. shoulder pin), branch on the type dropdown the
+// same way RebuildGateSolids handles its frustum / sub-runner split.
+//
+// Ejectors snapped onto an object face start above y=0 — the geometry
+// passes through the parting plane as a single straight cylinder. That's
+// fine for the preview; the eventual mould-cut step will be responsible
+// for clipping to the B half.
+// ---------------------------------------------------------------------------
+void GLCanvas::RebuildEjectorSolids()
+{
+    for (auto& ef : m_ejectors) ef.solid.Destroy();
+    if (m_ejectors.empty()) return;
+
+    float ejectorRadius = 1.5f;
+    float ejectorLength = 25.0f;
+    if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+    {
+        ejectorRadius = frame->GetEjectorDiameter() * 0.5f;
+        ejectorLength = frame->GetEjectorLength();
+    }
+
+    // Defensive: degenerate dimensions would produce an invalid SolidMesh,
+    // which is harmless but pointless to send to the GPU.
+    if (ejectorRadius < 1e-4f || ejectorLength < 1e-4f) return;
+
+    for (EjectorFeature& ef : m_ejectors)
+    {
+        const glm::vec3 start = ef.point;
+        const glm::vec3 end = start + glm::vec3(0.0f, -ejectorLength, 0.0f);
+        ef.solid = BuildCylinderMesh(start, end, ejectorRadius, 0.0f);
+    }
+}
 // feed-network segment (sprue parting point, or any point along a runner path)
 // in XZ, stores the result on the GateFeature, then uploads one GL_LINES pair
 // per gate.  Runner paths are treated as full segments (sprue parting pt →
@@ -1246,8 +1293,8 @@ void GLCanvas::GenerateMould()
         return;
     }
 
-    // Steps per fixture: 1 read + 1 transform + (1 per object subtract) + (1 per vent subtract) + (1 per runner subtract) + 1 sprue + 1 tessellate + 1 upload
-    const int stepsPerFixture = 4 + (int)m_objects.size() + (int)m_vents.size() + (int)m_runners.size() + (int)m_gates.size();
+    // Steps per fixture: 1 read + 1 transform + (1 per object subtract) + (1 per vent subtract) + (1 per runner subtract) + (1 per gate subtract) + (1 per ejector subtract) + 1 sprue + 1 tessellate + 1 upload
+    const int stepsPerFixture = 4 + (int)m_objects.size() + (int)m_vents.size() + (int)m_runners.size() + (int)m_gates.size() + (int)m_ejectors.size();
     const int totalSteps = stepsPerFixture * (int)m_fixtures.size();
 
     wxProgressDialog progress(
@@ -1635,6 +1682,66 @@ void GLCanvas::GenerateMould()
                     }
                 }
             }
+        }
+
+        // Step: subtract ejector pins
+        //
+        // Each ejector is a straight cylinder extruded in -Y from the snap
+        // point. The cylinder is overrun by kCutEps on BOTH ends — past the
+        // snap point and past the nominal endpoint — so that it punches
+        // cleanly through whatever parting / exit faces it crosses, rather
+        // than leaving sealed pockets. OCC's cut handles this gracefully:
+        // a fixture that doesn't intersect the cylinder is unchanged, so we
+        // can apply the same cut to every fixture without per-half logic
+        // (an ejector that snapped to y=0 only crosses the B half; one
+        // snapped to a face high in the A half cuts through both halves on
+        // its way down — both are correct for ejector geometry).
+        float ejectorRadius = 1.5f;
+        float ejectorLen = 25.0f;
+        if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+        {
+            ejectorRadius = frame->GetEjectorDiameter() * 0.5f;
+            ejectorLen = frame->GetEjectorLength();
+        }
+        if (!m_ejectors.empty() && ejectorRadius > 1e-6f && ejectorLen > 1e-6f)
+        {
+            for (int ei = 0; ei < (int)m_ejectors.size(); ++ei)
+            {
+                progress.Update(step++,
+                    fixLabel + ": cutting ejector " +
+                    std::to_string(ei + 1) + " of " +
+                    std::to_string((int)m_ejectors.size()) + "...");
+
+                static constexpr float kCutEps = 0.1f;
+                const glm::vec3 epPt = m_ejectors[ei].point;
+                // Origin lifted by kCutEps in +Y so the cylinder protrudes
+                // above the snap point; total length includes that overrun
+                // plus an equal amount past the bottom.
+                const gp_Ax2 ejAx(
+                    gp_Pnt(epPt.x, epPt.y + kCutEps, epPt.z),
+                    gp_Dir(0.0, -1.0, 0.0)
+                );
+                BRepPrimAPI_MakeCylinder ejCyl(ejAx, ejectorRadius,
+                    ejectorLen + 2.0f * kCutEps);
+                ejCyl.Build();
+                if (!ejCyl.IsDone() || ejCyl.Shape().IsNull()) continue;
+
+                BRepAlgoAPI_Cut ejCut(result, ejCyl.Shape());
+                ejCut.Build();
+                if (!ejCut.IsDone() || ejCut.Shape().IsNull())
+                {
+                    wxMessageBox("Ejector cut failed for ejector " + std::to_string(ei + 1),
+                        "Generate Mould", wxOK | wxICON_WARNING, this);
+                    continue;
+                }
+                result = ejCut.Shape();
+            }
+        }
+        else
+        {
+            // No ejectors / degenerate dimensions — advance progress
+            // counter so the bar stays in step with the loop accounting.
+            step += (int)m_ejectors.size();
         }
 
         // Step: subtract sprue (frustum + cold slug)
@@ -2763,6 +2870,159 @@ bool GLCanvas::RayCastToPartingPlane(int mouseX, int mouseY, glm::vec3& outPos)
 }
 
 // ---------------------------------------------------------------------------
+// RayCastEjectorSnap — pick helper for ejector placement.
+//
+// Considers four candidate sources, picks the one closest to the cursor in
+// SCREEN SPACE (pixels), and returns its world-space position. Screen-space
+// is the right metric for "snap feel" — feature spacing in 3D varies wildly
+// with camera distance, but a fixed pixel radius behaves consistently at
+// every zoom level (it's what the user actually sees).
+//
+// Candidate sources (only those currently valid in the scene):
+//   1. Sprue parting point      — m_sprue.partingPos (degenerate "segment")
+//   2. Each runner segment      — m_sprue.partingPos -> rf.point, on y=0
+//   3. Each gate segment        — gf.point.worldPos -> gf.pathEnd
+//   4. Object surfaces          — full mesh ray-cast via RayCastObjects
+//
+// Resolution rule:
+//   - Path snap (1/2/3) wins if any candidate is within kEjectorSnapRadiusPx
+//     of the cursor in pixels. Otherwise fall through to the face ray-cast.
+//   - This priority ordering is deliberate: hovering over a face that a gate
+//     path crosses should still let the user snap to the path, not always
+//     win on the face. Outside the snap radius, faces take over.
+//
+// The "closest 3D point on segment AB to the picking ray" is the foot of the
+// common perpendicular between the two lines, clamped to AB's [0,1] range.
+// For the sprue parting point (a single point) and for object surfaces (a
+// definite hit) the screen-space test is straightforward.
+// ---------------------------------------------------------------------------
+bool GLCanvas::RayCastEjectorSnap(int mouseX, int mouseY, glm::vec3& outPos)
+{
+    const wxSize sz = GetClientSize();
+    const int    w = std::max(1, sz.x);
+    const int    h = std::max(1, sz.y);
+
+    m_camera.SetAspect(float(w) / float(h));
+    const glm::mat4 view = m_camera.View();
+    const glm::mat4 proj = m_camera.Projection();
+    const glm::mat4 viewProj = proj * view;
+
+    // Build the same world-space ray we'd use elsewhere (mirrors
+    // RayCastObjects / RayCastToPartingPlane setup).
+    const float ndcX = (2.0f * float(mouseX)) / float(w) - 1.0f;
+    const float ndcY = 1.0f - (2.0f * float(mouseY)) / float(h);
+    const glm::mat4 invVP = glm::inverse(viewProj);
+    glm::vec4 nearH = invVP * glm::vec4(ndcX, ndcY, -1.0f, 1.0f);
+    glm::vec4 farH = invVP * glm::vec4(ndcX, ndcY, 1.0f, 1.0f);
+    nearH /= nearH.w;
+    farH /= farH.w;
+    const glm::vec3 rayOrig = glm::vec3(nearH);
+    const glm::vec3 rayDir = glm::normalize(glm::vec3(farH) - glm::vec3(nearH));
+
+    // Cursor in pixel coords (captured by lambdas below). Brace init is
+    // mandatory here: 'glm::vec2 cursorPx(float(mouseX), float(mouseY))' is
+    // interpreted by MSVC as a function declaration (the "most vexing
+    // parse"), which then causes confusing cascade errors at every use site.
+    const glm::vec2 cursorPx{ float(mouseX), float(mouseY) };
+
+    // Helper: project a world-space point to screen pixels. Returns false if
+    // the point is behind the camera (clip-space w <= 0). Explicit return
+    // type kept off the trailing position to avoid a known MSVC parser
+    // quirk where trailing-return lambdas in tight succession can confuse
+    // the parser of a following statement; both helpers are written as
+    // void/bool returners with the type in front via the declared return.
+    auto worldToScreen = [&](const glm::vec3& world, glm::vec2& outPx)
+        {
+            const glm::vec4 clip = viewProj * glm::vec4(world, 1.0f);
+            if (clip.w <= 1e-6f) return false;
+            const glm::vec3 ndc(clip.x / clip.w, clip.y / clip.w, clip.z / clip.w);
+            outPx.x = (ndc.x * 0.5f + 0.5f) * float(w);
+            outPx.y = (1.0f - (ndc.y * 0.5f + 0.5f)) * float(h);
+            return true;
+        };
+
+    // Helper: closest point on segment AB to the picking ray. Computes the
+    // common perpendicular's foot on AB and clamps to [0,1]. Degenerate
+    // segments collapse to A.
+    auto closestOnSegment = [&](const glm::vec3& A, const glm::vec3& B)
+        {
+            const glm::vec3 AB = B - A;
+            const float lenAB2 = glm::dot(AB, AB);
+            if (lenAB2 < 1e-10f) return A;
+
+            const glm::vec3 w0 = A - rayOrig;
+            const float aSq = lenAB2;
+            const float bDot = glm::dot(AB, rayDir);
+            const float cSq = glm::dot(rayDir, rayDir);   // == 1 (rayDir is normalised)
+            const float dDot = glm::dot(AB, w0);
+            const float eDot = glm::dot(rayDir, w0);
+            const float denom = aSq * cSq - bDot * bDot;  // 0 iff AB || ray
+
+            float tSeg = 0.0f;
+            if (denom >= 1e-10f)
+                tSeg = (bDot * eDot - cSq * dDot) / denom;
+            tSeg = glm::clamp(tSeg, 0.0f, 1.0f);
+            return A + AB * tSeg;
+        };
+
+    float     bestPx = kEjectorSnapRadiusPx;
+    glm::vec3 bestWorld(0.0f);
+    bool      hit = false;
+
+    // Inlined snap test rather than a third lambda — keeps the math local
+    // to each candidate and avoids any chance of parser confusion from
+    // back-to-back captured lambdas.
+    auto consider = [&](const glm::vec3& candidate)
+        {
+            glm::vec2 px;
+            if (!worldToScreen(candidate, px)) return;
+            const glm::vec2 delta = px - cursorPx;
+            const float distPx = glm::length(delta);
+            if (distPx < bestPx)
+            {
+                bestPx = distPx;
+                bestWorld = candidate;
+                hit = true;
+            }
+        };
+
+    // 1. Sprue parting point (single-point candidate).
+    if (m_sprue.hasPartingPoint)
+        consider(m_sprue.partingPos);
+
+    // 2. Runner segments (sprue parting -> runner pt, on y=0).
+    if (m_sprue.hasPartingPoint)
+        for (const RunnerFeature& rf : m_runners)
+            consider(closestOnSegment(m_sprue.partingPos, rf.point));
+
+    // 3. Gate segments (gate worldPos -> gate.pathEnd). pathEnd is only
+    //    valid when hasPath is true (computed by RebuildGatePathVBO).
+    for (const GateFeature& gf : m_gates)
+    {
+        if (!gf.hasPath) continue;
+        consider(closestOnSegment(gf.point.worldPos, gf.pathEnd));
+    }
+
+    if (hit)
+    {
+        outPos = bestWorld;
+        return true;
+    }
+
+    // 4. Fall through to object surfaces. RayCastObjects does the full
+    //    Möller-Trumbore mesh test and returns the world-space hit; we
+    //    discard the normal (ejectors don't store one).
+    glm::vec3 faceHit, faceNormal;
+    if (RayCastObjects(mouseX, mouseY, faceHit, faceNormal))
+    {
+        outPos = faceHit;
+        return true;
+    }
+
+    return false;
+}
+
+// ---------------------------------------------------------------------------
 // ClearRunnerPoints
 // ---------------------------------------------------------------------------
 void GLCanvas::ClearRunnerPoints()
@@ -2782,6 +3042,19 @@ void GLCanvas::ClearGatePoints()
     m_gateGhostActive = false;
     RebuildGatePathVBO();
     RebuildGateSolids();
+    Refresh(false);
+}
+
+void GLCanvas::ClearEjectors()
+{
+    // Mirrors ClearGatePoints — destroys GPU resources, clears the vector,
+    // resets the ghost preview, and refreshes. No path VBO equivalent for
+    // ejectors (they're standalone cylinders, not connected to a feed
+    // network), so RebuildEjectorSolids() is the only rebuild needed; with
+    // an empty vector it falls through its early-out cleanly.
+    for (auto& ef : m_ejectors) ef.Destroy();
+    m_ejectors.clear();
+    m_ejectorGhostActive = false;
     Refresh(false);
 }
 
@@ -2927,6 +3200,41 @@ void GLCanvas::RemoveGateAtMouse(int mouseX, int mouseY)
 
     RebuildGatePathVBO();
     RebuildGateSolids();
+    Refresh(false);
+}
+
+// ---------------------------------------------------------------------------
+// RemoveEjectorAtMouse — removes the ejector whose marker is closest to the
+// ray. Mirrors RemoveGateAtMouse but operates on m_ejectors and only needs
+// to rebuild the ejector solids (no path VBO).
+// ---------------------------------------------------------------------------
+void GLCanvas::RemoveEjectorAtMouse(int mouseX, int mouseY)
+{
+    if (m_ejectors.empty()) return;
+
+    glm::vec3 rayOrig, rayDir;
+    BuildMouseRay(mouseX, mouseY, rayOrig, rayDir);
+
+    const float hitRadius = kVentMarkerRadius * 2.0f;
+    float bestDist = hitRadius;
+    int   bestIdx = -1;
+
+    for (int i = 0; i < (int)m_ejectors.size(); ++i)
+    {
+        const float d = PointRayDistance(m_ejectors[i].point, rayOrig, rayDir);
+        if (d < bestDist)
+        {
+            bestDist = d;
+            bestIdx = i;
+        }
+    }
+
+    if (bestIdx < 0) return;
+
+    m_ejectors[bestIdx].Destroy();
+    m_ejectors.erase(m_ejectors.begin() + bestIdx);
+
+    RebuildEjectorSolids();
     Refresh(false);
 }
 
@@ -4087,6 +4395,22 @@ void GLCanvas::OnPaint(wxPaintEvent&)
                 RebuildGateSolids();
             }
         }
+        else if (m_transformMode == TransformMode::EditEjector &&
+            m_editFeatureIndex >= 0 && m_editFeatureIndex < (int)m_ejectors.size())
+        {
+            // Re-snap the dragged ejector with the same picker used at
+            // initial placement (RayCastEjectorSnap), so dragging onto a
+            // runner / gate / sprue parting / object face all behave
+            // exactly like placing a new ejector. RebuildEjectorSolids
+            // reconstructs the cylinder from the new point + current UI
+            // dimensions, mirroring the EditGate convention.
+            glm::vec3 hitPos;
+            if (RayCastEjectorSnap(m_editMousePos.x, m_editMousePos.y, hitPos))
+            {
+                m_ejectors[m_editFeatureIndex].point = hitPos;
+                RebuildEjectorSolids();
+            }
+        }
     }
 
     // ---- Vent point markers (green spheres) --------------------------------
@@ -4345,6 +4669,101 @@ void GLCanvas::OnPaint(wxPaintEvent&)
             for (int i = 0; i < (int)m_gates.size(); ++i)
             {
                 glm::mat4 model = glm::translate(glm::mat4(1.0f), m_gates[i].point.worldPos);
+                model = glm::scale(model, glm::vec3(kVentMarkerRadius));
+                glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &model[0][0]);
+                glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
+            }
+        }
+
+        glBindVertexArray(0);
+        glUseProgram(0);
+    }
+
+    // ---- Ejector point markers (cyan spheres) ------------------------------
+    // Mirrors the vent / gate marker pattern, but with an extended snap pick
+    // (RayCastEjectorSnap) instead of the parting-line snap. The ghost
+    // tracks whichever candidate currently wins (sprue parting pt / runner
+    // segment / gate segment / object face).
+    if (m_transformMode == TransformMode::PlaceEjector)
+    {
+        glm::vec3 hitPos;
+        m_ejectorGhostActive = RayCastEjectorSnap(m_ejectorGhostMousePos.x,
+            m_ejectorGhostMousePos.y, hitPos);
+        m_ejectorGhostPos = hitPos;
+    }
+    if (m_program && m_sphereVAO && m_sphereIndexCount > 0 &&
+        (!m_ejectors.empty() || m_ejectorGhostActive))
+    {
+        glEnable(GL_DEPTH_TEST);
+        glUseProgram(m_program);
+
+        glUniform3fv(glGetUniformLocation(m_program, "uCameraPos"), 1, &camPos[0]);
+        glUniform3fv(glGetUniformLocation(m_program, "uLightDir"), 1, &lightDir[0]);
+        glUniform3fv(glGetUniformLocation(m_program, "uLightColor"), 1, &lightColor[0]);
+        glUniform1f(glGetUniformLocation(m_program, "uAmbient"), 0.35f);
+        glUniform1f(glGetUniformLocation(m_program, "uDiffuse"), 0.75f);
+        glUniform1f(glGetUniformLocation(m_program, "uSpecular"), 0.60f);
+        glUniform1f(glGetUniformLocation(m_program, "uShininess"), 48.0f);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uView"), 1, GL_FALSE, &view[0][0]);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uProj"), 1, GL_FALSE, &proj[0][0]);
+
+        glBindVertexArray(m_sphereVAO);
+
+        // Ghost preview — translucent cyan, slightly oversized to read against
+        // a runner / gate line that already lives at the same world location.
+        if (m_ejectorGhostActive)
+        {
+            const glm::vec3 ghostColor(0.20f, 0.85f, 0.95f);   // cyan
+            glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &ghostColor[0]);
+            glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 0.45f);
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glDepthMask(GL_FALSE);
+
+            glm::mat4 model = glm::translate(glm::mat4(1.0f), m_ejectorGhostPos);
+            model = glm::scale(model, glm::vec3(kVentMarkerRadius * 1.15f));
+            glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &model[0][0]);
+            glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
+
+            glDepthMask(GL_TRUE);
+            glDisable(GL_BLEND);
+        }
+
+        // Confirmed ejector points — halo pass (edit mode) then markers.
+        if (!m_ejectors.empty())
+        {
+            // Pass 1: highlight halo for the selected marker (drawn behind
+            // via the depth-mask-off blend, same convention as gates).
+            // Orange against cyan markers — matches the gate halo so the
+            // edit-mode visual idiom is consistent across feature types.
+            if (m_transformMode == TransformMode::EditEjector &&
+                m_editFeatureIndex >= 0 && m_editFeatureIndex < (int)m_ejectors.size())
+            {
+                const glm::vec3 haloColor(1.0f, 0.55f, 0.0f);
+                glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &haloColor[0]);
+                glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 0.55f);
+                glEnable(GL_BLEND);
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                glDepthMask(GL_FALSE);
+
+                glm::mat4 model = glm::translate(glm::mat4(1.0f),
+                    m_ejectors[m_editFeatureIndex].point);
+                model = glm::scale(model, glm::vec3(kVentMarkerRadius * 1.8f));
+                glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &model[0][0]);
+                glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
+
+                glDepthMask(GL_TRUE);
+                glDisable(GL_BLEND);
+            }
+
+            // Pass 2: normal markers.
+            const glm::vec3 ejectorColor(0.20f, 0.85f, 0.95f);
+            glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &ejectorColor[0]);
+            glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 1.0f);
+
+            for (const EjectorFeature& ef : m_ejectors)
+            {
+                glm::mat4 model = glm::translate(glm::mat4(1.0f), ef.point);
                 model = glm::scale(model, glm::vec3(kVentMarkerRadius));
                 glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &model[0][0]);
                 glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
@@ -4719,6 +5138,47 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         glDisable(GL_BLEND);
     }
 
+    // ---- Ejector solids (lit, semi-transparent cyan) -----------------------
+    // Mirrors the gate-solid block exactly: same lighting setup, same blend
+    // / depth-mask convention, only the colour and the source vector differ.
+    // The cyan matches the ejector marker spheres so the geometry visually
+    // groups with its placement point.
+    if (m_program && !m_ejectors.empty())
+    {
+        glEnable(GL_DEPTH_TEST);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glDepthMask(GL_FALSE);
+        glUseProgram(m_program);
+
+        const glm::mat4 identity(1.0f);
+        glUniform3fv(glGetUniformLocation(m_program, "uCameraPos"), 1, &camPos[0]);
+        glUniform3fv(glGetUniformLocation(m_program, "uLightDir"), 1, &lightDir[0]);
+        glUniform3fv(glGetUniformLocation(m_program, "uLightColor"), 1, &lightColor[0]);
+        glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 0.55f);
+        glUniform1f(glGetUniformLocation(m_program, "uAmbient"), 0.30f);
+        glUniform1f(glGetUniformLocation(m_program, "uDiffuse"), 0.80f);
+        glUniform1f(glGetUniformLocation(m_program, "uSpecular"), 0.40f);
+        glUniform1f(glGetUniformLocation(m_program, "uShininess"), 32.0f);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uView"), 1, GL_FALSE, &view[0][0]);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uProj"), 1, GL_FALSE, &proj[0][0]);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &identity[0][0]);
+
+        const glm::vec3 ejectorColor(0.20f, 0.85f, 0.95f);   // cyan
+        glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &ejectorColor[0]);
+        for (const EjectorFeature& ef : m_ejectors)
+        {
+            if (!ef.solid.valid || ef.solid.vao == 0) continue;
+            glBindVertexArray(ef.solid.vao);
+            glDrawElements(GL_TRIANGLES, ef.solid.indexCount, GL_UNSIGNED_INT, 0);
+        }
+
+        glBindVertexArray(0);
+        glUseProgram(0);
+        glDepthMask(GL_TRUE);
+        glDisable(GL_BLEND);
+    }
+
     // ---- Sprue solid (lit, semi-transparent purple) ------------------------
     if (m_program && m_sprue.solid.valid && m_sprue.solid.vao != 0)
     {
@@ -4994,6 +5454,27 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
                 Refresh(false);
             }
         }
+        else if (m_transformMode == TransformMode::PlaceEjector)
+        {
+            // Snap to the closest of: sprue parting point, any runner
+            // segment, any gate segment, or any object face. Falls through
+            // silently if none are in range — matching the other Place*
+            // modes' behaviour for an out-of-bounds click.
+            const wxPoint p = evt.GetPosition();
+            glm::vec3 hitPos;
+            if (RayCastEjectorSnap(p.x, p.y, hitPos))
+            {
+                EjectorFeature ef;
+                ef.point = hitPos;
+                m_ejectors.push_back(std::move(ef));
+                // Rebuild every ejector's cylinder. Cheap with the small
+                // counts we deal with here, and matches the all-at-once
+                // pattern RebuildGateSolids uses (which lets a future
+                // "live update on UI change" feature plug in cleanly).
+                RebuildEjectorSolids();
+                Refresh(false);
+            }
+        }
         else if (m_transformMode == TransformMode::RemoveVent)
         {
             const wxPoint p = evt.GetPosition();
@@ -5013,6 +5494,11 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
         {
             const wxPoint p = evt.GetPosition();
             RemoveSprueAtMouse(p.x, p.y);
+        }
+        else if (m_transformMode == TransformMode::RemoveEjector)
+        {
+            const wxPoint p = evt.GetPosition();
+            RemoveEjectorAtMouse(p.x, p.y);
         }
         else if (m_transformMode == TransformMode::AlignFace)
         {
@@ -5202,6 +5688,25 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
             m_editFeatureIndex = bestIdx;
             Refresh(false);
         }
+        else if (m_transformMode == TransformMode::EditEjector)
+        {
+            // Same pick pattern as EditGate — closest marker within
+            // 2× the marker radius wins, -1 if no marker is in range.
+            const wxPoint p = evt.GetPosition();
+            glm::vec3 rayOrig, rayDir;
+            BuildMouseRay(p.x, p.y, rayOrig, rayDir);
+
+            const float hitRadius = kVentMarkerRadius * 2.0f;
+            float bestDist = hitRadius;
+            int   bestIdx = -1;
+            for (int i = 0; i < (int)m_ejectors.size(); ++i)
+            {
+                const float d = PointRayDistance(m_ejectors[i].point, rayOrig, rayDir);
+                if (d < bestDist) { bestDist = d; bestIdx = i; }
+            }
+            m_editFeatureIndex = bestIdx;
+            Refresh(false);
+        }
     }
 
     if (evt.LeftUp()) { m_lmb = false; if (HasCapture()) ReleaseMouse(); }
@@ -5247,6 +5752,11 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
         if (m_transformMode == TransformMode::PlaceGate)
         {
             m_gateGhostMousePos = pos;
+            Refresh(false);
+        }
+        if (m_transformMode == TransformMode::PlaceEjector)
+        {
+            m_ejectorGhostMousePos = pos;
             Refresh(false);
         }
         if (m_transformMode == TransformMode::AlignFace ||
@@ -5368,7 +5878,8 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
     }
     else if (m_lmb && (m_transformMode == TransformMode::EditVent ||
         m_transformMode == TransformMode::EditRunner ||
-        m_transformMode == TransformMode::EditGate))
+        m_transformMode == TransformMode::EditGate ||
+        m_transformMode == TransformMode::EditEjector))
     {
         if (m_editFeatureIndex >= 0)
         {
@@ -5418,6 +5929,11 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
         m_gateGhostMousePos = evt.GetPosition();
         Refresh(false);
     }
+    else if (m_transformMode == TransformMode::PlaceEjector)
+    {
+        m_ejectorGhostMousePos = evt.GetPosition();
+        Refresh(false);
+    }
     else if (m_transformMode == TransformMode::AlignFace ||
         m_transformMode == TransformMode::AlignMidplane)
     {
@@ -5425,11 +5941,13 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
         m_alignMousePos = evt.GetPosition();
         Refresh(false);
     }
-    else if (m_ventGhostActive || m_runnerGhostActive || m_gateGhostActive)
+    else if (m_ventGhostActive || m_runnerGhostActive || m_gateGhostActive ||
+        m_ejectorGhostActive)
     {
         m_ventGhostActive = false;
         m_runnerGhostActive = false;
         m_gateGhostActive = false;
+        m_ejectorGhostActive = false;
         Refresh(false);
     }
 
@@ -5454,6 +5972,7 @@ void GLCanvas::OnKeyDown(wxKeyEvent& evt)
             m_ventGhostActive = false;
             m_runnerGhostActive = false;
             m_gateGhostActive = false;
+            m_ejectorGhostActive = false;
             SetTransformMode(TransformMode::Select);
             if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
                 frame->SetActiveTool(TransformMode::Select);
@@ -5715,6 +6234,10 @@ void GLCanvas::ClearAll()
     for (auto& gf : m_gates) gf.Destroy();
     m_gates.clear();
 
+    // Ejectors
+    for (auto& ef : m_ejectors) ef.Destroy();
+    m_ejectors.clear();
+
     // Sprue
     m_sprue.Clear();
     m_sprue.DestroyGL();
@@ -5725,6 +6248,7 @@ void GLCanvas::ClearAll()
     m_ventGhostActive = false;
     m_runnerGhostActive = false;
     m_gateGhostActive = false;
+    m_ejectorGhostActive = false;
     m_editFeatureIndex = -1;
 
     // Rebuild all path/cross-section VBOs so stale highlights are cleared
@@ -5838,6 +6362,16 @@ void GLCanvas::RestoreVent(const glm::vec3& pos, const glm::vec3& normal,
     vi.localPos = localPos;
     vi.localNormal = localNormal;
     m_vents.push_back(std::move(vi));
+}
+
+void GLCanvas::RestoreEjector(const glm::vec3& point)
+{
+    // Programmatic placement during project load. Mirrors RestoreGate /
+    // RestoreVent — no rebuild here; the caller batches a single
+    // RebuildAllFeatures() at the end of the load.
+    EjectorFeature ef;
+    ef.point = point;
+    m_ejectors.push_back(std::move(ef));
 }
 
 // ---------------------------------------------------------------------------
@@ -5965,5 +6499,6 @@ void GLCanvas::RebuildAllFeatures()
     RebuildRunnerSolids();
     RebuildGatePathVBO();
     RebuildGateSolids();
+    RebuildEjectorSolids();
     Refresh(false);
 }

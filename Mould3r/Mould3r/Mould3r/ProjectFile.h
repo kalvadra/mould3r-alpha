@@ -66,6 +66,16 @@ struct ProjectVentData
     glm::vec3 localNormal{ 0.0f, 0.0f, 1.0f };
 };
 
+// Ejectors carry only a world-space point at present — no normal (none of the
+// snap surfaces share a normal concept), no parent association (sticky
+// placement isn't wired up for ejectors yet, mirroring how the feature
+// shipped). Diameter and length are global UI parameters and live on
+// ProjectParameters, exactly like the other geometry features.
+struct ProjectEjectorData
+{
+    glm::vec3 point{ 0.0f };
+};
+
 struct ProjectParameters
 {
     float ventWidth = 2.0f;
@@ -84,6 +94,9 @@ struct ProjectParameters
     float gateDiameter = 3.0f;
     float gateDraftAngle = 1.0f;
     float subRunnerDiameter = 5.0f;
+
+    float ejectorDiameter = 3.0f;
+    float ejectorLength = 25.0f;
 };
 
 struct ProjectData
@@ -96,9 +109,10 @@ struct ProjectData
     ProjectParameters params;
     ProjectSprueData  sprue;
 
-    std::vector<ProjectRunnerData> runners;
-    std::vector<ProjectGateData>   gates;
-    std::vector<ProjectVentData>   vents;
+    std::vector<ProjectRunnerData>  runners;
+    std::vector<ProjectGateData>    gates;
+    std::vector<ProjectVentData>    vents;
+    std::vector<ProjectEjectorData> ejectors;
 };
 
 // ---------------------------------------------------------------------------

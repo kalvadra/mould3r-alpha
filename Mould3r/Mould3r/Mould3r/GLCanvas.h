@@ -193,11 +193,23 @@ public:
     const std::vector<GateFeature>& GetGates() const { return m_gates; }
     void ClearGatePoints();
 
+    // Ejector placement
+    const std::vector<EjectorFeature>& GetEjectors() const { return m_ejectors; }
+    void ClearEjectors();
+    // Rebuild every ejector's preview cylinder. Called after place / clear /
+    // any operation that changes the ejector list. Reads diameter and
+    // length from the MainFrame UI at call time, same convention as
+    // RebuildGateSolids — so changing the dimension fields and placing a
+    // new ejector picks up fresh values, but existing ejectors keep
+    // whatever dimensions they were built with.
+    void RebuildEjectorSolids();
+
     // Remove individual features by clicking their marker
     void RemoveVentAtMouse(int mouseX, int mouseY);
     void RemoveRunnerAtMouse(int mouseX, int mouseY);
     void RemoveGateAtMouse(int mouseX, int mouseY);
     void RemoveSprueAtMouse(int mouseX, int mouseY);
+    void RemoveEjectorAtMouse(int mouseX, int mouseY);
 
     // ---- Project save/load support -----------------------------------------
 
@@ -228,6 +240,12 @@ public:
         int parentIndex = -1,
         const glm::vec3& localPos = glm::vec3(0.0f),
         const glm::vec3& localNormal = glm::vec3(0.0f, 0.0f, 1.0f));
+
+    // Restore an ejector during project load. No batch rebuild is performed
+    // here — the caller is expected to invoke RebuildAllFeatures() once at
+    // the end of the load to materialise GPU resources for every restored
+    // feature in one pass.
+    void RestoreEjector(const glm::vec3& point);
 
     // Rebuild all derived geometry after a batch restore (call once at end)
     void RebuildAllFeatures();
@@ -267,6 +285,17 @@ private:
 
     // Simple ray–plane intersection with y=0 (no mesh snapping)
     bool RayCastToPartingPlane(int mouseX, int mouseY, glm::vec3& outPos);
+
+    // Snap-pick for ejector placement. Considers four candidate sources:
+    //   1. Sprue path's intersection with y=0 (m_sprue.partingPos),
+    //   2. Any runner segment (sprue parting pos -> runner pt, on y=0),
+    //   3. Any gate segment (gate worldPos -> gate.pathEnd),
+    //   4. Any object face (full mesh ray-cast).
+    // Path candidates win when within kEjectorSnapRadiusPx screen-space
+    // pixels of the cursor; otherwise falls through to the face hit.
+    // Returns false if nothing is in range. See implementation for the
+    // ranking rationale.
+    bool RayCastEjectorSnap(int mouseX, int mouseY, glm::vec3& outPos);
 
     // Sticky placement helpers — re-derive a parented vent's / gate's
     // world-space data from its parent object's current transform plus the
@@ -426,6 +455,15 @@ private:
     VentPoint m_gateGhost;
     bool      m_gateGhostActive = false;
     wxPoint   m_gateGhostMousePos;
+
+    // Ejector features (placement points only, geometry TBD)
+    std::vector<EjectorFeature> m_ejectors;
+
+    // Ghost preview for ejector placement (follows mouse in PlaceEjector mode).
+    // No normal field — see EjectorFeature comment in MouldFeature.h.
+    glm::vec3 m_ejectorGhostPos{ 0.0f };
+    bool      m_ejectorGhostActive = false;
+    wxPoint   m_ejectorGhostMousePos;
 
     // Fallback test geometry (pyramid)
     unsigned int m_vao = 0;
