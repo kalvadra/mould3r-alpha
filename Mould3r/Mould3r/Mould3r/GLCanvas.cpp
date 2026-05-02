@@ -5991,6 +5991,21 @@ void GLCanvas::OnKeyDown(wxKeyEvent& evt)
             m_selectedIndices.push_back(i);
         Refresh(false);
     }
+    else if (evt.GetKeyCode() == 'C' && evt.ControlDown()
+        && m_transformMode == TransformMode::Select)
+    {
+        // Ctrl+C: copy current selection into m_clipboard. No-op when
+        // nothing is selected. Same Select-mode gate as Ctrl+A so
+        // copy/paste can't fire mid-placement.
+        CopySelectedToClipboard();
+    }
+    else if (evt.GetKeyCode() == 'V' && evt.ControlDown()
+        && m_transformMode == TransformMode::Select)
+    {
+        // Ctrl+V: paste clipboard contents at the world origin. No-op
+        // when the clipboard is empty.
+        PasteFromClipboard();
+    }
     else if (evt.GetKeyCode() == WXK_DELETE && !m_selectedIndices.empty())
     {
         // Sort selection in descending order so erasing each entry doesn't
@@ -6036,6 +6051,127 @@ void GLCanvas::OnKeyDown(wxKeyEvent& evt)
     else
     {
         evt.Skip();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Copy / Paste (Ctrl+C / Ctrl+V)
+//
+// Internal-only clipboard — does not touch the OS clipboard. Each entry
+// captures the CPU-side mesh and pose of one selected object; paste
+// rebuilds GPU resources from scratch via the same normal/crease pipeline
+// used at import time, so the new object owns its own VAO/VBO/EBO.
+//
+// Per spec: rotation, scale, and mirror flags are preserved on paste;
+// position is reset to the world origin. Repeated pastes therefore stack
+// at (0,0,0); the user is expected to translate them apart afterwards.
+// ---------------------------------------------------------------------------
+void GLCanvas::CopySelectedToClipboard()
+{
+    if (m_selectedIndices.empty()) return;
+
+    // Walk the selection in ascending index order so multi-paste preserves
+    // the on-screen layering (lowest index first). m_selectedIndices is in
+    // click order, which is fine for "primary" semantics but not for
+    // deterministic paste ordering — sort a local copy.
+    std::vector<int> indices = m_selectedIndices;
+    std::sort(indices.begin(), indices.end());
+
+    m_clipboard.clear();
+    m_clipboard.reserve(indices.size());
+    for (int idx : indices)
+    {
+        if (idx < 0 || idx >= (int)m_objects.size()) continue;
+        const SceneObject& src = m_objects[idx];
+
+        ClipboardEntry e;
+        e.cpuVerts = src.cpuVerts;
+        e.cpuIndices = src.cpuIndices;
+        e.sourcePath = src.sourcePath;
+        e.sourceShape = src.sourceShape;
+        e.hasSourceShape = src.hasSourceShape;
+        e.role = src.role;
+        e.yawDeg = src.yawDeg;
+        e.pitchDeg = src.pitchDeg;
+        e.rollDeg = src.rollDeg;
+        e.scale = src.scale;
+        e.mirrorX = src.mirrorX;
+        e.mirrorZ = src.mirrorZ;
+        m_clipboard.push_back(std::move(e));
+    }
+}
+
+void GLCanvas::PasteFromClipboard()
+{
+    if (m_clipboard.empty()) return;
+
+    // GL context must be current for UploadMeshToGPU. Mirrors the prelude
+    // used by ApplyCircularPattern / ApplyGridPattern.
+    SetCurrent(*m_context);
+    InitGLOnce();
+
+    // Indices of the new objects, captured as we go. After the loop we
+    // make these the new selection so the user immediately sees what
+    // they just pasted (and can drag it off the origin without an extra
+    // click). m_objects may reallocate during emplace_back, so we record
+    // indices rather than pointers.
+    std::vector<int> newIndices;
+    newIndices.reserve(m_clipboard.size());
+
+    for (const ClipboardEntry& e : m_clipboard)
+    {
+        // Skip empty meshes defensively — shouldn't occur because copy
+        // only stores objects that already imported successfully, but
+        // UploadMeshToGPU requires non-empty buffers.
+        if (e.cpuVerts.empty() || e.cpuIndices.empty()) continue;
+
+        m_objects.emplace_back();
+        SceneObject& obj = m_objects.back();
+
+        obj.role = e.role;
+        obj.sourcePath = e.sourcePath;
+        obj.sourceShape = e.sourceShape;
+        obj.hasSourceShape = e.hasSourceShape;
+        obj.cpuVerts = e.cpuVerts;
+        obj.cpuIndices = e.cpuIndices;
+        // triNeighbors / adjacencyBuilt left at defaults — rebuilt lazily
+        // on first use, identically to the original (same convention as
+        // pattern operations).
+
+        // Pose: world origin, but keep rotation, scale, and mirror flags.
+        obj.pos = glm::vec3(0.0f);
+        obj.yawDeg = e.yawDeg;
+        obj.pitchDeg = e.pitchDeg;
+        obj.rollDeg = e.rollDeg;
+        obj.scale = e.scale;
+        obj.mirrorX = e.mirrorX;
+        obj.mirrorZ = e.mirrorZ;
+        // mouldShape / hasMould intentionally left unset — pasted copies
+        // are fresh objects without a generated mould (matches pattern-op
+        // behavior; the user re-runs Generate Mould as needed).
+
+        // Rebuild GPU mesh from the cached CPU vertices, mirroring the
+        // post-import pipeline in ImportFile() (and the pattern ops).
+        FileImporter::MeshData md;
+        md.vertices = obj.cpuVerts;
+        md.indices = obj.cpuIndices;
+        ComputeVertexNormals_Pos3(md.vertices, md.indices, md.posNorm);
+        auto split = SplitByCreaseAngle_Pos3(md.vertices, md.indices, 35.0f);
+        md.posNorm = std::move(split.posNorm);
+        md.indices = std::move(split.indices);
+        UploadMeshToGPU(md, obj);
+
+        newIndices.push_back((int)m_objects.size() - 1);
+    }
+
+    if (!newIndices.empty())
+    {
+        // Replace selection with the freshly-pasted set. Any prior
+        // selection is dropped — feels right for a paste action and
+        // matches the conventional behavior of paste in editors that
+        // have a notion of selection.
+        m_selectedIndices = std::move(newIndices);
+        Refresh(false);
     }
 }
 
