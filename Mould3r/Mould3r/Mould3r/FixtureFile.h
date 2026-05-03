@@ -1,4 +1,5 @@
 #pragma once
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -22,6 +23,59 @@ struct InjectionPoint
     InjectionType type = InjectionType::Radial;
 };
 
+// ---------------------------------------------------------------------------
+// Per-feature default overrides parsed from the fixture file's optional
+// [<feature>_defaults] sections. Each field uses std::optional so the
+// fixture can specify exactly which defaults it cares about — anything left
+// unset falls back to the application's hardcoded UI defaults at apply
+// time. Distance fields are stored in millimetres; angle fields in degrees,
+// matching the file format and the rest of the data model.
+// ---------------------------------------------------------------------------
+struct VentDefaults
+{
+    std::optional<std::string> type;
+    std::optional<float>       length;
+    std::optional<float>       width;
+    std::optional<float>       overrunStart;
+    std::optional<float>       overrunEnd;
+};
+
+struct SprueDefaults
+{
+    std::optional<std::string> type;
+    std::optional<float>       diameter;
+    std::optional<float>       draftAngle;
+    std::optional<float>       coldSlugLength;
+    std::optional<float>       length;
+};
+
+struct RunnerDefaults
+{
+    std::optional<std::string> type;
+    std::optional<float>       diameter;
+    std::optional<float>       coldSlugLength;
+};
+
+struct GateDefaults
+{
+    std::optional<std::string> type;
+    std::optional<float>       diameter;
+    std::optional<float>       draftAngle;
+};
+
+struct SubRunnerDefaults
+{
+    std::optional<std::string> type;
+    std::optional<float>       diameter;
+};
+
+struct EjectorDefaults
+{
+    std::optional<std::string> type;
+    std::optional<float>       diameter;
+    std::optional<float>       length;
+};
+
 struct FixtureDefinition
 {
     std::string modelAPath;   // always stored as absolute internally
@@ -29,6 +83,16 @@ struct FixtureDefinition
     std::string fixturePath;  // directory anchor for relative path resolution
 
     std::vector<InjectionPoint> injectionPoints;
+
+    // Optional per-feature defaults. All fields default-construct to empty
+    // optionals — i.e. "no override". MainFrame::ApplyFixtureDefaults walks
+    // these and writes only the specified values into the side-panel UI.
+    VentDefaults      ventDefaults;
+    SprueDefaults     sprueDefaults;
+    RunnerDefaults    runnerDefaults;
+    GateDefaults      gateDefaults;
+    SubRunnerDefaults subRunnerDefaults;
+    EjectorDefaults   ejectorDefaults;
 
     bool IsValid() const
     {

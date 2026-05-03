@@ -57,6 +57,24 @@ public:
     // Set UI field values (used when restoring a project)
     void SetParameterFields(const ProjectParameters& params);
 
+    // Apply per-feature defaults specified in a fixture file to the
+    // side-panel UI fields. Only fields the fixture explicitly overrides
+    // (i.e. corresponding std::optional has a value) are written; missing
+    // overrides leave the existing field text untouched, so the
+    // application's hardcoded UI defaults remain the fallback.
+    //
+    // Distance fields are stored in mm in the fixture file and converted
+    // to the active display units (mm or in) before writing — same
+    // convention as SetParameterFields. Angle fields are degrees and are
+    // written verbatim.
+    //
+    // Call ordering when both project params and fixture defaults are
+    // available (project load): apply fixture defaults FIRST, then
+    // SetParameterFields — project values override fixture defaults
+    // because the user may have intentionally diverged from defaults
+    // before saving.
+    void ApplyFixtureDefaults(const FixtureDefinition& def);
+
     // If no fixture has been loaded yet, show the selection dialog and load
     // whatever the user chooses. Intended to be called once, right after the
     // frame is shown on app startup. If the user cancels, the frame stays

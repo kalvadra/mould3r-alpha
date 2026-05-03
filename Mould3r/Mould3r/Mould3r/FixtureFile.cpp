@@ -60,10 +60,23 @@ bool FixtureFile::Load(const std::string& path,
     out.injectionPoints.clear();
 
     // Section-aware parsing.
-    // Sections: [fixture], [injection_point.N]
+    // Sections: [fixture], [injection_point.N], [<feature>_defaults]
     // An injection_point block is committed to the list when the next section
-    // header (or EOF) is encountered.
-    enum class Section { None, Fixture, InjectionPoint };
+    // header (or EOF) is encountered. Defaults sections write directly into
+    // their corresponding struct on FixtureDefinition (no commit step needed
+    // — there's at most one of each defaults section per file).
+    enum class Section
+    {
+        None,
+        Fixture,
+        InjectionPoint,
+        VentDefaults,
+        SprueDefaults,
+        RunnerDefaults,
+        GateDefaults,
+        SubRunnerDefaults,
+        EjectorDefaults,
+    };
     Section     currentSection = Section::None;
     InjectionPoint pendingPoint;
     bool           hasPending = false;
@@ -76,6 +89,16 @@ bool FixtureFile::Load(const std::string& path,
                 pendingPoint = InjectionPoint{};
                 hasPending = false;
             }
+        };
+
+    // Helper: parse a numeric value into an optional<float>. Silently
+    // ignores malformed input (leaves the optional unset). Used by every
+    // defaults section so a typo in one field doesn't take down the rest
+    // of the file.
+    auto parseOptFloat = [](const std::string& s, std::optional<float>& dst)
+        {
+            try { dst = std::stof(s); }
+            catch (...) { /* leave dst unchanged */ }
         };
 
     std::string line;
@@ -99,6 +122,30 @@ bool FixtureFile::Load(const std::string& path,
             {
                 currentSection = Section::InjectionPoint;
                 hasPending = true;   // start accumulating a new point
+            }
+            else if (sectionName == "vent_defaults")
+            {
+                currentSection = Section::VentDefaults;
+            }
+            else if (sectionName == "sprue_defaults")
+            {
+                currentSection = Section::SprueDefaults;
+            }
+            else if (sectionName == "runner_defaults")
+            {
+                currentSection = Section::RunnerDefaults;
+            }
+            else if (sectionName == "gate_defaults")
+            {
+                currentSection = Section::GateDefaults;
+            }
+            else if (sectionName == "sub_runner_defaults")
+            {
+                currentSection = Section::SubRunnerDefaults;
+            }
+            else if (sectionName == "ejector_defaults")
+            {
+                currentSection = Section::EjectorDefaults;
             }
             else
             {
@@ -149,6 +196,49 @@ bool FixtureFile::Load(const std::string& path,
                 catch (...) {}
             }
         }
+        // ---- Per-feature defaults sections ---------------------------------
+        // Each branch routes recognised keys into the corresponding optional
+        // field on FixtureDefinition. Unknown keys are silently ignored so
+        // forward-compat additions don't break older builds.
+        else if (currentSection == Section::VentDefaults)
+        {
+            if (key == "type")          out.ventDefaults.type = value;
+            else if (key == "length")        parseOptFloat(value, out.ventDefaults.length);
+            else if (key == "width")         parseOptFloat(value, out.ventDefaults.width);
+            else if (key == "overrun_start") parseOptFloat(value, out.ventDefaults.overrunStart);
+            else if (key == "overrun_end")   parseOptFloat(value, out.ventDefaults.overrunEnd);
+        }
+        else if (currentSection == Section::SprueDefaults)
+        {
+            if (key == "type")             out.sprueDefaults.type = value;
+            else if (key == "diameter")         parseOptFloat(value, out.sprueDefaults.diameter);
+            else if (key == "draft_angle")      parseOptFloat(value, out.sprueDefaults.draftAngle);
+            else if (key == "cold_slug_length") parseOptFloat(value, out.sprueDefaults.coldSlugLength);
+            else if (key == "length")           parseOptFloat(value, out.sprueDefaults.length);
+        }
+        else if (currentSection == Section::RunnerDefaults)
+        {
+            if (key == "type")             out.runnerDefaults.type = value;
+            else if (key == "diameter")         parseOptFloat(value, out.runnerDefaults.diameter);
+            else if (key == "cold_slug_length") parseOptFloat(value, out.runnerDefaults.coldSlugLength);
+        }
+        else if (currentSection == Section::GateDefaults)
+        {
+            if (key == "type")        out.gateDefaults.type = value;
+            else if (key == "diameter")    parseOptFloat(value, out.gateDefaults.diameter);
+            else if (key == "draft_angle") parseOptFloat(value, out.gateDefaults.draftAngle);
+        }
+        else if (currentSection == Section::SubRunnerDefaults)
+        {
+            if (key == "type")     out.subRunnerDefaults.type = value;
+            else if (key == "diameter") parseOptFloat(value, out.subRunnerDefaults.diameter);
+        }
+        else if (currentSection == Section::EjectorDefaults)
+        {
+            if (key == "type")     out.ejectorDefaults.type = value;
+            else if (key == "diameter") parseOptFloat(value, out.ejectorDefaults.diameter);
+            else if (key == "length")   parseOptFloat(value, out.ejectorDefaults.length);
+        }
     }
 
     // Commit any point that reached EOF without a following section header
@@ -195,6 +285,85 @@ bool FixtureFile::Save(const std::string& path,
         file << "x     = " << ip.x << "\n";
         file << "y     = " << ip.y << "\n";
         file << "z     = " << ip.z << "\n";
+    }
+
+    // ---- Defaults sections -------------------------------------------------
+    // Only emit sections that have at least one field set, and within each
+    // section only emit the set fields. This keeps round-tripping clean: a
+    // file loaded with no defaults gets saved with no defaults, and a file
+    // that overrode (say) only sprue diameter doesn't sprout phantom
+    // overrides for every other sprue field on save.
+    auto writeKey = [&](const char* key, const std::optional<std::string>& v)
+        {
+            if (v) file << key << " = " << *v << "\n";
+        };
+    auto writeKeyF = [&](const char* key, const std::optional<float>& v)
+        {
+            if (v) file << key << " = " << *v << "\n";
+        };
+
+    {
+        const VentDefaults& d = def.ventDefaults;
+        if (d.type || d.length || d.width || d.overrunStart || d.overrunEnd)
+        {
+            file << "\n[vent_defaults]\n";
+            writeKey("type", d.type);
+            writeKeyF("length", d.length);
+            writeKeyF("width", d.width);
+            writeKeyF("overrun_start", d.overrunStart);
+            writeKeyF("overrun_end", d.overrunEnd);
+        }
+    }
+    {
+        const SprueDefaults& d = def.sprueDefaults;
+        if (d.type || d.diameter || d.draftAngle || d.coldSlugLength || d.length)
+        {
+            file << "\n[sprue_defaults]\n";
+            writeKey("type", d.type);
+            writeKeyF("diameter", d.diameter);
+            writeKeyF("draft_angle", d.draftAngle);
+            writeKeyF("cold_slug_length", d.coldSlugLength);
+            writeKeyF("length", d.length);
+        }
+    }
+    {
+        const RunnerDefaults& d = def.runnerDefaults;
+        if (d.type || d.diameter || d.coldSlugLength)
+        {
+            file << "\n[runner_defaults]\n";
+            writeKey("type", d.type);
+            writeKeyF("diameter", d.diameter);
+            writeKeyF("cold_slug_length", d.coldSlugLength);
+        }
+    }
+    {
+        const GateDefaults& d = def.gateDefaults;
+        if (d.type || d.diameter || d.draftAngle)
+        {
+            file << "\n[gate_defaults]\n";
+            writeKey("type", d.type);
+            writeKeyF("diameter", d.diameter);
+            writeKeyF("draft_angle", d.draftAngle);
+        }
+    }
+    {
+        const SubRunnerDefaults& d = def.subRunnerDefaults;
+        if (d.type || d.diameter)
+        {
+            file << "\n[sub_runner_defaults]\n";
+            writeKey("type", d.type);
+            writeKeyF("diameter", d.diameter);
+        }
+    }
+    {
+        const EjectorDefaults& d = def.ejectorDefaults;
+        if (d.type || d.diameter || d.length)
+        {
+            file << "\n[ejector_defaults]\n";
+            writeKey("type", d.type);
+            writeKeyF("diameter", d.diameter);
+            writeKeyF("length", d.length);
+        }
     }
 
     return true;
