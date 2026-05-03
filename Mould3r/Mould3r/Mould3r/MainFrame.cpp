@@ -297,6 +297,11 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
             m_canvas->SetActiveInjectionPoint(fixture.injectionPoints[0]);
             m_canvas->SetInjectionPoints(fixture.injectionPoints);
         }
+
+        // Apply any per-feature default overrides the fixture supplied.
+        // Safe here because CreateLeftPanel ran above, so all field/choice
+        // pointers are populated.
+        ApplyFixtureDefaults(fixture);
     }
 }
 
@@ -1049,6 +1054,9 @@ void MainFrame::OnChangeFixture(wxCommandEvent&)
         m_canvas->SetActiveInjectionPoint(fixture.injectionPoints[0]);
         m_canvas->SetInjectionPoints(fixture.injectionPoints);
     }
+
+    // Reset side-panel fields to the new fixture's per-feature defaults.
+    ApplyFixtureDefaults(fixture);
 }
 
 // ---------------------------------------------------------------------------
@@ -1084,6 +1092,8 @@ void MainFrame::PromptForFixtureIfMissing()
         m_canvas->SetActiveInjectionPoint(fixture.injectionPoints[0]);
         m_canvas->SetInjectionPoints(fixture.injectionPoints);
     }
+
+    ApplyFixtureDefaults(fixture);
 }
 
 // ---------------------------------------------------------------------------
@@ -1130,6 +1140,8 @@ void MainFrame::OnNewProject(wxCommandEvent&)
         m_canvas->SetActiveInjectionPoint(fixture.injectionPoints[0]);
         m_canvas->SetInjectionPoints(fixture.injectionPoints);
     }
+
+    ApplyFixtureDefaults(fixture);
 
     // Reset project state
     m_projectPath.clear();
@@ -1319,6 +1331,13 @@ void MainFrame::OnLoadProject(wxCommandEvent&)
                 m_canvas->SetActiveInjectionPoint(fixDef.injectionPoints[0]);
 
             m_canvas->SetInjectionPoints(fixDef.injectionPoints);
+
+            // Apply fixture's per-feature defaults FIRST, so that any UI
+            // fields the project hasn't customised pick up the fixture's
+            // values. SetParameterFields below then overwrites the numeric
+            // fields with the project's saved values, preserving exact
+            // round-trip behaviour for previously saved projects.
+            ApplyFixtureDefaults(fixDef);
         }
         else
         {
@@ -1406,6 +1425,94 @@ void MainFrame::SetParameterFields(const ProjectParameters& p)
     setField(m_subRunnerDiameter, p.subRunnerDiameter * conv);
     setField(m_ejectorDiameter, p.ejectorDiameter * conv);
     setField(m_ejectorLength, p.ejectorLength * conv);
+}
+
+// ---------------------------------------------------------------------------
+// ApplyFixtureDefaults — copy fixture-specified per-feature default overrides
+// into the side-panel UI fields.
+//
+// Each FixtureDefinition::*Defaults struct holds std::optional fields; only
+// the optionals that are set get written to the UI, so a fixture that
+// overrides only (say) sprue diameter leaves every other sprue field at its
+// existing value. On a freshly built side panel that existing value is the
+// application's hardcoded default; on an already-populated panel (e.g. user
+// changed a fixture mid-session) prior values are kept where the new fixture
+// is silent.
+//
+// Unit handling matches SetParameterFields: lengths come in mm and are scaled
+// to the current display unit; angles are degrees and pass through.
+//
+// Type-string overrides target the wxChoice controls. When the override
+// doesn't match a known entry we leave the choice untouched — this keeps
+// fixtures forward-compatible with builds that haven't added a particular
+// type yet, and avoids surprising the user with a silent fallback to index 0.
+// ---------------------------------------------------------------------------
+void MainFrame::ApplyFixtureDefaults(const FixtureDefinition& def)
+{
+    // Length conversion: stored as mm in the fixture, displayed in current unit.
+    const float lenConv = m_imperial ? (1.0f / 25.4f) : 1.0f;
+
+    auto setLen = [&](wxTextCtrl* ctrl, const std::optional<float>& v)
+        {
+            if (ctrl && v)
+                ctrl->SetValue(wxString::Format("%.4g", *v * lenConv));
+        };
+    auto setDeg = [&](wxTextCtrl* ctrl, const std::optional<float>& v)
+        {
+            if (ctrl && v)
+                ctrl->SetValue(wxString::Format("%.4g", *v));
+        };
+
+    // Type-choice override. We synthesise a wxEVT_CHOICE so any handlers
+    // bound to the control (which currently show/hide the matching dimensions
+    // panel) run the same way they would on a user click — keeps the UI
+    // consistent if/when more than one type per category exists.
+    auto setChoice = [](wxChoice* ctrl, const std::optional<std::string>& v)
+        {
+            if (!ctrl || !v) return;
+            const int idx = ctrl->FindString(wxString::FromUTF8(v->c_str()));
+            if (idx == wxNOT_FOUND) return;        // unknown type — ignore
+            if (idx == ctrl->GetSelection()) return; // already selected
+            ctrl->SetSelection(idx);
+
+            wxCommandEvent evt(wxEVT_CHOICE, ctrl->GetId());
+            evt.SetEventObject(ctrl);
+            evt.SetInt(idx);
+            ctrl->GetEventHandler()->ProcessEvent(evt);
+        };
+
+    // ---- Vent ---------------------------------------------------------------
+    setChoice(m_ventTypeChoice, def.ventDefaults.type);
+    setLen(m_ventLength, def.ventDefaults.length);
+    setLen(m_ventWidth, def.ventDefaults.width);
+    setLen(m_ventOverrunStart, def.ventDefaults.overrunStart);
+    setLen(m_ventOverrunEnd, def.ventDefaults.overrunEnd);
+
+    // ---- Sprue --------------------------------------------------------------
+    setChoice(m_sprueTypeChoice, def.sprueDefaults.type);
+    setLen(m_sprueDiameter, def.sprueDefaults.diameter);
+    setDeg(m_sprueDraftAngle, def.sprueDefaults.draftAngle);
+    setLen(m_sprueColdSlugDepth, def.sprueDefaults.coldSlugLength);
+    setLen(m_sprueLength, def.sprueDefaults.length);
+
+    // ---- Runner -------------------------------------------------------------
+    setChoice(m_runnerTypeChoice, def.runnerDefaults.type);
+    setLen(m_runnerDiameter, def.runnerDefaults.diameter);
+    setLen(m_runnerColdSlugDepth, def.runnerDefaults.coldSlugLength);
+
+    // ---- Gate ---------------------------------------------------------------
+    setChoice(m_gateTypeChoice, def.gateDefaults.type);
+    setLen(m_gateDiameter, def.gateDefaults.diameter);
+    setDeg(m_gateDraftAngle, def.gateDefaults.draftAngle);
+
+    // ---- Sub-runner ---------------------------------------------------------
+    setChoice(m_subRunnerTypeChoice, def.subRunnerDefaults.type);
+    setLen(m_subRunnerDiameter, def.subRunnerDefaults.diameter);
+
+    // ---- Ejector ------------------------------------------------------------
+    setChoice(m_ejectorTypeChoice, def.ejectorDefaults.type);
+    setLen(m_ejectorDiameter, def.ejectorDefaults.diameter);
+    setLen(m_ejectorLength, def.ejectorDefaults.length);
 }
 
 void MainFrame::OnBrowseExport(wxCommandEvent&)
