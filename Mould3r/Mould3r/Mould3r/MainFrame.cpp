@@ -3,6 +3,7 @@
 #include <wx/stdpaths.h>
 #include <wx/filename.h>
 #include <wx/file.h>
+#include <wx/filefn.h>
 #include <wx/dnd.h>
 #include <memory>
 
@@ -285,12 +286,6 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
     // PromptForFixtureIfMissing()).
     if (fixture.IsValid())
     {
-        // Apply per-feature defaults from the fixture file before model
-        // loading so the side-panel fields show the fixture's preferred
-        // values right away. No project params to consider here — that
-        // path is OnLoadProject.
-        ApplyFixtureDefaults(fixture);
-
         if (!fixture.modelAPath.empty())
             m_canvas->ImportFileAsFixture(fixture.modelAPath);
         if (!fixture.modelBPath.empty())
@@ -796,6 +791,34 @@ void MainFrame::OnEditSprue(wxCommandEvent&)
 }
 
 // ---------------------------------------------------------------------------
+// Called by GLCanvas when the user actively picks an injection point via the
+// SelectInjectionPoint tool. Currently only adjusts the Draft Angle field:
+// radial injection points zero it (the radial sprue is intended to lie flat
+// on the parting plane with no draft); axial injection points get the
+// default value back.
+//
+// Scope is deliberately limited to this user-driven gesture. Programmatic
+// SetActiveInjectionPoint calls (project load, fixture change) deliberately
+// do NOT trigger this — project load already restored the user's saved draft
+// angle, and clobbering it based on the active injection-point type would
+// silently override their stored setting.
+// ---------------------------------------------------------------------------
+void MainFrame::OnInjectionPointSelected(const InjectionPoint& ip)
+{
+    if (!m_sprueDraftAngle) return;
+
+    // "1.0" mirrors the default text used when this control is constructed
+    // (see the addRow("Draft angle:", m_sprueDraftAngle, "1.0", ...) call
+    // in the sprue panel builder) and the ProjectParameters default. If
+    // that default ever changes, both locations need to stay in sync.
+    const wxString defaultDraft = "1.0";
+    const wxString radialDraft = "0.0";
+
+    m_sprueDraftAngle->SetValue(
+        ip.type == InjectionType::Radial ? radialDraft : defaultDraft);
+}
+
+// ---------------------------------------------------------------------------
 // Unit system toggle
 // ---------------------------------------------------------------------------
 void MainFrame::OnSetMetric(wxCommandEvent&)
@@ -1016,10 +1039,6 @@ void MainFrame::OnChangeFixture(wxCommandEvent&)
     // Clear existing fixtures and reload
     m_canvas->ClearFixtures();
 
-    // New fixture means new defaults — apply before model loading so the
-    // side panel reflects the new fixture's preferred values immediately.
-    ApplyFixtureDefaults(fixture);
-
     if (!fixture.modelAPath.empty())
         m_canvas->ImportFileAsFixture(fixture.modelAPath);
     if (!fixture.modelBPath.empty())
@@ -1053,11 +1072,6 @@ void MainFrame::PromptForFixtureIfMissing()
     FixtureDefinition fixture = dlg.GetFixture();
     AppConfig::SaveLastFixture(fixture.fixturePath);
     m_fixtureDef = fixture;
-
-    // Apply fixture defaults to the side-panel fields before loading the
-    // models so the user sees the fixture's preferred values from the
-    // moment the fixture finishes loading.
-    ApplyFixtureDefaults(fixture);
 
     // Fresh frame, so no need to ClearFixtures() — just load.
     if (!fixture.modelAPath.empty())
@@ -1105,11 +1119,6 @@ void MainFrame::OnNewProject(wxCommandEvent&)
 
     // Load the selected fixture
     m_fixtureDef = fixture;
-
-    // New project: no saved params to honour, so fixture defaults are the
-    // final word. Apply them before model loading so the side panel
-    // reflects the fixture's preferred values from the start.
-    ApplyFixtureDefaults(fixture);
 
     if (!fixture.modelAPath.empty())
         m_canvas->ImportFileAsFixture(fixture.modelAPath);
@@ -1297,15 +1306,6 @@ void MainFrame::OnLoadProject(wxCommandEvent&)
             m_fixtureDef = fixDef;
             AppConfig::SaveLastFixture(fixDef.fixturePath);
 
-            // Apply fixture defaults to the side panel as a baseline. The
-            // following SetParameterFields call will overwrite any field
-            // that the project explicitly stored (which is currently every
-            // numeric field on ProjectParameters), preserving user changes
-            // made before the project was saved. In effect: project values
-            // win over fixture defaults, fixture defaults win over the
-            // hardcoded UI defaults.
-            ApplyFixtureDefaults(fixDef);
-
             if (!fixDef.modelAPath.empty())
                 m_canvas->ImportFileAsFixture(fixDef.modelAPath);
             if (!fixDef.modelBPath.empty())
@@ -1408,92 +1408,6 @@ void MainFrame::SetParameterFields(const ProjectParameters& p)
     setField(m_ejectorLength, p.ejectorLength * conv);
 }
 
-// ---------------------------------------------------------------------------
-// ApplyFixtureDefaults — overlay fixture-specified per-feature defaults onto
-// the side-panel UI fields.
-//
-// Each fixture field is an std::optional; only the ones with a value get
-// written, so missing overrides leave the application's built-in defaults
-// (the literal strings hardcoded in CreateVentsContent / CreateSpruesContent
-// / etc.) intact. This makes the function safe to call repeatedly and at
-// any point in the lifecycle — startup, change-fixture, project-load — with
-// no risk of clobbering user-modified values that aren't being overridden.
-//
-// Distance values in the fixture file are mm; convert to display units (mm
-// or in) using the same `conv` factor as SetParameterFields. Angles stay
-// verbatim. Float fields are formatted with %.4g to match SetParameterFields.
-//
-// Type strings are matched against the wxChoice's existing options via
-// FindString; unknown strings are silently ignored (the dropdown keeps its
-// current selection). When new geometry types are added to a dropdown,
-// matching fixture strings will start being accepted automatically — no
-// changes needed here.
-// ---------------------------------------------------------------------------
-void MainFrame::ApplyFixtureDefaults(const FixtureDefinition& def)
-{
-    const float conv = m_imperial ? (1.0f / 25.4f) : 1.0f;
-
-    auto setNumIfPresent = [&](wxTextCtrl* ctrl,
-        const std::optional<float>& v, bool convertUnits)
-        {
-            if (!ctrl || !v) return;
-            const float displayVal = convertUnits ? (*v * conv) : *v;
-            // ChangeValue (not SetValue) — no wxEVT_TEXT fires; mirrors how
-            // we treat field initialisation as a presentation concern, not
-            // a user edit. (SetParameterFields uses SetValue, but it's only
-            // called during a project load where downstream listeners
-            // expect to react to the new state anyway. Fixture-default
-            // application is more like initial population.)
-            ctrl->ChangeValue(wxString::Format("%.4g", displayVal));
-        };
-
-    auto setChoiceIfPresent = [](wxChoice* ctrl,
-        const std::optional<std::string>& v)
-        {
-            if (!ctrl || !v) return;
-            const int idx = ctrl->FindString(*v);
-            if (idx != wxNOT_FOUND)
-                ctrl->SetSelection(idx);
-            // Unknown type string -> leave current selection alone. We
-            // deliberately don't pop a warning: a forward-compat fixture
-            // referencing a future type should still load gracefully on
-            // older builds.
-        };
-
-    // Vents
-    setChoiceIfPresent(m_ventTypeChoice, def.ventDefaults.type);
-    setNumIfPresent(m_ventLength, def.ventDefaults.length,       /*convert=*/true);
-    setNumIfPresent(m_ventWidth, def.ventDefaults.width, true);
-    setNumIfPresent(m_ventOverrunStart, def.ventDefaults.overrunStart, true);
-    setNumIfPresent(m_ventOverrunEnd, def.ventDefaults.overrunEnd, true);
-
-    // Sprue
-    setChoiceIfPresent(m_sprueTypeChoice, def.sprueDefaults.type);
-    setNumIfPresent(m_sprueDiameter, def.sprueDefaults.diameter, true);
-    setNumIfPresent(m_sprueDraftAngle, def.sprueDefaults.draftAngle,     /*convert=*/false);
-    setNumIfPresent(m_sprueColdSlugDepth, def.sprueDefaults.coldSlugLength, true);
-    setNumIfPresent(m_sprueLength, def.sprueDefaults.length, true);
-
-    // Runners
-    setChoiceIfPresent(m_runnerTypeChoice, def.runnerDefaults.type);
-    setNumIfPresent(m_runnerDiameter, def.runnerDefaults.diameter, true);
-    setNumIfPresent(m_runnerColdSlugDepth, def.runnerDefaults.coldSlugLength, true);
-
-    // Gates
-    setChoiceIfPresent(m_gateTypeChoice, def.gateDefaults.type);
-    setNumIfPresent(m_gateDiameter, def.gateDefaults.diameter, true);
-    setNumIfPresent(m_gateDraftAngle, def.gateDefaults.draftAngle, false);
-
-    // Sub-runner (lives inside the gates panel but has its own dropdown)
-    setChoiceIfPresent(m_subRunnerTypeChoice, def.subRunnerDefaults.type);
-    setNumIfPresent(m_subRunnerDiameter, def.subRunnerDefaults.diameter, true);
-
-    // Ejectors
-    setChoiceIfPresent(m_ejectorTypeChoice, def.ejectorDefaults.type);
-    setNumIfPresent(m_ejectorDiameter, def.ejectorDefaults.diameter, true);
-    setNumIfPresent(m_ejectorLength, def.ejectorDefaults.length, true);
-}
-
 void MainFrame::OnBrowseExport(wxCommandEvent&)
 {
     wxDirDialog dlg(this, "Select export folder", "",
@@ -1504,14 +1418,78 @@ void MainFrame::OnBrowseExport(wxCommandEvent&)
 
 void MainFrame::OnExport(wxCommandEvent&)
 {
-    wxDirDialog dlg(this, "Select export folder", "",
-        wxDD_DEFAULT_STYLE | wxDD_DIR_MUST_EXIST);
+    // Filename-driven export. Instead of asking only for an output folder
+    // and writing fixed "model_a.step" / "model_b.step" into it, prompt
+    // the user for a base filename and append "_a.step" / "_b.step" to
+    // produce the two halves.
+    //
+    // Suggestion logic:
+    //   - If a project has been saved or loaded (m_projectPath non-empty),
+    //     use the project's stem as the suggested base filename and start
+    //     the dialog in the project's directory. This makes the common
+    //     case (export named-project mould) a single Enter press.
+    //   - Otherwise, no default — the user types a name from scratch.
+    //
+    // Note on overwrite handling: we deliberately do NOT pass
+    // wxFD_OVERWRITE_PROMPT to the file dialog. The path the user picks
+    // (e.g. "widget.step") is not what we actually write — we write
+    // "widget_a.step" and "widget_b.step" — so wx's built-in prompt
+    // would ask about the wrong file. We do a manual existence check on
+    // the real output paths below instead.
+    wxString suggestedDir;
+    wxString suggestedName;
+    if (!m_projectPath.empty())
+    {
+        wxFileName fn(m_projectPath);
+        suggestedDir = fn.GetPath();
+        suggestedName = fn.GetName();   // bare stem, no extension
+    }
+
+    wxFileDialog dlg(this, "Export Mould Halves",
+        suggestedDir, suggestedName,
+        "STEP files (*.step;*.stp)|*.step;*.stp|All files (*.*)|*.*",
+        wxFD_SAVE);
+
     if (dlg.ShowModal() != wxID_OK)
         return;
 
-    const std::string folder = dlg.GetPath().ToStdString();
-    m_canvas->ExportFixtures(folder + "/model_a.step",
-        folder + "/model_b.step");
+    // Strip extension from whatever the user typed/selected. wxFileName
+    // strips only the trailing extension, so "widget.step" -> "widget"
+    // and "widget.v2.step" -> "widget.v2", which is the right policy.
+    // We deliberately do not strip a trailing "_a"/"_b" — if the user
+    // explicitly types one, treat it as part of their chosen base.
+    wxFileName picked(dlg.GetPath());
+    const wxString folder = picked.GetPath();
+    const wxString baseStem = picked.GetName();
+
+    if (baseStem.IsEmpty())
+    {
+        wxMessageBox("Please enter a filename for the export.",
+            "Export", wxOK | wxICON_INFORMATION, this);
+        return;
+    }
+
+    const wxString pathA = folder + wxFileName::GetPathSeparator()
+        + baseStem + "_a.step";
+    const wxString pathB = folder + wxFileName::GetPathSeparator()
+        + baseStem + "_b.step";
+
+    // Manual overwrite check on the real output paths. List only the
+    // halves that actually exist so the prompt isn't misleading when
+    // only one of the two would be overwritten.
+    wxString existing;
+    if (wxFileExists(pathA)) existing += pathA + "\n";
+    if (wxFileExists(pathB)) existing += pathB + "\n";
+    if (!existing.IsEmpty())
+    {
+        const int ans = wxMessageBox(
+            "The following file(s) already exist:\n\n"
+            + existing + "\nOverwrite?",
+            "Export", wxYES_NO | wxICON_QUESTION, this);
+        if (ans != wxYES) return;
+    }
+
+    m_canvas->ExportFixtures(pathA.ToStdString(), pathB.ToStdString());
 }
 
 void MainFrame::OnGenerateMould(wxCommandEvent&)

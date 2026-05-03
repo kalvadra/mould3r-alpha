@@ -1118,12 +1118,27 @@ void GLCanvas::PlaceSprue()
 
     if (m_activeInjectionPoint.type == InjectionType::Radial)
     {
-        // ---- Radial sprue: horizontal path from injection point outward ----
+        // ---- Radial sprue: lies on the parting plane (y=0). Path direction
+        // depends on whether a model is in the way:
+        //   - Direct injection: cast a ray inward (from the injection point
+        //     toward the cavity interior) and end the sprue at the hit
+        //     point on the model. Mirrors the axial direct-injection check.
+        //   - Otherwise: legacy outward-toward-perimeter behavior — the
+        //     path terminates sprueLength past the fixture perimeter, where
+        //     the moulding-machine nozzle would attach.
+        // The solid mesh and cold slug are built by the common code below
+        // (shared with the axial branch) — this block is responsible only
+        // for setting pathStart, pathEnd, partingPos, hasPartingPoint and
+        // isDirectInjection.
+
         // Project injection point onto the parting plane (y=0)
         const glm::vec3 ipAtParting(m_sprue.worldPos.x, 0.0f, m_sprue.worldPos.z);
         const glm::vec2 ipXZ(ipAtParting.x, ipAtParting.z);
 
-        // Find nearest point on the fixture perimeter
+        // Find nearest point on the fixture perimeter. Used to derive the
+        // outward radial direction (whose negation is the inward
+        // direct-injection ray) and, on direct-injection miss, to place
+        // the non-direct path's terminus.
         float     bestDist = std::numeric_limits<float>::max();
         glm::vec2 bestPt(0.0f);
 
@@ -1149,32 +1164,51 @@ void GLCanvas::PlaceSprue()
             }
         }
 
-        // Direction from injection point outward toward the perimeter
+        // Direction from injection point outward toward the perimeter.
+        // Falls back to (0, 1) when the injection point coincides with the
+        // perimeter (bestDist ~ 0); the inward ray will then probe along
+        // -Z, which is no worse than any other arbitrary axis.
         glm::vec2 outDir(0.0f, 1.0f);
         if (bestDist > 1e-6f)
             outDir = glm::normalize(bestPt - ipXZ);
 
-        // Read the sprue length from the UI
-        float sprueLength = 20.0f;
-        if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
-            sprueLength = frame->GetSprueLength();
-
-        // Path: from injection point outward past the perimeter by sprueLength
-        const glm::vec2 outerXZ = bestPt + outDir * sprueLength;
-
         m_sprue.pathStart = ipAtParting;
-        m_sprue.pathEnd = glm::vec3(outerXZ.x, 0.0f, outerXZ.y);
-        m_sprue.partingPos = m_sprue.pathEnd;
-        m_sprue.hasPartingPoint = true;
-        m_sprue.isDirectInjection = false;
 
-        // Build the swept cylinder preview mesh
-        m_sprue.solid.Destroy();
-        m_sprue.solid = BuildCylinderMesh(m_sprue.pathStart, m_sprue.pathEnd,
-            m_sprue.radius, m_sprue.draftAngleDeg);
+        // Try direct injection first: cast a ray from the injection point
+        // INWARD along the parting plane and see if it hits a model. The
+        // inward direction is -outDir, pointing from the injection point
+        // away from the perimeter and toward the cavity interior where the
+        // part lives.
+        constexpr float kMaxDist = 1000.0f;
+        const glm::vec3 inDir(outDir.x, 0.0f, outDir.y);
 
-        // No cold slug for radial sprues
-        m_sprue.coldSlugSolid.Destroy();
+        glm::vec3 hitPos;
+        if (RayCastWorldRay(ipAtParting, inDir, kMaxDist, hitPos))
+        {
+            // Direct injection — sprue runs from injection point inward to
+            // the model contact point. Same semantics as axial direct
+            // injection; the only difference is the ray direction.
+            m_sprue.pathEnd = hitPos;
+            m_sprue.partingPos = ipAtParting;
+            m_sprue.hasPartingPoint = true;
+            m_sprue.isDirectInjection = true;
+        }
+        else
+        {
+            // No model in the inward direction — fall back to the legacy
+            // outward-perimeter behavior. Path goes from the injection
+            // point outward, ending sprueLength past the fixture perimeter.
+            float sprueLength = 20.0f;
+            if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+                sprueLength = frame->GetSprueLength();
+
+            const glm::vec2 outerXZ = bestPt + outDir * sprueLength;
+
+            m_sprue.pathEnd = glm::vec3(outerXZ.x, 0.0f, outerXZ.y);
+            m_sprue.partingPos = m_sprue.pathEnd;
+            m_sprue.hasPartingPoint = true;
+            m_sprue.isDirectInjection = false;
+        }
     }
     else
     {
@@ -1228,26 +1262,45 @@ void GLCanvas::PlaceSprue()
                 m_sprue.hasPartingPoint = false;
             }
         }
+    }
 
-        // Build the swept cylinder preview mesh
-        m_sprue.solid.Destroy();
-        m_sprue.solid = BuildCylinderMesh(m_sprue.pathStart, m_sprue.pathEnd,
-            m_sprue.radius, m_sprue.draftAngleDeg);
+    // ---- Common build steps (axial and radial) -----------------------------
+    // Both branches set pathStart / pathEnd / isDirectInjection / coldSlugDepth
+    // identically as far as the geometry below is concerned, so the sprue
+    // cylinder and cold-slug well are built once here.
 
-        // Build cold slug well — a straight cylinder extending beyond the sprue end,
-        // using the end radius of the drafted sprue.  Skipped for direct injection.
-        m_sprue.coldSlugSolid.Destroy();
-        if (!m_sprue.isDirectInjection && m_sprue.coldSlugDepth > 1e-6f)
-        {
-            const glm::vec3 sprueDir = glm::normalize(m_sprue.pathEnd - m_sprue.pathStart);
-            const float sprueLen = glm::length(m_sprue.pathEnd - m_sprue.pathStart);
-            const float draftRad = glm::radians(glm::clamp(m_sprue.draftAngleDeg, 0.0f, 45.0f));
-            const float endRadius = m_sprue.radius + sprueLen * std::tan(draftRad);
+    // Build the swept sprue cylinder preview mesh.
+    m_sprue.solid.Destroy();
+    m_sprue.solid = BuildCylinderMesh(m_sprue.pathStart, m_sprue.pathEnd,
+        m_sprue.radius, m_sprue.draftAngleDeg);
 
-            const glm::vec3 slugStart = m_sprue.pathEnd;
-            const glm::vec3 slugEnd = m_sprue.pathEnd + sprueDir * m_sprue.coldSlugDepth;
-            m_sprue.coldSlugSolid = BuildCylinderMesh(slugStart, slugEnd, endRadius, 0.0f);
-        }
+    // Build cold slug well — a straight cylinder extending beyond pathEnd in
+    // the path direction, using the drafted end radius. Skipped for direct
+    // injection regardless of injection type.
+    //
+    // We also zero out m_sprue.coldSlugDepth in the direct-injection case so
+    // the stored data matches what's actually drawn. Otherwise the value read
+    // from the UI at the top of PlaceSprue (before the ray cast determined
+    // direct-injection) lingers on the sprue, gets persisted to project files,
+    // and could surface through any future code path that misses the
+    // isDirectInjection gate. The downstream BREP cut and RestoreSprue still
+    // check isDirectInjection too — defense in depth — but with the depth
+    // zeroed, even an accidentally-ungated read returns the right answer.
+    m_sprue.coldSlugSolid.Destroy();
+    if (m_sprue.isDirectInjection)
+    {
+        m_sprue.coldSlugDepth = 0.0f;
+    }
+    else if (m_sprue.coldSlugDepth > 1e-6f)
+    {
+        const glm::vec3 sprueDir = glm::normalize(m_sprue.pathEnd - m_sprue.pathStart);
+        const float sprueLen = glm::length(m_sprue.pathEnd - m_sprue.pathStart);
+        const float draftRad = glm::radians(glm::clamp(m_sprue.draftAngleDeg, 0.0f, 45.0f));
+        const float endRadius = m_sprue.radius + sprueLen * std::tan(draftRad);
+
+        const glm::vec3 slugStart = m_sprue.pathEnd;
+        const glm::vec3 slugEnd = m_sprue.pathEnd + sprueDir * m_sprue.coldSlugDepth;
+        m_sprue.coldSlugSolid = BuildCylinderMesh(slugStart, slugEnd, endRadius, 0.0f);
     }
 
     RebuildSpruePathVBO();
@@ -5627,6 +5680,14 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
                 if (bestIdx >= 0)
                 {
                     SetActiveInjectionPoint(m_injectionPoints[bestIdx]);
+
+                    // Notify MainFrame BEFORE PlaceSprue so any UI fields
+                    // whose value depends on injection-point type (currently
+                    // just the Draft Angle) update first — PlaceSprue reads
+                    // those fields back when building the sprue.
+                    if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+                        frame->OnInjectionPointSelected(m_injectionPoints[bestIdx]);
+
                     PlaceSprue();
 
                     // Exit selection mode back to Select
@@ -6085,18 +6146,18 @@ void GLCanvas::CopySelectedToClipboard()
         const SceneObject& src = m_objects[idx];
 
         ClipboardEntry e;
-        e.cpuVerts = src.cpuVerts;
-        e.cpuIndices = src.cpuIndices;
-        e.sourcePath = src.sourcePath;
-        e.sourceShape = src.sourceShape;
+        e.cpuVerts       = src.cpuVerts;
+        e.cpuIndices     = src.cpuIndices;
+        e.sourcePath     = src.sourcePath;
+        e.sourceShape    = src.sourceShape;
         e.hasSourceShape = src.hasSourceShape;
-        e.role = src.role;
-        e.yawDeg = src.yawDeg;
-        e.pitchDeg = src.pitchDeg;
-        e.rollDeg = src.rollDeg;
-        e.scale = src.scale;
-        e.mirrorX = src.mirrorX;
-        e.mirrorZ = src.mirrorZ;
+        e.role           = src.role;
+        e.yawDeg         = src.yawDeg;
+        e.pitchDeg       = src.pitchDeg;
+        e.rollDeg        = src.rollDeg;
+        e.scale          = src.scale;
+        e.mirrorX        = src.mirrorX;
+        e.mirrorZ        = src.mirrorZ;
         m_clipboard.push_back(std::move(e));
     }
 }
@@ -6128,24 +6189,24 @@ void GLCanvas::PasteFromClipboard()
         m_objects.emplace_back();
         SceneObject& obj = m_objects.back();
 
-        obj.role = e.role;
-        obj.sourcePath = e.sourcePath;
-        obj.sourceShape = e.sourceShape;
+        obj.role           = e.role;
+        obj.sourcePath     = e.sourcePath;
+        obj.sourceShape    = e.sourceShape;
         obj.hasSourceShape = e.hasSourceShape;
-        obj.cpuVerts = e.cpuVerts;
-        obj.cpuIndices = e.cpuIndices;
+        obj.cpuVerts       = e.cpuVerts;
+        obj.cpuIndices     = e.cpuIndices;
         // triNeighbors / adjacencyBuilt left at defaults — rebuilt lazily
         // on first use, identically to the original (same convention as
         // pattern operations).
 
         // Pose: world origin, but keep rotation, scale, and mirror flags.
-        obj.pos = glm::vec3(0.0f);
-        obj.yawDeg = e.yawDeg;
+        obj.pos      = glm::vec3(0.0f);
+        obj.yawDeg   = e.yawDeg;
         obj.pitchDeg = e.pitchDeg;
-        obj.rollDeg = e.rollDeg;
-        obj.scale = e.scale;
-        obj.mirrorX = e.mirrorX;
-        obj.mirrorZ = e.mirrorZ;
+        obj.rollDeg  = e.rollDeg;
+        obj.scale    = e.scale;
+        obj.mirrorX  = e.mirrorX;
+        obj.mirrorZ  = e.mirrorZ;
         // mouldShape / hasMould intentionally left unset — pasted copies
         // are fresh objects without a generated mould (matches pattern-op
         // behavior; the user re-runs Generate Mould as needed).
@@ -6154,7 +6215,7 @@ void GLCanvas::PasteFromClipboard()
         // post-import pipeline in ImportFile() (and the pattern ops).
         FileImporter::MeshData md;
         md.vertices = obj.cpuVerts;
-        md.indices = obj.cpuIndices;
+        md.indices  = obj.cpuIndices;
         ComputeVertexNormals_Pos3(md.vertices, md.indices, md.posNorm);
         auto split = SplitByCreaseAngle_Pos3(md.vertices, md.indices, 35.0f);
         md.posNorm = std::move(split.posNorm);
