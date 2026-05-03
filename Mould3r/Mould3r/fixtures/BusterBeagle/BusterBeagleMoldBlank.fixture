@@ -1,0 +1,38 @@
+[fixture]
+modelA = BusterBeagleMoldBlank_A.step
+modelB = BusterBeagleMoldBlank_B.step
+
+[injection_point.0]
+label = A
+type  = axial
+x     = 0.0
+y     = 20.0
+z     = 0.0
+
+[injection_point.1]
+label = B
+type  = axial
+x     = 38.4
+y     = 20.0
+z     = 0.0
+
+[injection_point.2]
+label = C
+type  = radial
+x     = 38.4
+y     = 0.0
+z     = 39.0
+
+[injection_point.3]
+label = D
+type  = radial
+x     = 0.0
+y     = 0.0
+z     = 39.0
+
+[injection_point.4]
+label = E
+type  = radial
+x     = 52.0
+y     = 0.0
+z     = 0.0
