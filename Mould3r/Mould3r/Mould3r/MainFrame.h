@@ -27,6 +27,14 @@ public:
     // Called by GLCanvas when Escape is pressed to sync button state
     void SetActiveTool(TransformMode mode);
 
+    // Called by GLCanvas when the user picks an injection point via the
+    // SelectInjectionPoint tool. Updates UI fields whose value depends on
+    // the injection-point type — currently just the Draft Angle field,
+    // which goes to 0° for radial injection points and reverts to the
+    // default for axial. Invoked before PlaceSprue so the new value is
+    // visible to the sprue build.
+    void OnInjectionPointSelected(const InjectionPoint& ip);
+
     // Read current vent dimensions from the left-panel UI fields
     void GetVentDimensions(float& outLength, float& outWidth,
         float& outOverrunStart, float& outOverrunEnd) const;
@@ -56,6 +64,18 @@ public:
 
     // Set UI field values (used when restoring a project)
     void SetParameterFields(const ProjectParameters& params);
+
+    // Apply per-feature default overrides from a fixture into the side-panel
+    // UI fields. Walks each FixtureDefinition::*Defaults struct and writes
+    // only the fields the fixture actually specified (std::optional set);
+    // unspecified fields are left at their existing UI value, which on a
+    // freshly built panel is the application's hardcoded default. Length
+    // fields are converted from the fixture's mm representation to the
+    // current display unit; angles pass through unchanged. Type-string
+    // overrides that don't match an entry in the corresponding wxChoice are
+    // ignored (no-op) to preserve forward compatibility with fixtures that
+    // reference types this build doesn't know about yet.
+    void ApplyFixtureDefaults(const FixtureDefinition& def);
 
     // If no fixture has been loaded yet, show the selection dialog and load
     // whatever the user chooses. Intended to be called once, right after the

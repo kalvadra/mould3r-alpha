@@ -362,6 +362,17 @@ private:
     // OnPaint detect when the hover changed and avoid redundant region growth.
     bool RayCastFacePick(int mouseX, int mouseY, int& outObj, int& outTri);
 
+    // Ctrl+C / Ctrl+V: in-process clipboard for selected objects. Copy
+    // captures the CPU mesh + transform of every currently-selected object
+    // (no GPU handles, no mould, no parented features). Paste appends a
+    // fresh SceneObject per clipboard entry at the world origin, retaining
+    // rotation, scale, and mirror flags; the GPU mesh is rebuilt via the
+    // same pipeline used by ImportFile and the pattern operations. After
+    // pasting, m_selectedIndices is set to the newly-pasted objects so the
+    // user can immediately drag them off the origin.
+    void CopySelectedToClipboard();
+    void PasteFromClipboard();
+
     // Build edge adjacency for the object's CPU mesh if not already built.
     void EnsureTriAdjacency(SceneObject& obj);
 
@@ -425,6 +436,39 @@ private:
     //   - Ctrl+LMB on an object: toggles that index in the vector.
     //   - Ctrl+A: fills the vector with every object index.
     std::vector<int>         m_selectedIndices;
+
+    // In-process clipboard populated by Ctrl+C and consumed by Ctrl+V.
+    // Stores only the data needed to rebuild a SceneObject from scratch:
+    // CPU mesh (so the paste can re-run the normal/crease pipeline and
+    // upload its own GPU buffers), source path/shape (so future operations
+    // like mould generation and export still see a real BREP), role, and
+    // pose minus position. Position is intentionally not captured — paste
+    // always places the new object at the world origin per spec.
+    //
+    // Notably absent: GPUMesh handles (each paste owns its own GPU
+    // resources, and stashing live handles here would risk double-free if
+    // the source object got deleted before paste); mouldShape/hasMould
+    // (matches pattern-op behavior — user re-generates the mould after
+    // duplicating); and any parented vents/gates (also matches pattern-op
+    // conservatism — the original retains its features, the copy starts
+    // clean).
+    struct ClipboardEntry
+    {
+        std::vector<float>    cpuVerts;
+        std::vector<uint32_t> cpuIndices;
+        std::string           sourcePath;
+        TopoDS_Shape          sourceShape;
+        bool                  hasSourceShape = false;
+        ObjectRole            role = ObjectRole::Imported;
+
+        float yawDeg = 0.0f;
+        float pitchDeg = 0.0f;
+        float rollDeg = 0.0f;
+        float scale = 1.0f;
+        bool  mirrorX = false;
+        bool  mirrorZ = false;
+    };
+    std::vector<ClipboardEntry> m_clipboard;
 
     // Vent features (consolidated: point + path + cross-section + solid)
     std::vector<VentInstance> m_vents;

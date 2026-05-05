@@ -1,0 +1,15 @@
+[fixture]
+modelA = APSX-PIM_A.step
+modelB = APSX-PIM_B.step
+
+[injection_point.0]
+label = A
+type  = axial
+x     = 0.0
+y     = 25.4
+z     = 0.0
+
+[Sprues]
+Sprue type = "Cylinder"
+Diameter = 6.65
+Draft angle = 2.5

@@ -1,3 +1,10 @@
 [fixture]
-modelA = CircleMoldBlankTop.step
-modelB = CircleBlankMoldBottom.step
+modelA = BlankMoldTop.step
+modelB = BlankMoldBottom.step
+
+[injection_point.0]
+label = A
+type  = axial
+x     = 0.0
+y     = 15.0
+z     = 0.0
