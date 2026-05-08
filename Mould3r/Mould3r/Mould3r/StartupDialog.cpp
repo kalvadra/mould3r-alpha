@@ -4,6 +4,7 @@
 #include <wx/stdpaths.h>
 #include <filesystem>
 #include "style.h"
+#include "FixtureEditor.h"
 
 namespace fs = std::filesystem;
 
@@ -255,50 +256,21 @@ void StartupDialog::OnBrowseFolder(wxCommandEvent&)
 
 void StartupDialog::OnNewFixture(wxCommandEvent&)
 {
-    wxFileDialog dlgA(this, "Select Model A", "", "",
-        "STEP files (*.step;*.stp)|*.step;*.stp",
-        wxFD_OPEN | wxFD_FILE_MUST_EXIST);
-    if (dlgA.ShowModal() != wxID_OK) return;
-
-    wxFileDialog dlgB(this, "Select Model B", "", "",
-        "STEP files (*.step;*.stp)|*.step;*.stp",
-        wxFD_OPEN | wxFD_FILE_MUST_EXIST);
-    if (dlgB.ShowModal() != wxID_OK) return;
-
-    // Default save location is the fixtures folder
-    wxFileDialog dlgSave(this, "Save Fixture As",
-        m_fixturesFolder, "new_fixture.fixture",
-        "Fixture files (*.fixture)|*.fixture",
-        wxFD_SAVE | wxFD_OVERWRITE_PROMPT);
-    if (dlgSave.ShowModal() != wxID_OK) return;
-
-    FixtureDefinition def;
-    def.modelAPath = dlgA.GetPath().ToStdString();
-    def.modelBPath = dlgB.GetPath().ToStdString();
-
-    std::string error;
-    if (!FixtureFile::Save(dlgSave.GetPath().ToStdString(), def, error))
-    {
-        wxMessageBox(error, "Save Failed", wxOK | wxICON_ERROR, this);
-        return;
-    }
-
-    // Rescan so the new fixture appears in the list
-    ScanFixturesFolder();
-
-    // Auto-select the newly created fixture
-    const std::string newPath = dlgSave.GetPath().ToStdString();
-    for (int i = 0; i < (int)m_fixturePaths.size(); ++i)
-    {
-        if (m_fixturePaths[i] == newPath)
-        {
-            m_list->SetItemState(i, wxLIST_STATE_SELECTED, wxLIST_STATE_SELECTED);
-            m_list->EnsureVisible(i);
-            FixtureFile::Load(newPath, m_fixture, error);
-            RefreshPreview();
-            break;
-        }
-    }
+    // Open the floating Fixture Editor window. The editor owns the full
+    // authoring flow — STEP-half loading, positioning, and saving the
+    // .fixture file — replacing the previous "two file pickers + a save
+    // dialog" sequence that lived inline here.
+    //
+    // Currently scaffolding only: the editor brings up its toolbar and a
+    // canvas placeholder, then closes when the user dismisses it. The
+    // save flow (rescan + auto-select on success) will reattach here once
+    // the editor reports a saved-fixture path back; at that point this
+    // handler will roughly mirror the old post-save logic — call
+    // ScanFixturesFolder() and walk m_fixturePaths to select the new
+    // entry. Until then, closing the editor simply leaves the user back
+    // at the fixture list with no change.
+    auto* editor = new FixtureEditor(this);
+    editor->Show();
 }
 
 void StartupDialog::OnOK(wxCommandEvent&)

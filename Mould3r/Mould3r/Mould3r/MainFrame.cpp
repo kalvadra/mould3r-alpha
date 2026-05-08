@@ -9,6 +9,7 @@
 
 #include "MainFrame.h"
 #include "GLCanvas.h"
+#include "FixtureEditor.h"
 #include "RotateDialog.h"
 #include "TranslateDialog.h"
 #include "ScaleDialog.h"
@@ -180,12 +181,19 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
     fileMenu->Append(ID_LoadProject, "Open Project...\tCtrl+O");
     fileMenu->Append(ID_SaveProject, "Save Project...\tCtrl+S");
     fileMenu->AppendSeparator();
-    fileMenu->Append(ID_ChangeFixture, "Change Fixture...");
-    fileMenu->AppendSeparator();
     fileMenu->Append(wxID_EXIT, "Exit\tAlt+F4");
 
     auto* menuBar = new wxMenuBar();
     menuBar->Append(fileMenu, "&File");
+
+    // Fixture menu — top-level so the two fixture actions surface together
+    // rather than hiding under File. Create opens the FixtureEditor (the
+    // floating authoring window); Change opens the StartupDialog picker
+    // for swapping between already-saved fixtures.
+    auto* fixtureMenu = new wxMenu();
+    fixtureMenu->Append(ID_CreateFixture, "Create Fixture...");
+    fixtureMenu->Append(ID_ChangeFixture, "Change Fixture...");
+    menuBar->Append(fixtureMenu, "&Fixture");
 
     auto* unitsMenu = new wxMenu();
     unitsMenu->AppendRadioItem(ID_UnitMetric, "Metric (mm)");
@@ -221,6 +229,7 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
 
     Bind(wxEVT_MENU, &MainFrame::OnExit, this, wxID_EXIT);
     Bind(wxEVT_MENU, &MainFrame::OnImport, this, ID_Import);
+    Bind(wxEVT_MENU, &MainFrame::OnCreateFixture, this, ID_CreateFixture);
     Bind(wxEVT_MENU, &MainFrame::OnChangeFixture, this, ID_ChangeFixture);
     Bind(wxEVT_MENU, &MainFrame::OnSaveProject, this, ID_SaveProject);
     Bind(wxEVT_MENU, &MainFrame::OnLoadProject, this, ID_LoadProject);
@@ -1025,6 +1034,21 @@ void MainFrame::OnImport(wxCommandEvent&)
         return;
 
     m_canvas->ImportFile(dlg.GetPath().ToStdString());
+}
+
+// ---------------------------------------------------------------------------
+// Fixture menu handlers
+// ---------------------------------------------------------------------------
+// Create Fixture pops the editor for authoring a new .fixture from scratch.
+// The editor is non-modal (floating wxFrame), so this returns immediately
+// and the user works in parallel with the main app. Once the editor reports
+// a saved fixture back, this handler will likely also reload the new
+// fixture into the canvas — same shape as OnChangeFixture below — but
+// while the editor is scaffolding-only it just opens the window.
+void MainFrame::OnCreateFixture(wxCommandEvent&)
+{
+    auto* editor = new FixtureEditor(this);
+    editor->Show();
 }
 
 void MainFrame::OnChangeFixture(wxCommandEvent&)

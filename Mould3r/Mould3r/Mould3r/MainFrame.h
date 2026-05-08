@@ -80,12 +80,13 @@ public:
     // If no fixture has been loaded yet, show the selection dialog and load
     // whatever the user chooses. Intended to be called once, right after the
     // frame is shown on app startup. If the user cancels, the frame stays
-    // open but empty — they can pick a fixture later via File -> Change Fixture.
+    // open but empty — they can pick a fixture later via Fixture -> Change Fixture.
     void PromptForFixtureIfMissing();
 
 private:
     // Menu handlers
     void OnImport(wxCommandEvent& evt);
+    void OnCreateFixture(wxCommandEvent&);
     void OnChangeFixture(wxCommandEvent&);
     void OnExit(wxCommandEvent& evt);
     void OnSaveProject(wxCommandEvent&);
@@ -244,6 +245,7 @@ private:
         ID_BrowseExport,
         ID_Export,
         ID_GenerateMould,
+        ID_CreateFixture,
         ID_ChangeFixture,
         ID_ClearVentPoints,
         ID_PlaceSprue,

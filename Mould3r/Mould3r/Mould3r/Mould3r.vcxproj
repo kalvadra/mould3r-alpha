@@ -141,8 +141,11 @@
     <ClCompile Include="AppConfig.cpp" />
     <ClCompile Include="camera.cpp" />
     <ClCompile Include="FileImporter.cpp" />
+    <ClCompile Include="FixtureCanvas.cpp" />
+    <ClCompile Include="FixtureEditor.cpp" />
     <ClCompile Include="FixtureFile.cpp" />
     <ClCompile Include="GLCanvas.cpp" />
+    <ClCompile Include="GLLoader.cpp" />
     <ClCompile Include="GridRenderer.cpp" />
     <ClCompile Include="MainFrame.cpp" />
     <ClCompile Include="MeshImportSettings.cpp" />
@@ -165,8 +168,11 @@
     <ClInclude Include="AppConfig.h" />
     <ClInclude Include="camera.h" />
     <ClInclude Include="FileImporter.h" />
+    <ClInclude Include="FixtureCanvas.h" />
+    <ClInclude Include="FixtureEditor.h" />
     <ClInclude Include="FixtureFile.h" />
     <ClInclude Include="GLCanvas.h" />
+    <ClInclude Include="GLLoader.h" />
     <ClInclude Include="GridRenderer.h" />
     <ClInclude Include="MainFrame.h" />
     <ClInclude Include="MeshImportSettings.h" />

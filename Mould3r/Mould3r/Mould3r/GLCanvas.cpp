@@ -43,6 +43,7 @@
 
 #include "camera.h"
 #include "FileImporter.h"
+#include "GLLoader.h"
 #include "GridRenderer.h"
 #include "shaders.h"
 #include "MeshUtils.h"
@@ -102,20 +103,15 @@ static GLuint Link(GLuint vs, GLuint fs)
     return p;
 }
 
-static int glArgs[] = {
-    WX_GL_RGBA, WX_GL_DOUBLEBUFFER,
-    WX_GL_DEPTH_SIZE, 24,
-    WX_GL_STENCIL_SIZE, 8,
-    WX_GL_SAMPLE_BUFFERS, 1,
-    WX_GL_SAMPLES, 4,
-    0
-};
+// glArgs[] (pixel-format / context attributes) now lives in GLLoader.h —
+// shared with FixtureCanvas so adding a third viewport doesn't fork the
+// pixel-format request.
 
 // ---------------------------------------------------------------------------
 // Constructor / Destructor
 // ---------------------------------------------------------------------------
 GLCanvas::GLCanvas(wxWindow* parent)
-    : wxGLCanvas(parent, wxID_ANY, glArgs,
+    : wxGLCanvas(parent, wxID_ANY, GLLoader::glArgs,
         wxDefaultPosition, wxDefaultSize,
         wxFULL_REPAINT_ON_RESIZE, "GLCanvas")
 {
@@ -3613,21 +3609,15 @@ void GLCanvas::RebuildCrossSectionVBO()
 // ---------------------------------------------------------------------------
 // GL init
 // ---------------------------------------------------------------------------
-static void* GetAnyGLFuncAddress(const char* name)
-{
-    void* p = (void*)wglGetProcAddress(name);
-    if (p) return p;
-    static HMODULE module = LoadLibraryA("opengl32.dll");
-    if (!module) return nullptr;
-    return (void*)GetProcAddress(module, name);
-}
+// GetAnyGLFuncAddress() now lives in GLLoader.cpp — shared with
+// FixtureCanvas. Same Win32 wglGetProcAddress + opengl32.dll fallback.
 
 void GLCanvas::InitGLOnce()
 {
     if (m_inited) return;
     SetCurrent(*m_context);
 
-    if (!gladLoadGLLoader((GLADloadproc)GetAnyGLFuncAddress)) {
+    if (!gladLoadGLLoader((GLADloadproc)GLLoader::GetAnyGLFuncAddress)) {
         wxLogError("Failed to load OpenGL functions");
         return;
     }
@@ -6146,18 +6136,18 @@ void GLCanvas::CopySelectedToClipboard()
         const SceneObject& src = m_objects[idx];
 
         ClipboardEntry e;
-        e.cpuVerts       = src.cpuVerts;
-        e.cpuIndices     = src.cpuIndices;
-        e.sourcePath     = src.sourcePath;
-        e.sourceShape    = src.sourceShape;
+        e.cpuVerts = src.cpuVerts;
+        e.cpuIndices = src.cpuIndices;
+        e.sourcePath = src.sourcePath;
+        e.sourceShape = src.sourceShape;
         e.hasSourceShape = src.hasSourceShape;
-        e.role           = src.role;
-        e.yawDeg         = src.yawDeg;
-        e.pitchDeg       = src.pitchDeg;
-        e.rollDeg        = src.rollDeg;
-        e.scale          = src.scale;
-        e.mirrorX        = src.mirrorX;
-        e.mirrorZ        = src.mirrorZ;
+        e.role = src.role;
+        e.yawDeg = src.yawDeg;
+        e.pitchDeg = src.pitchDeg;
+        e.rollDeg = src.rollDeg;
+        e.scale = src.scale;
+        e.mirrorX = src.mirrorX;
+        e.mirrorZ = src.mirrorZ;
         m_clipboard.push_back(std::move(e));
     }
 }
@@ -6189,24 +6179,24 @@ void GLCanvas::PasteFromClipboard()
         m_objects.emplace_back();
         SceneObject& obj = m_objects.back();
 
-        obj.role           = e.role;
-        obj.sourcePath     = e.sourcePath;
-        obj.sourceShape    = e.sourceShape;
+        obj.role = e.role;
+        obj.sourcePath = e.sourcePath;
+        obj.sourceShape = e.sourceShape;
         obj.hasSourceShape = e.hasSourceShape;
-        obj.cpuVerts       = e.cpuVerts;
-        obj.cpuIndices     = e.cpuIndices;
+        obj.cpuVerts = e.cpuVerts;
+        obj.cpuIndices = e.cpuIndices;
         // triNeighbors / adjacencyBuilt left at defaults — rebuilt lazily
         // on first use, identically to the original (same convention as
         // pattern operations).
 
         // Pose: world origin, but keep rotation, scale, and mirror flags.
-        obj.pos      = glm::vec3(0.0f);
-        obj.yawDeg   = e.yawDeg;
+        obj.pos = glm::vec3(0.0f);
+        obj.yawDeg = e.yawDeg;
         obj.pitchDeg = e.pitchDeg;
-        obj.rollDeg  = e.rollDeg;
-        obj.scale    = e.scale;
-        obj.mirrorX  = e.mirrorX;
-        obj.mirrorZ  = e.mirrorZ;
+        obj.rollDeg = e.rollDeg;
+        obj.scale = e.scale;
+        obj.mirrorX = e.mirrorX;
+        obj.mirrorZ = e.mirrorZ;
         // mouldShape / hasMould intentionally left unset — pasted copies
         // are fresh objects without a generated mould (matches pattern-op
         // behavior; the user re-runs Generate Mould as needed).
@@ -6215,7 +6205,7 @@ void GLCanvas::PasteFromClipboard()
         // post-import pipeline in ImportFile() (and the pattern ops).
         FileImporter::MeshData md;
         md.vertices = obj.cpuVerts;
-        md.indices  = obj.cpuIndices;
+        md.indices = obj.cpuIndices;
         ComputeVertexNormals_Pos3(md.vertices, md.indices, md.posNorm);
         auto split = SplitByCreaseAngle_Pos3(md.vertices, md.indices, 35.0f);
         md.posNorm = std::move(split.posNorm);
