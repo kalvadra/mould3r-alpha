@@ -9,6 +9,9 @@
 #include <memory>
 
 #include "FixtureCanvas.h"
+#include "RotateDialog.h"      // OnToolRotate
+#include "ScaleDialog.h"       // OnToolScale
+#include "TranslateDialog.h"   // OnToolMove
 #include "style.h"
 
 // ---------------------------------------------------------------------------
@@ -374,54 +377,120 @@ wxWindow* FixtureEditor::BuildCanvasArea(wxWindow* parent)
 
 // ---------------------------------------------------------------------------
 // Active-tool routing
+//
+// Drives toolbar visuals AND the canvas's transform mode in lock-step. The
+// only persistent canvas mode the fixture editor uses is AlignFace; every
+// other active-tool ID corresponds to either a dialog tool (Move/Rotate/
+// Scale) that immediately untoggles itself, a momentary action (Center),
+// or wxID_NONE (post-ESC, post-dialog). All of those want the canvas back
+// in Select. Centralising the mapping here keeps the two state machines
+// from drifting out of sync regardless of how SetActiveTool got called —
+// button click, dialog handler clearing toggles, or the canvas's ESC
+// callback.
 // ---------------------------------------------------------------------------
 void FixtureEditor::SetActiveTool(int activeId)
 {
     m_activeToolId = activeId;
     for (auto& kv : m_toolBtnSetters)
         kv.second(kv.first == activeId);
+
+    if (m_canvas)
+    {
+        m_canvas->SetTransformMode(activeId == ID_FE_AlignFace
+            ? FixtureCanvas::TransformMode::AlignFace
+            : FixtureCanvas::TransformMode::Select);
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Tool button handlers — scaffolding only.
+// Tool button handlers — wired through to the canvas.
 //
-// Each toggle handler reads the wxCommandEvent's Int() (set to 1 when the
-// button just turned ON, 0 when it turned OFF by makeToolBtn's onClick).
-// On the ON edge we route through SetActiveTool so the other toggles
-// deactivate; on the OFF edge we clear the active tool so no button is
-// shown selected. This keeps the visual state consistent while the
-// real transform-mode logic is still pending.
+// Move / Rotate / Scale follow MainFrame's dialog-based convention exactly:
+// the toggle latches on briefly when clicked, the handler immediately
+// untoggles it via SetActiveTool(wxID_NONE) (which also brings the canvas
+// back to Select if it was in AlignFace), then the matching dialog opens.
+// On OK, the result is forwarded to the canvas; if no half is selected,
+// the canvas's Apply* methods no-op silently — same behaviour as
+// MainFrame's HasSelection guard.
+//
+// Center is a momentary action — never latches, never affects the active-
+// tool state, mirrors MainFrame::OnToolCenter.
+//
+// AlignFace is the only true persistent toggle. Routing through
+// SetActiveTool keeps the toolbar visual and the canvas mode in sync
+// (and ESC on the canvas side calls back into SetActiveTool to clear the
+// toggle when the user bails out).
 // ---------------------------------------------------------------------------
-void FixtureEditor::OnToolMove(wxCommandEvent& evt)
+void FixtureEditor::OnToolMove(wxCommandEvent&)
 {
-    SetActiveTool(evt.GetInt() ? ID_FE_Move : wxID_NONE);
-    // TODO: enter Translate transform mode on the fixture canvas.
+    SetActiveTool(wxID_NONE);
+
+    if (!m_canvas) return;
+
+    TranslateDialog dlg(this);
+    if (dlg.ShowModal() != wxID_OK)
+        return;
+
+    if (!m_canvas->HasSelection())
+        return;
+
+    const TranslateValues v = dlg.GetValues();
+    m_canvas->ApplyTranslation(v.x, v.y, v.z);
 }
 
-void FixtureEditor::OnToolRotate(wxCommandEvent& evt)
+void FixtureEditor::OnToolRotate(wxCommandEvent&)
 {
-    SetActiveTool(evt.GetInt() ? ID_FE_Rotate : wxID_NONE);
-    // TODO: enter Rotate transform mode (or open RotateDialog, TBD).
+    SetActiveTool(wxID_NONE);
+
+    if (!m_canvas) return;
+
+    RotateDialog dlg(this);
+    if (dlg.ShowModal() != wxID_OK)
+        return;
+
+    if (!m_canvas->HasSelection())
+        return;
+
+    const RotateValues v = dlg.GetValues();
+    m_canvas->ApplyRotation(v.x, v.y, v.z);
 }
 
-void FixtureEditor::OnToolScale(wxCommandEvent& evt)
+void FixtureEditor::OnToolScale(wxCommandEvent&)
 {
-    SetActiveTool(evt.GetInt() ? ID_FE_Scale : wxID_NONE);
-    // TODO: enter Scale transform mode (or open ScaleDialog, TBD).
+    SetActiveTool(wxID_NONE);
+
+    if (!m_canvas) return;
+
+    ScaleDialog dlg(this);
+    if (dlg.ShowModal() != wxID_OK)
+        return;
+
+    if (!m_canvas->HasSelection())
+        return;
+
+    const ScaleValues v = dlg.GetValues();
+    m_canvas->ApplyScale(v.uniform);
 }
 
 void FixtureEditor::OnToolCenter(wxCommandEvent&)
 {
     // Momentary action — does not affect the active-tool state. Intentional
     // mirror of MainFrame::OnToolCenter, which immediately re-centers the
-    // selected object without leaving any tool latched.
-    // TODO: re-center the currently-selected fixture half on the world origin.
+    // selected object without leaving any tool latched. No-op silently
+    // when no half is selected.
+    if (!m_canvas) return;
+    if (!m_canvas->HasSelection()) return;
+    m_canvas->CenterSelected();
 }
 
 void FixtureEditor::OnToolAlignFace(wxCommandEvent& evt)
 {
+    // True persistent toggle. The wxEVT_TOGGLEBUTTON event's Int() carries
+    // the new toggle state from makeToolBtn — 1 for ON, 0 for OFF —
+    // letting us drive the canvas's mode without having to inspect the
+    // button visual directly. SetActiveTool also brings the canvas's
+    // TransformMode in sync, so we don't call SetTransformMode here.
     SetActiveTool(evt.GetInt() ? ID_FE_AlignFace : wxID_NONE);
-    // TODO: enter AlignFace pick mode on the fixture canvas.
 }
 
 // ---------------------------------------------------------------------------

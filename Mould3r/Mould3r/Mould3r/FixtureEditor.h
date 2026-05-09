@@ -18,16 +18,17 @@ class FixtureCanvas;
 // What's wired up:
 //   * Top ribbon with "Import Mould Half A/B" buttons + path labels;
 //     picking a STEP file loads it into the canvas and updates the path.
-//   * Lefthand toolbar (Move, Rotate, Scale, Center, Align Face) with
-//     mutually-exclusive toggle visuals — handlers themselves are still
-//     stubs and don't yet mutate geometry.
-//   * 3D viewport (FixtureCanvas) with grid, orbit camera, and lit
-//     rendering of any imported halves.
+//   * Lefthand toolbar (Move, Rotate, Scale, Center, Align Face) routed
+//     through to the canvas. Move/Rotate/Scale follow MainFrame's
+//     dialog-based convention (toggle latches briefly, dialog opens,
+//     toggle clears on dialog close); Center is a momentary action;
+//     Align Face is a true persistent toggle with ESC-to-cancel.
+//   * 3D viewport (FixtureCanvas) with grid, orbit camera, lit rendering
+//     of any imported halves, single-half selection (warm-yellow tint
+//     indicates selection), and a dark-grey hover overlay during Align
+//     Face mode.
 //
 // What's still pending:
-//   * The toolbar handlers — currently only flip toggle state; they need
-//     to drive transform modes on the canvas the way MainFrame's MODEL
-//     TOOLS panel drives the main canvas.
 //   * The save flow — we collect both half paths, but nothing writes a
 //     .fixture file or notifies StartupDialog of the new fixture yet.
 //
@@ -41,6 +42,16 @@ class FixtureEditor : public wxFrame
 public:
     explicit FixtureEditor(wxWindow* parent);
     ~FixtureEditor() override = default;
+
+    // Drive the visual state of every registered toggle button to reflect
+    // a single active tool. Pass wxID_NONE to clear all toggles. Mirrors
+    // the role MainFrame::SetActiveTool plays for the main tool grid.
+    //
+    // Public so FixtureCanvas can call back here when ESC drops AlignFace
+    // mode, the same way GLCanvas calls MainFrame::SetActiveTool from its
+    // own Escape handler. Also drives the canvas's transform mode in lock
+    // step — see the implementation for the AlignFace-vs-Select mapping.
+    void SetActiveTool(int activeId);
 
 private:
     void BuildUI();
@@ -61,11 +72,15 @@ private:
     // code can drive scene state from the import handlers.
     wxWindow* BuildCanvasArea(wxWindow* parent);
 
-    // Toolbar click handlers — stubs for now. Each persistent-toggle
-    // handler routes through SetActiveTool so the four toggles stay
-    // mutually exclusive (matching MainFrame's MODEL TOOLS behavior).
-    // OnToolCenter is the only momentary action; it does not affect the
-    // active-tool state.
+    // Toolbar click handlers. Move/Rotate/Scale open the existing
+    // TranslateDialog/RotateDialog/ScaleDialog and forward results to the
+    // canvas — same dialog-based UX MainFrame uses for its equivalent
+    // tools. Their toggles untoggle immediately on click via
+    // SetActiveTool(wxID_NONE) so the buttons don't appear stuck on after
+    // the dialog closes. OnToolCenter is a momentary action (no toggle
+    // state change). OnToolAlignFace is the only true persistent toggle —
+    // it routes through SetActiveTool so the canvas's transform mode
+    // stays in sync with the button visual.
     void OnToolMove(wxCommandEvent&);
     void OnToolRotate(wxCommandEvent&);
     void OnToolScale(wxCommandEvent&);
@@ -90,9 +105,8 @@ private:
         wxStaticText* pathLabel);
 
     // Drive the visual state of every registered toggle button to reflect
-    // a single active tool. Pass wxID_NONE to clear all toggles. Mirrors
-    // the role MainFrame::SetActiveTool plays for the main tool grid.
-    void SetActiveTool(int activeId);
+    // a single active tool. Public; declared above with the rest of the
+    // class's public API so the canvas's ESC handler can call it.
 
     // Per-button visual setters keyed by command ID. Populated by the
     // makeToolBtn helper in BuildToolbar; consumed by SetActiveTool.
