@@ -65,6 +65,32 @@ public:
     // which is which.
     enum class HalfSlot { A, B };
 
+    // Per-half pose snapshot returned by GetHalfPose. Mirrors the relevant
+    // fields of the private FixtureMesh struct (see FixtureCanvas.cpp). The
+    // `valid` flag distinguishes "the slot is loaded with geometry" from
+    // "the slot is empty" — readers can treat an !valid pose as "no half",
+    // and an identity pose with valid=true as "loaded but never moved".
+    //
+    // Same YXZ convention as FixtureMesh::BuildModelMatrix: yawDeg rotates
+    // around Y, pitchDeg around X, rollDeg around Z, applied in YXZ order.
+    // Translating these axis names for the file format (rotation_x =
+    // pitchDeg, rotation_y = yawDeg, rotation_z = rollDeg) is the caller's
+    // job — see FixtureEditor::OnGenerateFixture.
+    struct HalfPose
+    {
+        bool      valid = false;
+        glm::vec3 pos{ 0.0f };
+        float     yawDeg = 0.0f;
+        float     pitchDeg = 0.0f;
+        float     rollDeg = 0.0f;
+        float     scale = 1.0f;
+    };
+
+    // Read the current pose of a given half. Returns a pose with
+    // valid=false when the slot has no geometry loaded — callers should
+    // treat that as "no half here yet" and skip emission accordingly.
+    HalfPose GetHalfPose(HalfSlot slot) const;
+
     // Load a STEP/STL/OBJ file into the given slot. Replaces any geometry
     // previously occupying that slot. On import failure, shows a message
     // box, clears the slot, and returns false. On success returns true and

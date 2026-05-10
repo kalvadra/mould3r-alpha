@@ -117,7 +117,17 @@ public:
 
     // Imports any supported format (STEP, STL, OBJ) based on file extension.
     void ImportFile(const std::string& path);
-    void ImportFileAsFixture(const std::string& path);
+
+    // Import a single fixture half. The optional `xform` carries the per-half
+    // pose authored in the FixtureEditor and persisted to the .fixture file
+    // ([half_a_transform] / [half_b_transform]). It is applied to the new
+    // SceneObject before BuildFixturePerimeter runs, so the parting-line
+    // perimeter sees the transformed mesh. Defaulting to an identity
+    // HalfTransform makes this a pure no-op for callers that don't have
+    // pose data — fixtures from older files (no transform sections) load
+    // exactly as they did before.
+    void ImportFileAsFixture(const std::string& path,
+        const HalfTransform& xform = HalfTransform{});
 
     // Called by MainFrame ribbon buttons
     void SetTransformMode(TransformMode mode);

@@ -60,11 +60,14 @@ bool FixtureFile::Load(const std::string& path,
     out.injectionPoints.clear();
 
     // Section-aware parsing.
-    // Sections: [fixture], [injection_point.N], [<feature>_defaults]
+    // Sections: [fixture], [injection_point.N], [<feature>_defaults],
+    //           [half_a_transform], [half_b_transform]
     // An injection_point block is committed to the list when the next section
     // header (or EOF) is encountered. Defaults sections write directly into
     // their corresponding struct on FixtureDefinition (no commit step needed
-    // — there's at most one of each defaults section per file).
+    // — there's at most one of each defaults section per file). The half
+    // transform sections work the same way — at most one of each — and write
+    // straight into out.halfATransform / halfBTransform.
     enum class Section
     {
         None,
@@ -76,6 +79,8 @@ bool FixtureFile::Load(const std::string& path,
         GateDefaults,
         SubRunnerDefaults,
         EjectorDefaults,
+        HalfATransform,
+        HalfBTransform,
     };
     Section     currentSection = Section::None;
     InjectionPoint pendingPoint;
@@ -98,6 +103,16 @@ bool FixtureFile::Load(const std::string& path,
     auto parseOptFloat = [](const std::string& s, std::optional<float>& dst)
         {
             try { dst = std::stof(s); }
+            catch (...) { /* leave dst unchanged */ }
+        };
+
+    // Helper: parse into a non-optional double, leaving the destination at
+    // its prior value (the struct's default of 0/0/0/0/0/0/1) if parsing
+    // fails. Used by the half-transform sections — same forgiving stance
+    // as parseOptFloat above.
+    auto parseDouble = [](const std::string& s, double& dst)
+        {
+            try { dst = std::stod(s); }
             catch (...) { /* leave dst unchanged */ }
         };
 
@@ -146,6 +161,14 @@ bool FixtureFile::Load(const std::string& path,
             else if (sectionName == "ejector_defaults")
             {
                 currentSection = Section::EjectorDefaults;
+            }
+            else if (sectionName == "half_a_transform")
+            {
+                currentSection = Section::HalfATransform;
+            }
+            else if (sectionName == "half_b_transform")
+            {
+                currentSection = Section::HalfBTransform;
             }
             else
             {
@@ -238,6 +261,26 @@ bool FixtureFile::Load(const std::string& path,
             if (key == "type")     out.ejectorDefaults.type = value;
             else if (key == "diameter") parseOptFloat(value, out.ejectorDefaults.diameter);
             else if (key == "length")   parseOptFloat(value, out.ejectorDefaults.length);
+        }
+        // ---- Per-half pose sections ----------------------------------------
+        // Same forgiving parsing as the defaults sections above — unknown
+        // keys silently dropped, malformed numbers leave the destination at
+        // its identity default. Both [half_a_transform] and [half_b_transform]
+        // share the same key set; the only thing the section header decides
+        // is which HalfTransform struct receives the writes.
+        else if (currentSection == Section::HalfATransform ||
+            currentSection == Section::HalfBTransform)
+        {
+            HalfTransform& t = (currentSection == Section::HalfATransform)
+                ? out.halfATransform : out.halfBTransform;
+
+            if (key == "position_x")      parseDouble(value, t.posX);
+            else if (key == "position_y") parseDouble(value, t.posY);
+            else if (key == "position_z") parseDouble(value, t.posZ);
+            else if (key == "rotation_x") parseDouble(value, t.rotX);
+            else if (key == "rotation_y") parseDouble(value, t.rotY);
+            else if (key == "rotation_z") parseDouble(value, t.rotZ);
+            else if (key == "scale")      parseDouble(value, t.scale);
         }
     }
 
@@ -365,6 +408,37 @@ bool FixtureFile::Save(const std::string& path,
             writeKeyF("length", d.length);
         }
     }
+
+    // ---- Per-half transform sections ---------------------------------------
+    // Skip emission when a half is at identity — keeps hand-written fixture
+    // files free of redundant zero-valued sections, and means a fixture
+    // round-tripped through Load → Save without going through the editor
+    // doesn't sprout new sections it didn't have on disk before.
+    //
+    // Precision: 9 digits is enough to round-trip an mm-scale double through
+    // text without losing meaningful resolution, while staying readable. The
+    // ostream's default of 6 would truncate sub-micron alignment work the
+    // user did via Align Face.
+    auto writeTransform = [&](const char* sectionName, const HalfTransform& t)
+        {
+            if (t.IsIdentity()) return;
+
+            const std::streamsize savedPrec = file.precision();
+            file.precision(9);
+
+            file << "\n[" << sectionName << "]\n";
+            file << "position_x = " << t.posX << "\n";
+            file << "position_y = " << t.posY << "\n";
+            file << "position_z = " << t.posZ << "\n";
+            file << "rotation_x = " << t.rotX << "\n";
+            file << "rotation_y = " << t.rotY << "\n";
+            file << "rotation_z = " << t.rotZ << "\n";
+            file << "scale      = " << t.scale << "\n";
+
+            file.precision(savedPrec);
+        };
+    writeTransform("half_a_transform", def.halfATransform);
+    writeTransform("half_b_transform", def.halfBTransform);
 
     return true;
 }

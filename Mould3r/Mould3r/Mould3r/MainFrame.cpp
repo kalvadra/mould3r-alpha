@@ -296,9 +296,9 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
     if (fixture.IsValid())
     {
         if (!fixture.modelAPath.empty())
-            m_canvas->ImportFileAsFixture(fixture.modelAPath);
+            m_canvas->ImportFileAsFixture(fixture.modelAPath, fixture.halfATransform);
         if (!fixture.modelBPath.empty())
-            m_canvas->ImportFileAsFixture(fixture.modelBPath);
+            m_canvas->ImportFileAsFixture(fixture.modelBPath, fixture.halfBTransform);
 
         // Set the active injection point (first in the list for now)
         if (!fixture.injectionPoints.empty())
@@ -1069,9 +1069,9 @@ void MainFrame::OnChangeFixture(wxCommandEvent&)
     m_canvas->ClearFixtures();
 
     if (!fixture.modelAPath.empty())
-        m_canvas->ImportFileAsFixture(fixture.modelAPath);
+        m_canvas->ImportFileAsFixture(fixture.modelAPath, fixture.halfATransform);
     if (!fixture.modelBPath.empty())
-        m_canvas->ImportFileAsFixture(fixture.modelBPath);
+        m_canvas->ImportFileAsFixture(fixture.modelBPath, fixture.halfBTransform);
 
     if (!fixture.injectionPoints.empty())
     {
@@ -1107,9 +1107,9 @@ void MainFrame::PromptForFixtureIfMissing()
 
     // Fresh frame, so no need to ClearFixtures() — just load.
     if (!fixture.modelAPath.empty())
-        m_canvas->ImportFileAsFixture(fixture.modelAPath);
+        m_canvas->ImportFileAsFixture(fixture.modelAPath, fixture.halfATransform);
     if (!fixture.modelBPath.empty())
-        m_canvas->ImportFileAsFixture(fixture.modelBPath);
+        m_canvas->ImportFileAsFixture(fixture.modelBPath, fixture.halfBTransform);
 
     if (!fixture.injectionPoints.empty())
     {
@@ -1155,9 +1155,9 @@ void MainFrame::OnNewProject(wxCommandEvent&)
     m_fixtureDef = fixture;
 
     if (!fixture.modelAPath.empty())
-        m_canvas->ImportFileAsFixture(fixture.modelAPath);
+        m_canvas->ImportFileAsFixture(fixture.modelAPath, fixture.halfATransform);
     if (!fixture.modelBPath.empty())
-        m_canvas->ImportFileAsFixture(fixture.modelBPath);
+        m_canvas->ImportFileAsFixture(fixture.modelBPath, fixture.halfBTransform);
 
     if (!fixture.injectionPoints.empty())
     {
@@ -1343,9 +1343,9 @@ void MainFrame::OnLoadProject(wxCommandEvent&)
             AppConfig::SaveLastFixture(fixDef.fixturePath);
 
             if (!fixDef.modelAPath.empty())
-                m_canvas->ImportFileAsFixture(fixDef.modelAPath);
+                m_canvas->ImportFileAsFixture(fixDef.modelAPath, fixDef.halfATransform);
             if (!fixDef.modelBPath.empty())
-                m_canvas->ImportFileAsFixture(fixDef.modelBPath);
+                m_canvas->ImportFileAsFixture(fixDef.modelBPath, fixDef.halfBTransform);
 
             // Set injection point (use the one from the sprue data if available,
             // otherwise fall back to the first in the fixture)

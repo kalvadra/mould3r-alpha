@@ -76,11 +76,61 @@ struct EjectorDefaults
     std::optional<float>       length;
 };
 
+// ---------------------------------------------------------------------------
+// HalfTransform — per-half pose stored alongside the modelA / modelB paths.
+//
+// Captures any positioning the user does in the FixtureEditor (Move,
+// Rotate, Scale, Center, Align Face) so a fixture file round-trips back to
+// the same scene state. Identity is the default (zero pos, zero rot,
+// scale = 1) and skips emission entirely on save — a hand-written fixture
+// without a [half_*_transform] section behaves exactly like one with all
+// fields explicitly zeroed.
+//
+// Distance is millimetres; rotation is degrees. Rotation axes are world-
+// space X/Y/Z, applied in YXZ order (Ry * Rx * Rz) — matching
+// SceneObject::BuildModelMatrix and FixtureCanvas::FixtureMesh::
+// BuildModelMatrix. The X/Y/Z names here are chosen for readability in
+// the file; the YXZ application order lives in the consuming code, not
+// the schema. Doubles, not floats — these are persisted values where the
+// ~7 digits of float precision could meaningfully truncate the user's
+// alignment work.
+// ---------------------------------------------------------------------------
+struct HalfTransform
+{
+    double posX = 0.0;
+    double posY = 0.0;
+    double posZ = 0.0;
+    double rotX = 0.0;     // degrees, around world X (= pitch in canvas)
+    double rotY = 0.0;     // degrees, around world Y (= yaw   in canvas)
+    double rotZ = 0.0;     // degrees, around world Z (= roll  in canvas)
+    double scale = 1.0;
+
+    // True when every field is at its identity value. Used by
+    // FixtureFile::Save to skip writing a [half_*_transform] section for
+    // halves the user never touched.
+    bool IsIdentity() const
+    {
+        return posX == 0.0 && posY == 0.0 && posZ == 0.0
+            && rotX == 0.0 && rotY == 0.0 && rotZ == 0.0
+            && scale == 1.0;
+    }
+};
+
 struct FixtureDefinition
 {
     std::string modelAPath;   // always stored as absolute internally
     std::string modelBPath;
     std::string fixturePath;  // directory anchor for relative path resolution
+
+    // Per-half pose. Identity by default — no pose data on disk means the
+    // half loads at origin with no rotation / unit scale. The FixtureEditor
+    // populates these from canvas state at save time; MainFrame's loader
+    // forwards them into GLCanvas::ImportFileAsFixture, which copies them
+    // onto the new SceneObject (axis mapping: rotX→pitchDeg, rotY→yawDeg,
+    // rotZ→rollDeg, matching the YXZ Euler order used by both
+    // BuildModelMatrix implementations).
+    HalfTransform halfATransform;
+    HalfTransform halfBTransform;
 
     std::vector<InjectionPoint> injectionPoints;
 

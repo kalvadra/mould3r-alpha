@@ -876,6 +876,28 @@ void FixtureCanvas::CenterSelected()
 }
 
 // ---------------------------------------------------------------------------
+// GetHalfPose — public read-only window onto a half's pose. Used by the
+// FixtureEditor's Generate-Fixture flow to pull pose state out of the
+// canvas at save time. Returns valid=false for a slot with no geometry,
+// which the caller treats as "no half here yet".
+// ---------------------------------------------------------------------------
+FixtureCanvas::HalfPose FixtureCanvas::GetHalfPose(HalfSlot slot) const
+{
+    const FixtureMesh& m = (slot == HalfSlot::A) ? m_meshA : m_meshB;
+
+    HalfPose out;
+    if (!m.valid) return out;   // valid stays false on the default-constructed pose
+
+    out.valid = true;
+    out.pos = m.pos;
+    out.yawDeg = m.yawDeg;
+    out.pitchDeg = m.pitchDeg;
+    out.rollDeg = m.rollDeg;
+    out.scale = m.scale;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
 // PickHalf — single-half ray-vs-mesh test. Returns 0 (A), 1 (B), or -1.
 // Identical math to RayCastFacePick below; we expose the simpler two-line
 // signature separately because Select-mode picking doesn't need the

@@ -1,6 +1,8 @@
 #pragma once
 #include <wx/wx.h>
+#include <wx/choice.h>
 #include <wx/frame.h>
+#include <wx/textctrl.h>
 #include <functional>
 #include <string>
 #include <unordered_map>
@@ -12,12 +14,22 @@ class FixtureCanvas;
 //
 // Floating top-level window (separate from MainFrame) used to author a new
 // fixture — that is, to load the two STEP halves, position them in space,
-// and save the resulting .fixture file. Replaces the old "two file dialogs
-// + a save dialog" flow that StartupDialog::OnNewFixture used to drive.
+// configure default feature parameters, and (eventually) save the resulting
+// .fixture file. Replaces the old "two file dialogs + a save dialog" flow
+// that StartupDialog::OnNewFixture used to drive.
+//
+// Layout:
+//   [top ribbon: Import A / Import B + paths .... Generate Fixture button]
+//   [toolbar | canvas | feature defaults sidebar                          ]
 //
 // What's wired up:
 //   * Top ribbon with "Import Mould Half A/B" buttons + path labels;
 //     picking a STEP file loads it into the canvas and updates the path.
+//   * "Generate Fixture" primary action button on the right of the ribbon —
+//     validates inputs, prompts for a save location (defaults to the
+//     fixtures/ folder StartupDialog scans), and writes a .fixture file
+//     containing both half paths, per-half pose, and every sidebar
+//     default. Closes the editor on success.
 //   * Lefthand toolbar (Move, Rotate, Scale, Center, Align Face) routed
 //     through to the canvas. Move/Rotate/Scale follow MainFrame's
 //     dialog-based convention (toggle latches briefly, dialog opens,
@@ -27,10 +39,17 @@ class FixtureCanvas;
 //     of any imported halves, single-half selection (warm-yellow tint
 //     indicates selection), and a dark-grey hover overlay during Align
 //     Face mode.
+//   * Right-hand "Feature Defaults" sidebar — five per-feature cards
+//     (Sprues, Runners, Gates, Vents, Ejectors) exposing the type and
+//     dimension defaults that get baked into the saved .fixture file.
+//     No Place/Edit/Remove/Clear buttons, no collapsible Settings toggle:
+//     the fixture editor isn't a placement context, so the entire card
+//     IS the settings.
 //
 // What's still pending:
-//   * The save flow — we collect both half paths, but nothing writes a
-//     .fixture file or notifies StartupDialog of the new fixture yet.
+//   * Auto-rescan of StartupDialog's fixture list after a successful
+//     Generate. Today the user has to click Browse Folder (or close and
+//     reopen StartupDialog) to pick up the freshly-written file.
 //
 // Pattern and Align Midplane are intentionally absent from the toolbar:
 // pattern doesn't apply to fixture authoring (a fixture is exactly one A
@@ -72,6 +91,26 @@ private:
     // code can drive scene state from the import handlers.
     wxWindow* BuildCanvasArea(wxWindow* parent);
 
+    // Builds the right-hand feature-defaults sidebar — header + scrollable
+    // column of feature cards (Sprues, Runners, Gates, Vents, Ejectors).
+    // Each card is a self-contained panel with a section title, type
+    // dropdown, and dimension fields. There are no Place/Edit/Remove/
+    // Clear buttons here (those are MainFrame's placement-mode concerns,
+    // not relevant to fixture authoring) and no collapsible Settings
+    // toggle — the entire card IS the settings.
+    wxWindow* BuildSidePanel(wxWindow* parent);
+
+    // Per-feature card builders. Mirror the structure of MainFrame's
+    // CreateXxxContent functions but stripped down: no Place button, no
+    // action grid, no collapsible Settings sub-section. Each populates the
+    // matching m_xxx* member pointers (type choice, dimension fields) so
+    // the future Generate-Fixture handler can read values back.
+    wxPanel* CreateSpruesContent(wxWindow* parent);
+    wxPanel* CreateRunnersContent(wxWindow* parent);
+    wxPanel* CreateGatesContent(wxWindow* parent);
+    wxPanel* CreateVentsContent(wxWindow* parent);
+    wxPanel* CreateEjectorsContent(wxWindow* parent);
+
     // Toolbar click handlers. Move/Rotate/Scale open the existing
     // TranslateDialog/RotateDialog/ScaleDialog and forward results to the
     // canvas — same dialog-based UX MainFrame uses for its equivalent
@@ -86,6 +125,14 @@ private:
     void OnToolScale(wxCommandEvent&);
     void OnToolCenter(wxCommandEvent&);
     void OnToolAlignFace(wxCommandEvent&);
+
+    // Top-ribbon "Generate Fixture" handler. Validates that both halves
+    // are imported and loaded, prompts for a save location (defaulting to
+    // the fixtures/ folder next to the executable), gathers paths +
+    // per-half pose + every sidebar default into a FixtureDefinition,
+    // writes the .fixture file via FixtureFile::Save, and closes the
+    // editor on success.
+    void OnGenerateFixture(wxCommandEvent&);
 
     // Top-ribbon Import handlers — open a STEP file picker, then store the
     // chosen path in m_modelA/BPath and update the corresponding path
@@ -103,10 +150,6 @@ private:
     bool PickStepFile(const wxString& title,
         std::string& outPath,
         wxStaticText* pathLabel);
-
-    // Drive the visual state of every registered toggle button to reflect
-    // a single active tool. Public; declared above with the rest of the
-    // class's public API so the canvas's ESC handler can call it.
 
     // Per-button visual setters keyed by command ID. Populated by the
     // makeToolBtn helper in BuildToolbar; consumed by SetActiveTool.
@@ -131,6 +174,48 @@ private:
     // push state into the canvas without re-walking the widget tree.
     FixtureCanvas* m_canvas = nullptr;
 
+    // ---- Feature-defaults sidebar fields ----------------------------------
+    // Same naming convention as MainFrame's matching members — keeps the
+    // generate-fixture handler symmetric with MainFrame's existing
+    // FixtureDefinition-population code in ApplyFixtureDefaults. All field
+    // pointers are owned by the wxWidgets parent-child hierarchy (sidebar
+    // → card panel → control); no manual delete.
+    //
+    // Distance fields are mm-only — the fixture file format stores
+    // distances in mm, and the fixture editor doesn't carry the
+    // metric/imperial toggle MainFrame does. Angle fields are degrees.
+
+    // Sprue
+    wxChoice* m_sprueTypeChoice = nullptr;
+    wxTextCtrl* m_sprueDiameter = nullptr;
+    wxTextCtrl* m_sprueDraftAngle = nullptr;
+    wxTextCtrl* m_sprueColdSlugDepth = nullptr;
+    wxTextCtrl* m_sprueLength = nullptr;
+
+    // Runner
+    wxChoice* m_runnerTypeChoice = nullptr;
+    wxTextCtrl* m_runnerDiameter = nullptr;
+    wxTextCtrl* m_runnerColdSlugDepth = nullptr;
+
+    // Gate (+ sub-runner — same card per MainFrame's convention)
+    wxChoice* m_gateTypeChoice = nullptr;
+    wxTextCtrl* m_gateDiameter = nullptr;
+    wxTextCtrl* m_gateDraftAngle = nullptr;
+    wxChoice* m_subRunnerTypeChoice = nullptr;
+    wxTextCtrl* m_subRunnerDiameter = nullptr;
+
+    // Vent
+    wxChoice* m_ventTypeChoice = nullptr;
+    wxTextCtrl* m_ventLength = nullptr;
+    wxTextCtrl* m_ventWidth = nullptr;
+    wxTextCtrl* m_ventOverrunStart = nullptr;
+    wxTextCtrl* m_ventOverrunEnd = nullptr;
+
+    // Ejector
+    wxChoice* m_ejectorTypeChoice = nullptr;
+    wxTextCtrl* m_ejectorDiameter = nullptr;
+    wxTextCtrl* m_ejectorLength = nullptr;
+
     enum
     {
         // Range chosen to avoid collisions with MainFrame's tool IDs
@@ -138,6 +223,7 @@ private:
         // (wxID_HIGHEST + 300).
         ID_FE_ImportModelA = wxID_HIGHEST + 700,
         ID_FE_ImportModelB,
+        ID_FE_GenerateFixture,
         ID_FE_Move,
         ID_FE_Rotate,
         ID_FE_Scale,

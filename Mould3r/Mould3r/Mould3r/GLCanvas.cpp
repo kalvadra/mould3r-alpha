@@ -3993,7 +3993,8 @@ void GLCanvas::ImportFile(const std::string& path)
     Refresh(false);
 }
 
-void GLCanvas::ImportFileAsFixture(const std::string& path)
+void GLCanvas::ImportFileAsFixture(const std::string& path,
+    const HalfTransform& xform)
 {
     SetCurrent(*m_context);
     InitGLOnce();
@@ -4056,6 +4057,27 @@ void GLCanvas::ImportFileAsFixture(const std::string& path)
         m_fixtures.back().hasSourceShape = true;
     }
     UploadMeshToGPU(res.meshes[0], m_fixtures.back());
+
+    // Apply the per-half pose authored in the FixtureEditor. Axis mapping
+    // mirrors the save side in FixtureEditor::OnGenerateFixture:
+    //   rotation_x  →  pitchDeg   (rotation around world X)
+    //   rotation_y  →  yawDeg     (rotation around world Y)
+    //   rotation_z  →  rollDeg    (rotation around world Z)
+    // HalfTransform stores doubles for round-trip fidelity in the file;
+    // SceneObject is float — narrowing here is fine for runtime display.
+    // Done before BuildFixturePerimeter() below because the perimeter
+    // builder calls fix.BuildModelMatrix() on each fixture, so an
+    // un-applied transform would produce a parting band against the
+    // mesh's local origin instead of its placed pose.
+    SceneObject& fixObj = m_fixtures.back();
+    fixObj.pos = glm::vec3(
+        static_cast<float>(xform.posX),
+        static_cast<float>(xform.posY),
+        static_cast<float>(xform.posZ));
+    fixObj.pitchDeg = static_cast<float>(xform.rotX);
+    fixObj.yawDeg = static_cast<float>(xform.rotY);
+    fixObj.rollDeg = static_cast<float>(xform.rotZ);
+    fixObj.scale = static_cast<float>(xform.scale);
 
     progress.Update(step++, "Done.");
 
