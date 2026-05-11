@@ -12,6 +12,7 @@
 
 #include "camera.h"
 #include "FileImporter.h"
+#include "FixtureFile.h"   // InjectionPoint — passed by value to SetInjectionPoints
 #include "GridRenderer.h"
 #include "shaders.h"
 
@@ -128,6 +129,15 @@ public:
     void ApplyRotation(float xDeg, float yDeg, float zDeg);
     void ApplyScale(float factor);
     void CenterSelected();
+
+    // Push the current list of injection points the FixtureEditor wants
+    // visualised. Each entry's (x, y, z) is treated as a fixture-origin-
+    // relative coordinate (= world coordinate in the editor, where the
+    // fixture origin coincides with the world origin) and rendered as a
+    // purple sphere. Pass an empty vector to clear all markers. Cheap to
+    // call on every list mutation — the list is small and the renderer
+    // walks it per-frame; no GPU buffer rebuild is needed.
+    void SetInjectionPoints(const std::vector<InjectionPoint>& pts);
 
 private:
     void OnPaint(wxPaintEvent&);
@@ -280,6 +290,13 @@ private:
     void RebuildAlignHighlightVBO(const FixtureMesh& m,
         const std::vector<uint32_t>& tris);
 
+    // Generate a unit UV sphere and upload to m_sphereVAO/VBO/EBO. Same
+    // implementation as GLCanvas::BuildSphereGPU — this canvas can't share
+    // the main canvas's GL resources because each wxGLCanvas owns its own
+    // context. Called once from EnsureLitProgram after the lit shader is
+    // ready, since the sphere uses the same vertex layout (pos+normal).
+    void BuildSphereGPU(float radius, int stacks, int slices);
+
     wxGLContext* m_context = nullptr;
     bool         m_inited = false;
 
@@ -341,6 +358,23 @@ private:
     GLuint m_flatProgram = 0;
     GLint  m_flat_uVP = -1;
     GLint  m_flat_uColor = -1;
+
+    // Unit UV sphere — used to render the purple injection-point markers.
+    // Built once by BuildSphereGPU; per-marker scaling is done by the
+    // model matrix at draw time so we don't need a sphere per radius.
+    // Same vertex layout (pos+normal) as the imported half meshes, so the
+    // same lit shader and uniform set draws both.
+    GLuint  m_sphereVAO = 0;
+    GLuint  m_sphereVBO = 0;
+    GLuint  m_sphereEBO = 0;
+    GLsizei m_sphereIndexCount = 0;
+
+    // Injection points the editor has staged for inclusion in the saved
+    // fixture file. Coordinates are fixture-origin-relative (= world-
+    // relative in the editor). Rendered as purple spheres in OnPaint;
+    // pushed in by FixtureEditor::SetInjectionPoints whenever the side-
+    // panel list is rebuilt.
+    std::vector<InjectionPoint> m_injectionPoints;
 
     // Mouse state for camera controls. Tracked the same way the main
     // GLCanvas does — m_hasLast=false on each button-down so the first

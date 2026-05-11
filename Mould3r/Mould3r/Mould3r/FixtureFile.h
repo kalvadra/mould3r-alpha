@@ -21,6 +21,30 @@ struct InjectionPoint
     float         y = 0.0f;
     float         z = 0.0f;
     InjectionType type = InjectionType::Radial;
+
+    // Derive the injection type from a Y coordinate. The rule is fixed:
+    // points sitting exactly on the parting plane (y = 0) are Radial —
+    // material flows sideways into the cavity from the parting line.
+    // Anything off the plane is Axial — material flows along the fixture
+    // axis (typically vertical) into a top/bottom face. The downstream
+    // sprue-generation code in GLCanvas branches on this distinction;
+    // see RebuildSpruePath for the radial vs axial path construction.
+    //
+    // Exposed as a free static helper rather than a setter so callers
+    // make the assignment explicit (`p.type = InjectionPoint::TypeFor(p.y)`)
+    // — that reads as a one-line invariant restoration at every entry
+    // point, and a search for "TypeFor" finds every site that maintains
+    // the invariant.
+    //
+    // Exact equality on y is intentional. User-typed "0" and "0.0" parse
+    // to exactly 0.0f via wxString::ToDouble, and points loaded from a
+    // fixture file written by this app round-trip exactly. A non-zero
+    // typed value (even something tiny like 0.0001) is the user's
+    // explicit signal of "off the parting plane" → Axial.
+    static InjectionType TypeFor(float y)
+    {
+        return (y == 0.0f) ? InjectionType::Radial : InjectionType::Axial;
+    }
 };
 
 // ---------------------------------------------------------------------------

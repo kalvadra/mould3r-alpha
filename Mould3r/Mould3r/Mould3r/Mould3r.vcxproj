@@ -147,6 +147,7 @@
     <ClCompile Include="GLCanvas.cpp" />
     <ClCompile Include="GLLoader.cpp" />
     <ClCompile Include="GridRenderer.cpp" />
+    <ClCompile Include="InjectionPointDialog.cpp" />
     <ClCompile Include="MainFrame.cpp" />
     <ClCompile Include="MeshImportSettings.cpp" />
     <ClCompile Include="MeshOps.cpp" />
@@ -174,6 +175,7 @@
     <ClInclude Include="GLCanvas.h" />
     <ClInclude Include="GLLoader.h" />
     <ClInclude Include="GridRenderer.h" />
+    <ClInclude Include="InjectionPointDialog.h" />
     <ClInclude Include="MainFrame.h" />
     <ClInclude Include="MeshImportSettings.h" />
     <ClInclude Include="MeshOps.h" />

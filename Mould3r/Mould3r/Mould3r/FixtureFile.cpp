@@ -48,6 +48,17 @@ bool FixtureFile::Load(const std::string& path,
     FixtureDefinition& out,
     std::string& error)
 {
+    // Reset every field to its default. Most callers pass a freshly-built
+    // FixtureDefinition, but StartupDialog reuses a member across selections —
+    // PreSelectFixture loads the last-used fixture into m_fixture, then
+    // OnFixtureSelected loads a different fixture into the same slot when
+    // the user clicks a row. Without this reset, fields the new file is
+    // silent on (e.g. an absent [half_a_transform] section, or an unspecified
+    // gate diameter override) would silently inherit values from the
+    // previously-loaded fixture, applying old transforms to a new model.
+    // Idempotent for the default-construct case, so it's safe everywhere.
+    out = FixtureDefinition{};
+
     std::ifstream file(path);
     if (!file.is_open())
     {
@@ -57,7 +68,6 @@ bool FixtureFile::Load(const std::string& path,
 
     const std::string baseDir = GetDirectory(path);
     out.fixturePath = path;
-    out.injectionPoints.clear();
 
     // Section-aware parsing.
     // Sections: [fixture], [injection_point.N], [<feature>_defaults],
@@ -90,6 +100,13 @@ bool FixtureFile::Load(const std::string& path,
         {
             if (hasPending)
             {
+                // Enforce the type-from-Y invariant on every parsed point:
+                // y=0 → Radial, otherwise → Axial. Overrides whatever the
+                // file's `type =` line said. This normalises older fixtures
+                // (authored before the rule existed) and hand-edited files
+                // where the type and y might disagree, so the in-memory
+                // FixtureDefinition is always self-consistent.
+                pendingPoint.type = InjectionPoint::TypeFor(pendingPoint.y);
                 out.injectionPoints.push_back(pendingPoint);
                 pendingPoint = InjectionPoint{};
                 hasPending = false;

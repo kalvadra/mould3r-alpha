@@ -53,6 +53,7 @@ public:
 
     float GetGateDiameter() const;
     float GetGateDraftAngle() const;
+    float GetGateOverrun() const;
     float GetSubRunnerDiameter() const;
 
     float GetEjectorDiameter() const;
@@ -182,6 +183,7 @@ private:
     wxChoice* m_gateTypeChoice = nullptr;
     wxTextCtrl* m_gateDiameter = nullptr;
     wxTextCtrl* m_gateDraftAngle = nullptr;
+    wxTextCtrl* m_gateOverrun = nullptr;     // mm extension into the model
 
     // Sub-runner field members (within the Gates section)
     wxChoice* m_subRunnerTypeChoice = nullptr;

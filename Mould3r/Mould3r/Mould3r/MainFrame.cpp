@@ -979,6 +979,21 @@ float MainFrame::GetGateDraftAngle() const
     return static_cast<float>(v);   // degrees — no unit conversion
 }
 
+// Distance the gate cylinder is extended backward along -pathDir into the
+// model body. Returns mm regardless of the active unit system, matching the
+// other length accessors. Default 0 means the gate starts exactly at the
+// parting-surface placement point (legacy behaviour). Negative inputs are
+// clamped to 0 — a "shorter than the surface" gate doesn't make sense for
+// the cut-clearance use case.
+float MainFrame::GetGateOverrun() const
+{
+    if (!m_gateOverrun) return 0.0f;
+    double v = 0.0;
+    if (!m_gateOverrun->GetValue().ToDouble(&v)) return 0.0f;
+    if (v < 0.0) v = 0.0;
+    return static_cast<float>(v) * (m_imperial ? 25.4f : 1.0f);
+}
+
 float MainFrame::GetSubRunnerDiameter() const
 {
     if (!m_subRunnerDiameter) return 5.0f;
@@ -1232,6 +1247,7 @@ void MainFrame::OnSaveProject(wxCommandEvent&)
         p.runnerColdPlugDist = GetRunnerColdPlugDist();
         p.gateDiameter = GetGateDiameter();
         p.gateDraftAngle = GetGateDraftAngle();
+        p.gateOverrun = GetGateOverrun();
         p.subRunnerDiameter = GetSubRunnerDiameter();
         p.ejectorDiameter = GetEjectorDiameter();
         p.ejectorLength = GetEjectorLength();
@@ -1446,6 +1462,7 @@ void MainFrame::SetParameterFields(const ProjectParameters& p)
     setField(m_runnerColdSlugDepth, p.runnerColdPlugDist * conv);
     setField(m_gateDiameter, p.gateDiameter * conv);
     setField(m_gateDraftAngle, p.gateDraftAngle);           // degrees — no conversion
+    setField(m_gateOverrun, p.gateOverrun * conv);
     setField(m_subRunnerDiameter, p.subRunnerDiameter * conv);
     setField(m_ejectorDiameter, p.ejectorDiameter * conv);
     setField(m_ejectorLength, p.ejectorLength * conv);
@@ -2299,6 +2316,12 @@ wxPanel* MainFrame::CreateGatesContent(wxWindow* parent)
     auto* dimsSizer = new wxBoxSizer(wxVERTICAL);
     addRow(dimsPanel, dimsSizer, "Diameter:", m_gateDiameter, "3.0", "mm");
     addRow(dimsPanel, dimsSizer, "Draft angle:", m_gateDraftAngle, "1.0", wxString::FromUTF8("\xC2\xB0"));
+    // Overrun extends the gate cylinder backward into the model along the
+    // path direction, so the cut clears irregular geometry near the
+    // parting-line entry. Default 0 = current behaviour (gate starts at
+    // the parting surface). The radius at the parting surface is preserved
+    // — see RebuildGateSolids for the math.
+    addRow(dimsPanel, dimsSizer, "Overrun:", m_gateOverrun, "0.0", "mm");
     dimsPanel->SetSizer(dimsSizer);
     settingsSizer->Add(dimsPanel, 0, wxEXPAND | wxBOTTOM, 6);
 

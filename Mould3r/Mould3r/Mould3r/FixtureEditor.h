@@ -6,6 +6,9 @@
 #include <functional>
 #include <string>
 #include <unordered_map>
+#include <vector>
+
+#include "FixtureFile.h"   // InjectionPoint — held by value in m_injectionPoints
 
 class FixtureCanvas;
 
@@ -105,11 +108,28 @@ private:
     // action grid, no collapsible Settings sub-section. Each populates the
     // matching m_xxx* member pointers (type choice, dimension fields) so
     // the future Generate-Fixture handler can read values back.
+    wxPanel* CreateInjectionPointsContent(wxWindow* parent);
     wxPanel* CreateSpruesContent(wxWindow* parent);
     wxPanel* CreateRunnersContent(wxWindow* parent);
     wxPanel* CreateGatesContent(wxWindow* parent);
     wxPanel* CreateVentsContent(wxWindow* parent);
     wxPanel* CreateEjectorsContent(wxWindow* parent);
+
+    // Rebuild the list of injection-point entries inside m_injectionListPanel
+    // from m_injectionPoints. Called after Add / Edit / Remove. Each entry
+    // gets its own Edit and Remove buttons, bound via per-button lambdas
+    // that capture the index into m_injectionPoints by value — safe because
+    // the panel's children are destroyed and rebuilt on every list mutation,
+    // so a bound lambda's captured index is always the current index.
+    void RebuildInjectionList();
+
+    // Add / Edit / Remove handlers. Add and Edit open InjectionPointDialog
+    // (the Edit variant pre-populates from the existing point); Remove
+    // simply drops the point by index. All three end with a call to
+    // RebuildInjectionList so the sidebar stays in sync.
+    void OnAddInjectionPoint(wxCommandEvent&);
+    void EditInjectionPointAt(int index);
+    void RemoveInjectionPointAt(int index);
 
     // Toolbar click handlers. Move/Rotate/Scale open the existing
     // TranslateDialog/RotateDialog/ScaleDialog and forward results to the
@@ -216,6 +236,21 @@ private:
     wxTextCtrl* m_ejectorDiameter = nullptr;
     wxTextCtrl* m_ejectorLength = nullptr;
 
+    // ---- Injection points ------------------------------------------------
+    // Live list of points the user has added through the side-panel card.
+    // Survives Add / Edit / Remove operations as a plain vector — order
+    // mirrors the visible list, and OnGenerateFixture copies it straight
+    // into FixtureDefinition::injectionPoints. Defaults each new point to
+    // InjectionType::Radial (the file format's default for unspecified
+    // types); the dialog doesn't surface a type picker today.
+    std::vector<InjectionPoint> m_injectionPoints;
+
+    // Container panel for the per-entry rows. Held as a member so
+    // RebuildInjectionList can walk back to it after an Add / Edit /
+    // Remove without re-finding it through the widget tree. Owned by the
+    // wxWidgets parent-child hierarchy.
+    wxPanel* m_injectionListPanel = nullptr;
+
     enum
     {
         // Range chosen to avoid collisions with MainFrame's tool IDs
@@ -228,6 +263,10 @@ private:
         ID_FE_Rotate,
         ID_FE_Scale,
         ID_FE_Center,
-        ID_FE_AlignFace
+        ID_FE_AlignFace,
+        ID_FE_AddInjectionPoint
+        // Edit / Remove buttons inside the injection list don't get static
+        // IDs — they're rebuilt on every list mutation, so each one binds
+        // its own lambda directly via wxButton::Bind in RebuildInjectionList.
     };
 };

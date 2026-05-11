@@ -16,6 +16,7 @@
 
 #include "FixtureCanvas.h"
 #include "FixtureFile.h"       // OnGenerateFixture
+#include "InjectionPointDialog.h"  // Add/Edit injection-point flow
 #include "RotateDialog.h"      // OnToolRotate
 #include "ScaleDialog.h"       // OnToolScale
 #include "TranslateDialog.h"   // OnToolMove
@@ -229,6 +230,7 @@ FixtureEditor::FixtureEditor(wxWindow* parent)
     Bind(wxEVT_BUTTON, &FixtureEditor::OnImportModelA, this, ID_FE_ImportModelA);
     Bind(wxEVT_BUTTON, &FixtureEditor::OnImportModelB, this, ID_FE_ImportModelB);
     Bind(wxEVT_BUTTON, &FixtureEditor::OnGenerateFixture, this, ID_FE_GenerateFixture);
+    Bind(wxEVT_BUTTON, &FixtureEditor::OnAddInjectionPoint, this, ID_FE_AddInjectionPoint);
     Bind(wxEVT_TOGGLEBUTTON, &FixtureEditor::OnToolMove, this, ID_FE_Move);
     Bind(wxEVT_TOGGLEBUTTON, &FixtureEditor::OnToolRotate, this, ID_FE_Rotate);
     Bind(wxEVT_TOGGLEBUTTON, &FixtureEditor::OnToolScale, this, ID_FE_Scale);
@@ -593,7 +595,11 @@ wxWindow* FixtureEditor::BuildSidePanel(wxWindow* parent)
     sizer->AddSpacer(4);
 
     // Card order matches MainFrame so users transitioning between the two
-    // panels find features in the same place.
+    // panels find features in the same place. The Injection Points card
+    // leads — points are upstream of every per-feature default (sprues
+    // feed from them, runners route between them), so it reads naturally
+    // as the first thing the user configures after positioning the halves.
+    sizer->Add(CreateInjectionPointsContent(scrollWin), 0, wxEXPAND | wxTOP, 8);
     sizer->Add(CreateSpruesContent(scrollWin), 0, wxEXPAND | wxTOP, 8);
     sizer->Add(CreateRunnersContent(scrollWin), 0, wxEXPAND | wxTOP, 8);
     sizer->Add(CreateGatesContent(scrollWin), 0, wxEXPAND | wxTOP, 8);
@@ -621,6 +627,245 @@ wxWindow* FixtureEditor::BuildSidePanel(wxWindow* parent)
 // MainFrame.cpp exactly: same numbers, same units, same wxChoice options.
 // Distance fields are mm, angle fields are degrees.
 // ---------------------------------------------------------------------------
+wxPanel* FixtureEditor::CreateInjectionPointsContent(wxWindow* parent)
+{
+    // Injection-points card differs structurally from the per-feature
+    // defaults below: instead of a fixed set of dimension fields, it
+    // surfaces a dynamic list of user-added points plus an "Add" button
+    // that opens InjectionPointDialog. Entries are rendered into
+    // m_injectionListPanel by RebuildInjectionList — see that function
+    // for the per-row layout.
+    wxSizer* sizer = nullptr;
+    auto* card = MakeCardWithTitle(parent, "Injection Points", sizer);
+
+    // List container — empty at construction; RebuildInjectionList
+    // populates it after each Add / Edit / Remove.
+    m_injectionListPanel = new wxPanel(card, wxID_ANY);
+    m_injectionListPanel->SetBackgroundColour(Style::CardBg);
+    m_injectionListPanel->SetSizer(new wxBoxSizer(wxVERTICAL));
+    sizer->Add(m_injectionListPanel, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
+
+    // Add button — full-width inside the card, matching the visual weight
+    // of MainFrame's Place button on placement-mode cards. ID is the
+    // single static button on this card; Edit/Remove buttons inside the
+    // list bind their own per-row lambdas (see RebuildInjectionList).
+    auto* addBtn = new wxButton(card, ID_FE_AddInjectionPoint,
+        "Add Injection Point",
+        wxDefaultPosition, wxSize(-1, 26));
+    addBtn->SetBackgroundColour(Style::BtnSmall);
+    addBtn->SetForegroundColour(*wxWHITE);
+    sizer->Add(addBtn, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
+
+    sizer->AddSpacer(10);
+
+    // Render the (empty) initial state. RebuildInjectionList draws a
+    // muted "No injection points" placeholder when the vector is empty,
+    // so the card doesn't collapse to a thin sliver before the user adds
+    // anything.
+    RebuildInjectionList();
+
+    return card;
+}
+
+// ---------------------------------------------------------------------------
+// RebuildInjectionList — repaint the list of injection points inside
+// m_injectionListPanel from m_injectionPoints.
+//
+// Called after every Add / Edit / Remove. We tear down and rebuild the
+// child windows entirely rather than trying to incrementally diff the
+// list — the list is small (typically 1-5 entries) and rebuilding is
+// trivially cheap, while diff logic would have to track per-row sub-
+// panels and re-bind buttons on index shifts. The teardown also disposes
+// of the per-row Edit/Remove button bindings cleanly: wxWindow children
+// destroy their own bound event handlers.
+//
+// Layout per entry — two stacked rows inside a sub-panel:
+//   row 1: [ label_text ........ ] [ Edit ] [ Remove ]
+//   row 2:   ( x.x, y.y, z.z ) mm
+// keeping the buttons on the busier first row and letting the coordinate
+// readout sit on its own line so long labels don't get truncated.
+//
+// Empty state: a single muted "No injection points" line, so the card
+// has visible content even before the first point is added.
+// ---------------------------------------------------------------------------
+void FixtureEditor::RebuildInjectionList()
+{
+    if (!m_injectionListPanel) return;
+
+    m_injectionListPanel->DestroyChildren();
+    auto* listSizer = m_injectionListPanel->GetSizer();
+    listSizer->Clear(false);   // children already destroyed; just empty the sizer
+
+    if (m_injectionPoints.empty())
+    {
+        auto* placeholder = new wxStaticText(m_injectionListPanel, wxID_ANY,
+            "No injection points");
+        placeholder->SetForegroundColour(Style::TextSubtle);
+        placeholder->SetFont(kFieldLabelFont);
+        listSizer->Add(placeholder, 0, wxTOP | wxBOTTOM, 4);
+    }
+    else
+    {
+        for (int i = 0; i < (int)m_injectionPoints.size(); ++i)
+        {
+            const InjectionPoint& ip = m_injectionPoints[i];
+
+            // Per-entry sub-panel keeps the two rows visually grouped and
+            // makes spacing trivial — vertical sizer with the two rows
+            // stacked, an 8px bottom margin between entries.
+            auto* entry = new wxPanel(m_injectionListPanel, wxID_ANY);
+            entry->SetBackgroundColour(Style::CardBg);
+            auto* entrySizer = new wxBoxSizer(wxVERTICAL);
+
+            // Row 1: label text + Edit/Remove buttons
+            {
+                auto* row = new wxBoxSizer(wxHORIZONTAL);
+
+                // Empty-label fallback so a row with no label still has
+                // visible content (rather than just appearing blank).
+                const wxString labelText = ip.label.empty()
+                    ? wxString("(unnamed)")
+                    : wxString(ip.label);
+                auto* lblText = new wxStaticText(entry, wxID_ANY, labelText,
+                    wxDefaultPosition, wxDefaultSize,
+                    wxST_ELLIPSIZE_END);
+                lblText->SetForegroundColour(*wxWHITE);
+                lblText->SetFont(kFieldLabelFont);
+
+                auto* editBtn = new wxButton(entry, wxID_ANY, "Edit",
+                    wxDefaultPosition, wxSize(44, 22));
+                editBtn->SetBackgroundColour(Style::BtnSmall);
+                editBtn->SetForegroundColour(*wxWHITE);
+
+                auto* removeBtn = new wxButton(entry, wxID_ANY, "Remove",
+                    wxDefaultPosition, wxSize(56, 22));
+                removeBtn->SetBackgroundColour(Style::BtnSmall);
+                removeBtn->SetForegroundColour(*wxWHITE);
+
+                // Per-button bindings via lambda. Capturing `i` by value
+                // is intentional — `i` here is the index into
+                // m_injectionPoints AT BUILD TIME, which equals the
+                // current index for this row because the whole list is
+                // rebuilt on every mutation. Capturing `this` lets the
+                // lambdas dispatch back into the editor's own helpers.
+                editBtn->Bind(wxEVT_BUTTON,
+                    [this, i](wxCommandEvent&) { EditInjectionPointAt(i); });
+                removeBtn->Bind(wxEVT_BUTTON,
+                    [this, i](wxCommandEvent&) { RemoveInjectionPointAt(i); });
+
+                row->Add(lblText, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, 6);
+                row->Add(editBtn, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
+                row->Add(removeBtn, 0, wxALIGN_CENTER_VERTICAL);
+                entrySizer->Add(row, 0, wxEXPAND);
+            }
+
+            // Row 2: coordinate readout. Single decimal is enough — the
+            // user typed mm values that were almost certainly authored
+            // to the millimetre or finer; %g would chop trailing zeros
+            // (10 → "10") and lose the unit feel, so %.1f for a stable
+            // readable column.
+            {
+                const wxString coords = wxString::Format(
+                    "(%.1f, %.1f, %.1f) mm", ip.x, ip.y, ip.z);
+                auto* coordText = new wxStaticText(entry, wxID_ANY, coords);
+                coordText->SetForegroundColour(Style::TextSubtle);
+                coordText->SetFont(kFieldLabelFont);
+                entrySizer->Add(coordText, 0, wxTOP, 2);
+            }
+
+            entry->SetSizer(entrySizer);
+            listSizer->Add(entry, 0, wxEXPAND | wxBOTTOM, 8);
+        }
+    }
+
+    // Re-layout from the list panel up to the scrolled window's virtual
+    // size — without this, newly-added rows render with stale geometry
+    // until the next external Layout() trigger (e.g. window resize).
+    m_injectionListPanel->Layout();
+    if (auto* parent = m_injectionListPanel->GetParent())
+    {
+        parent->Layout();
+        // Walk up to the wxScrolledWindow (sidebar's scrollable column)
+        // and refresh its virtual size — otherwise the scrollbar doesn't
+        // appear when the list grows past the visible area.
+        for (wxWindow* w = parent; w; w = w->GetParent())
+        {
+            if (auto* scr = wxDynamicCast(w, wxScrolledWindow))
+            {
+                scr->FitInside();
+                break;
+            }
+        }
+    }
+
+    // Push the staged points to the canvas so it renders the purple
+    // markers alongside the imported halves. Cheap on every list mutation
+    // — the canvas just stores the vector and walks it per-frame.
+    if (m_canvas)
+        m_canvas->SetInjectionPoints(m_injectionPoints);
+}
+
+// ---------------------------------------------------------------------------
+// Add / Edit / Remove handlers.
+//
+// Add opens InjectionPointDialog with empty defaults; on OK, appends a
+// new point with type derived from Y via InjectionPoint::TypeFor — points
+// on the parting plane (y=0) become Radial, anything else becomes Axial.
+// Edit pre-fills the dialog from the existing point and replaces in
+// place, re-deriving the type from the (possibly edited) Y. The fixture
+// file's `type` field is therefore always consistent with `y` for every
+// point this editor produces; older or hand-authored files get
+// normalised on load by FixtureFile::Load applying the same rule.
+// Remove just drops the entry and rebuilds.
+// ---------------------------------------------------------------------------
+void FixtureEditor::OnAddInjectionPoint(wxCommandEvent&)
+{
+    InjectionPointDialog dlg(this, "Add Injection Point");
+    if (dlg.ShowModal() != wxID_OK) return;
+
+    const InjectionPointValues vals = dlg.GetValues();
+    InjectionPoint ip;
+    ip.label = vals.label;
+    ip.x = vals.x;
+    ip.y = vals.y;
+    ip.z = vals.z;
+    ip.type = InjectionPoint::TypeFor(ip.y);
+    m_injectionPoints.push_back(std::move(ip));
+
+    RebuildInjectionList();
+}
+
+void FixtureEditor::EditInjectionPointAt(int index)
+{
+    if (index < 0 || index >= (int)m_injectionPoints.size()) return;
+
+    const InjectionPoint& existing = m_injectionPoints[index];
+    InjectionPointValues initial;
+    initial.label = existing.label;
+    initial.x = existing.x;
+    initial.y = existing.y;
+    initial.z = existing.z;
+
+    InjectionPointDialog dlg(this, "Edit Injection Point", initial);
+    if (dlg.ShowModal() != wxID_OK) return;
+
+    const InjectionPointValues vals = dlg.GetValues();
+    m_injectionPoints[index].label = vals.label;
+    m_injectionPoints[index].x = vals.x;
+    m_injectionPoints[index].y = vals.y;
+    m_injectionPoints[index].z = vals.z;
+    m_injectionPoints[index].type = InjectionPoint::TypeFor(vals.y);
+
+    RebuildInjectionList();
+}
+
+void FixtureEditor::RemoveInjectionPointAt(int index)
+{
+    if (index < 0 || index >= (int)m_injectionPoints.size()) return;
+    m_injectionPoints.erase(m_injectionPoints.begin() + index);
+    RebuildInjectionList();
+}
+
 wxPanel* FixtureEditor::CreateSpruesContent(wxWindow* parent)
 {
     wxSizer* sizer = nullptr;
@@ -938,6 +1183,21 @@ void FixtureEditor::OnGenerateFixture(wxCommandEvent&)
         return;
     }
 
+    // ---- Injection points required ----------------------------------------
+    // A fixture with no injection points has nothing for the main app's
+    // sprue placement (and downstream runner / gate / vent flow) to attach
+    // to — it'd load successfully but be unusable. Catch the omission here
+    // rather than letting the user discover it on next session by clicking
+    // "Place Sprue" and finding nothing to choose from.
+    if (m_injectionPoints.empty())
+    {
+        wxMessageBox("Add at least one injection point before generating "
+            "the fixture. Use the \"Add Injection Point\" button on the "
+            "Injection Points card to author one.",
+            "Generate Fixture", wxOK | wxICON_WARNING, this);
+        return;
+    }
+
     // ---- Save target ------------------------------------------------------
     // Default to the same fixtures/ folder StartupDialog scans on launch,
     // so a freshly-written fixture appears in the dialog's list without
@@ -1037,6 +1297,11 @@ void FixtureEditor::OnGenerateFixture(wxCommandEvent&)
     readChoice(m_ejectorTypeChoice, def.ejectorDefaults.type);
     readField(m_ejectorDiameter, def.ejectorDefaults.diameter);
     readField(m_ejectorLength, def.ejectorDefaults.length);
+
+    // Injection points — straight copy of the editor's live list. Order
+    // is preserved so the saved file's [injection_point.0..N] sections
+    // come out in the same order the user added them in the sidebar.
+    def.injectionPoints = m_injectionPoints;
 
     // ---- Write ------------------------------------------------------------
     std::string error;

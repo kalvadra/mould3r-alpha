@@ -29,6 +29,12 @@
 
 namespace
 {
+    // Injection-point marker radius (mm). Matches the main canvas's
+    // kVentMarkerRadius * 0.9 used for the SelectInjectionPoint render
+    // pass (1.5 * 0.9 = 1.35), so the dots in the editor and the main
+    // app read at the same visual size at the same zoom level.
+    static constexpr float kInjectionMarkerRadius = 1.35f;
+
     // Local Compile/Link helpers — same approach the main GLCanvas uses,
     // intentionally kept file-static here rather than promoted to a shared
     // header (the helpers exist in GLCanvas.cpp too; if a third caller
@@ -233,6 +239,10 @@ void FixtureCanvas::DestroyGL()
     if (m_alignHighlightVBO) { glDeleteBuffers(1, &m_alignHighlightVBO); m_alignHighlightVBO = 0; }
     if (m_alignHighlightVAO) { glDeleteVertexArrays(1, &m_alignHighlightVAO); m_alignHighlightVAO = 0; }
     m_alignHighlightVertexCount = 0;
+    if (m_sphereEBO) { glDeleteBuffers(1, &m_sphereEBO); m_sphereEBO = 0; }
+    if (m_sphereVBO) { glDeleteBuffers(1, &m_sphereVBO); m_sphereVBO = 0; }
+    if (m_sphereVAO) { glDeleteVertexArrays(1, &m_sphereVAO); m_sphereVAO = 0; }
+    m_sphereIndexCount = 0;
     m_grid.Destroy();
     m_inited = false;
 }
@@ -313,6 +323,13 @@ void FixtureCanvas::EnsureLitProgram()
     m_uDiffuse = glGetUniformLocation(m_litProgram, "uDiffuse");
     m_uSpecular = glGetUniformLocation(m_litProgram, "uSpecular");
     m_uShininess = glGetUniformLocation(m_litProgram, "uShininess");
+
+    // Build the unit sphere used to render injection-point markers. Same
+    // tessellation as the main canvas (12 stacks, 16 slices) so the dots
+    // look identical between viewports. Done here because the sphere
+    // shares the lit shader's vertex layout — once the program exists,
+    // the VAO is safe to set up.
+    BuildSphereGPU(1.0f, 12, 16);
 }
 
 // ---------------------------------------------------------------------------
@@ -333,6 +350,78 @@ void FixtureCanvas::EnsureFlatProgram()
 
     m_flat_uVP = glGetUniformLocation(m_flatProgram, "uVP");
     m_flat_uColor = glGetUniformLocation(m_flatProgram, "uColor");
+}
+
+// ---------------------------------------------------------------------------
+// BuildSphereGPU — generates a UV sphere and uploads it to the GPU.
+// Vertex layout: [pos(3), normal(3)] — compatible with the lit shader,
+// matching GLCanvas::BuildSphereGPU exactly. Two GL contexts can't share
+// VAOs, so the sphere is duplicated per canvas; the implementation is
+// kept in lock-step intentionally so any future refresh (e.g. higher
+// tessellation) hits both viewports.
+// ---------------------------------------------------------------------------
+void FixtureCanvas::BuildSphereGPU(float radius, int stacks, int slices)
+{
+    std::vector<float>    verts;
+    std::vector<uint32_t> idx;
+
+    for (int i = 0; i <= stacks; ++i)
+    {
+        const float phi = glm::pi<float>() * float(i) / float(stacks);
+        const float sinPhi = sinf(phi);
+        const float cosPhi = cosf(phi);
+
+        for (int j = 0; j <= slices; ++j)
+        {
+            const float theta = 2.0f * glm::pi<float>() * float(j) / float(slices);
+            const float x = sinPhi * cosf(theta);
+            const float y = cosPhi;
+            const float z = sinPhi * sinf(theta);
+
+            verts.push_back(x * radius);  verts.push_back(y * radius);  verts.push_back(z * radius);
+            verts.push_back(x);           verts.push_back(y);           verts.push_back(z);
+        }
+    }
+
+    for (int i = 0; i < stacks; ++i)
+    {
+        for (int j = 0; j < slices; ++j)
+        {
+            const uint32_t a = uint32_t(i * (slices + 1) + j);
+            const uint32_t b = uint32_t(a + slices + 1);
+            idx.push_back(a);     idx.push_back(b);     idx.push_back(a + 1);
+            idx.push_back(b);     idx.push_back(b + 1); idx.push_back(a + 1);
+        }
+    }
+
+    glGenVertexArrays(1, &m_sphereVAO);
+    glGenBuffers(1, &m_sphereVBO);
+    glGenBuffers(1, &m_sphereEBO);
+
+    glBindVertexArray(m_sphereVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, m_sphereVBO);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(verts.size() * sizeof(float)), verts.data(), GL_STATIC_DRAW);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m_sphereEBO);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)(idx.size() * sizeof(uint32_t)), idx.data(), GL_STATIC_DRAW);
+
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+    glBindVertexArray(0);
+
+    m_sphereIndexCount = (GLsizei)idx.size();
+}
+
+// ---------------------------------------------------------------------------
+// SetInjectionPoints — replace the staged injection-point list and
+// request a repaint. No GPU work happens here; the markers are drawn
+// from m_injectionPoints in OnPaint, walking the (small) list each frame.
+// ---------------------------------------------------------------------------
+void FixtureCanvas::SetInjectionPoints(const std::vector<InjectionPoint>& pts)
+{
+    m_injectionPoints = pts;
+    Refresh(false);
 }
 
 // ---------------------------------------------------------------------------
@@ -569,6 +658,56 @@ void FixtureCanvas::OnPaint(wxPaintEvent&)
 
             glBindVertexArray(m->vao);
             glDrawElements(GL_TRIANGLES, m->indexCount, GL_UNSIGNED_INT, 0);
+        }
+        glBindVertexArray(0);
+        glUseProgram(0);
+    }
+
+    // ---- Injection-point markers (purple spheres) -----------------------
+    // Always visible while the editor is open — the user is staging points
+    // for the saved fixture, so seeing them alongside the geometry is the
+    // whole reason for the visualisation. Coordinates in m_injectionPoints
+    // are fixture-origin-relative (= world-relative here, since the
+    // fixture origin coincides with the world origin in the editor — the
+    // halves move; the points stay put). Identical look to the main
+    // canvas's SelectInjectionPoint render pass: same purple, same sphere
+    // tessellation, same radius factor.
+    if (m_litProgram && m_sphereVAO && m_sphereIndexCount > 0 &&
+        !m_injectionPoints.empty())
+    {
+        glEnable(GL_DEPTH_TEST);
+        glUseProgram(m_litProgram);
+
+        // Lighting matches the half meshes' pass above so the dots feel
+        // lit by the same light. Slightly hotter ambient/specular than
+        // the half pass so the small markers stay readable against a
+        // textured fixture surface.
+        const glm::vec3 lightDir = glm::normalize(glm::vec3(0.4f, 0.8f, 0.2f));
+        const glm::vec3 lightColor = glm::vec3(1.0f);
+
+        glUniformMatrix4fv(m_uView, 1, GL_FALSE, &view[0][0]);
+        glUniformMatrix4fv(m_uProj, 1, GL_FALSE, &proj[0][0]);
+        glUniform3fv(m_uCameraPos, 1, &camPos[0]);
+        glUniform3fv(m_uLightDir, 1, &lightDir[0]);
+        glUniform3fv(m_uLightColor, 1, &lightColor[0]);
+        glUniform1f(m_uAmbient, 0.35f);
+        glUniform1f(m_uDiffuse, 0.75f);
+        glUniform1f(m_uSpecular, 0.60f);
+        glUniform1f(m_uShininess, 48.0f);
+        glUniform1f(m_uAlpha, 1.0f);
+
+        const glm::vec3 ipColor(0.65f, 0.10f, 0.90f);   // purple
+        glUniform3fv(m_uBaseColor, 1, &ipColor[0]);
+
+        glBindVertexArray(m_sphereVAO);
+        for (const auto& ip : m_injectionPoints)
+        {
+            glm::mat4 model = glm::translate(glm::mat4(1.0f),
+                glm::vec3(ip.x, ip.y, ip.z));
+            model = glm::scale(model, glm::vec3(kInjectionMarkerRadius));
+            glUniformMatrix4fv(m_uModel, 1, GL_FALSE, &model[0][0]);
+            glDrawElements(GL_TRIANGLES, m_sphereIndexCount,
+                GL_UNSIGNED_INT, 0);
         }
         glBindVertexArray(0);
         glUseProgram(0);

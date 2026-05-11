@@ -897,11 +897,13 @@ void GLCanvas::RebuildGateSolids()
     float gateRadius = 1.5f;
     float draftAngle = 1.0f;
     float subRunnerRadius = 2.5f;
+    float overrun = 0.0f;
     if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
     {
         gateRadius = frame->GetGateDiameter() * 0.5f;
         draftAngle = frame->GetGateDraftAngle();
         subRunnerRadius = frame->GetSubRunnerDiameter() * 0.5f;
+        overrun = frame->GetGateOverrun();
     }
 
     const float draftRad = glm::radians(glm::clamp(draftAngle, 0.0f, 45.0f));
@@ -922,16 +924,29 @@ void GLCanvas::RebuildGateSolids()
         if (tanDraft > 1e-6f && subRunnerRadius > gateRadius)
             taperLen = (subRunnerRadius - gateRadius) / tanDraft;
 
+        // Overrun shifts the cylinder's start backward along -pathDir into
+        // the model. The radius at the start is reduced so that the radius
+        // at the original origin (parting surface) still equals gateRadius —
+        // i.e. the user-typed Diameter remains the diameter of the inlet
+        // hole at the parting surface, regardless of overrun. For typical
+        // drafts the start-radius shrinkage is sub-millimetre and the
+        // visible effect is just "the cylinder pokes back into the model".
+        // Clamped to a small floor so aggressive overrun + draft combos
+        // don't degenerate into a zero-radius cap (BuildCylinderMesh
+        // rejects radii below 1e-6).
+        const glm::vec3 startPt = origin - pathDir * overrun;
+        const float startRadius = std::max(0.01f, gateRadius - tanDraft * overrun);
+
         if (taperLen >= totalLen)
         {
             // Gate fills the entire path — no sub-runner section
-            gf.solid = BuildCylinderMesh(origin, gf.pathEnd, gateRadius, draftAngle);
+            gf.solid = BuildCylinderMesh(startPt, gf.pathEnd, startRadius, draftAngle);
         }
         else
         {
             const glm::vec3 transitionPt = origin + pathDir * taperLen;
-            gf.solid = BuildCylinderMesh(origin, transitionPt,
-                gateRadius, draftAngle);
+            gf.solid = BuildCylinderMesh(startPt, transitionPt,
+                startRadius, draftAngle);
             gf.subRunnerSolid = BuildCylinderMesh(transitionPt, gf.pathEnd,
                 subRunnerRadius, 0.0f);
         }
@@ -1614,11 +1629,13 @@ void GLCanvas::GenerateMould()
             float gateRadius = 1.5f;
             float draftAngle = 1.0f;
             float subRunnerRadius = 2.5f;
+            float overrun = 0.0f;
             if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
             {
                 gateRadius = frame->GetGateDiameter() * 0.5f;
                 draftAngle = frame->GetGateDraftAngle();
                 subRunnerRadius = frame->GetSubRunnerDiameter() * 0.5f;
+                overrun = frame->GetGateOverrun();
             }
 
             const float draftRad = glm::radians(glm::clamp(draftAngle, 0.0f, 45.0f));
@@ -1643,13 +1660,31 @@ void GLCanvas::GenerateMould()
                 const gp_Pnt occOrigin(origin.x, origin.y, origin.z);
                 const gp_Dir occDir(pathDir.x, pathDir.y, pathDir.z);
 
-                // Pull the gate origin back by kCutEps so the primitive protrudes
-                // through the part surface and avoids co-planar boundary failures.
+                // Back-extension along -pathDir into the model, combining two
+                // contributions: a small constant kCutEps so the primitive
+                // protrudes through the parting surface and avoids co-planar
+                // boundary failures, plus the user-controlled `overrun` field
+                // (mm) which extends the cut deeper into the model body to
+                // clear irregular perimeter geometry. The two add: overrun=0
+                // recovers the legacy behaviour, while a non-zero overrun
+                // produces the same shape as the preview built in
+                // RebuildGateSolids.
                 static constexpr float kCutEps = 0.1f;
-                const glm::vec3 originExt = origin - pathDir * kCutEps;
-                const float     totalLenExt = totalLen + kCutEps;  // extends into the feed network
+                const float backExt = kCutEps + overrun;
+                const glm::vec3 originExt = origin - pathDir * backExt;
+                const float     totalLenExt = totalLen + backExt;
                 const gp_Pnt    occOriginExt(originExt.x, originExt.y, originExt.z);
                 const gp_Ax2    gateAxExt(occOriginExt, occDir);
+
+                // Radius at originExt, derived so the radius at the original
+                // parting-surface point (origin) is exactly gateRadius — i.e.
+                // the user-typed Diameter is the diameter of the inlet hole
+                // at the parting surface, regardless of overrun. Floor at
+                // 0.01 mm so aggressive overrun + draft combos can't drive
+                // the back radius to zero (BRepPrimAPI rejects degenerate
+                // primitives). Matches the preview math in RebuildGateSolids.
+                const float startRadius = std::max(0.01f,
+                    gateRadius - tanDraft * backExt);
 
                 // Distance along path where draft expands to sub-runner radius
                 float taperLen = std::numeric_limits<float>::max();
@@ -1657,23 +1692,27 @@ void GLCanvas::GenerateMould()
                     taperLen = (subRunnerRadius - gateRadius) / tanDraft;
 
                 // Adjust taperLen relative to the extended origin
-                const float taperLenExt = taperLen + kCutEps;
+                const float taperLenExt = taperLen + backExt;
 
                 if (taperLen >= totalLen)
                 {
-                    // Gate fills the whole path — single cone/cylinder cut
-                    const float endR = gateRadius + totalLenExt * tanDraft;
+                    // Gate fills the whole path — single cone/cylinder cut.
+                    // End radius at pathEnd is the geometric extension from
+                    // startRadius over totalLenExt, which simplifies to
+                    // gateRadius + totalLen*tanDraft (the back-extension
+                    // contributions cancel by construction of startRadius).
+                    const float endR = startRadius + totalLenExt * tanDraft;
                     TopoDS_Shape gateShape;
-                    if (std::abs(endR - gateRadius) > 1e-6f)
+                    if (std::abs(endR - startRadius) > 1e-6f)
                     {
-                        BRepPrimAPI_MakeCone cone(gateAxExt, gateRadius, endR, totalLenExt);
+                        BRepPrimAPI_MakeCone cone(gateAxExt, startRadius, endR, totalLenExt);
                         cone.Build();
                         if (cone.IsDone() && !cone.Shape().IsNull())
                             gateShape = cone.Shape();
                     }
                     else
                     {
-                        BRepPrimAPI_MakeCylinder cyl(gateAxExt, gateRadius, totalLenExt);
+                        BRepPrimAPI_MakeCylinder cyl(gateAxExt, startRadius, totalLenExt);
                         cyl.Build();
                         if (cyl.IsDone() && !cyl.Shape().IsNull())
                             gateShape = cyl.Shape();
@@ -1693,8 +1732,12 @@ void GLCanvas::GenerateMould()
                 else
                 {
                     // --- Gate frustum (extended origin → transition point) ---
+                    // End radius at the transition is exactly subRunnerRadius
+                    // by definition of taperLen — the back-extension shifts
+                    // the start without changing where the taper hits
+                    // subRunnerRadius in world space.
                     {
-                        BRepPrimAPI_MakeCone cone(gateAxExt, gateRadius, subRunnerRadius, taperLenExt);
+                        BRepPrimAPI_MakeCone cone(gateAxExt, startRadius, subRunnerRadius, taperLenExt);
                         cone.Build();
                         if (cone.IsDone() && !cone.Shape().IsNull())
                         {
