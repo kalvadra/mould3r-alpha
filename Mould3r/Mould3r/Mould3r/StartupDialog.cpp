@@ -4,6 +4,7 @@
 #include <vector>
 #include "style.h"
 #include "FixtureEditor.h"
+#include "CreateFixtureDialog.h"
 
 namespace fs = std::filesystem;
 
@@ -370,20 +371,42 @@ void StartupDialog::OnListDoubleClick(wxListEvent& evt)
 
 void StartupDialog::OnNewFixture(wxCommandEvent&)
 {
-    // Open the floating Fixture Editor window. The editor owns the full
-    // authoring flow — STEP-half loading, positioning, and saving the
-    // .fixture file — replacing the previous "two file pickers + a save
-    // dialog" sequence that lived inline here.
+    // Two-step flow: CreateFixtureDialog collects name + both half paths
+    // up front and shows a progress bar while the editor's SetInitialFixture
+    // does the slow STEP loading. The editor is constructed up front (but
+    // not shown) so the load handler has something to drive; on cancel we
+    // tear it back down, on OK we Show() it.
     //
-    // Currently scaffolding only: the editor brings up its toolbar and a
-    // canvas placeholder, then closes when the user dismisses it. The
-    // save flow (rescan + auto-select on success) will reattach here once
-    // the editor reports a saved-fixture path back; at that point this
-    // handler will roughly mirror the old post-save logic — call
-    // ScanFixturesFolder() and walk m_fixturePaths to select the new
-    // entry. Until then, closing the editor simply leaves the user back
-    // at the fixture list with no change.
-    auto* editor = new FixtureEditor(this);
+    // The editor is still scaffolding for the rescan-on-save loop — see
+    // the longer comment that previously lived here. Once the editor
+    // reports a saved-fixture path back, this handler will roughly mirror
+    // the old post-save logic (ScanFixturesFolder + walk m_fixturePaths
+    // to select the new entry).
+    CreateFixtureDialog createDlg(this);
+    FixtureEditor* editor = new FixtureEditor(this);
+
+    // Lambda owns nothing — captures `editor` and `createDlg` by reference
+    // because both outlive the handler invocation (createDlg until
+    // ShowModal returns, editor until either Show or Destroy below). The
+    // progress callback is forwarded straight through into SetInitialFixture.
+    createDlg.SetLoadHandler(
+        [editor, &createDlg](CreateFixtureDialog::ProgressFn progress)
+        {
+            editor->SetInitialFixture(createDlg.GetFixtureName(),
+                createDlg.GetModelAPath(),
+                createDlg.GetModelBPath(),
+                progress);
+        });
+
+    if (createDlg.ShowModal() != wxID_OK)
+    {
+        // User cancelled before Create was pressed (no loading happened),
+        // or closed the dialog via the title-row X. Tear down the editor
+        // we speculatively constructed.
+        editor->Destroy();
+        return;
+    }
+
     editor->Show();
 }
 

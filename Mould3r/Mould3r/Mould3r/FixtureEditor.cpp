@@ -127,9 +127,12 @@ namespace
     // Append [label .... field unit] to `parentSz`, with `field` set to a
     // fresh wxTextCtrl carrying `defVal`. `unitStr` is rendered after the
     // field (e.g. "mm" or "°").
+    // outUnitLabel (optional): if non-null, receives the unit wxStaticText*
+    // so the caller can register it in m_mmUnitLabels for mm <-> in swaps.
     void AddDimRow(wxWindow* parent, wxSizer* parentSz,
         const wxString& label, wxTextCtrl*& outField,
-        const wxString& defVal, const wxString& unitStr)
+        const wxString& defVal, const wxString& unitStr,
+        wxStaticText** outUnitLabel = nullptr)
     {
         auto* row = new wxBoxSizer(wxHORIZONTAL);
 
@@ -152,6 +155,8 @@ namespace
         row->Add(outField, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, kFieldGap);
         row->Add(unit, 0, wxALIGN_CENTER_VERTICAL);
         parentSz->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
+
+        if (outUnitLabel) *outUnitLabel = unit;
     }
 
     // Append [label ............ choice] to `parentSz`, with `outChoice`
@@ -227,8 +232,8 @@ FixtureEditor::FixtureEditor(wxWindow* parent)
     // the makeToolBtn helper synthesizes that event type for toggles, and
     // wxEVT_BUTTON for momentary actions (Center, Generate Fixture) and
     // the Import buttons.
-    Bind(wxEVT_BUTTON, &FixtureEditor::OnImportModelA, this, ID_FE_ImportModelA);
-    Bind(wxEVT_BUTTON, &FixtureEditor::OnImportModelB, this, ID_FE_ImportModelB);
+    Bind(wxEVT_BUTTON, &FixtureEditor::OnSelectModelA, this, ID_FE_SelectModelA);
+    Bind(wxEVT_BUTTON, &FixtureEditor::OnSelectModelB, this, ID_FE_SelectModelB);
     Bind(wxEVT_BUTTON, &FixtureEditor::OnGenerateFixture, this, ID_FE_GenerateFixture);
     Bind(wxEVT_BUTTON, &FixtureEditor::OnAddInjectionPoint, this, ID_FE_AddInjectionPoint);
     Bind(wxEVT_TOGGLEBUTTON, &FixtureEditor::OnToolMove, this, ID_FE_Move);
@@ -271,7 +276,6 @@ void FixtureEditor::BuildUI()
     auto* contentSizer = new wxBoxSizer(wxHORIZONTAL);
     contentSizer->Add(BuildToolbar(root), 0, wxEXPAND);
     contentSizer->Add(BuildCanvasArea(root), 1, wxEXPAND);
-    contentSizer->Add(BuildSidePanel(root), 0, wxEXPAND);
     vSizer->Add(contentSizer, 1, wxEXPAND);
 
     root->SetSizer(vSizer);
@@ -289,89 +293,75 @@ void FixtureEditor::BuildUI()
 wxWindow* FixtureEditor::BuildTopRibbon(wxWindow* parent)
 {
     // Layout (single horizontal sizer at the outer level):
-    //   [vertical stack: Import Half A row, Import Half B row]   [Generate Fixture]
+    //   [label] [Path A field] [Select]  [spacer]  [label] [Path B field] [Select]   [Save Fixture]
     //
-    // The two import rows are 32px tall each plus padding; the Generate
-    // Fixture button on the right matches the combined import-stack height
-    // so it visually anchors that side of the ribbon.
+    // Each "cell" is a label + editable text field + Select button, matching
+    // the styling used in CreateFixtureDialog so the two surfaces read as
+    // part of the same family (was wxFilePickerCtrl; swapped because the
+    // system-themed picker didn't match the rest of the app's chrome).
     auto* ribbon = new wxPanel(parent, wxID_ANY);
     ribbon->SetBackgroundColour(kEditorBg);
 
     auto* outerSizer = new wxBoxSizer(wxHORIZONTAL);
 
-    // Inner vertical stack for the two Import-Half rows. Built first so the
-    // buildRow lambda below has a target sizer to add into.
-    auto* importsCol = new wxBoxSizer(wxVERTICAL);
+    // Single horizontal row that holds both label+field+select trios.
+    auto* pickerRow = new wxBoxSizer(wxHORIZONTAL);
 
-    // Empty-state placeholder shown next to a button until the user picks
-    // a file. Kept identical between rows so they line up visually.
-    static const wxString kNoFileText = "(no file selected)";
-
-    static const wxFont kBtnFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+    static const wxFont kLabelFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI");
-    static const wxFont kPathFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+    static const wxFont kFieldFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_NORMAL, false, "Segoe UI");
+    static const wxFont kSelectFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI");
 
-    // Builds one [Import button] [path label] row. Returns the path
-    // wxStaticText so the caller can stash it in a member for later
-    // updates.
-    auto buildRow = [&](int btnId, const wxString& btnLabel) -> wxStaticText*
+    // Builds one [label] [wxTextCtrl] [Select button] unit and appends it
+    // to pickerRow. Returns the text field so the caller can stash it
+    // in a member. Mirrors CreateFixtureDialog's per-row layout exactly.
+    auto buildCell = [&](int selectId, const wxString& rowLabel) -> wxTextCtrl*
         {
-            auto* row = new wxBoxSizer(wxHORIZONTAL);
-
-            // Button — same indigo/white treatment as the main ribbon's
-            // "Import Model" button, just sized wider to fit the longer
-            // "Import Mould Half X" text.
-            auto* btn = new wxButton(ribbon, btnId, btnLabel,
-                wxDefaultPosition, wxSize(180, 32), wxBORDER_NONE);
-            btn->SetBackgroundColour(Style::BtnSecondary);
-            btn->SetForegroundColour(*wxWHITE);
-            btn->SetFont(kBtnFont);
-            row->Add(btn, 0, wxALIGN_CENTER_VERTICAL);
-
-            // Path label. wxST_ELLIPSIZE_END so a long absolute path
-            // doesn't push the right edge of the ribbon out — same
-            // treatment StartupDialog uses for the fixtures-folder
-            // label.
-            auto* lbl = new wxStaticText(ribbon, wxID_ANY, kNoFileText,
-                wxDefaultPosition, wxDefaultSize,
-                wxST_ELLIPSIZE_END);
+            auto* lbl = new wxStaticText(ribbon, wxID_ANY, rowLabel);
             lbl->SetForegroundColour(Style::TextSubtext);
-            lbl->SetFont(kPathFont);
-            // proportion=1 so the label takes the remaining horizontal
-            // space and the ellipsize behavior actually has something to
-            // ellipsize against.
-            row->Add(lbl, 1, wxALIGN_CENTER_VERTICAL | wxLEFT, 12);
+            lbl->SetFont(kLabelFont);
+            pickerRow->Add(lbl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
 
-            importsCol->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 8);
-            return lbl;
+            auto* field = new wxTextCtrl(ribbon, wxID_ANY, wxEmptyString,
+                wxDefaultPosition, wxSize(-1, 28), wxBORDER_NONE);
+            field->SetBackgroundColour(Style::InputBg);
+            field->SetForegroundColour(Style::TextPrimary);
+            field->SetFont(kFieldFont);
+
+            auto* btnSelect = new wxButton(ribbon, selectId, "Select",
+                wxDefaultPosition, wxSize(70, 28), wxBORDER_NONE);
+            btnSelect->SetBackgroundColour(Style::BtnSecondary);
+            btnSelect->SetForegroundColour(*wxWHITE);
+            btnSelect->SetFont(kSelectFont);
+
+            // proportion=1 on the text field so both halves share the
+            // available width equally — the Select button takes its fixed
+            // 70px and the label takes its intrinsic size.
+            pickerRow->Add(field, 1, wxALIGN_CENTER_VERTICAL);
+            pickerRow->Add(btnSelect, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 6);
+            return field;
         };
 
-    m_lblModelAPath = buildRow(ID_FE_ImportModelA, "Import Mould Half A");
-    m_lblModelBPath = buildRow(ID_FE_ImportModelB, "Import Mould Half B");
-    importsCol->AddSpacer(8);   // bottom padding so rows don't hug the separator
+    m_pathACtrl = buildCell(ID_FE_SelectModelA, "MOULD HALF A");
+    pickerRow->AddSpacer(16);   // gap between the two cells
+    m_pathBCtrl = buildCell(ID_FE_SelectModelB, "MOULD HALF B");
 
-    // proportion=1 so the import column takes the available width and the
-    // path labels can ellipsize against the leftover space (rather than
-    // collapsing to text-width and pulling Generate Fixture inwards).
-    outerSizer->Add(importsCol, 1, wxEXPAND);
+    outerSizer->Add(pickerRow, 1, wxALIGN_CENTER_VERTICAL | wxLEFT | wxRIGHT, 12);
 
-    // ---- Generate Fixture — primary action on the right --------------------
-    // Same Style::BtnPlace indigo MainFrame uses for its primary "Place"
-    // actions, so the button reads as the editor's headline action without
-    // any extra styling. Sized to roughly match the combined height of the
-    // two import rows above (32 + 32 + ~16 padding ≈ 80) so it visually
-    // anchors the ribbon's right side.
-    //
-    // Handler is a stub for now — see OnGenerateFixture below for the wiring
-    // intent.
+    // ---- Save Fixture — primary action on the right -----------------------
+    // Wrapped in a vertical sizer so the 5px top/bottom gap and the 12px
+    // left/right margin can be applied independently in one clean block.
+    auto* btnWrap = new wxBoxSizer(wxVERTICAL);
     auto* btnGenerate = new wxButton(ribbon, ID_FE_GenerateFixture,
-        "Generate Fixture", wxDefaultPosition, wxSize(160, 64), wxBORDER_NONE);
-    btnGenerate->SetBackgroundColour(Style::BtnPlace);
+        "Save Fixture", wxDefaultPosition, wxSize(160, 32), wxBORDER_NONE);
+    btnGenerate->SetBackgroundColour(Style::BtnGenerate);
     btnGenerate->SetForegroundColour(*wxWHITE);
     btnGenerate->SetFont(wxFont(10, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_BOLD, false, "Segoe UI"));
-    outerSizer->Add(btnGenerate, 0, wxALIGN_CENTER_VERTICAL | wxLEFT | wxRIGHT, 12);
+    btnWrap->Add(btnGenerate, 0, wxTOP | wxBOTTOM, 5);
+    outerSizer->Add(btnWrap, 0, wxALIGN_CENTER_VERTICAL | wxLEFT | wxRIGHT, 12);
 
     ribbon->SetSizer(outerSizer);
     return ribbon;
@@ -382,11 +372,11 @@ wxWindow* FixtureEditor::BuildTopRibbon(wxWindow* parent)
 // ---------------------------------------------------------------------------
 wxWindow* FixtureEditor::BuildToolbar(wxWindow* parent)
 {
-    // Fixed-width column on the left. Width matches roughly the cell
-    // width of MainFrame's 2-column tool grid plus side padding so the
-    // buttons read as the same size to the user.
+    // Left-hand panel: tool buttons on top, feature-defaults cards below.
+    // Width matches the former right sidebar so the total editor width is
+    // unchanged — we've just consolidated both columns into one.
     auto* toolbar = new wxPanel(parent, wxID_ANY,
-        wxDefaultPosition, wxSize(160, -1));
+        wxDefaultPosition, wxSize(kSidebarWidth, -1));
     toolbar->SetBackgroundColour(kEditorBg);
 
     auto* sizer = new wxBoxSizer(wxVERTICAL);
@@ -508,18 +498,72 @@ wxWindow* FixtureEditor::BuildToolbar(wxWindow* parent)
             return panel;
         };
 
-    // Vertical stack — Pattern + Align Midplane intentionally omitted
-    // (see class comment in FixtureEditor.h for why).
-    sizer->Add(makeToolBtn(ID_FE_Move, "Move", true, kIconMove),
-        0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 12);
-    sizer->Add(makeToolBtn(ID_FE_Rotate, "Rotate", true, kIconRotate),
-        0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 4);
-    sizer->Add(makeToolBtn(ID_FE_Scale, "Scale", true, kIconScale),
-        0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 4);
-    sizer->Add(makeToolBtn(ID_FE_Center, "Center", false, kIconCenter),
-        0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 4);
+    // ---- FIXTURE TOOLS — Move/Rotate/Scale/Center in a 2x2 grid -----------
+    // wxGridSizer gives equal-width cells without manual proportion math.
+    auto* grid = new wxGridSizer(2, 2, 4, 4);
+    grid->Add(makeToolBtn(ID_FE_Move, "Move", true, kIconMove), 1, wxEXPAND);
+    grid->Add(makeToolBtn(ID_FE_Rotate, "Rotate", true, kIconRotate), 1, wxEXPAND);
+    grid->Add(makeToolBtn(ID_FE_Scale, "Scale", true, kIconScale), 1, wxEXPAND);
+    grid->Add(makeToolBtn(ID_FE_Center, "Center", false, kIconCenter), 1, wxEXPAND);
+    sizer->Add(grid, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 12);
+
+    // ---- Divider + FIXTURE ALIGNMENT section ------------------------------
+    sizer->AddSpacer(8);
+    auto* alignDivider = new wxPanel(toolbar, wxID_ANY,
+        wxDefaultPosition, wxSize(-1, 1));
+    alignDivider->SetBackgroundColour(Style::Divider);
+    sizer->Add(alignDivider, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
+
+    auto* alignHeader = new wxStaticText(toolbar, wxID_ANY, "FIXTURE ALIGNMENT");
+    alignHeader->SetForegroundColour(Style::TextPrimary);
+    alignHeader->SetFont(wxFont(7, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_BOLD, false, "Segoe UI"));
+    sizer->Add(alignHeader, 0, wxLEFT | wxTOP, 12);
+    sizer->AddSpacer(8);
+
     sizer->Add(makeToolBtn(ID_FE_AlignFace, "Align Face", true, kIconAlignFace),
-        0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 4);
+        0, wxEXPAND | wxLEFT | wxRIGHT, 12);
+
+    // ---- Divider between tool buttons and fixture defaults ----------------
+    sizer->AddSpacer(8);
+    auto* divider = new wxPanel(toolbar, wxID_ANY,
+        wxDefaultPosition, wxSize(-1, 1));
+    divider->SetBackgroundColour(Style::Divider);
+    sizer->Add(divider, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
+    sizer->AddSpacer(4);
+
+    // ---- Fixture defaults header ------------------------------------------
+    auto* defaultsHeader = new wxStaticText(toolbar, wxID_ANY, "FIXTURE DEFAULTS");
+    defaultsHeader->SetForegroundColour(Style::TextPrimary);
+    defaultsHeader->SetFont(kSectionHeaderFont);
+    sizer->Add(defaultsHeader, 0, wxLEFT | wxTOP, 12);
+    sizer->AddSpacer(8);
+
+    // ---- Scrollable feature cards -----------------------------------------
+    auto* scrollWin = new wxScrolledWindow(toolbar, wxID_ANY,
+        wxDefaultPosition, wxDefaultSize,
+        wxVSCROLL | wxBORDER_NONE);
+    scrollWin->SetScrollRate(0, 8);
+    scrollWin->SetBackgroundColour(kEditorBg);
+
+    auto* cardSizer = new wxBoxSizer(wxVERTICAL);
+    cardSizer->AddSpacer(4);
+    // Unit toggle sits above the injection-points card so it reads as a
+    // global setting for all the defaults below it. Margins match the
+    // left/right inset used by the fixture-tool buttons above.
+    cardSizer->Add(CreateUnitToggle(scrollWin), 0,
+        wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 8);
+    cardSizer->Add(CreateInjectionPointsContent(scrollWin), 0, wxEXPAND | wxTOP, 8);
+    cardSizer->Add(CreateSpruesContent(scrollWin), 0, wxEXPAND | wxTOP, 8);
+    cardSizer->Add(CreateRunnersContent(scrollWin), 0, wxEXPAND | wxTOP, 8);
+    cardSizer->Add(CreateGatesContent(scrollWin), 0, wxEXPAND | wxTOP, 8);
+    cardSizer->Add(CreateVentsContent(scrollWin), 0, wxEXPAND | wxTOP, 8);
+    cardSizer->Add(CreateEjectorsContent(scrollWin), 0, wxEXPAND | wxTOP, 8);
+    cardSizer->AddSpacer(12);
+    scrollWin->SetSizer(cardSizer);
+    scrollWin->FitInside();
+
+    sizer->Add(scrollWin, 1, wxEXPAND);
 
     toolbar->SetSizer(sizer);
     return toolbar;
@@ -530,12 +574,41 @@ wxWindow* FixtureEditor::BuildToolbar(wxWindow* parent)
 // ---------------------------------------------------------------------------
 wxWindow* FixtureEditor::BuildCanvasArea(wxWindow* parent)
 {
+    // Wrapper panel so we can stack a title ribbon above the GL viewport
+    // without disturbing the outer content-row sizer proportions.
+    auto* container = new wxPanel(parent, wxID_ANY);
+    container->SetBackgroundColour(kEditorBg);
+
+    auto* vSizer = new wxBoxSizer(wxVERTICAL);
+
+    // ---- Title ribbon ------------------------------------------------------
+    auto* titleBar = new wxPanel(container, wxID_ANY,
+        wxDefaultPosition, wxSize(-1, 32));
+    titleBar->SetBackgroundColour(Style::BtnSecondary);
+
+    auto* titleSizer = new wxBoxSizer(wxHORIZONTAL);
+    auto* titleLbl = new wxStaticText(titleBar, wxID_ANY, "FIXTURE EDITOR",
+        wxDefaultPosition, wxDefaultSize, wxALIGN_CENTER_HORIZONTAL);
+    titleLbl->SetForegroundColour(*wxWHITE);
+    titleLbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_BOLD, false, "Segoe UI"));
+    titleSizer->AddStretchSpacer(1);
+    titleSizer->Add(titleLbl, 0, wxALIGN_CENTER_VERTICAL);
+    titleSizer->AddStretchSpacer(1);
+    titleBar->SetSizer(titleSizer);
+
+    vSizer->Add(titleBar, 0, wxEXPAND);
+
+    // ---- GL viewport -------------------------------------------------------
     // Real GL viewport. The canvas owns its own context, camera, and grid
     // renderer — see FixtureCanvas.h for the rationale on why this isn't
-    // the main GLCanvas. Stored in m_canvas so the (future) import
-    // handlers and toolbar wiring can push state into it directly.
-    m_canvas = new FixtureCanvas(parent);
-    return m_canvas;
+    // the main GLCanvas. Stored in m_canvas so the import handlers and
+    // toolbar wiring can push state into it directly.
+    m_canvas = new FixtureCanvas(container);
+    vSizer->Add(m_canvas, 1, wxEXPAND);
+
+    container->SetSizer(vSizer);
+    return container;
 }
 
 // ---------------------------------------------------------------------------
@@ -556,66 +629,10 @@ wxWindow* FixtureEditor::BuildCanvasArea(wxWindow* parent)
 // ---------------------------------------------------------------------------
 wxWindow* FixtureEditor::BuildSidePanel(wxWindow* parent)
 {
-    // Outer container: content column + left border (the canvas sits to
-    // the left of us, so the border lives on our left edge).
-    auto* outer = new wxPanel(parent, wxID_ANY,
-        wxDefaultPosition, wxSize(kSidebarWidth, -1));
-    outer->SetBackgroundColour(kEditorBg);
-
-    auto* outerSizer = new wxBoxSizer(wxHORIZONTAL);
-
-    // Left-edge accent line — same 1px Divider treatment used between the
-    // ribbon and content area, so the visual seams match.
-    auto* borderLine = new wxPanel(outer, wxID_ANY,
-        wxDefaultPosition, wxSize(1, -1));
-    borderLine->SetBackgroundColour(Style::Divider);
-    outerSizer->Add(borderLine, 0, wxEXPAND);
-
-    auto* column = new wxPanel(outer, wxID_ANY);
-    column->SetBackgroundColour(kEditorBg);
-    auto* colSizer = new wxBoxSizer(wxVERTICAL);
-
-    // Header — same styling as MainFrame's "MOULD TOOL SETTINGS" label.
-    auto* title = new wxStaticText(column, wxID_ANY, "FEATURE DEFAULTS");
-    title->SetForegroundColour(Style::TextPrimary);
-    title->SetFont(kSectionHeaderFont);
-    colSizer->Add(title, 0, wxLEFT | wxTOP, 12);
-    colSizer->AddSpacer(8);
-
-    // Scrollable card column — five feature cards likely overflow on a
-    // ~720px-tall window, so wrap the list in a wxScrolledWindow with a
-    // vertical scrollbar.
-    auto* scrollWin = new wxScrolledWindow(column, wxID_ANY,
-        wxDefaultPosition, wxDefaultSize,
-        wxVSCROLL | wxBORDER_NONE);
-    scrollWin->SetScrollRate(0, 8);
-    scrollWin->SetBackgroundColour(kEditorBg);
-
-    auto* sizer = new wxBoxSizer(wxVERTICAL);
-    sizer->AddSpacer(4);
-
-    // Card order matches MainFrame so users transitioning between the two
-    // panels find features in the same place. The Injection Points card
-    // leads — points are upstream of every per-feature default (sprues
-    // feed from them, runners route between them), so it reads naturally
-    // as the first thing the user configures after positioning the halves.
-    sizer->Add(CreateInjectionPointsContent(scrollWin), 0, wxEXPAND | wxTOP, 8);
-    sizer->Add(CreateSpruesContent(scrollWin), 0, wxEXPAND | wxTOP, 8);
-    sizer->Add(CreateRunnersContent(scrollWin), 0, wxEXPAND | wxTOP, 8);
-    sizer->Add(CreateGatesContent(scrollWin), 0, wxEXPAND | wxTOP, 8);
-    sizer->Add(CreateVentsContent(scrollWin), 0, wxEXPAND | wxTOP, 8);
-    sizer->Add(CreateEjectorsContent(scrollWin), 0, wxEXPAND | wxTOP, 8);
-
-    sizer->AddSpacer(12);
-
-    scrollWin->SetSizer(sizer);
-    colSizer->Add(scrollWin, 1, wxEXPAND);
-
-    column->SetSizer(colSizer);
-    outerSizer->Add(column, 1, wxEXPAND);
-
-    outer->SetSizer(outerSizer);
-    return outer;
+    // Feature defaults have been consolidated into the left-hand toolbar
+    // (BuildToolbar). This function is retained to satisfy the declaration
+    // in FixtureEditor.h; it is no longer called from BuildUI.
+    return new wxPanel(parent, wxID_ANY);
 }
 
 // ---------------------------------------------------------------------------
@@ -627,6 +644,156 @@ wxWindow* FixtureEditor::BuildSidePanel(wxWindow* parent)
 // MainFrame.cpp exactly: same numbers, same units, same wxChoice options.
 // Distance fields are mm, angle fields are degrees.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Unit toggle
+//
+// A two-segment pill control (Metric | Imperial) placed above the injection-
+// points card. Metric is the default (left segment starts selected).
+// The segments store their active state in m_isMetric and expose m_metricSeg /
+// m_imperialSeg so future unit-conversion wiring has a clear hook point.
+// ---------------------------------------------------------------------------
+wxPanel* FixtureEditor::CreateUnitToggle(wxWindow* parent)
+{
+    // Outer wrapper matches the scroll window background so only the two
+    // segments themselves are visible as a pill.
+    auto* container = new wxPanel(parent, wxID_ANY,
+        wxDefaultPosition, wxSize(-1, 32));
+    container->SetBackgroundColour(kEditorBg);
+
+    // ---- Build one segment --------------------------------------------
+    // Returns the segment panel + label pair; caller assigns to members.
+    auto makeSegment = [&](const wxString& label, bool active)
+        -> std::pair<wxPanel*, wxStaticText*>
+        {
+            const wxColour& bgOn = Style::BtnSecondarySelected;
+            const wxColour& bgOff = Style::BtnSecondary;
+
+            auto* seg = new wxPanel(container, wxID_ANY,
+                wxDefaultPosition, wxDefaultSize, wxBORDER_NONE);
+            seg->SetBackgroundColour(active ? bgOn : bgOff);
+
+            auto* lbl = new wxStaticText(seg, wxID_ANY, label,
+                wxDefaultPosition, wxDefaultSize,
+                wxALIGN_CENTRE_HORIZONTAL | wxST_NO_AUTORESIZE);
+            lbl->SetFont(kToolBtnFont);
+            lbl->SetForegroundColour(active ? kTextActive : Style::TextPrimary);
+            lbl->SetBackgroundColour(active ? bgOn : bgOff);
+
+            auto* inner = new wxBoxSizer(wxHORIZONTAL);
+            inner->AddStretchSpacer(1);
+            inner->Add(lbl, 0, wxALIGN_CENTER_VERTICAL | wxTOP | wxBOTTOM, 6);
+            inner->AddStretchSpacer(1);
+            seg->SetSizer(inner);
+
+            return { seg, lbl };
+        };
+
+    auto [metSeg, metLbl] = makeSegment("Metric", true);
+    auto [impSeg, impLbl] = makeSegment("Imperial", false);
+
+    m_metricSeg = metSeg;
+    m_metricLbl = metLbl;
+    m_imperialSeg = impSeg;
+    m_imperialLbl = impLbl;
+
+    // 1-px vertical divider between the two segments, matching the
+    // colour used by all other dividers in the sidebar.
+    auto* divider = new wxPanel(container, wxID_ANY,
+        wxDefaultPosition, wxSize(1, -1));
+    divider->SetBackgroundColour(Style::Divider);
+
+    // ---- Click + hover handlers -------------------------------------
+    // applyUnit: switches active segment, swaps colours, converts all
+    // tracked mm field values, and updates their unit labels in one pass.
+    // Clicking the already-active segment is a no-op.
+    // Degree fields are not in m_mmFields so they are never touched.
+    auto applyUnit = [this](bool toMetric)
+        {
+            if (m_isMetric == toMetric) return;
+            m_isMetric = toMetric;
+
+            auto recolour = [](wxPanel* seg, wxStaticText* lbl, bool active)
+                {
+                    const wxColour& bg = active
+                        ? Style::BtnSecondarySelected : Style::BtnSecondary;
+                    const wxColour& fg = active
+                        ? Style::TextActive : Style::TextPrimary;
+                    seg->SetBackgroundColour(bg);
+                    lbl->SetBackgroundColour(bg);
+                    lbl->SetForegroundColour(fg);
+                    seg->Refresh();
+                    lbl->Refresh();
+                };
+            recolour(m_metricSeg, m_metricLbl, toMetric);
+            recolour(m_imperialSeg, m_imperialLbl, !toMetric);
+
+            // Convert every tracked mm field and swap its unit label.
+            // toMetric:   in  * 25.4 -> mm
+            // toImperial: mm / 25.4  -> in
+            const double factor = toMetric ? 25.4 : (1.0 / 25.4);
+            const wxString fmt = toMetric ? "%.2f" : "%.4f";
+            const wxString newLbl = toMetric ? "mm" : "in";
+
+            for (size_t i = 0; i < m_mmFields.size(); ++i)
+            {
+                wxTextCtrl* field = m_mmFields[i];
+                wxStaticText* lbl = m_mmUnitLabels[i];
+                if (!field || !lbl) continue;
+                lbl->SetLabel(newLbl);
+                double v = 0.0;
+                if (field->GetValue().ToDouble(&v))
+                    field->SetValue(wxString::Format(fmt, v * factor));
+            }
+        };
+
+    // Hover: highlight the inactive segment on mouse-over.
+    auto onEnterMetric = [this](wxMouseEvent& e)
+        { if (!m_isMetric) {
+        m_metricSeg->SetBackgroundColour(Style::BtnSecondaryHover);
+        m_metricLbl->SetBackgroundColour(Style::BtnSecondaryHover);
+        m_metricSeg->Refresh();
+    } e.Skip(); };
+    auto onLeaveMetric = [this](wxMouseEvent& e)
+        { if (!m_isMetric) {
+        m_metricSeg->SetBackgroundColour(Style::BtnSecondary);
+        m_metricLbl->SetBackgroundColour(Style::BtnSecondary);
+        m_metricSeg->Refresh();
+    } e.Skip(); };
+    auto onEnterImperial = [this](wxMouseEvent& e)
+        { if (m_isMetric) {
+        m_imperialSeg->SetBackgroundColour(Style::BtnSecondaryHover);
+        m_imperialLbl->SetBackgroundColour(Style::BtnSecondaryHover);
+        m_imperialSeg->Refresh();
+    } e.Skip(); };
+    auto onLeaveImperial = [this](wxMouseEvent& e)
+        { if (m_isMetric) {
+        m_imperialSeg->SetBackgroundColour(Style::BtnSecondary);
+        m_imperialLbl->SetBackgroundColour(Style::BtnSecondary);
+        m_imperialSeg->Refresh();
+    } e.Skip(); };
+
+    for (wxWindow* w : { (wxWindow*)m_metricSeg, (wxWindow*)m_metricLbl })
+    {
+        w->Bind(wxEVT_LEFT_UP, [applyUnit](wxMouseEvent& e) { applyUnit(true);  e.Skip(); });
+        w->Bind(wxEVT_ENTER_WINDOW, onEnterMetric);
+        w->Bind(wxEVT_LEAVE_WINDOW, onLeaveMetric);
+    }
+    for (wxWindow* w : { (wxWindow*)m_imperialSeg, (wxWindow*)m_imperialLbl })
+    {
+        w->Bind(wxEVT_LEFT_UP, [applyUnit](wxMouseEvent& e) { applyUnit(false); e.Skip(); });
+        w->Bind(wxEVT_ENTER_WINDOW, onEnterImperial);
+        w->Bind(wxEVT_LEAVE_WINDOW, onLeaveImperial);
+    }
+
+    auto* hSizer = new wxBoxSizer(wxHORIZONTAL);
+    hSizer->Add(m_metricSeg, 1, wxEXPAND);
+    hSizer->Add(divider, 0, wxEXPAND);
+    hSizer->Add(m_imperialSeg, 1, wxEXPAND);
+    container->SetSizer(hSizer);
+
+    return container;
+}
+
 wxPanel* FixtureEditor::CreateInjectionPointsContent(wxWindow* parent)
 {
     // Injection-points card differs structurally from the per-feature
@@ -871,15 +1038,59 @@ wxPanel* FixtureEditor::CreateSpruesContent(wxWindow* parent)
     wxSizer* sizer = nullptr;
     auto* card = MakeCardWithTitle(parent, "Sprues", sizer);
 
-    AddTypeRow(card, sizer, "Sprue type:", { "Cylinder" }, m_sprueTypeChoice);
+    // "No Override" is index 0 and the default selection. When active, all
+    // dimension fields are hidden and nothing is written to the fixture file.
+    AddTypeRow(card, sizer, "Sprue type:",
+        { "No Override", "Cylinder" }, m_sprueTypeChoice);
 
-    AddDimRow(card, sizer, "Diameter:", m_sprueDiameter, "5.0", "mm");
-    AddDimRow(card, sizer, "Draft angle:", m_sprueDraftAngle, "1.0", DegSym());
-    AddDimRow(card, sizer, "Cold slug:", m_sprueColdSlugDepth, "5.0", "mm");
-    AddDimRow(card, sizer, "Sprue length:", m_sprueLength, "20.0", "mm");
+    // Sub-panel wrapping all dim rows so they can be shown/hidden as a unit
+    // by toggling m_sprueDimsPanel->Show() + Layout().
+    m_sprueDimsPanel = new wxPanel(card, wxID_ANY);
+    m_sprueDimsPanel->SetBackgroundColour(Style::CardBg);
+    auto* dimSizer = new wxBoxSizer(wxVERTICAL);
 
-    sizer->AddSpacer(10);   // matches the wxBOTTOM=10 margin on MainFrame's
-    // dimsPanel — keeps card heights consistent.
+    {
+        wxStaticText* ul = nullptr;
+        AddDimRow(m_sprueDimsPanel, dimSizer, "Diameter:", m_sprueDiameter, "5.0", "mm", &ul);
+        m_mmFields.push_back(m_sprueDiameter); m_mmUnitLabels.push_back(ul);
+    }
+    AddDimRow(m_sprueDimsPanel, dimSizer, "Draft angle:", m_sprueDraftAngle, "1.0", DegSym());
+    {
+        wxStaticText* ul = nullptr;
+        AddDimRow(m_sprueDimsPanel, dimSizer, "Cold slug:", m_sprueColdSlugDepth, "5.0", "mm", &ul);
+        m_mmFields.push_back(m_sprueColdSlugDepth); m_mmUnitLabels.push_back(ul);
+    }
+    {
+        wxStaticText* ul = nullptr;
+        AddDimRow(m_sprueDimsPanel, dimSizer, "Sprue length:", m_sprueLength, "20.0", "mm", &ul);
+        m_mmFields.push_back(m_sprueLength); m_mmUnitLabels.push_back(ul);
+    }
+    dimSizer->AddSpacer(4);
+
+    m_sprueDimsPanel->SetSizer(dimSizer);
+    m_sprueDimsPanel->Hide();   // hidden by default — "No Override" is selected
+    sizer->Add(m_sprueDimsPanel, 0, wxEXPAND);
+
+    // Show/hide the dims panel whenever the type choice changes.
+    m_sprueTypeChoice->Bind(wxEVT_CHOICE, [this](wxCommandEvent&)
+        {
+            const bool noOverride =
+                m_sprueTypeChoice->GetSelection() == 0;   // "No Override"
+            m_sprueDimsPanel->Show(!noOverride);
+            // Re-layout upward to the scrolled window so the card collapses
+            // or expands cleanly without leaving stale whitespace.
+            for (wxWindow* w = m_sprueDimsPanel->GetParent(); w; w = w->GetParent())
+            {
+                w->Layout();
+                if (wxDynamicCast(w, wxScrolledWindow))
+                {
+                    wxDynamicCast(w, wxScrolledWindow)->FitInside();
+                    break;
+                }
+            }
+        });
+
+    sizer->AddSpacer(10);
     return card;
 }
 
@@ -888,10 +1099,48 @@ wxPanel* FixtureEditor::CreateRunnersContent(wxWindow* parent)
     wxSizer* sizer = nullptr;
     auto* card = MakeCardWithTitle(parent, "Runners", sizer);
 
-    AddTypeRow(card, sizer, "Runner type:", { "Cylindrical" }, m_runnerTypeChoice);
+    // "No Override" is index 0 and the default selection. When active, all
+    // dimension fields are hidden and nothing is written to the fixture file.
+    AddTypeRow(card, sizer, "Runner type:",
+        { "No Override", "Cylindrical" }, m_runnerTypeChoice);
 
-    AddDimRow(card, sizer, "Diameter:", m_runnerDiameter, "4.0", "mm");
-    AddDimRow(card, sizer, "Cold slug length:", m_runnerColdSlugDepth, "5.0", "mm");
+    // Sub-panel wrapping all dim rows so they can be shown/hidden as a unit.
+    m_runnerDimsPanel = new wxPanel(card, wxID_ANY);
+    m_runnerDimsPanel->SetBackgroundColour(Style::CardBg);
+    auto* dimSizer = new wxBoxSizer(wxVERTICAL);
+
+    {
+        wxStaticText* ul = nullptr;
+        AddDimRow(m_runnerDimsPanel, dimSizer, "Diameter:", m_runnerDiameter, "4.0", "mm", &ul);
+        m_mmFields.push_back(m_runnerDiameter); m_mmUnitLabels.push_back(ul);
+    }
+    {
+        wxStaticText* ul = nullptr;
+        AddDimRow(m_runnerDimsPanel, dimSizer, "Cold slug length:", m_runnerColdSlugDepth, "5.0", "mm", &ul);
+        m_mmFields.push_back(m_runnerColdSlugDepth); m_mmUnitLabels.push_back(ul);
+    }
+    dimSizer->AddSpacer(4);
+
+    m_runnerDimsPanel->SetSizer(dimSizer);
+    m_runnerDimsPanel->Hide();   // hidden by default — "No Override" is selected
+    sizer->Add(m_runnerDimsPanel, 0, wxEXPAND);
+
+    // Show/hide the dims panel whenever the type choice changes.
+    m_runnerTypeChoice->Bind(wxEVT_CHOICE, [this](wxCommandEvent&)
+        {
+            const bool noOverride =
+                m_runnerTypeChoice->GetSelection() == 0;   // "No Override"
+            m_runnerDimsPanel->Show(!noOverride);
+            for (wxWindow* w = m_runnerDimsPanel->GetParent(); w; w = w->GetParent())
+            {
+                w->Layout();
+                if (wxDynamicCast(w, wxScrolledWindow))
+                {
+                    wxDynamicCast(w, wxScrolledWindow)->FitInside();
+                    break;
+                }
+            }
+        });
 
     sizer->AddSpacer(10);
     return card;
@@ -907,18 +1156,83 @@ wxPanel* FixtureEditor::CreateGatesContent(wxWindow* parent)
     wxSizer* sizer = nullptr;
     auto* card = MakeCardWithTitle(parent, "Gates", sizer);
 
-    AddTypeRow(card, sizer, "Gate type:", { "Tapered Cylinder" }, m_gateTypeChoice);
+    // ---- Gate half ----------------------------------------------------
+    // "No Override" is index 0. When selected, gate dim fields are hidden.
+    AddTypeRow(card, sizer, "Gate type:",
+        { "No Override", "Tapered Cylinder" }, m_gateTypeChoice);
 
-    AddDimRow(card, sizer, "Diameter:", m_gateDiameter, "3.0", "mm");
-    AddDimRow(card, sizer, "Draft angle:", m_gateDraftAngle, "1.0", DegSym());
+    m_gateDimsPanel = new wxPanel(card, wxID_ANY);
+    m_gateDimsPanel->SetBackgroundColour(Style::CardBg);
+    auto* gateDimSizer = new wxBoxSizer(wxVERTICAL);
 
+    {
+        wxStaticText* ul = nullptr;
+        AddDimRow(m_gateDimsPanel, gateDimSizer, "Diameter:", m_gateDiameter, "3.0", "mm", &ul);
+        m_mmFields.push_back(m_gateDiameter); m_mmUnitLabels.push_back(ul);
+    }
+    AddDimRow(m_gateDimsPanel, gateDimSizer, "Draft angle:", m_gateDraftAngle, "1.0", DegSym());
+    gateDimSizer->AddSpacer(4);
+
+    m_gateDimsPanel->SetSizer(gateDimSizer);
+    m_gateDimsPanel->Hide();   // hidden by default — "No Override" is selected
+    sizer->Add(m_gateDimsPanel, 0, wxEXPAND);
+
+    m_gateTypeChoice->Bind(wxEVT_CHOICE, [this](wxCommandEvent&)
+        {
+            const bool noOverride =
+                m_gateTypeChoice->GetSelection() == 0;   // "No Override"
+            m_gateDimsPanel->Show(!noOverride);
+            for (wxWindow* w = m_gateDimsPanel->GetParent(); w; w = w->GetParent())
+            {
+                w->Layout();
+                if (wxDynamicCast(w, wxScrolledWindow))
+                {
+                    wxDynamicCast(w, wxScrolledWindow)->FitInside();
+                    break;
+                }
+            }
+        });
+
+    // ---- Visual divider between gate and sub-runner -------------------
     sizer->AddSpacer(6);
     auto* subSep = new wxPanel(card, wxID_ANY, wxDefaultPosition, wxSize(-1, 1));
     subSep->SetBackgroundColour(Style::Divider);
     sizer->Add(subSep, 0, wxEXPAND | wxLEFT | wxRIGHT, 10);
 
-    AddTypeRow(card, sizer, "Sub-runner type:", { "Cylinder" }, m_subRunnerTypeChoice);
-    AddDimRow(card, sizer, "Diameter:", m_subRunnerDiameter, "5.0", "mm");
+    // ---- Sub-runner half ----------------------------------------------
+    AddTypeRow(card, sizer, "Sub-runner type:",
+        { "No Override", "Cylinder" }, m_subRunnerTypeChoice);
+
+    m_subRunnerDimsPanel = new wxPanel(card, wxID_ANY);
+    m_subRunnerDimsPanel->SetBackgroundColour(Style::CardBg);
+    auto* subDimSizer = new wxBoxSizer(wxVERTICAL);
+
+    {
+        wxStaticText* ul = nullptr;
+        AddDimRow(m_subRunnerDimsPanel, subDimSizer, "Diameter:", m_subRunnerDiameter, "5.0", "mm", &ul);
+        m_mmFields.push_back(m_subRunnerDiameter); m_mmUnitLabels.push_back(ul);
+    }
+    subDimSizer->AddSpacer(4);
+
+    m_subRunnerDimsPanel->SetSizer(subDimSizer);
+    m_subRunnerDimsPanel->Hide();   // hidden by default — "No Override" is selected
+    sizer->Add(m_subRunnerDimsPanel, 0, wxEXPAND);
+
+    m_subRunnerTypeChoice->Bind(wxEVT_CHOICE, [this](wxCommandEvent&)
+        {
+            const bool noOverride =
+                m_subRunnerTypeChoice->GetSelection() == 0;   // "No Override"
+            m_subRunnerDimsPanel->Show(!noOverride);
+            for (wxWindow* w = m_subRunnerDimsPanel->GetParent(); w; w = w->GetParent())
+            {
+                w->Layout();
+                if (wxDynamicCast(w, wxScrolledWindow))
+                {
+                    wxDynamicCast(w, wxScrolledWindow)->FitInside();
+                    break;
+                }
+            }
+        });
 
     sizer->AddSpacer(10);
     return card;
@@ -929,12 +1243,58 @@ wxPanel* FixtureEditor::CreateVentsContent(wxWindow* parent)
     wxSizer* sizer = nullptr;
     auto* card = MakeCardWithTitle(parent, "Vents", sizer);
 
-    AddTypeRow(card, sizer, "Vent type:", { "Rectangular" }, m_ventTypeChoice);
+    // "No Override" is index 0 and the default selection. When active, all
+    // dimension fields are hidden and nothing is written to the fixture file.
+    AddTypeRow(card, sizer, "Vent type:",
+        { "No Override", "Rectangular" }, m_ventTypeChoice);
 
-    AddDimRow(card, sizer, "Length:", m_ventLength, "1.0", "mm");
-    AddDimRow(card, sizer, "Width:", m_ventWidth, "2.0", "mm");
-    AddDimRow(card, sizer, "Overrun (start):", m_ventOverrunStart, "0.5", "mm");
-    AddDimRow(card, sizer, "Overrun (end):", m_ventOverrunEnd, "0.5", "mm");
+    // Sub-panel wrapping all dim rows so they can be shown/hidden as a unit.
+    m_ventDimsPanel = new wxPanel(card, wxID_ANY);
+    m_ventDimsPanel->SetBackgroundColour(Style::CardBg);
+    auto* ventDimSizer = new wxBoxSizer(wxVERTICAL);
+
+    {
+        wxStaticText* ul = nullptr;
+        AddDimRow(m_ventDimsPanel, ventDimSizer, "Length:", m_ventLength, "1.0", "mm", &ul);
+        m_mmFields.push_back(m_ventLength); m_mmUnitLabels.push_back(ul);
+    }
+    {
+        wxStaticText* ul = nullptr;
+        AddDimRow(m_ventDimsPanel, ventDimSizer, "Width:", m_ventWidth, "2.0", "mm", &ul);
+        m_mmFields.push_back(m_ventWidth); m_mmUnitLabels.push_back(ul);
+    }
+    {
+        wxStaticText* ul = nullptr;
+        AddDimRow(m_ventDimsPanel, ventDimSizer, "Overrun (start):", m_ventOverrunStart, "0.5", "mm", &ul);
+        m_mmFields.push_back(m_ventOverrunStart); m_mmUnitLabels.push_back(ul);
+    }
+    {
+        wxStaticText* ul = nullptr;
+        AddDimRow(m_ventDimsPanel, ventDimSizer, "Overrun (end):", m_ventOverrunEnd, "0.5", "mm", &ul);
+        m_mmFields.push_back(m_ventOverrunEnd); m_mmUnitLabels.push_back(ul);
+    }
+    ventDimSizer->AddSpacer(4);
+
+    m_ventDimsPanel->SetSizer(ventDimSizer);
+    m_ventDimsPanel->Hide();   // hidden by default — "No Override" is selected
+    sizer->Add(m_ventDimsPanel, 0, wxEXPAND);
+
+    // Show/hide the dims panel whenever the type choice changes.
+    m_ventTypeChoice->Bind(wxEVT_CHOICE, [this](wxCommandEvent&)
+        {
+            const bool noOverride =
+                m_ventTypeChoice->GetSelection() == 0;   // "No Override"
+            m_ventDimsPanel->Show(!noOverride);
+            for (wxWindow* w = m_ventDimsPanel->GetParent(); w; w = w->GetParent())
+            {
+                w->Layout();
+                if (wxDynamicCast(w, wxScrolledWindow))
+                {
+                    wxDynamicCast(w, wxScrolledWindow)->FitInside();
+                    break;
+                }
+            }
+        });
 
     sizer->AddSpacer(10);
     return card;
@@ -945,10 +1305,48 @@ wxPanel* FixtureEditor::CreateEjectorsContent(wxWindow* parent)
     wxSizer* sizer = nullptr;
     auto* card = MakeCardWithTitle(parent, "Ejectors", sizer);
 
-    AddTypeRow(card, sizer, "Ejector type:", { "Cylindrical" }, m_ejectorTypeChoice);
+    // "No Override" is index 0 and the default selection. When active, all
+    // dimension fields are hidden and nothing is written to the fixture file.
+    AddTypeRow(card, sizer, "Ejector type:",
+        { "No Override", "Cylindrical" }, m_ejectorTypeChoice);
 
-    AddDimRow(card, sizer, "Diameter:", m_ejectorDiameter, "3.0", "mm");
-    AddDimRow(card, sizer, "Length:", m_ejectorLength, "25.0", "mm");
+    // Sub-panel wrapping all dim rows so they can be shown/hidden as a unit.
+    m_ejectorDimsPanel = new wxPanel(card, wxID_ANY);
+    m_ejectorDimsPanel->SetBackgroundColour(Style::CardBg);
+    auto* ejectorDimSizer = new wxBoxSizer(wxVERTICAL);
+
+    {
+        wxStaticText* ul = nullptr;
+        AddDimRow(m_ejectorDimsPanel, ejectorDimSizer, "Diameter:", m_ejectorDiameter, "3.0", "mm", &ul);
+        m_mmFields.push_back(m_ejectorDiameter); m_mmUnitLabels.push_back(ul);
+    }
+    {
+        wxStaticText* ul = nullptr;
+        AddDimRow(m_ejectorDimsPanel, ejectorDimSizer, "Length:", m_ejectorLength, "25.0", "mm", &ul);
+        m_mmFields.push_back(m_ejectorLength); m_mmUnitLabels.push_back(ul);
+    }
+    ejectorDimSizer->AddSpacer(4);
+
+    m_ejectorDimsPanel->SetSizer(ejectorDimSizer);
+    m_ejectorDimsPanel->Hide();   // hidden by default — "No Override" is selected
+    sizer->Add(m_ejectorDimsPanel, 0, wxEXPAND);
+
+    // Show/hide the dims panel whenever the type choice changes.
+    m_ejectorTypeChoice->Bind(wxEVT_CHOICE, [this](wxCommandEvent&)
+        {
+            const bool noOverride =
+                m_ejectorTypeChoice->GetSelection() == 0;   // "No Override"
+            m_ejectorDimsPanel->Show(!noOverride);
+            for (wxWindow* w = m_ejectorDimsPanel->GetParent(); w; w = w->GetParent())
+            {
+                w->Layout();
+                if (wxDynamicCast(w, wxScrolledWindow))
+                {
+                    wxDynamicCast(w, wxScrolledWindow)->FitInside();
+                    break;
+                }
+            }
+        });
 
     sizer->AddSpacer(10);
     return card;
@@ -1073,57 +1471,125 @@ void FixtureEditor::OnToolAlignFace(wxCommandEvent& evt)
 }
 
 // ---------------------------------------------------------------------------
-// Import handlers
+// Fixture pre-population + Select-button handlers
 //
-// Both handlers share the same body via PickStepFile — the only difference is
-// which member path/label they target. STEP filter matches what the old
-// StartupDialog::OnNewFixture flow used (".step;.stp"). On a successful
-// pick, the file is also pushed into the canvas's matching half slot via
-// FixtureCanvas::LoadHalf, which runs the shared FileImporter pipeline
-// (parse + normals + crease split + GPU upload).
+// SetInitialFixture is the entry point CreateFixtureDialog uses to push its
+// gathered name + paths into a fresh editor. Below it, the OnSelectModelA/B
+// handlers drive the per-half "Select" buttons in the top ribbon — both go
+// through the same wxFileDialog → field → canvas pipeline. The canvas call
+// is guarded so a Select press before the canvas is initialised (unlikely
+// but possible during startup) is a no-op rather than a crash.
 // ---------------------------------------------------------------------------
-void FixtureEditor::OnImportModelA(wxCommandEvent&)
+void FixtureEditor::SetInitialFixture(const std::string& fixtureName,
+    const std::string& modelAPath,
+    const std::string& modelBPath,
+    ProgressCallback   progress)
 {
-    if (PickStepFile("Select Mould Half A", m_modelAPath, m_lblModelAPath)
-        && m_canvas)
+    // Local helper — invokes the caller's progress callback if one was
+    // supplied, swallows otherwise. Keeps the call sites readable.
+    auto report = [&progress](int pct, const std::string& status)
+        {
+            if (progress) progress(pct, status);
+        };
+
+    // Stash the name unconditionally — OnGenerateFixture reads it later as
+    // the default save filename. Empty just falls back to the hardcoded
+    // "NewFixture.fixture" default.
+    m_fixtureName = fixtureName;
+
+    // Progress steps are coarse because there's no per-feature hook into
+    // FixtureCanvas::LoadHalf yet. Each LoadHalf is one synchronous chunk;
+    // we report before and after so the bar moves twice. If LoadHalf
+    // grows a callback later, the percent can become finer-grained
+    // without changing this call's shape.
+    report(0, "Preparing fixture...");
+
+    // For each half: mirror exactly what OnSelectModelA/B do (set the path
+    // member + load into the canvas), and additionally push the path into
+    // the text field so the top ribbon displays what the user picked in
+    // CreateFixtureDialog. SetValue does NOT fire the wxEVT_BUTTON binding
+    // (that only fires on the Select button click), so we won't double-
+    // trigger LoadHalf.
+    if (!modelAPath.empty())
     {
+        report(10, "Loading Mould Half A...");
+        m_modelAPath = modelAPath;
+        if (m_pathACtrl)
+            m_pathACtrl->SetValue(modelAPath);
+        if (m_canvas)
+            m_canvas->LoadHalf(FixtureCanvas::HalfSlot::A, modelAPath);
+        report(50, "Loaded Mould Half A");
+    }
+    if (!modelBPath.empty())
+    {
+        report(55, "Loading Mould Half B...");
+        m_modelBPath = modelBPath;
+        if (m_pathBCtrl)
+            m_pathBCtrl->SetValue(modelBPath);
+        if (m_canvas)
+            m_canvas->LoadHalf(FixtureCanvas::HalfSlot::B, modelBPath);
+        report(95, "Loaded Mould Half B");
+    }
+
+    report(100, "Opening editor...");
+}
+
+// ---------------------------------------------------------------------------
+// Select handlers — wxFileDialog → text field → canvas
+//
+// Shared "pick a STEP/IGES file" helper kept inline because it's only two
+// call sites and threading another file/header just for that would be
+// overkill. Mirrors CreateFixtureDialog::PickModelPath; if a third site
+// ever needs it, factor into a shared utility header.
+// ---------------------------------------------------------------------------
+namespace
+{
+    bool PickModelPath(wxWindow* parent, wxTextCtrl* target, std::string& outPath)
+    {
+        // Default the open dialog to the directory of the field's current
+        // value (if any) — so picking half B after half A doesn't drop
+        // the user back at their home folder.
+        wxString defaultDir;
+        const wxString current = target->GetValue();
+        if (!current.IsEmpty())
+        {
+            std::error_code ec;
+            namespace fs = std::filesystem;
+            const auto parentDir = fs::path(current.ToStdString()).parent_path();
+            if (!parentDir.empty() && fs::exists(parentDir, ec))
+                defaultDir = parentDir.string();
+        }
+
+        wxFileDialog dlg(parent, "Select Mould Half",
+            defaultDir, wxEmptyString,
+            "STEP files (*.step;*.stp)|*.step;*.stp"
+            "|IGES files (*.iges;*.igs)|*.iges;*.igs"
+            "|All files (*.*)|*.*",
+            wxFD_OPEN | wxFD_FILE_MUST_EXIST);
+        if (dlg.ShowModal() != wxID_OK) return false;
+
+        outPath = dlg.GetPath().ToStdString();
+        target->SetValue(outPath);
+        return true;
+    }
+}
+
+void FixtureEditor::OnSelectModelA(wxCommandEvent&)
+{
+    std::string picked;
+    if (!PickModelPath(this, m_pathACtrl, picked)) return;
+    m_modelAPath = picked;
+    if (m_canvas)
         m_canvas->LoadHalf(FixtureCanvas::HalfSlot::A, m_modelAPath);
-    }
 }
 
-void FixtureEditor::OnImportModelB(wxCommandEvent&)
+void FixtureEditor::OnSelectModelB(wxCommandEvent&)
 {
-    if (PickStepFile("Select Mould Half B", m_modelBPath, m_lblModelBPath)
-        && m_canvas)
-    {
+    std::string picked;
+    if (!PickModelPath(this, m_pathBCtrl, picked)) return;
+    m_modelBPath = picked;
+    if (m_canvas)
         m_canvas->LoadHalf(FixtureCanvas::HalfSlot::B, m_modelBPath);
-    }
-}
-
-bool FixtureEditor::PickStepFile(const wxString& title,
-    std::string& outPath,
-    wxStaticText* pathLabel)
-{
-    wxFileDialog dlg(this, title, "", "",
-        "STEP files (*.step;*.stp)|*.step;*.stp",
-        wxFD_OPEN | wxFD_FILE_MUST_EXIST);
-    if (dlg.ShowModal() != wxID_OK) return false;   // user cancelled — keep prior state
-
-    outPath = dlg.GetPath().ToStdString();
-
-    if (pathLabel)
-    {
-        // Switch from the muted empty-state look to the primary-text look
-        // so a populated row is visually distinct from a never-touched one.
-        pathLabel->SetLabel(outPath);
-        pathLabel->SetForegroundColour(Style::TextPrimary);
-        // The label sits inside an ellipsizing static-text whose width is
-        // sizer-driven. Re-laying out the parent picks up the new text
-        // length and re-applies the ellipsis if needed.
-        if (pathLabel->GetParent())
-            pathLabel->GetParent()->Layout();
-    }
-    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1212,8 +1678,23 @@ void FixtureEditor::OnGenerateFixture(wxCommandEvent&)
     // which matches how StartupDialog feeds m_fixturesFolder into wxControls.
     // No explicit FromUTF8 here — that'd misinterpret legacy-ANSI paths on
     // Windows installations that haven't opted into the UTF-8 codepage.
+
+    // Default save filename — if CreateFixtureDialog supplied a fixture
+    // name via SetInitialFixture, use it (with a .fixture suffix); otherwise
+    // fall back to the historical placeholder. The name comes in human-
+    // readable form ("ASPX Rev 2") and we just append the extension; spaces
+    // and mixed case are valid on Windows and the user can still rename in
+    // the save dialog if they want a more conventional filename. Filesystem
+    // characters that aren't valid in NTFS filenames (\ / : * ? " < > |)
+    // would surface here as an OS-level rename failure rather than a silent
+    // bad-name; can revisit with explicit sanitisation if it shows up in
+    // practice.
+    const std::string defaultFile = m_fixtureName.empty()
+        ? std::string("NewFixture.fixture")
+        : (m_fixtureName + ".fixture");
+
     wxFileDialog dlg(this, "Save Fixture",
-        defaultDir, "NewFixture.fixture",
+        defaultDir, defaultFile,
         "Fixture files (*.fixture)|*.fixture",
         wxFD_SAVE | wxFD_OVERWRITE_PROMPT);
     if (dlg.ShowModal() != wxID_OK) return;   // user cancelled
@@ -1252,6 +1733,18 @@ void FixtureEditor::OnGenerateFixture(wxCommandEvent&)
     // on parse failure (e.g. user typed "abc"). We leave the optional
     // unset on failure so that field falls back to the application
     // default at load time — same forgiving stance MainFrame uses.
+    // Base units in the fixture file are always mm. If the user switched to
+    // imperial, displayed values are in inches and must be converted back.
+    // Degree fields (draft angles) are never scaled.
+    const double toMM = m_isMetric ? 1.0 : 25.4;
+
+    auto readFieldMM = [toMM](wxTextCtrl* ctrl, std::optional<float>& dst)
+        {
+            if (!ctrl) return;
+            double v = 0.0;
+            if (ctrl->GetValue().ToDouble(&v))
+                dst = static_cast<float>(v * toMM);
+        };
     auto readField = [](wxTextCtrl* ctrl, std::optional<float>& dst)
         {
             if (!ctrl) return;
@@ -1267,36 +1760,55 @@ void FixtureEditor::OnGenerateFixture(wxCommandEvent&)
                 dst = sel.ToStdString();
         };
 
-    // Sprues
-    readChoice(m_sprueTypeChoice, def.sprueDefaults.type);
-    readField(m_sprueDiameter, def.sprueDefaults.diameter);
-    readField(m_sprueDraftAngle, def.sprueDefaults.draftAngle);
-    readField(m_sprueColdSlugDepth, def.sprueDefaults.coldSlugLength);
-    readField(m_sprueLength, def.sprueDefaults.length);
+    // Sprues — skipped entirely when type is "No Override" (index 0).
+    if (m_sprueTypeChoice && m_sprueTypeChoice->GetSelection() != 0)
+    {
+        readChoice(m_sprueTypeChoice, def.sprueDefaults.type);
+        readFieldMM(m_sprueDiameter, def.sprueDefaults.diameter);
+        readField(m_sprueDraftAngle, def.sprueDefaults.draftAngle);
+        readFieldMM(m_sprueColdSlugDepth, def.sprueDefaults.coldSlugLength);
+        readFieldMM(m_sprueLength, def.sprueDefaults.length);
+    }
 
-    // Runners
-    readChoice(m_runnerTypeChoice, def.runnerDefaults.type);
-    readField(m_runnerDiameter, def.runnerDefaults.diameter);
-    readField(m_runnerColdSlugDepth, def.runnerDefaults.coldSlugLength);
+    // Runners — skipped entirely when type is "No Override" (index 0).
+    if (m_runnerTypeChoice && m_runnerTypeChoice->GetSelection() != 0)
+    {
+        readChoice(m_runnerTypeChoice, def.runnerDefaults.type);
+        readFieldMM(m_runnerDiameter, def.runnerDefaults.diameter);
+        readFieldMM(m_runnerColdSlugDepth, def.runnerDefaults.coldSlugLength);
+    }
 
     // Gates + sub-runner — both feed off the gate card.
-    readChoice(m_gateTypeChoice, def.gateDefaults.type);
-    readField(m_gateDiameter, def.gateDefaults.diameter);
-    readField(m_gateDraftAngle, def.gateDefaults.draftAngle);
-    readChoice(m_subRunnerTypeChoice, def.subRunnerDefaults.type);
-    readField(m_subRunnerDiameter, def.subRunnerDefaults.diameter);
+    // Each half is skipped independently when its type is "No Override".
+    if (m_gateTypeChoice && m_gateTypeChoice->GetSelection() != 0)
+    {
+        readChoice(m_gateTypeChoice, def.gateDefaults.type);
+        readFieldMM(m_gateDiameter, def.gateDefaults.diameter);
+        readField(m_gateDraftAngle, def.gateDefaults.draftAngle);
+    }
+    if (m_subRunnerTypeChoice && m_subRunnerTypeChoice->GetSelection() != 0)
+    {
+        readChoice(m_subRunnerTypeChoice, def.subRunnerDefaults.type);
+        readFieldMM(m_subRunnerDiameter, def.subRunnerDefaults.diameter);
+    }
 
-    // Vents
-    readChoice(m_ventTypeChoice, def.ventDefaults.type);
-    readField(m_ventLength, def.ventDefaults.length);
-    readField(m_ventWidth, def.ventDefaults.width);
-    readField(m_ventOverrunStart, def.ventDefaults.overrunStart);
-    readField(m_ventOverrunEnd, def.ventDefaults.overrunEnd);
+    // Vents — skipped entirely when type is "No Override" (index 0).
+    if (m_ventTypeChoice && m_ventTypeChoice->GetSelection() != 0)
+    {
+        readChoice(m_ventTypeChoice, def.ventDefaults.type);
+        readFieldMM(m_ventLength, def.ventDefaults.length);
+        readFieldMM(m_ventWidth, def.ventDefaults.width);
+        readFieldMM(m_ventOverrunStart, def.ventDefaults.overrunStart);
+        readFieldMM(m_ventOverrunEnd, def.ventDefaults.overrunEnd);
+    }
 
-    // Ejectors
-    readChoice(m_ejectorTypeChoice, def.ejectorDefaults.type);
-    readField(m_ejectorDiameter, def.ejectorDefaults.diameter);
-    readField(m_ejectorLength, def.ejectorDefaults.length);
+    // Ejectors — skipped entirely when type is "No Override" (index 0).
+    if (m_ejectorTypeChoice && m_ejectorTypeChoice->GetSelection() != 0)
+    {
+        readChoice(m_ejectorTypeChoice, def.ejectorDefaults.type);
+        readFieldMM(m_ejectorDiameter, def.ejectorDefaults.diameter);
+        readFieldMM(m_ejectorLength, def.ejectorDefaults.length);
+    }
 
     // Injection points — straight copy of the editor's live list. Order
     // is preserved so the saved file's [injection_point.0..N] sections

@@ -10,6 +10,7 @@
 #include "MainFrame.h"
 #include "GLCanvas.h"
 #include "FixtureEditor.h"
+#include "CreateFixtureDialog.h"
 #include "RotateDialog.h"
 #include "TranslateDialog.h"
 #include "ScaleDialog.h"
@@ -1062,7 +1063,26 @@ void MainFrame::OnImport(wxCommandEvent&)
 // while the editor is scaffolding-only it just opens the window.
 void MainFrame::OnCreateFixture(wxCommandEvent&)
 {
-    auto* editor = new FixtureEditor(this);
+    // Same two-step flow as StartupDialog::OnNewFixture — see that comment
+    // for the rationale and the editor-lifecycle reasoning.
+    CreateFixtureDialog createDlg(this);
+    FixtureEditor* editor = new FixtureEditor(this);
+
+    createDlg.SetLoadHandler(
+        [editor, &createDlg](CreateFixtureDialog::ProgressFn progress)
+        {
+            editor->SetInitialFixture(createDlg.GetFixtureName(),
+                createDlg.GetModelAPath(),
+                createDlg.GetModelBPath(),
+                progress);
+        });
+
+    if (createDlg.ShowModal() != wxID_OK)
+    {
+        editor->Destroy();
+        return;
+    }
+
     editor->Show();
 }
 

@@ -65,6 +65,29 @@ public:
     explicit FixtureEditor(wxWindow* parent);
     ~FixtureEditor() override = default;
 
+    // Pre-populate the editor with values gathered by CreateFixtureDialog
+    // before showing it. Sets the displayed paths on both file pickers,
+    // immediately loads each half into the canvas (same pipeline the
+    // OnSelectModelA/B handlers use), and stashes the fixture name so
+    // OnGenerateFixture can use it as the default save filename.
+    //
+    // Safe to call with empty strings — empty paths just skip the load,
+    // matching the picker handlers' guard. Intended to be called exactly
+    // once, before Show(); calling it again later would re-trigger
+    // LoadHalf and stomp any unsaved pose edits.
+    //
+    // The optional progress callback is invoked at each step (before/after
+    // each LoadHalf). CreateFixtureDialog uses it to drive the dialog's
+    // progress bar; pass an empty std::function (the default) to silence
+    // it. The percent values are coarse — there's no per-feature hook
+    // into FixtureCanvas::LoadHalf yet, so progress steps in chunks.
+    using ProgressCallback =
+        std::function<void(int percent, const std::string& status)>;
+    void SetInitialFixture(const std::string& fixtureName,
+        const std::string& modelAPath,
+        const std::string& modelBPath,
+        ProgressCallback   progress = {});
+
     // Drive the visual state of every registered toggle button to reflect
     // a single active tool. Pass wxID_NONE to clear all toggles. Mirrors
     // the role MainFrame::SetActiveTool plays for the main tool grid.
@@ -108,6 +131,7 @@ private:
     // action grid, no collapsible Settings sub-section. Each populates the
     // matching m_xxx* member pointers (type choice, dimension fields) so
     // the future Generate-Fixture handler can read values back.
+    wxPanel* CreateUnitToggle(wxWindow* parent);
     wxPanel* CreateInjectionPointsContent(wxWindow* parent);
     wxPanel* CreateSpruesContent(wxWindow* parent);
     wxPanel* CreateRunnersContent(wxWindow* parent);
@@ -154,22 +178,15 @@ private:
     // editor on success.
     void OnGenerateFixture(wxCommandEvent&);
 
-    // Top-ribbon Import handlers — open a STEP file picker, then store the
-    // chosen path in m_modelA/BPath and update the corresponding path
-    // label. Re-importing simply overwrites the previous selection. Once
-    // the editor's runtime exists these will also feed the picked file
-    // into the canvas, but for now they only update state + label.
-    void OnImportModelA(wxCommandEvent&);
-    void OnImportModelB(wxCommandEvent&);
-
-    // Shared body for the two Import handlers above. Pops the file dialog
-    // with `title`, and on success writes into `outPath`, refreshes
-    // `pathLabel` with the chosen path, and returns true. Returns false on
-    // cancel (with `outPath` and `pathLabel` left untouched) so the caller
-    // can skip downstream work like canvas loading.
-    bool PickStepFile(const wxString& title,
-        std::string& outPath,
-        wxStaticText* pathLabel);
+    // Top-ribbon "Select" button handlers — one per half. Each opens a
+    // wxFileDialog (STEP/IGES filter, same as CreateFixtureDialog), writes
+    // the chosen path into the matching text field, stores it in
+    // m_modelA/BPath, and pushes it through to the canvas LoadHalf
+    // pipeline. The text fields themselves are editable but don't have
+    // change handlers — typing a path doesn't load it until the user
+    // presses Select (intentional: avoids reload-on-every-keystroke).
+    void OnSelectModelA(wxCommandEvent&);
+    void OnSelectModelB(wxCommandEvent&);
 
     // Per-button visual setters keyed by command ID. Populated by the
     // makeToolBtn helper in BuildToolbar; consumed by SetActiveTool.
@@ -177,17 +194,29 @@ private:
     std::unordered_map<int, std::function<void(bool)>> m_toolBtnSetters;
     int m_activeToolId = wxID_NONE;
 
-    // Picked-file paths. Empty until the user runs an import. These are
-    // the inputs that the (future) save flow will read when writing the
-    // .fixture file.
+    // Picked-file paths. Empty until the user selects a file. These are
+    // the inputs the save flow reads when writing the .fixture file.
     std::string m_modelAPath;
     std::string m_modelBPath;
 
-    // Path-display labels in the top ribbon. Held as members so the
-    // import handlers can update them after a successful pick. Owned by
-    // the wxWidgets parent-child hierarchy — no manual delete.
-    wxStaticText* m_lblModelAPath = nullptr;
-    wxStaticText* m_lblModelBPath = nullptr;
+    // Human-readable fixture name supplied by CreateFixtureDialog (empty
+    // when the editor is opened without going through that dialog — e.g.
+    // future direct-launch flows). When non-empty, OnGenerateFixture uses
+    // it as the default save filename instead of the hardcoded
+    // "NewFixture.fixture". The name is not currently persisted inside
+    // the .fixture file itself — if that becomes useful, the FixtureFile
+    // schema will need a new field; deferred for now.
+    std::string m_fixtureName;
+
+    // Path text fields in the top ribbon (one per half). Editable
+    // wxTextCtrls paired with adjacent "Select" buttons that open a
+    // wxFileDialog — same idiom CreateFixtureDialog uses, replacing the
+    // earlier wxFilePickerCtrl system-themed widgets so the two surfaces
+    // visually match. Held as members so the picker handlers and save
+    // flow can read/set the displayed path. Owned by the wxWidgets
+    // parent-child hierarchy — no manual delete.
+    wxTextCtrl* m_pathACtrl = nullptr;
+    wxTextCtrl* m_pathBCtrl = nullptr;
 
     // 3D viewport. Owned by the parent-child hierarchy. Held as a member
     // so future runtime code (transform handlers, file-load wiring) can
@@ -205,8 +234,23 @@ private:
     // distances in mm, and the fixture editor doesn't carry the
     // metric/imperial toggle MainFrame does. Angle fields are degrees.
 
+    // Unit toggle (metric / imperial) -- above injection points card.
+    // m_isMetric drives display and save-time conversion.
+    // m_mmFields / m_mmUnitLabels are parallel vectors populated by the
+    // CreateXxxContent helpers for every dimension field whose unit is mm
+    // (draft-angle degree fields are excluded). The toggle handler iterates
+    // them to update labels and convert displayed values in one pass.
+    bool          m_isMetric = true;
+    std::vector<wxTextCtrl*>   m_mmFields;
+    std::vector<wxStaticText*> m_mmUnitLabels;
+    wxPanel* m_metricSeg = nullptr;   // left segment (active by default)
+    wxStaticText* m_metricLbl = nullptr;
+    wxPanel* m_imperialSeg = nullptr;   // right segment
+    wxStaticText* m_imperialLbl = nullptr;
+
     // Sprue
     wxChoice* m_sprueTypeChoice = nullptr;
+    wxPanel* m_sprueDimsPanel = nullptr;   // shown/hidden by type choice
     wxTextCtrl* m_sprueDiameter = nullptr;
     wxTextCtrl* m_sprueDraftAngle = nullptr;
     wxTextCtrl* m_sprueColdSlugDepth = nullptr;
@@ -214,18 +258,22 @@ private:
 
     // Runner
     wxChoice* m_runnerTypeChoice = nullptr;
+    wxPanel* m_runnerDimsPanel = nullptr;   // shown/hidden by type choice
     wxTextCtrl* m_runnerDiameter = nullptr;
     wxTextCtrl* m_runnerColdSlugDepth = nullptr;
 
     // Gate (+ sub-runner — same card per MainFrame's convention)
     wxChoice* m_gateTypeChoice = nullptr;
+    wxPanel* m_gateDimsPanel = nullptr;      // shown/hidden by type choice
     wxTextCtrl* m_gateDiameter = nullptr;
     wxTextCtrl* m_gateDraftAngle = nullptr;
     wxChoice* m_subRunnerTypeChoice = nullptr;
+    wxPanel* m_subRunnerDimsPanel = nullptr; // shown/hidden by type choice
     wxTextCtrl* m_subRunnerDiameter = nullptr;
 
     // Vent
     wxChoice* m_ventTypeChoice = nullptr;
+    wxPanel* m_ventDimsPanel = nullptr;     // shown/hidden by type choice
     wxTextCtrl* m_ventLength = nullptr;
     wxTextCtrl* m_ventWidth = nullptr;
     wxTextCtrl* m_ventOverrunStart = nullptr;
@@ -233,6 +281,7 @@ private:
 
     // Ejector
     wxChoice* m_ejectorTypeChoice = nullptr;
+    wxPanel* m_ejectorDimsPanel = nullptr;  // shown/hidden by type choice
     wxTextCtrl* m_ejectorDiameter = nullptr;
     wxTextCtrl* m_ejectorLength = nullptr;
 
@@ -254,10 +303,10 @@ private:
     enum
     {
         // Range chosen to avoid collisions with MainFrame's tool IDs
-        // (which start at wxID_HIGHEST + 1) and StartupDialog's IDs
-        // (wxID_HIGHEST + 300).
-        ID_FE_ImportModelA = wxID_HIGHEST + 700,
-        ID_FE_ImportModelB,
+        // (which start at wxID_HIGHEST + 1), StartupDialog's IDs
+        // (wxID_HIGHEST + 300), and CreateFixtureDialog (HIGHEST + 400).
+        ID_FE_SelectModelA = wxID_HIGHEST + 700,
+        ID_FE_SelectModelB,
         ID_FE_GenerateFixture,
         ID_FE_Move,
         ID_FE_Rotate,

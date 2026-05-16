@@ -140,6 +140,7 @@
   <ItemGroup>
     <ClCompile Include="AppConfig.cpp" />
     <ClCompile Include="camera.cpp" />
+    <ClCompile Include="CreateFixtureDialog.cpp" />
     <ClCompile Include="FileImporter.cpp" />
     <ClCompile Include="FixtureCanvas.cpp" />
     <ClCompile Include="FixtureEditor.cpp" />
@@ -168,6 +169,7 @@
   <ItemGroup>
     <ClInclude Include="AppConfig.h" />
     <ClInclude Include="camera.h" />
+    <ClInclude Include="CreateFixtureDialog.h" />
     <ClInclude Include="FileImporter.h" />
     <ClInclude Include="FixtureCanvas.h" />
     <ClInclude Include="FixtureEditor.h" />
