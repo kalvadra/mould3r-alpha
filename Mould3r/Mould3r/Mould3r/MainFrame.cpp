@@ -2576,8 +2576,6 @@ wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
 
         toolsSizer->AddSpacer(8);
 
-        auto* grid = new wxGridSizer(3, 2, 4, 4);
-
         // ---- SVG icon paths for model tool buttons --------------------------------
         // Fill in the path to each SVG file (relative to the executable, or absolute).
         // Leave a string empty ("") to show the text label only.
@@ -2732,15 +2730,55 @@ wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
                 return panel;
             };
 
-        grid->Add(makeToolBtn(ID_ToolTranslate, "Move", true, kIconMove), 0, wxEXPAND);
-        grid->Add(makeToolBtn(ID_ToolRotate, "Rotate", true, kIconRotate), 0, wxEXPAND);
-        grid->Add(makeToolBtn(ID_ToolScale, "Scale", true, kIconScale), 0, wxEXPAND);
-        grid->Add(makeToolBtn(ID_ToolPattern, "Pattern", true, kIconPattern), 0, wxEXPAND);
-        grid->Add(makeToolBtn(ID_ToolCenter, "Center", false, kIconCenter), 0, wxEXPAND);
-        grid->Add(makeToolBtn(ID_ToolAlignFace, "Align Face", true, kIconAlignFace), 0, wxEXPAND);
-        grid->Add(makeToolBtn(ID_ToolAlignMidplane, "Align Midplane", true, kIconAlignMidplane), 0, wxEXPAND);
+        // Row 1 — Move / Rotate / Scale in equal thirds.
+        auto* toolsRow1 = new wxGridSizer(1, 3, 0, 4);
+        toolsRow1->Add(makeToolBtn(ID_ToolTranslate, "Move", true, kIconMove), 0, wxEXPAND);
+        toolsRow1->Add(makeToolBtn(ID_ToolRotate, "Rotate", true, kIconRotate), 0, wxEXPAND);
+        toolsRow1->Add(makeToolBtn(ID_ToolScale, "Scale", true, kIconScale), 0, wxEXPAND);
+        toolsSizer->Add(toolsRow1, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
+        toolsSizer->AddSpacer(4);  // matches the original 4-px inter-row gap
 
-        toolsSizer->Add(grid, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
+        // Row 2 — Center / Pattern in halves. Center is the only non-toggle
+        // (one-shot action); the rest of the model tools are modal toggles.
+        auto* toolsRow2 = new wxGridSizer(1, 2, 0, 4);
+        toolsRow2->Add(makeToolBtn(ID_ToolCenter, "Center", false, kIconCenter), 0, wxEXPAND);
+        toolsRow2->Add(makeToolBtn(ID_ToolPattern, "Pattern", true, kIconPattern), 0, wxEXPAND);
+        toolsSizer->Add(toolsRow2, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
+
+        toolsSizer->AddSpacer(14);  // gap before the next subsection header
+
+        // ---- Model Alignment subsection ------------------------------------
+        // Same MODEL TOOLS header treatment plus an inline help indicator.
+        // The "?" character is a placeholder for the circled-question-mark
+        // glyph in the reference image — see flag in the chat, the final
+        // visual (Unicode glyph vs. SVG icon vs. custom-painted badge) is
+        // intentionally left as a follow-up once the help-text content is
+        // settled.
+        auto* alignHeaderRow = new wxBoxSizer(wxHORIZONTAL);
+
+        auto* alignLabel = new wxStaticText(toolsPanel, wxID_ANY, "MODEL ALIGNMENT");
+        alignLabel->SetForegroundColour(Style::TextPrimary);
+        alignLabel->SetFont(wxFont(7, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_BOLD, false, "Segoe UI"));
+        alignHeaderRow->Add(alignLabel, 0, wxALIGN_CENTER_VERTICAL);
+
+        auto* alignHelp = new wxStaticText(toolsPanel, wxID_ANY, "?");
+        alignHelp->SetForegroundColour(Style::TextMuted);
+        alignHelp->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_BOLD, false, "Segoe UI"));
+        alignHelp->SetToolTip("Align selected geometry to a reference face or "
+            "midplane of another object.");
+        alignHeaderRow->Add(alignHelp, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 6);
+
+        toolsSizer->Add(alignHeaderRow, 0, wxLEFT | wxTOP, 12);
+        toolsSizer->AddSpacer(8);
+
+        // Row 3 — Align Face / Align Midplane in halves.
+        auto* alignRow = new wxGridSizer(1, 2, 0, 4);
+        alignRow->Add(makeToolBtn(ID_ToolAlignFace, "Align Face", true, kIconAlignFace), 0, wxEXPAND);
+        alignRow->Add(makeToolBtn(ID_ToolAlignMidplane, "Align Midplane", true, kIconAlignMidplane), 0, wxEXPAND);
+        toolsSizer->Add(alignRow, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
+
         toolsSizer->AddSpacer(10);
 
         toolsPanel->SetSizer(toolsSizer);
