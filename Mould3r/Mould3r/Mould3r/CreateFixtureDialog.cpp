@@ -3,6 +3,8 @@
 #include <wx/msgdlg.h>
 #include <filesystem>
 #include "style.h"
+#include "RoundedButton.h"     // rounded button for Select / Create / Cancel
+#include "WindowEffects.h"     // DWM corner rounding for the frameless dialog
 
 namespace fs = std::filesystem;
 
@@ -20,7 +22,7 @@ namespace
     // semibold. Used here for the per-row Select buttons (same colour the
     // Import button in the main ribbon and StartupDialog's New Fixture
     // button use).
-    void StylePrimaryButton(wxButton* btn)
+    void StylePrimaryButton(RoundedButton* btn)
     {
         btn->SetBackgroundColour(Style::BtnSecondary);
         btn->SetForegroundColour(*wxWHITE);
@@ -30,7 +32,7 @@ namespace
     // Style a button as the "confirm" action — green, white label.
     // Mirrors StartupDialog's Select button and the main ribbon's
     // "Generate Mould". Used here for Create.
-    void StyleConfirmButton(wxButton* btn)
+    void StyleConfirmButton(RoundedButton* btn)
     {
         btn->SetBackgroundColour(Style::BtnGenerate);
         btn->SetForegroundColour(*wxWHITE);
@@ -40,7 +42,7 @@ namespace
     // Style a button to read as "text only" — background blended into the
     // dialog's AppBg so the rectangle disappears, leaving just a label.
     // Used for Cancel, same as StartupDialog's bottom-row Cancel.
-    void StyleTextButton(wxButton* btn)
+    void StyleTextButton(RoundedButton* btn)
     {
         btn->SetBackgroundColour(Style::AppBg);
         btn->SetForegroundColour(Style::TextPrimary);
@@ -94,7 +96,7 @@ CreateFixtureDialog::CreateFixtureDialog(wxWindow* parent)
     // uses a private ID for the same reason StartupDialog does: to keep
     // Windows stock-button styling from interfering with the explicit
     // colours we set.
-    auto* btnClose = new wxButton(m_titleRow, wxID_CANCEL,
+    auto* btnClose = new RoundedButton(m_titleRow, wxID_CANCEL,
         wxString::FromUTF8("\xE2\x9C\x95"),
         wxDefaultPosition, wxSize(30, 30), wxBORDER_NONE);
     btnClose->SetBackgroundColour(Style::AppBg);
@@ -179,7 +181,7 @@ CreateFixtureDialog::CreateFixtureDialog(wxWindow* parent)
     m_pathACtrl->SetForegroundColour(Style::TextPrimary);
     m_pathACtrl->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
-    auto* btnSelectA = new wxButton(m_formPanel, ID_SelectA, "Select",
+    auto* btnSelectA = new RoundedButton(m_formPanel, ID_SelectA, "Select",
         wxDefaultPosition, wxSize(70, 28), wxBORDER_NONE);
     StylePrimaryButton(btnSelectA);
 
@@ -200,7 +202,7 @@ CreateFixtureDialog::CreateFixtureDialog(wxWindow* parent)
     m_pathBCtrl->SetForegroundColour(Style::TextPrimary);
     m_pathBCtrl->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
-    auto* btnSelectB = new wxButton(m_formPanel, ID_SelectB, "Select",
+    auto* btnSelectB = new RoundedButton(m_formPanel, ID_SelectB, "Select",
         wxDefaultPosition, wxSize(70, 28), wxBORDER_NONE);
     StylePrimaryButton(btnSelectB);
 
@@ -216,11 +218,11 @@ CreateFixtureDialog::CreateFixtureDialog(wxWindow* parent)
     auto* btnSizer = new wxBoxSizer(wxHORIZONTAL);
     btnSizer->AddStretchSpacer();
 
-    auto* btnCancel = new wxButton(m_formPanel, ID_Cancel, "Cancel",
+    auto* btnCancel = new RoundedButton(m_formPanel, ID_Cancel, "Cancel",
         wxDefaultPosition, wxSize(90, 32), wxBORDER_NONE);
     StyleTextButton(btnCancel);
 
-    auto* btnCreate = new wxButton(m_formPanel, ID_Create, "Create",
+    auto* btnCreate = new RoundedButton(m_formPanel, ID_Create, "Create",
         wxDefaultPosition, wxSize(90, 32), wxBORDER_NONE);
     StyleConfirmButton(btnCreate);
 
@@ -269,6 +271,11 @@ CreateFixtureDialog::CreateFixtureDialog(wxWindow* parent)
 
     contentPanel->SetSizer(main);
     CentreOnScreen();
+
+    // Win11 corner rounding via DWM (no-op on Win10). Same idiom as
+    // StartupDialog — see that file's matching call for the hairline-
+    // border interaction note.
+    WindowEffects::ApplyRoundedCorners(this);
 
     // Bindings. Cancel uses a private ID (rather than wxID_CANCEL) for the
     // same reason StartupDialog does — see that file's comment. The dialog

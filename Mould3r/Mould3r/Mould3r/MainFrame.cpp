@@ -5,6 +5,8 @@
 #include <wx/file.h>
 #include <wx/filefn.h>
 #include <wx/dnd.h>
+#include <wx/graphics.h>   // wxGraphicsContext — rounded-rect paint for icon tool buttons
+#include <wx/dcbuffer.h>   // wxAutoBufferedPaintDC — flicker-free repaint on hover/toggle
 #include <memory>
 
 #include "MainFrame.h"
@@ -16,6 +18,8 @@
 #include "ScaleDialog.h"
 #include "AppConfig.h"
 #include "MeshImportSettings.h"
+#include "RoundedButton.h"     // rounded button for sidebar / toolbar action buttons
+#include "WindowEffects.h"     // DWM corner rounding for the main frame
 #include "style.h"
 
 // ---------------------------------------------------------------------------
@@ -313,6 +317,10 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
         // pointers are populated.
         ApplyFixtureDefaults(fixture);
     }
+
+    // Win11 DWM corner rounding for the main frame — matches the rest
+    // of the app's window family.
+    WindowEffects::ApplyRoundedCorners(this);
 }
 
 // ---------------------------------------------------------------------------
@@ -339,7 +347,7 @@ wxPanel* MainFrame::CreateRibbon(wxWindow* parent)
     }
 
     // Import button (accent blue, left-aligned)
-    auto* btnImport = new wxButton(panel, ID_Import, "Import Model",
+    auto* btnImport = new RoundedButton(panel, ID_Import, "Import Model",
         wxDefaultPosition, wxSize(120, 32), wxBORDER_NONE);
     btnImport->SetBackgroundColour(Style::BtnSecondary);
     btnImport->SetForegroundColour(*wxWHITE);
@@ -350,7 +358,7 @@ wxPanel* MainFrame::CreateRibbon(wxWindow* parent)
     hSizer->AddStretchSpacer();
 
     // ---- Export (right-aligned) ---------------------------------------------
-    auto* btnExport = new wxButton(panel, ID_Export, "Export",
+    auto* btnExport = new RoundedButton(panel, ID_Export, "Export",
         wxDefaultPosition, wxSize(90, 32), wxBORDER_NONE);
     btnExport->SetBackgroundColour(Style::InputBg);
     btnExport->SetForegroundColour(*wxWHITE);
@@ -359,7 +367,7 @@ wxPanel* MainFrame::CreateRibbon(wxWindow* parent)
     hSizer->Add(btnExport, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
 
     // ---- Generate Mould (green, right-aligned) --------------------------------
-    auto* btnGenerate = new wxButton(panel, ID_GenerateMould, "Generate Mould",
+    auto* btnGenerate = new RoundedButton(panel, ID_GenerateMould, "Generate Mould",
         wxDefaultPosition, wxSize(130, 32), wxBORDER_NONE);
     btnGenerate->SetBackgroundColour(Style::BtnGenerate);
     btnGenerate->SetForegroundColour(*wxWHITE);
@@ -440,7 +448,7 @@ wxPanel* MainFrame::CreateSidePanel(wxWindow* parent)
             ctrl->SetBackgroundColour(Style::InputBg);
             ctrl->SetForegroundColour(kTextDefault);
 
-            auto* browse = new wxButton(panel, browseId, "...",
+            auto* browse = new RoundedButton(panel, browseId, "...",
                 wxDefaultPosition, wxSize(28, 24));
             browse->SetBackgroundColour(Style::InputBg);
             browse->SetForegroundColour(kTextDefault);
@@ -1773,9 +1781,9 @@ wxPanel* MainFrame::CreateVentsContent(wxWindow* parent)
 
     // ---- Edit / Remove / Clear all ------------------------------------------
     auto* actionGrid = new wxGridSizer(1, 3, 0, 4);
-    auto makeSmallBtn = [&](const wxString& label) -> wxButton*
+    auto makeSmallBtn = [&](const wxString& label) -> RoundedButton*
         {
-            auto* btn = new wxButton(panel, wxID_ANY, label,
+            auto* btn = new RoundedButton(panel, wxID_ANY, label,
                 wxDefaultPosition, wxSize(-1, 26), wxBORDER_NONE);
             btn->SetBackgroundColour(Style::BtnSmall);
             btn->SetForegroundColour(Style::TextPrimary);
@@ -1915,7 +1923,7 @@ wxPanel* MainFrame::CreateSpruesContent(wxWindow* parent)
     sizer->AddSpacer(6);
 
     // Place Sprue — regular button (one-shot action, not a toggle mode)
-    auto* btnPlace = new wxButton(panel, ID_PlaceSprue, "Place Sprue",
+    auto* btnPlace = new RoundedButton(panel, ID_PlaceSprue, "Place Sprue",
         wxDefaultPosition, wxSize(-1, 32), wxBORDER_NONE);
     btnPlace->SetBackgroundColour(Style::BtnPlace);
     btnPlace->SetForegroundColour(*wxWHITE);
@@ -1925,8 +1933,8 @@ wxPanel* MainFrame::CreateSpruesContent(wxWindow* parent)
     sizer->AddSpacer(6);
 
     auto* actionGrid = new wxGridSizer(1, 3, 0, 4);
-    auto makeSmallBtn = [&](const wxString& label) -> wxButton* {
-        auto* btn = new wxButton(panel, wxID_ANY, label,
+    auto makeSmallBtn = [&](const wxString& label) -> RoundedButton* {
+        auto* btn = new RoundedButton(panel, wxID_ANY, label,
             wxDefaultPosition, wxSize(-1, 26), wxBORDER_NONE);
         btn->SetBackgroundColour(Style::BtnSmall);
         btn->SetForegroundColour(Style::TextPrimary);
@@ -2065,9 +2073,9 @@ wxPanel* MainFrame::CreateRunnersContent(wxWindow* parent)
     // ---- Edit / Remove / Clear all — equal-width button row -----------------
     auto* actionGrid = new wxGridSizer(1, 3, 0, 4);   // 1 row, 3 cols, 4px h-gap
 
-    auto makeSmallBtn = [&](const wxString& label) -> wxButton*
+    auto makeSmallBtn = [&](const wxString& label) -> RoundedButton*
         {
-            auto* btn = new wxButton(panel, wxID_ANY, label,
+            auto* btn = new RoundedButton(panel, wxID_ANY, label,
                 wxDefaultPosition, wxSize(-1, 26), wxBORDER_NONE);
             btn->SetBackgroundColour(Style::BtnSmall);
             btn->SetForegroundColour(Style::TextPrimary);
@@ -2251,8 +2259,8 @@ wxPanel* MainFrame::CreateGatesContent(wxWindow* parent)
     sizer->AddSpacer(6);
 
     auto* actionGrid = new wxGridSizer(1, 3, 0, 4);
-    auto makeSmallBtn = [&](const wxString& label) -> wxButton* {
-        auto* btn = new wxButton(panel, wxID_ANY, label,
+    auto makeSmallBtn = [&](const wxString& label) -> RoundedButton* {
+        auto* btn = new RoundedButton(panel, wxID_ANY, label,
             wxDefaultPosition, wxSize(-1, 26), wxBORDER_NONE);
         btn->SetBackgroundColour(Style::BtnSmall);
         btn->SetForegroundColour(Style::TextPrimary);
@@ -2437,8 +2445,8 @@ wxPanel* MainFrame::CreateEjectorsContent(wxWindow* parent)
     sizer->AddSpacer(6);
 
     auto* actionGrid = new wxGridSizer(1, 3, 0, 4);
-    auto makeSmallBtn = [&](const wxString& label) -> wxButton* {
-        auto* btn = new wxButton(panel, wxID_ANY, label,
+    auto makeSmallBtn = [&](const wxString& label) -> RoundedButton* {
+        auto* btn = new RoundedButton(panel, wxID_ANY, label,
             wxDefaultPosition, wxSize(-1, 26), wxBORDER_NONE);
         btn->SetBackgroundColour(Style::BtnSmall);
         btn->SetForegroundColour(Style::TextPrimary);
@@ -2653,6 +2661,45 @@ wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
                     wxDefaultPosition, wxSize(-1, 34), wxBORDER_NONE);
                 panel->SetBackgroundColour(Style::BtnSecondary);
 
+                // ---- Rounded-corner repaint -----------------------------------
+                // The panel paints itself: parent bg fills the whole client
+                // area first (so the four corner triangles outside the rounded
+                // shape pick up the toolbar's colour), then a filled rounded
+                // rectangle in the panel's *current* bg colour covers the rest.
+                // applyColours below mutates panel->SetBackgroundColour and
+                // calls Refresh(), so the existing hover / selected / idle
+                // state machine drives the paint with no extra wiring.
+                //
+                // wxBG_STYLE_PAINT promises wxWidgets we'll fill the client
+                // area ourselves — required when pairing with wxAutoBuffered-
+                // PaintDC, otherwise the default erase pass fights the buffer
+                // and the result flickers on hover.
+                //
+                // Matches the pattern used by RoundedButton.cpp; the 4 px
+                // radius keeps these in lockstep with the text-only
+                // RoundedButton's default. One constant to tune if the
+                // design ever wants a different number.
+                constexpr int kToolBtnCornerRadius = 4;
+                panel->SetBackgroundStyle(wxBG_STYLE_PAINT);
+                panel->Bind(wxEVT_PAINT, [panel](wxPaintEvent&) {
+                    wxAutoBufferedPaintDC dc(panel);
+                    const wxColour parentBg = panel->GetParent()
+                        ? panel->GetParent()->GetBackgroundColour()
+                        : panel->GetBackgroundColour();
+                    dc.SetBackground(wxBrush(parentBg));
+                    dc.Clear();
+
+                    std::unique_ptr<wxGraphicsContext> gc(
+                        wxGraphicsContext::Create(dc));
+                    if (!gc) return;
+                    gc->SetAntialiasMode(wxANTIALIAS_DEFAULT);
+                    gc->SetBrush(wxBrush(panel->GetBackgroundColour()));
+                    gc->SetPen(*wxTRANSPARENT_PEN);
+                    const wxSize sz = panel->GetClientSize();
+                    gc->DrawRoundedRectangle(0, 0, sz.x, sz.y,
+                        kToolBtnCornerRadius);
+                    });
+
                 // Inner horizontal sizer: [icon] [gap] [label]
                 auto* hSizer = new wxBoxSizer(wxHORIZONTAL);
 
@@ -2732,8 +2779,28 @@ wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
                     e.Skip();
                     };
                 auto onLeave = [=](wxMouseEvent& e) {
-                    if (!*toggled)
-                        applyColours(Style::BtnSecondary, Style::TextPrimary);
+                    // Phantom-leave guard: txt and bmpCtrl are real child
+                    // windows of the panel, so the panel fires LEAVE as
+                    // soon as the cursor crosses onto either one — even
+                    // though, from the user's point of view, the cursor is
+                    // still very much on the button. The corollary ENTER
+                    // on the child does fire, but the relative ordering
+                    // between the two isn't guaranteed on Windows and we
+                    // were getting a stuck-off hover from the race.
+                    //
+                    // Fix: hit-test the cursor in screen coords against
+                    // the panel's screen rect. If it's still anywhere over
+                    // the composite, the leave is phantom — suppress it.
+                    // A genuine leave (cursor truly off the button) lands
+                    // outside the rect and falls through to the colour
+                    // reset.
+                    const wxRect screenRect(panel->GetScreenPosition(),
+                        panel->GetSize());
+                    if (!screenRect.Contains(wxGetMousePosition()))
+                    {
+                        if (!*toggled)
+                            applyColours(Style::BtnSecondary, Style::TextPrimary);
+                    }
                     e.Skip();
                     };
 

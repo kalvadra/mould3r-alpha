@@ -1,4 +1,5 @@
 #include "RotateDialog.h"
+#include "WindowEffects.h"   // DWM corner rounding for this dialog frame
 
 RotateDialog::RotateDialog(wxWindow* parent)
     : wxDialog(parent, wxID_ANY, "Rotate Object",
@@ -38,6 +39,7 @@ RotateDialog::RotateDialog(wxWindow* parent)
     SetSizer(main);
     Fit();
     CentreOnParent();
+    WindowEffects::ApplyRoundedCorners(this);
 
     m_ctrlX->SetFocus();
     m_ctrlX->SelectAll();

@@ -1,4 +1,5 @@
 #include "ScaleDialog.h"
+#include "WindowEffects.h"   // DWM corner rounding for this dialog frame
 
 ScaleDialog::ScaleDialog(wxWindow* parent)
     : wxDialog(parent, wxID_ANY, "Scale Object",
@@ -31,6 +32,7 @@ ScaleDialog::ScaleDialog(wxWindow* parent)
     SetSizer(main);
     Fit();
     CentreOnParent();
+    WindowEffects::ApplyRoundedCorners(this);
     m_ctrlUniform->SetFocus();
     m_ctrlUniform->SelectAll();
 }

@@ -1,9 +1,11 @@
 #include "FixtureEditor.h"
 
 #include <wx/bmpbndl.h>
+#include <wx/dcbuffer.h>  // wxAutoBufferedPaintDC — flicker-free repaint on hover/toggle for tool buttons
 #include <wx/file.h>
 #include <wx/filedlg.h>  // wxFileDialog — Import buttons + Generate Fixture save
 #include <wx/filename.h>
+#include <wx/graphics.h> // wxGraphicsContext — rounded-rect paint for icon tool buttons
 #include <wx/msgdlg.h>   // wxMessageBox — OnGenerateFixture validation/error
 #include <wx/scrolwin.h> // wxScrolledWindow — sidebar scrolls when cards overflow
 #include <wx/stattext.h>
@@ -16,6 +18,8 @@
 
 #include "FixtureCanvas.h"
 #include "FixtureFile.h"       // OnGenerateFixture
+#include "RoundedButton.h"     // owner-drawn rounded button — replaces wxButton in custom-themed UI
+#include "WindowEffects.h"     // DWM corner rounding for the editor frame
 #include "InjectionPointDialog.h"  // Add/Edit injection-point flow
 #include "RotateDialog.h"      // OnToolRotate
 #include "ScaleDialog.h"       // OnToolScale
@@ -253,6 +257,12 @@ FixtureEditor::FixtureEditor(wxWindow* parent)
     Bind(wxEVT_CLOSE_WINDOW, [this](wxCloseEvent&) { Destroy(); });
 
     CentreOnScreen();
+
+    // Round the frame's outer corners via DWM on Win11. wxFrame's
+    // system title bar comes along for the ride (it's drawn by the
+    // compositor, not by us), so the result looks consistent with
+    // native Win11 windows.
+    WindowEffects::ApplyRoundedCorners(this);
 }
 
 void FixtureEditor::BuildUI()
@@ -351,7 +361,7 @@ wxWindow* FixtureEditor::BuildTopRibbon(wxWindow* parent)
             field->SetForegroundColour(Style::TextPrimary);
             field->SetFont(kFieldFont);
 
-            auto* btnSelect = new wxButton(ribbon, selectId, "...",
+            auto* btnSelect = new RoundedButton(ribbon, selectId, "...",
                 wxDefaultPosition, wxSize(36, 28), wxBORDER_NONE);
             btnSelect->SetBackgroundColour(Style::BtnSecondary);
             btnSelect->SetForegroundColour(*wxWHITE);
@@ -402,7 +412,7 @@ wxWindow* FixtureEditor::BuildTopRibbon(wxWindow* parent)
     // through to the ribbon's bottom edge). Split into two Adds because
     // wxSizer borders take a single value for all flagged sides.
     auto* btnWrap = new wxBoxSizer(wxVERTICAL);
-    auto* btnGenerate = new wxButton(ribbon, ID_FE_GenerateFixture,
+    auto* btnGenerate = new RoundedButton(ribbon, ID_FE_GenerateFixture,
         "Save Fixture", wxDefaultPosition, wxSize(160, 32), wxBORDER_NONE);
     btnGenerate->SetBackgroundColour(Style::BtnGenerate);
     btnGenerate->SetForegroundColour(*wxWHITE);
@@ -453,6 +463,47 @@ wxWindow* FixtureEditor::BuildToolbar(wxWindow* parent)
             auto* panel = new wxPanel(toolbar, wxID_ANY,
                 wxDefaultPosition, wxSize(-1, 34), wxBORDER_NONE);
             panel->SetBackgroundColour(Style::BtnSecondary);
+
+            // ---- Rounded-corner repaint ---------------------------------
+            // The panel paints itself: parent bg fills the whole client
+            // area first (so the four corner triangles outside the rounded
+            // shape pick up the toolbar's colour), then a filled rounded
+            // rectangle in the panel's *current* bg colour covers the
+            // rest. applyColours below mutates panel->SetBackgroundColour
+            // and calls Refresh(), so the existing hover / selected /
+            // idle state machine drives the paint with no extra wiring.
+            //
+            // wxBG_STYLE_PAINT promises wxWidgets we'll fill the client
+            // area ourselves — required when pairing with wxAutoBuffered-
+            // PaintDC, otherwise the default erase pass fights the buffer
+            // and the result flickers on hover.
+            //
+            // Kept in lockstep with the same block in MainFrame.cpp's
+            // makeToolBtn — the two helpers are parallel by design, see
+            // the namespace-level comment at the top of this file. The
+            // 4 px radius matches RoundedButton's default so the icon
+            // tool buttons and the text-only rounded buttons share a
+            // corner profile across the app.
+            constexpr int kToolBtnCornerRadius = 4;
+            panel->SetBackgroundStyle(wxBG_STYLE_PAINT);
+            panel->Bind(wxEVT_PAINT, [panel](wxPaintEvent&) {
+                wxAutoBufferedPaintDC dc(panel);
+                const wxColour parentBg = panel->GetParent()
+                    ? panel->GetParent()->GetBackgroundColour()
+                    : panel->GetBackgroundColour();
+                dc.SetBackground(wxBrush(parentBg));
+                dc.Clear();
+
+                std::unique_ptr<wxGraphicsContext> gc(
+                    wxGraphicsContext::Create(dc));
+                if (!gc) return;
+                gc->SetAntialiasMode(wxANTIALIAS_DEFAULT);
+                gc->SetBrush(wxBrush(panel->GetBackgroundColour()));
+                gc->SetPen(*wxTRANSPARENT_PEN);
+                const wxSize sz = panel->GetClientSize();
+                gc->DrawRoundedRectangle(0, 0, sz.x, sz.y,
+                    kToolBtnCornerRadius);
+                });
 
             auto* hSizer = new wxBoxSizer(wxHORIZONTAL);
 
@@ -528,8 +579,28 @@ wxWindow* FixtureEditor::BuildToolbar(wxWindow* parent)
                 e.Skip();
                 };
             auto onLeave = [=](wxMouseEvent& e) {
-                if (!*toggled)
-                    applyColours(Style::BtnSecondary, Style::TextPrimary);
+                // Phantom-leave guard: txt and bmpCtrl are real child
+                // windows of the panel, so the panel fires LEAVE as
+                // soon as the cursor crosses onto either one — even
+                // though, from the user's point of view, the cursor is
+                // still very much on the button. The corollary ENTER
+                // on the child does fire, but the relative ordering
+                // between the two isn't guaranteed on Windows and we
+                // were getting a stuck-off hover from the race.
+                //
+                // Fix: hit-test the cursor in screen coords against the
+                // panel's screen rect. If it's still anywhere over the
+                // composite, the leave is phantom — suppress it. A
+                // genuine leave (cursor truly off the button) lands
+                // outside the rect and falls through to the colour
+                // reset.
+                const wxRect screenRect(panel->GetScreenPosition(),
+                    panel->GetSize());
+                if (!screenRect.Contains(wxGetMousePosition()))
+                {
+                    if (!*toggled)
+                        applyColours(Style::BtnSecondary, Style::TextPrimary);
+                }
                 e.Skip();
                 };
 
@@ -868,7 +939,7 @@ wxPanel* FixtureEditor::CreateInjectionPointsContent(wxWindow* parent)
     // of MainFrame's Place button on placement-mode cards. ID is the
     // single static button on this card; Edit/Remove buttons inside the
     // list bind their own per-row lambdas (see RebuildInjectionList).
-    auto* addBtn = new wxButton(card, ID_FE_AddInjectionPoint,
+    auto* addBtn = new RoundedButton(card, ID_FE_AddInjectionPoint,
         "Add Injection Point",
         wxDefaultPosition, wxSize(-1, 26));
     addBtn->SetBackgroundColour(Style::BtnSmall);
@@ -951,12 +1022,12 @@ void FixtureEditor::RebuildInjectionList()
                 lblText->SetForegroundColour(*wxWHITE);
                 lblText->SetFont(kFieldLabelFont);
 
-                auto* editBtn = new wxButton(entry, wxID_ANY, "Edit",
+                auto* editBtn = new RoundedButton(entry, wxID_ANY, "Edit",
                     wxDefaultPosition, wxSize(44, 22));
                 editBtn->SetBackgroundColour(Style::BtnSmall);
                 editBtn->SetForegroundColour(*wxWHITE);
 
-                auto* removeBtn = new wxButton(entry, wxID_ANY, "Remove",
+                auto* removeBtn = new RoundedButton(entry, wxID_ANY, "Remove",
                     wxDefaultPosition, wxSize(56, 22));
                 removeBtn->SetBackgroundColour(Style::BtnSmall);
                 removeBtn->SetForegroundColour(*wxWHITE);

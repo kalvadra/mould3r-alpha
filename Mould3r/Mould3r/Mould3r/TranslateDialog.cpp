@@ -1,4 +1,5 @@
 #include "TranslateDialog.h"
+#include "WindowEffects.h"   // DWM corner rounding for this dialog frame
 
 TranslateDialog::TranslateDialog(wxWindow* parent)
     : wxDialog(parent, wxID_ANY, "Translate Object",
@@ -33,6 +34,7 @@ TranslateDialog::TranslateDialog(wxWindow* parent)
     SetSizer(main);
     Fit();
     CentreOnParent();
+    WindowEffects::ApplyRoundedCorners(this);
     m_ctrlX->SetFocus();
     m_ctrlX->SelectAll();
 }

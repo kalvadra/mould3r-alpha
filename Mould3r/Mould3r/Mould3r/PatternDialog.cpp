@@ -1,4 +1,5 @@
 #include "PatternDialog.h"
+#include "WindowEffects.h"   // DWM corner rounding for this dialog frame
 
 PatternDialog::PatternDialog(wxWindow* parent)
     : wxDialog(parent, wxID_ANY, "Pattern",
@@ -150,6 +151,7 @@ PatternDialog::PatternDialog(wxWindow* parent)
     SetSizer(main);
     Fit();
     CentreOnParent();
+    WindowEffects::ApplyRoundedCorners(this);
 
     // Bind dynamic-show handlers
     m_typeChoice->Bind(wxEVT_CHOICE,

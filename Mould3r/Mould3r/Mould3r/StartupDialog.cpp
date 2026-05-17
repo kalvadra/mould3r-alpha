@@ -5,6 +5,8 @@
 #include "style.h"
 #include "FixtureEditor.h"
 #include "CreateFixtureDialog.h"
+#include "RoundedButton.h"     // rounded button for the dialog's action buttons
+#include "WindowEffects.h"     // DWM corner rounding for the frameless dialog
 
 namespace fs = std::filesystem;
 
@@ -21,7 +23,7 @@ namespace
     // Style a button as the "primary" action — indigo, white label,
     // semibold, no system border. Matches the Import button in the main
     // ribbon. Used here for the left-side "New Fixture..." action.
-    void StylePrimaryButton(wxButton* btn)
+    void StylePrimaryButton(RoundedButton* btn)
     {
         btn->SetBackgroundColour(Style::BtnSecondary);
         btn->SetForegroundColour(*wxWHITE);
@@ -31,7 +33,7 @@ namespace
     // Style a button as the "confirm" action — green, white label,
     // semibold, no system border. Mirrors the "Generate Mould" button in
     // the main ribbon; used here for the dialog's Select action.
-    void StyleConfirmButton(wxButton* btn)
+    void StyleConfirmButton(RoundedButton* btn)
     {
         btn->SetBackgroundColour(Style::BtnGenerate);
         btn->SetForegroundColour(*wxWHITE);
@@ -42,7 +44,7 @@ namespace
     // dialog's AppBg so the rectangle disappears, leaving just a label.
     // Used for Cancel in dialogs where it's the dismissive (not destructive)
     // action and shouldn't compete visually with the primary confirm.
-    void StyleTextButton(wxButton* btn)
+    void StyleTextButton(RoundedButton* btn)
     {
         btn->SetBackgroundColour(Style::AppBg);
         btn->SetForegroundColour(Style::TextPrimary);
@@ -106,7 +108,7 @@ StartupDialog::StartupDialog(wxWindow* parent)
     // interfere. The bottom-row "Cancel" button uses a private ID_Cancel
     // for that reason — see its binding below. ✕ is U+2715 (MULTIPLICATION
     // X), passed as UTF-8 bytes to avoid source-encoding assumptions.
-    auto* btnClose = new wxButton(m_titleRow, wxID_CANCEL,
+    auto* btnClose = new RoundedButton(m_titleRow, wxID_CANCEL,
         wxString::FromUTF8("\xE2\x9C\x95"),
         wxDefaultPosition, wxSize(30, 30), wxBORDER_NONE);
     btnClose->SetBackgroundColour(Style::AppBg);
@@ -215,18 +217,18 @@ StartupDialog::StartupDialog(wxWindow* parent)
     // ---- Buttons ----------------------------------------------------------
     auto* btnSizer = new wxBoxSizer(wxHORIZONTAL);
 
-    auto* btnNew = new wxButton(contentPanel, ID_NewFixture, "New Fixture...",
+    auto* btnNew = new RoundedButton(contentPanel, ID_NewFixture, "New Fixture...",
         wxDefaultPosition, wxSize(130, 32), wxBORDER_NONE);
     StylePrimaryButton(btnNew);
 
     btnSizer->Add(btnNew, 0);
     btnSizer->AddStretchSpacer();
 
-    auto* btnCancel = new wxButton(contentPanel, ID_Cancel, "Cancel",
+    auto* btnCancel = new RoundedButton(contentPanel, ID_Cancel, "Cancel",
         wxDefaultPosition, wxSize(90, 32), wxBORDER_NONE);
     StyleTextButton(btnCancel);
 
-    auto* btnOK = new wxButton(contentPanel, wxID_OK, "Select",
+    auto* btnOK = new RoundedButton(contentPanel, wxID_OK, "Select",
         wxDefaultPosition, wxSize(90, 32), wxBORDER_NONE);
     StyleConfirmButton(btnOK);
 
@@ -256,6 +258,13 @@ StartupDialog::StartupDialog(wxWindow* parent)
         &StartupDialog::OnListDoubleClick, this, m_list->GetId());
 
     ScanFixturesFolder();
+
+    // Round the dialog's corners via DWM on Win11 (no-op on Win10). The
+    // 1-px sky-blue hairline border this dialog draws around its content
+    // panel still works — DWM rounds the outer window edge and the
+    // hairline gets clipped along that arc, giving a subtle rounded
+    // accent ring.
+    WindowEffects::ApplyRoundedCorners(this);
 }
 
 // ---------------------------------------------------------------------------

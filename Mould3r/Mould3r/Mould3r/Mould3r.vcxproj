@@ -160,11 +160,13 @@
     <ClCompile Include="PatternDialog.cpp" />
     <ClCompile Include="ProjectFile.cpp" />
     <ClCompile Include="RotateDialog.cpp" />
+    <ClCompile Include="RoundedButton.cpp" />
     <ClCompile Include="ScaleDialog.cpp" />
     <ClCompile Include="shaders.cpp" />
     <ClCompile Include="StartupDialog.cpp" />
     <ClCompile Include="TranslateDialog.cpp" />
     <ClCompile Include="VentFeature.cpp" />
+    <ClCompile Include="WindowEffects.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="AppConfig.h" />
@@ -188,12 +190,14 @@
     <ClInclude Include="PatternDialog.h" />
     <ClInclude Include="ProjectFile.h" />
     <ClInclude Include="RotateDialog.h" />
+    <ClInclude Include="RoundedButton.h" />
     <ClInclude Include="ScaleDialog.h" />
     <ClInclude Include="shaders.h" />
     <ClInclude Include="StartupDialog.h" />
     <ClInclude Include="style.h" />
     <ClInclude Include="TranslateDialog.h" />
     <ClInclude Include="VentFeature.h" />
+    <ClInclude Include="WindowEffects.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="vcpkg.json" />

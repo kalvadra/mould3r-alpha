@@ -1,4 +1,5 @@
 #include "InjectionPointDialog.h"
+#include "WindowEffects.h"   // DWM corner rounding for this dialog frame
 
 // ---------------------------------------------------------------------------
 // Layout mirrors TranslateDialog exactly so the two prompts read as
@@ -61,6 +62,7 @@ InjectionPointDialog::InjectionPointDialog(wxWindow* parent,
     SetSizer(main);
     Fit();
     CentreOnParent();
+    WindowEffects::ApplyRoundedCorners(this);
 
     // Focus the label first — for an Add (empty initial), that's where
     // the user will start; for an Edit (pre-filled), select-all is harmless
