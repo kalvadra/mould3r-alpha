@@ -102,6 +102,15 @@ public:
     // canvas has had its first paint.
     bool LoadHalf(HalfSlot slot, const std::string& path);
 
+    // Per-slot visibility toggle. Hidden halves are skipped by both the
+    // render pass and the picking ray-cast, so a hidden half is neither
+    // drawn nor selectable. Selection / pose state is preserved across a
+    // hide → show round-trip (the user can still transform a hidden half
+    // via the toolbar dialogs and see the result on un-hide). LoadHalf
+    // resets visibility to true via Destroy, so a freshly-imported slot
+    // is always visible regardless of the previous slot's state.
+    void SetHalfVisible(HalfSlot slot, bool visible);
+
     // ---- Selection / transform mode ----------------------------------------
     // Subset of TransformMode from MainFrame.h. Move/Rotate/Scale are dialog-
     // driven in the fixture editor (matching MainFrame's UX), so they need no
@@ -220,6 +229,13 @@ private:
         float     pitchDeg = 0.0f;
         float     rollDeg = 0.0f;
         float     scale = 1.0f;
+
+        // Per-slot visibility flag, toggled by FixtureEditor's "Hide"
+        // checkbox via FixtureCanvas::SetHalfVisible. Hidden halves are
+        // skipped in both the lit render pass and PickHalf/RayCastFacePick,
+        // so a hidden half is neither drawn nor clickable. Defaults true
+        // so fresh imports show up without an explicit show call.
+        bool visible = true;
 
         // T * Ry(yaw) * Rx(pitch) * Rz(roll) * S(scale). YXZ order matches
         // SceneObject::BuildModelMatrix and the YXZ decomposition used by

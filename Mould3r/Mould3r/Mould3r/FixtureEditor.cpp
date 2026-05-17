@@ -234,6 +234,8 @@ FixtureEditor::FixtureEditor(wxWindow* parent)
     // the Import buttons.
     Bind(wxEVT_BUTTON, &FixtureEditor::OnSelectModelA, this, ID_FE_SelectModelA);
     Bind(wxEVT_BUTTON, &FixtureEditor::OnSelectModelB, this, ID_FE_SelectModelB);
+    Bind(wxEVT_CHECKBOX, &FixtureEditor::OnHideHalfA, this, ID_FE_HideA);
+    Bind(wxEVT_CHECKBOX, &FixtureEditor::OnHideHalfB, this, ID_FE_HideB);
     Bind(wxEVT_BUTTON, &FixtureEditor::OnGenerateFixture, this, ID_FE_GenerateFixture);
     Bind(wxEVT_BUTTON, &FixtureEditor::OnAddInjectionPoint, this, ID_FE_AddInjectionPoint);
     Bind(wxEVT_TOGGLEBUTTON, &FixtureEditor::OnToolMove, this, ID_FE_Move);
@@ -293,36 +295,55 @@ void FixtureEditor::BuildUI()
 wxWindow* FixtureEditor::BuildTopRibbon(wxWindow* parent)
 {
     // Layout (single horizontal sizer at the outer level):
-    //   [label] [Path A field] [Select]  [spacer]  [label] [Path B field] [Select]   [Save Fixture]
+    //   [Cell A vertical]  [spacer]  [Cell B vertical]   [50px gap]   [Save Fixture]
     //
-    // Each "cell" is a label + editable text field + Select button, matching
-    // the styling used in CreateFixtureDialog so the two surfaces read as
-    // part of the same family (was wxFilePickerCtrl; swapped because the
-    // system-themed picker didn't match the rest of the app's chrome).
+    // Each cell stacks vertically:
+    //   MOULD HALF A
+    //   [........ path field ........]  [Select]  [☐ Hide]
+    //
+    // Label sits above the field/Select/Hide row so the label can be wide
+    // without eating into the field's working width. Label font is small
+    // (7pt) and uppercase to keep the two-row cell visually compact.
     auto* ribbon = new wxPanel(parent, wxID_ANY);
     ribbon->SetBackgroundColour(kEditorBg);
 
     auto* outerSizer = new wxBoxSizer(wxHORIZONTAL);
 
-    // Single horizontal row that holds both label+field+select trios.
+    // Single horizontal row that holds both cells side by side.
     auto* pickerRow = new wxBoxSizer(wxHORIZONTAL);
 
-    static const wxFont kLabelFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+    // Label dropped from 9pt to 7pt to keep the two-row cell compact —
+    // the label is short and bold so legibility holds. Field stays at 9pt
+    // because the path is what the user reads; Select button keeps its
+    // 9pt semibold to match the rest of the app's primary actions.
+    static const wxFont kLabelFont(7, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI");
     static const wxFont kFieldFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_NORMAL, false, "Segoe UI");
     static const wxFont kSelectFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI");
+    static const wxFont kHideFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_NORMAL, false, "Segoe UI");
 
-    // Builds one [label] [wxTextCtrl] [Select button] unit and appends it
-    // to pickerRow. Returns the text field so the caller can stash it
-    // in a member. Mirrors CreateFixtureDialog's per-row layout exactly.
-    auto buildCell = [&](int selectId, const wxString& rowLabel) -> wxTextCtrl*
+    // Builds one vertical cell:
+    //   row 1: [label]
+    //   row 2: [path field (expand)] [Select] [Hide]
+    // and appends it to pickerRow. Returns the text field; the checkbox
+    // is captured via an out-param. Hide sits at the end of the field
+    // row as a row-level affordance — keeps field+Select tightly grouped
+    // as the load action, with the visibility toggle as a separate concern.
+    auto buildCell = [&](int selectId, int hideId, const wxString& rowLabel,
+        wxCheckBox*& outHideCheck) -> wxTextCtrl*
         {
+            auto* cellCol = new wxBoxSizer(wxVERTICAL);
+
             auto* lbl = new wxStaticText(ribbon, wxID_ANY, rowLabel);
-            lbl->SetForegroundColour(Style::TextSubtext);
+            lbl->SetForegroundColour(Style::TextPrimary);
             lbl->SetFont(kLabelFont);
-            pickerRow->Add(lbl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
+            cellCol->Add(lbl, 0, wxBOTTOM | wxLEFT, 2);
+
+            // Inner horizontal row for the actual controls.
+            auto* fieldRow = new wxBoxSizer(wxHORIZONTAL);
 
             auto* field = new wxTextCtrl(ribbon, wxID_ANY, wxEmptyString,
                 wxDefaultPosition, wxSize(-1, 28), wxBORDER_NONE);
@@ -330,29 +351,56 @@ wxWindow* FixtureEditor::BuildTopRibbon(wxWindow* parent)
             field->SetForegroundColour(Style::TextPrimary);
             field->SetFont(kFieldFont);
 
-            auto* btnSelect = new wxButton(ribbon, selectId, "Select",
-                wxDefaultPosition, wxSize(70, 28), wxBORDER_NONE);
+            auto* btnSelect = new wxButton(ribbon, selectId, "...",
+                wxDefaultPosition, wxSize(36, 28), wxBORDER_NONE);
             btnSelect->SetBackgroundColour(Style::BtnSecondary);
             btnSelect->SetForegroundColour(*wxWHITE);
             btnSelect->SetFont(kSelectFont);
 
-            // proportion=1 on the text field so both halves share the
-            // available width equally — the Select button takes its fixed
-            // 70px and the label takes its intrinsic size.
-            pickerRow->Add(field, 1, wxALIGN_CENTER_VERTICAL);
-            pickerRow->Add(btnSelect, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 6);
+            // wxCheckBox uses native Windows theming for the check glyph
+            // itself; we can only colour the surrounding label and bg.
+            // Font dropped to 8pt — same family-of-text-shrinking as the
+            // section label, keeps the row visually balanced.
+            auto* hide = new wxCheckBox(ribbon, hideId, "Hide");
+            hide->SetBackgroundColour(kEditorBg);
+            hide->SetForegroundColour(Style::TextPrimary);
+            hide->SetFont(kHideFont);
+            outHideCheck = hide;
+
+            // proportion=1 on the field so both cells' fields fill the
+            // available width minus Select+Hide. Select (36px ellipsis
+            // button — was "Select" at 70px; shortened to reclaim ribbon
+            // space) and Hide take their intrinsic widths.
+            fieldRow->Add(field, 1, wxALIGN_CENTER_VERTICAL);
+            fieldRow->Add(btnSelect, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 6);
+            fieldRow->Add(hide, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 10);
+
+            cellCol->Add(fieldRow, 0, wxEXPAND);
+
+            // proportion=1 on the cell so cell A and cell B share the
+            // available horizontal space equally.
+            pickerRow->Add(cellCol, 1, wxALIGN_CENTER_VERTICAL);
             return field;
         };
 
-    m_pathACtrl = buildCell(ID_FE_SelectModelA, "MOULD HALF A");
+    m_pathACtrl = buildCell(ID_FE_SelectModelA, ID_FE_HideA, "MOULD HALF A", m_hideACheck);
     pickerRow->AddSpacer(16);   // gap between the two cells
-    m_pathBCtrl = buildCell(ID_FE_SelectModelB, "MOULD HALF B");
+    m_pathBCtrl = buildCell(ID_FE_SelectModelB, ID_FE_HideB, "MOULD HALF B", m_hideBCheck);
 
-    outerSizer->Add(pickerRow, 1, wxALIGN_CENTER_VERTICAL | wxLEFT | wxRIGHT, 12);
+    // Outer: pickerRow takes the bulk, fixed 100px gap, then Save Fixture
+    // on the right. wxRIGHT dropped from pickerRow and wxLEFT from btnWrap
+    // so the literal 100 in the code is exactly the gap between the two
+    // regions — easier to tune than juggling three contributing values.
+    outerSizer->Add(pickerRow, 1, wxALIGN_CENTER_VERTICAL | wxLEFT, 12);
+    outerSizer->AddSpacer(100);
 
     // ---- Save Fixture — primary action on the right -----------------------
-    // Wrapped in a vertical sizer so the 5px top/bottom gap and the 12px
-    // left/right margin can be applied independently in one clean block.
+    // Wrapped in a vertical sizer with asymmetric top/bottom margins —
+    // top stays at 5 (where it was), bottom grows to 10 so the ribbon
+    // overall gains 5px of bottom padding (the button drives the ribbon
+    // height since pickerRow is shorter, so the bottom spacer flows
+    // through to the ribbon's bottom edge). Split into two Adds because
+    // wxSizer borders take a single value for all flagged sides.
     auto* btnWrap = new wxBoxSizer(wxVERTICAL);
     auto* btnGenerate = new wxButton(ribbon, ID_FE_GenerateFixture,
         "Save Fixture", wxDefaultPosition, wxSize(160, 32), wxBORDER_NONE);
@@ -360,8 +408,9 @@ wxWindow* FixtureEditor::BuildTopRibbon(wxWindow* parent)
     btnGenerate->SetForegroundColour(*wxWHITE);
     btnGenerate->SetFont(wxFont(10, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_BOLD, false, "Segoe UI"));
-    btnWrap->Add(btnGenerate, 0, wxTOP | wxBOTTOM, 5);
-    outerSizer->Add(btnWrap, 0, wxALIGN_CENTER_VERTICAL | wxLEFT | wxRIGHT, 12);
+    btnWrap->Add(btnGenerate, 0, wxTOP, 5);
+    btnWrap->AddSpacer(10);
+    outerSizer->Add(btnWrap, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 12);
 
     ribbon->SetSizer(outerSizer);
     return ribbon;
@@ -655,9 +704,12 @@ wxWindow* FixtureEditor::BuildSidePanel(wxWindow* parent)
 wxPanel* FixtureEditor::CreateUnitToggle(wxWindow* parent)
 {
     // Outer wrapper matches the scroll window background so only the two
-    // segments themselves are visible as a pill.
+    // segments themselves are visible as a pill. Container height shrunk
+    // from 32 → 22 (about 10px shorter, per design tweak). Inner label
+    // padding also dropped from 6 → 3 each side to keep the 9pt label
+    // from clipping in the reduced height.
     auto* container = new wxPanel(parent, wxID_ANY,
-        wxDefaultPosition, wxSize(-1, 32));
+        wxDefaultPosition, wxSize(-1, 22));
     container->SetBackgroundColour(kEditorBg);
 
     // ---- Build one segment --------------------------------------------
@@ -681,7 +733,7 @@ wxPanel* FixtureEditor::CreateUnitToggle(wxWindow* parent)
 
             auto* inner = new wxBoxSizer(wxHORIZONTAL);
             inner->AddStretchSpacer(1);
-            inner->Add(lbl, 0, wxALIGN_CENTER_VERTICAL | wxTOP | wxBOTTOM, 6);
+            inner->Add(lbl, 0, wxALIGN_CENTER_VERTICAL | wxTOP | wxBOTTOM, 3);
             inner->AddStretchSpacer(1);
             seg->SetSizer(inner);
 
@@ -1518,6 +1570,9 @@ void FixtureEditor::SetInitialFixture(const std::string& fixtureName,
             m_pathACtrl->SetValue(modelAPath);
         if (m_canvas)
             m_canvas->LoadHalf(FixtureCanvas::HalfSlot::A, modelAPath);
+        // Fresh import — keep the Hide checkbox in sync with the
+        // canvas's Destroy-resets-to-visible behaviour.
+        if (m_hideACheck) m_hideACheck->SetValue(false);
         report(50, "Loaded Mould Half A");
     }
     if (!modelBPath.empty())
@@ -1528,6 +1583,7 @@ void FixtureEditor::SetInitialFixture(const std::string& fixtureName,
             m_pathBCtrl->SetValue(modelBPath);
         if (m_canvas)
             m_canvas->LoadHalf(FixtureCanvas::HalfSlot::B, modelBPath);
+        if (m_hideBCheck) m_hideBCheck->SetValue(false);
         report(95, "Loaded Mould Half B");
     }
 
@@ -1581,6 +1637,10 @@ void FixtureEditor::OnSelectModelA(wxCommandEvent&)
     m_modelAPath = picked;
     if (m_canvas)
         m_canvas->LoadHalf(FixtureCanvas::HalfSlot::A, m_modelAPath);
+    // LoadHalf's Destroy resets visible=true on the new geometry; mirror
+    // that on the UI side so a previously-hidden slot doesn't look
+    // (checkbox-wise) hidden after a fresh import.
+    if (m_hideACheck) m_hideACheck->SetValue(false);
 }
 
 void FixtureEditor::OnSelectModelB(wxCommandEvent&)
@@ -1590,6 +1650,26 @@ void FixtureEditor::OnSelectModelB(wxCommandEvent&)
     m_modelBPath = picked;
     if (m_canvas)
         m_canvas->LoadHalf(FixtureCanvas::HalfSlot::B, m_modelBPath);
+    if (m_hideBCheck) m_hideBCheck->SetValue(false);
+}
+
+// ---------------------------------------------------------------------------
+// Hide handlers — forward the checkbox state into FixtureCanvas. Checked
+// means "hide", so visibility = !checked. Both handlers are guarded on
+// m_canvas because BuildTopRibbon (which creates the checkboxes) runs
+// before BuildCanvasArea — if Bind fired during construction for any
+// reason, the canvas pointer wouldn't be live yet.
+// ---------------------------------------------------------------------------
+void FixtureEditor::OnHideHalfA(wxCommandEvent& evt)
+{
+    if (m_canvas)
+        m_canvas->SetHalfVisible(FixtureCanvas::HalfSlot::A, !evt.IsChecked());
+}
+
+void FixtureEditor::OnHideHalfB(wxCommandEvent& evt)
+{
+    if (m_canvas)
+        m_canvas->SetHalfVisible(FixtureCanvas::HalfSlot::B, !evt.IsChecked());
 }
 
 // ---------------------------------------------------------------------------

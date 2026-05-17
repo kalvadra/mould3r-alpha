@@ -279,6 +279,12 @@ void FixtureCanvas::FixtureMesh::Destroy()
     pitchDeg = 0.0f;
     rollDeg = 0.0f;
     scale = 1.0f;
+
+    // Reset visibility too — a fresh import should be visible, even if
+    // the previous occupant of this slot was hidden. The editor mirrors
+    // this on its side by un-checking the Hide checkbox after each
+    // LoadHalf, so the two stay in sync.
+    visible = true;
 }
 
 glm::mat4 FixtureCanvas::FixtureMesh::BuildModelMatrix() const
@@ -647,7 +653,7 @@ void FixtureCanvas::OnPaint(wxPaintEvent&)
         for (int i = 0; i < 2; ++i)
         {
             const FixtureMesh* m = halves[i];
-            if (!m->valid || m->indexCount == 0) continue;
+            if (!m->valid || !m->visible || m->indexCount == 0) continue;
 
             const bool selected = (m_selectedHalf == halfTags[i]);
             glUniform3fv(m_uBaseColor, 1,
@@ -1037,6 +1043,24 @@ FixtureCanvas::HalfPose FixtureCanvas::GetHalfPose(HalfSlot slot) const
 }
 
 // ---------------------------------------------------------------------------
+// SetHalfVisible — toggle the per-slot visibility flag and repaint.
+//
+// No-op if the flag is already at the requested value, to avoid kicking
+// off a redundant Refresh on the (frequent) "checkbox state synced from
+// the load handler with the same value it already has" case. Selection
+// state is intentionally preserved across hide/show — the editor's
+// transform dialogs can still operate on a hidden selection, and the
+// selection visual reappears when the half is shown again.
+// ---------------------------------------------------------------------------
+void FixtureCanvas::SetHalfVisible(HalfSlot slot, bool visible)
+{
+    FixtureMesh& target = (slot == HalfSlot::A) ? m_meshA : m_meshB;
+    if (target.visible == visible) return;
+    target.visible = visible;
+    Refresh(false);
+}
+
+// ---------------------------------------------------------------------------
 // PickHalf — single-half ray-vs-mesh test. Returns 0 (A), 1 (B), or -1.
 // Identical math to RayCastFacePick below; we expose the simpler two-line
 // signature separately because Select-mode picking doesn't need the
@@ -1087,6 +1111,7 @@ bool FixtureCanvas::RayCastFacePick(int mouseX, int mouseY, int& outHalf, int& o
     {
         const FixtureMesh* m = halves[hi];
         if (!m->valid) continue;
+        if (!m->visible) continue;   // hidden halves are skipped by both render and pick — see SetHalfVisible
         if (m->cpuVerts.empty() || m->cpuIndices.empty()) continue;
 
         const glm::mat4 model = m->BuildModelMatrix();

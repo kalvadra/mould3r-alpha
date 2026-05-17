@@ -1,5 +1,6 @@
 #pragma once
 #include <wx/wx.h>
+#include <wx/checkbox.h>
 #include <wx/choice.h>
 #include <wx/frame.h>
 #include <wx/textctrl.h>
@@ -188,6 +189,13 @@ private:
     void OnSelectModelA(wxCommandEvent&);
     void OnSelectModelB(wxCommandEvent&);
 
+    // Top-ribbon "Hide" checkbox handlers — one per half. Forward the new
+    // check state to FixtureCanvas::SetHalfVisible (checked = hide, so
+    // visibility = !checked). The canvas owns the actual show/hide
+    // behaviour (render + pick skip); these handlers are pure forwarders.
+    void OnHideHalfA(wxCommandEvent&);
+    void OnHideHalfB(wxCommandEvent&);
+
     // Per-button visual setters keyed by command ID. Populated by the
     // makeToolBtn helper in BuildToolbar; consumed by SetActiveTool.
     // Same pattern as MainFrame::m_toolBtnSetters.
@@ -217,6 +225,15 @@ private:
     // parent-child hierarchy — no manual delete.
     wxTextCtrl* m_pathACtrl = nullptr;
     wxTextCtrl* m_pathBCtrl = nullptr;
+
+    // Per-half "Hide" checkboxes in the top ribbon. Held as members so
+    // (a) the OnHideHalf handlers can read the checked state, and (b) the
+    // load paths (OnSelectModelA/B, SetInitialFixture) can force them
+    // back to unchecked when a new file is loaded — matching the canvas's
+    // "Destroy resets visible=true" semantics so the UI and canvas stay
+    // in sync after a re-import.
+    wxCheckBox* m_hideACheck = nullptr;
+    wxCheckBox* m_hideBCheck = nullptr;
 
     // 3D viewport. Owned by the parent-child hierarchy. Held as a member
     // so future runtime code (transform handlers, file-load wiring) can
@@ -307,6 +324,8 @@ private:
         // (wxID_HIGHEST + 300), and CreateFixtureDialog (HIGHEST + 400).
         ID_FE_SelectModelA = wxID_HIGHEST + 700,
         ID_FE_SelectModelB,
+        ID_FE_HideA,
+        ID_FE_HideB,
         ID_FE_GenerateFixture,
         ID_FE_Move,
         ID_FE_Rotate,
