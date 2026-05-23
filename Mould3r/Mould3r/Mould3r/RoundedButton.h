@@ -43,6 +43,23 @@ public:
     void SetCornerRadius(int r);
     int  GetCornerRadius() const { return m_cornerRadius; }
 
+    // Visual-disabled state — paints the button in the standard disabled
+    // colours (bg + fg blended toward parent bg) WITHOUT blocking mouse
+    // or keyboard events. Used by callers that want a "looks disabled"
+    // affordance while still receiving clicks — typically so the click
+    // handler can show an explanatory dialog instead of running the
+    // real action. The MainFrame Export button uses this to display
+    // "Mould must be generated before it can be exported" on click.
+    //
+    // Independent of wxWindow::Enable(). When either is set (real
+    // disabled OR visually disabled), the paint goes muted; hover and
+    // pressed states stop applying so the button looks consistent
+    // regardless of pointer state. Tooltips and clicks still fire as
+    // long as the wxWindow side is actually enabled — that's the whole
+    // point of this distinction.
+    void SetVisuallyDisabled(bool disabled);
+    bool IsVisuallyDisabled() const { return m_visuallyDisabled; }
+
     // wxWindow focus opt-in — required for keyboard-only activation
     // (Space / Enter). AcceptsFocus gates programmatic SetFocus and
     // AcceptsFocusFromKeyboard gates the TAB cycle. Both return false
@@ -75,4 +92,7 @@ private:
     int      m_cornerRadius = 4;
     bool     m_hovered = false;
     bool     m_pressed = false;
+    bool     m_visuallyDisabled = false;   // paints muted but still
+    // accepts clicks — see
+    // SetVisuallyDisabled docs.
 };

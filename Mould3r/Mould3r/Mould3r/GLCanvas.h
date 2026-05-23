@@ -4,6 +4,7 @@
 #include <wx/glcanvas.h>
 #include <vector>
 #include <array>
+#include <functional>   // std::function for scene-mutation callback
 
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
@@ -175,8 +176,32 @@ public:
     bool HasSelection() const { return !m_selectedIndices.empty(); }
     TransformMode GetTransformMode() const { return m_transformMode; }
 
-    void GenerateMould();
+    // Build the moulds for every fixture in the scene. Returns true when the
+    // generation pipeline ran to completion, false when an up-front validation
+    // failed (no fixtures loaded, or no imported objects to subtract). Used by
+    // MainFrame to gate the Export button — Export stays disabled until at
+    // least one successful run. Per-fixture failures inside the loop don't
+    // affect the return: the function still falls through and returns true,
+    // matching the existing success-message-box behaviour.
+    bool GenerateMould();
     void ExportFixtures(const std::string& pathA, const std::string& pathB);
+
+    // Scene-mutation callback. MainFrame registers a callback that
+    // invalidates the Export button when anything that would stale a
+    // previously generated mould happens — transforms, feature place /
+    // remove, sprue placement, etc. Fired synchronously from every
+    // mutating method on this class that I've identified; project-
+    // level changes (import, fixture swap, project load) are handled
+    // on the MainFrame side directly since some of them route around
+    // canvas methods entirely.
+    //
+    // Known gap as of this iteration: Edit* modes commit their drag
+    // updates via OnPaint's m_editNeedsUpdate path, which doesn't
+    // currently emit through here. Tracked as a follow-up.
+    void SetOnSceneMutated(std::function<void()> cb)
+    {
+        m_onSceneMutated = std::move(cb);
+    }
 
     void ClearFixtures();
 
@@ -626,4 +651,18 @@ private:
     GLuint  m_midplaneLockedVAO = 0;
     GLuint  m_midplaneLockedVBO = 0;
     GLsizei m_midplaneLockedVertexCount = 0;
+
+    // ---- Scene mutation observer ------------------------------------------
+    // Registered by MainFrame to invalidate the Export button. Fired from
+    // mutation methods via NotifySceneMutated() below — see SetOnSceneMutated
+    // (public, near GenerateMould) for the user-facing contract.
+    std::function<void()> m_onSceneMutated;
+
+    // Helper: fire the scene-mutation callback if one is registered. Called
+    // from every mutating method on this class. Synchronous — the callback
+    // runs on the wxWidgets main thread before the mutating method returns.
+    void NotifySceneMutated()
+    {
+        if (m_onSceneMutated) m_onSceneMutated();
+    }
 };

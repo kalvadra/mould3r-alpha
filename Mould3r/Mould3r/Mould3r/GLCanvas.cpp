@@ -256,6 +256,7 @@ void GLCanvas::ApplyRotation(float xDeg, float yDeg, float zDeg)
     // are independent of object transforms and are left alone.
     ReanchorFeaturesForObjects(m_selectedIndices);
     Refresh(false);
+    NotifySceneMutated();
 }
 
 void GLCanvas::ApplyTranslation(float x, float y, float z)
@@ -269,6 +270,7 @@ void GLCanvas::ApplyTranslation(float x, float y, float z)
     }
     ReanchorFeaturesForObjects(m_selectedIndices);
     Refresh(false);
+    NotifySceneMutated();
 }
 
 void GLCanvas::ApplyScale(float factor)
@@ -281,6 +283,7 @@ void GLCanvas::ApplyScale(float factor)
     }
     ReanchorFeaturesForObjects(m_selectedIndices);
     Refresh(false);
+    NotifySceneMutated();
 }
 
 void GLCanvas::CenterSelectedObject()
@@ -308,6 +311,7 @@ void GLCanvas::CenterSelectedObject()
     }
     ReanchorFeaturesForObjects(m_selectedIndices);
     Refresh(false);
+    NotifySceneMutated();
 }
 
 // ---------------------------------------------------------------------------
@@ -487,6 +491,7 @@ void GLCanvas::ApplyCircularPattern(int count, bool overrideRadius, float radius
     // / RebuildGateSolids internally if either feature list was touched.
     ReanchorFeaturesForObjects(reanchorTargets);
     Refresh(false);
+    NotifySceneMutated();
 }
 
 // ---------------------------------------------------------------------------
@@ -705,6 +710,7 @@ void GLCanvas::ApplyGridPattern(int numH, int numV, bool mirrorH, bool mirrorV,
 
     ReanchorFeaturesForObjects(reanchorTargets);
     Refresh(false);
+    NotifySceneMutated();
 }
 
 void GLCanvas::ClearVentPoints()
@@ -714,6 +720,7 @@ void GLCanvas::ClearVentPoints()
     RebuildPathVBO();
     RebuildCrossSectionVBO();
     Refresh(false);
+    NotifySceneMutated();
 }
 
 // ---------------------------------------------------------------------------
@@ -1321,6 +1328,7 @@ void GLCanvas::PlaceSprue()
     RebuildGatePathVBO();
     RebuildGateSolids();
     Refresh(false);
+    NotifySceneMutated();
 }
 
 void GLCanvas::ClearSprue()
@@ -1337,24 +1345,25 @@ void GLCanvas::ClearSprue()
     RebuildGatePathVBO();
     RebuildGateSolids();
     Refresh(false);
+    NotifySceneMutated();
 }
 
 // ---------------------------------------------------------------------------
 // Generate Mould Operation — Cuts objects, vents, runners, and sprues from blank mold halves
 // ---------------------------------------------------------------------------
-void GLCanvas::GenerateMould()
+bool GLCanvas::GenerateMould()
 {
     if (m_fixtures.empty())
     {
         wxMessageBox("No fixtures loaded.",
             "Generate Mould", wxOK | wxICON_WARNING, this);
-        return;
+        return false;
     }
     if (m_objects.empty())
     {
         wxMessageBox("No imported objects to subtract.",
             "Generate Mould", wxOK | wxICON_WARNING, this);
-        return;
+        return false;
     }
 
     // Steps per fixture: 1 read + 1 transform + (1 per object subtract) + (1 per vent subtract) + (1 per runner subtract) + (1 per gate subtract) + (1 per ejector subtract) + 1 sprue + 1 tessellate + 1 upload
@@ -1987,6 +1996,7 @@ void GLCanvas::GenerateMould()
     Refresh(false);
     wxMessageBox("Mould generated successfully.",
         "Generate Mould", wxOK | wxICON_INFORMATION, this);
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -2573,6 +2583,11 @@ void GLCanvas::ApplyPlaneAlignmentToObject(int objIdx,
     obj.pos.x = a_w.x - v_new.x;
     obj.pos.y = -v_new.y;
     obj.pos.z = a_w.z - v_new.z;
+
+    // Both ApplyAlignFaceToObject and ApplyAlignMidplaneToObject delegate
+    // their actual transform write to this method, so notifying once here
+    // covers both entry points.
+    NotifySceneMutated();
 }
 
 // ---------------------------------------------------------------------------
@@ -3125,6 +3140,7 @@ void GLCanvas::ClearRunnerPoints()
     RebuildGatePathVBO();
     RebuildGateSolids();
     Refresh(false);
+    NotifySceneMutated();
 }
 
 void GLCanvas::ClearGatePoints()
@@ -3135,6 +3151,7 @@ void GLCanvas::ClearGatePoints()
     RebuildGatePathVBO();
     RebuildGateSolids();
     Refresh(false);
+    NotifySceneMutated();
 }
 
 void GLCanvas::ClearEjectors()
@@ -3148,6 +3165,7 @@ void GLCanvas::ClearEjectors()
     m_ejectors.clear();
     m_ejectorGhostActive = false;
     Refresh(false);
+    NotifySceneMutated();
 }
 
 // ---------------------------------------------------------------------------
@@ -3223,6 +3241,7 @@ void GLCanvas::RemoveVentAtMouse(int mouseX, int mouseY)
     RebuildPathVBO();
     RebuildCrossSectionVBO();
     Refresh(false);
+    NotifySceneMutated();
 }
 
 // ---------------------------------------------------------------------------
@@ -3259,6 +3278,7 @@ void GLCanvas::RemoveRunnerAtMouse(int mouseX, int mouseY)
     RebuildGatePathVBO();
     RebuildGateSolids();
     Refresh(false);
+    NotifySceneMutated();
 }
 
 // ---------------------------------------------------------------------------
@@ -3293,6 +3313,7 @@ void GLCanvas::RemoveGateAtMouse(int mouseX, int mouseY)
     RebuildGatePathVBO();
     RebuildGateSolids();
     Refresh(false);
+    NotifySceneMutated();
 }
 
 // ---------------------------------------------------------------------------
@@ -3328,6 +3349,7 @@ void GLCanvas::RemoveEjectorAtMouse(int mouseX, int mouseY)
 
     RebuildEjectorSolids();
     Refresh(false);
+    NotifySceneMutated();
 }
 
 // ---------------------------------------------------------------------------
@@ -5512,6 +5534,7 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
                 RebuildPathVBO();
                 RebuildCrossSectionVBO();
                 Refresh(false);
+                NotifySceneMutated();
             }
         }
         else if (m_transformMode == TransformMode::PlaceRunner)
@@ -5529,6 +5552,7 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
                     RebuildGatePathVBO();
                     RebuildGateSolids();
                     Refresh(false);
+                    NotifySceneMutated();
                 }
             }
         }
@@ -5560,6 +5584,7 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
                 RebuildGatePathVBO();
                 RebuildGateSolids();
                 Refresh(false);
+                NotifySceneMutated();
             }
         }
         else if (m_transformMode == TransformMode::PlaceEjector)
@@ -5581,6 +5606,7 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
                 // "live update on UI change" feature plug in cleanly).
                 RebuildEjectorSolids();
                 Refresh(false);
+                NotifySceneMutated();
             }
         }
         else if (m_transformMode == TransformMode::RemoveVent)

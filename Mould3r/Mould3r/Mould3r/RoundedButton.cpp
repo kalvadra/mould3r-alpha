@@ -91,6 +91,13 @@ void RoundedButton::SetCornerRadius(int r)
     Refresh();
 }
 
+void RoundedButton::SetVisuallyDisabled(bool disabled)
+{
+    if (m_visuallyDisabled == disabled) return;
+    m_visuallyDisabled = disabled;
+    Refresh();
+}
+
 wxSize RoundedButton::DoGetBestClientSize() const
 {
     // Same horizontal/vertical padding as a typical wxButton: ~10px each
@@ -131,11 +138,16 @@ void RoundedButton::OnPaint(wxPaintEvent&)
     // Resolve bg / fg based on interaction state. The colour deltas are
     // small (12 / 16) — Windows 11 button hover feedback is similarly
     // subtle, and a louder change would fight the rest of the dark
-    // theme. Disabled state desaturates toward the parent bg.
+    // theme. Disabled state desaturates toward the parent bg. Visually
+    // disabled (set via SetVisuallyDisabled) shares the same muted
+    // branch — the only difference between the two is that the visual
+    // variant still passes mouse/keyboard events through to the click
+    // handler. Both states short-circuit the hover/press branches so
+    // the button looks consistent regardless of pointer activity.
     wxColour bg = GetBackgroundColour();
     wxColour fg = GetForegroundColour();
 
-    if (!IsEnabled())
+    if (!IsEnabled() || m_visuallyDisabled)
     {
         bg = Blend(bg, parentBg, 0.55f);
         fg = Blend(fg, parentBg, 0.55f);

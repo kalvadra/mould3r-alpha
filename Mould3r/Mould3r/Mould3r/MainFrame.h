@@ -16,6 +16,8 @@
 #include <unordered_map>
 
 class GLCanvas;
+class RoundedButton;   // forward decl — m_btnExport pointer below; full def
+// is included from MainFrame.cpp where it's used.
 
 enum class TransformMode { Select, Translate, Rotate, Scale, Pattern, PlaceVent, PlaceRunner, PlaceGate, PlaceEjector, RemoveVent, RemoveRunner, RemoveGate, RemoveSprue, RemoveEjector, EditVent, EditRunner, EditGate, EditEjector, SelectInjectionPoint, AlignFace, AlignMidplane };
 
@@ -225,6 +227,25 @@ private:
 
     wxPanel* m_sidePanel = nullptr;
     wxTextCtrl* m_exportPath = nullptr;
+
+    // Export button on the top ribbon. Held as a member so OnGenerateMould
+    // can flip it from disabled → enabled once the mould build succeeds.
+    // The button starts visually-disabled in CreateRibbon and toggles via
+    // SetExportAvailable below.
+    RoundedButton* m_btnExport = nullptr;
+
+    // True iff the mould has been generated and nothing has changed since
+    // that would stale it. Drives the Export button's visual state and the
+    // OnExport popup gate. Single source of truth — read by OnExport,
+    // written only by SetExportAvailable below.
+    bool m_canExport = false;
+
+    // Toggle the Export button between available and visually-disabled
+    // states. Single chokepoint so the button visual, the tooltip, and
+    // the m_canExport flag never drift apart. Safe to call before the
+    // ribbon is constructed (m_btnExport may be null) — the flag still
+    // gets set; the visual catches up when CreateRibbon runs.
+    void SetExportAvailable(bool available);
 
     void OnBrowseExport(wxCommandEvent&);
     void OnExport(wxCommandEvent&);
