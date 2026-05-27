@@ -281,10 +281,15 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
     // Register the scene-mutation hook. Any time the canvas mutates in a
     // way that would stale a generated mould — object transforms, feature
     // place / remove, sprue placement — it fires this callback, which
-    // invalidates Export. Project-level mutations (import, fixture swap,
-    // load) that don't route through canvas methods are handled
-    // separately in the relevant handlers.
-    m_canvas->SetOnSceneMutated([this] { SetExportAvailable(false); });
+    // bumps the mould state from Clean to Dirty. NeverGenerated stays
+    // NeverGenerated (mutating an unbuilt mould isn't meaningful — we
+    // wait for an actual Generate run to leave that state). Project-level
+    // mutations (import, fixture swap, load) handle their own state reset
+    // directly in the relevant handlers below.
+    m_canvas->SetOnSceneMutated([this] {
+        if (m_mouldState == MouldState::Clean)
+            m_mouldState = MouldState::Dirty;
+        });
 
     contentSizer->Add(m_leftPanel, 0, wxEXPAND);
     contentSizer->Add(m_canvas, 1, wxEXPAND);
@@ -377,27 +382,23 @@ wxPanel* MainFrame::CreateRibbon(wxWindow* parent)
         wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
     hSizer->Add(btnGenerate, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
 
-    // ---- Export (secondary colour, right-aligned, initially disabled) -------
+    // ---- Export (secondary colour, right-aligned) ----------------------------
     // Sits to the RIGHT of Generate Mould. Background uses Style::BtnSecondary
     // to match the rest of the secondary-action buttons in the app; the old
     // Style::InputBg was a darker text-field colour that read as too-quiet
     // for an actionable button.
     //
-    // Starts in the visually-disabled state — RoundedButton paints the
-    // bg/fg muted while still receiving mouse and keyboard events. That
-    // matters because we want clicks on the disabled-looking button to
-    // pop an explanatory dialog (handled in OnExport below); a real
-    // wxWindow::Disable() would eat the click before the handler ever
-    // saw it. The hover tooltip explains the gating; the click dialog
-    // is the same message escalated.
+    // No longer visually-gated: the earlier "muted until mould generated"
+    // affordance was replaced with a click-time warning dialog (see OnExport
+    // for the state machine). Button stays fully coloured at all times; if
+    // the user clicks before generating or after editing, OnExport pops the
+    // appropriate message before reaching the file dialog.
     auto* btnExport = new RoundedButton(panel, ID_Export, "Export",
         wxDefaultPosition, wxSize(90, 32), wxBORDER_NONE);
     btnExport->SetBackgroundColour(Style::BtnSecondary);
     btnExport->SetForegroundColour(*wxWHITE);
     btnExport->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
-    btnExport->SetVisuallyDisabled(true);
-    btnExport->SetToolTip("Mould must be generated before it can be exported");
     m_btnExport = btnExport;
     hSizer->Add(btnExport, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 12);
 
@@ -1085,11 +1086,15 @@ void MainFrame::OnImport(wxCommandEvent&)
 
     m_canvas->ImportFile(dlg.GetPath().ToStdString());
 
-    // New geometry in the scene — any mould that was previously generated
-    // is stale relative to the new object set. The canvas's ImportFile
-    // path may not route through any of the public mutation methods that
-    // fire NotifySceneMutated, so do it explicitly here.
-    SetExportAvailable(false);
+    // Treat as a scene mutation, not a project reset: importing adds an
+    // object without wiping any previously-generated mould geometry, so
+    // the prior generation is stale (Dirty) but not gone (NeverGenerated).
+    // ImportFile may not route through the canvas's NotifySceneMutated
+    // hooks, so apply the same Clean→Dirty transition here that the
+    // canvas callback would have applied. (If the user hasn't generated
+    // yet, this is a no-op and state stays NeverGenerated.)
+    if (m_mouldState == MouldState::Clean)
+        m_mouldState = MouldState::Dirty;
 }
 
 // ---------------------------------------------------------------------------
@@ -1158,8 +1163,9 @@ void MainFrame::OnChangeFixture(wxCommandEvent&)
     ApplyFixtureDefaults(fixture);
 
     // Fixture swap = scene effectively reset. Any previously-generated
-    // mould was built against the old fixture(s) and is meaningless now.
-    SetExportAvailable(false);
+    // mould was built against the old fixture(s) and is meaningless now —
+    // back to "nothing to export until you Generate".
+    m_mouldState = MouldState::NeverGenerated;
 }
 
 // ---------------------------------------------------------------------------
@@ -1252,9 +1258,10 @@ void MainFrame::OnNewProject(wxCommandEvent&)
 
     // Fresh project = nothing has been generated yet. Even though
     // ClearAll above ran some canvas mutation paths that may have
-    // fired NotifySceneMutated already, lock it in here so the flag is
-    // unambiguously false after the new-project flow completes.
-    SetExportAvailable(false);
+    // fired NotifySceneMutated already, lock in the canonical reset
+    // state here so a Generate run is genuinely required before
+    // Export will quietly succeed.
+    m_mouldState = MouldState::NeverGenerated;
 }
 
 // ---------------------------------------------------------------------------
@@ -1512,7 +1519,7 @@ void MainFrame::OnLoadProject(wxCommandEvent&)
     // Export gate is correctly closed until the user runs Generate.
     // The various Restore* paths may have fired NotifySceneMutated
     // during load already; this explicit set locks the final state.
-    SetExportAvailable(false);
+    m_mouldState = MouldState::NeverGenerated;
 }
 
 // ---------------------------------------------------------------------------
@@ -1645,17 +1652,37 @@ void MainFrame::OnBrowseExport(wxCommandEvent&)
 
 void MainFrame::OnExport(wxCommandEvent&)
 {
-    // Gate: the Export button looks disabled and is conceptually unavailable
-    // until a successful Generate Mould run. The button paints itself muted
-    // (via RoundedButton::SetVisuallyDisabled) but still receives clicks,
-    // and this is what we do with them — pop the same message that the
-    // tooltip carries, then return without running any of the file-dialog
-    // / export logic below.
-    if (!m_canExport)
+    // Gate: tri-state model (see MouldState enum in MainFrame.h).
+    //   NeverGenerated  - nothing to export. Hard block with an
+    //                     informational popup, then return.
+    //   Dirty           - mould exists but is stale relative to the
+    //                     current scene. Warn the user; let them decide
+    //                     whether to proceed with the older geometry.
+    //                     State stays Dirty after a Yes — the user
+    //                     accepted this export but the mould isn't
+    //                     refreshed, so a subsequent click warrants
+    //                     another warning.
+    //   Clean           - happy path. Fall through to the file dialog
+    //                     below without prompting.
+    switch (m_mouldState)
     {
+    case MouldState::NeverGenerated:
         wxMessageBox("Mould must be generated before it can be exported.",
             "Export", wxOK | wxICON_INFORMATION, this);
         return;
+
+    case MouldState::Dirty:
+    {
+        const int ans = wxMessageBox(
+            "An edit has been made since the last Mould Generation, "
+            "some features may not be reflected. Would you like to continue?",
+            "Export", wxYES_NO | wxICON_WARNING, this);
+        if (ans != wxYES) return;
+        break;
+    }
+
+    case MouldState::Clean:
+        break;
     }
 
     // Filename-driven export. Instead of asking only for an output folder
@@ -1732,48 +1759,24 @@ void MainFrame::OnExport(wxCommandEvent&)
     m_canvas->ExportFixtures(pathA.ToStdString(), pathB.ToStdString());
 }
 
-// ---------------------------------------------------------------------------
-// SetExportAvailable — single chokepoint for Export button state.
-//
-// Keeps three things in sync: the m_canExport flag (read by OnExport), the
-// RoundedButton's visual state (muted vs. normal colours), and the tooltip
-// text. Called from OnGenerateMould (true) and from every mutation hook
-// (false) — see the bottom of the constructor where the canvas callback is
-// registered, and the project-change handlers (OnImport, OnNewProject,
-// OnLoadProject, OnChangeFixture, OnCreateFixture) that call this directly.
-//
-// Safe to call before m_btnExport exists (during early construction). The
-// flag still updates; the visual catches up when CreateRibbon builds the
-// button and applies its initial state.
-// ---------------------------------------------------------------------------
-void MainFrame::SetExportAvailable(bool available)
-{
-    m_canExport = available;
-    if (!m_btnExport) return;
-    m_btnExport->SetVisuallyDisabled(!available);
-    m_btnExport->SetToolTip(available
-        ? wxString()
-        : wxString("Mould must be generated before it can be exported"));
-    m_btnExport->Refresh();
-}
-
 void MainFrame::OnGenerateMould(wxCommandEvent&)
 {
     if (!m_canvas) return;
     // GenerateMould returns true only when both up-front validations
     // (fixtures loaded, objects to subtract) pass and the build pipeline
-    // ran to its natural end. Failure leaves Export disabled — the user
-    // gets the validation message box from inside GenerateMould itself.
+    // ran to its natural end. Failure leaves the previous mould state
+    // untouched — the user gets the validation message box from inside
+    // GenerateMould itself.
     //
-    // Subtle ordering: GenerateMould internally calls into mutating canvas
-    // methods (PlaceSprue at the very least), each of which fires
-    // NotifySceneMutated, which routes through SetExportAvailable(false).
-    // So during the call, the flag toggles off and on potentially many
-    // times. The call below is the authoritative "now ready" set — it
-    // runs AFTER GenerateMould returns, so it wins regardless of how
-    // many intermediate invalidations happened inside.
+    // Subtle ordering: GenerateMould internally calls into mutating
+    // canvas methods (PlaceSprue at the very least), each of which
+    // fires NotifySceneMutated, which routes through the canvas callback
+    // and may bump Clean → Dirty mid-flight. The state set below runs
+    // AFTER GenerateMould returns and authoritatively reflects "the
+    // mould is now fresh", so it wins regardless of how many
+    // intermediate Clean→Dirty toggles happened inside.
     if (m_canvas->GenerateMould())
-        SetExportAvailable(true);
+        m_mouldState = MouldState::Clean;
 }
 
 wxPanel* MainFrame::CreateCollapsibleSection(wxWindow* parent,

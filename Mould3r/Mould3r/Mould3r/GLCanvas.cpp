@@ -2070,10 +2070,33 @@ static bool RayTriangle(const glm::vec3& orig, const glm::vec3& dir,
     const glm::vec3 e2 = v2 - v0;
     const glm::vec3 h = glm::cross(dir, e2);
     const float     a = glm::dot(e1, h);
-    // a < EPS rejects back-facing triangles (standard front-face-only MT).
-    // This prevents hits on the far side of a cavity when the near face is
-    // occluded by the fixture (which has no CPU geometry to block the ray).
-    if (a < EPS) return false;
+    // Double-sided test: |a| < EPS rejects only the degenerate case where
+    // the ray is parallel to the triangle's plane (no intersection or
+    // grazing). Either sign of `a` is accepted, so a ray hitting the
+    // triangle from the back (winding-wise) is treated the same as one
+    // hitting from the front.
+    //
+    // Earlier revisions used `a < EPS` — front-face-only Möller-Trumbore.
+    // That gate caused two pain points: (1) AlignFace / AlignMidplane
+    // couldn't pick cavity-interior walls and any imported triangles with
+    // inconsistent winding, which is the user-visible "I have to put the
+    // camera inside the part to select the face" symptom; (2) when the
+    // camera sat inside a closed object, generic object picking
+    // (RayCastObjects) skipped the near (back-facing) wall and returned
+    // the far front-facing wall on the opposite side — counterintuitive
+    // for placement tools.
+    //
+    // The original comment justified the gate as "prevents hits on the
+    // far side of a cavity when the near face is occluded by the fixture
+    // (which has no CPU geometry to block the ray)". On closer reading,
+    // that scenario is already handled correctly by the closest-T logic
+    // in every caller: a near front face always beats a far back face on
+    // T, so the gate wasn't actually doing the work the comment claimed.
+    // Downstream consumers don't depend on which side was hit — they
+    // either flip the returned normal to face the camera (RayCastObjects)
+    // or use the triangle's own normal independent of pick side
+    // (RayCastFacePick → GrowCoplanarFace).
+    if (std::abs(a) < EPS) return false;
     const float     f = 1.0f / a;
     const glm::vec3 s = orig - v0;
     const float     u = f * glm::dot(s, h);
@@ -2166,9 +2189,10 @@ bool GLCanvas::RayCastObjects(int mouseX, int mouseY,
 
 // ---------------------------------------------------------------------------
 // RayCastWorldRay — fires a pre-built world-space ray against all imported
-// objects (Möller–Trumbore, front-faces only).  Returns the closest hit.
-// Unlike RayCastObjects this takes an explicit origin + direction rather than
-// unprojecting mouse coordinates, so it can be called without a mouse event.
+// objects (Möller–Trumbore, double-sided — see RayTriangle for the rationale).
+// Returns the closest hit. Unlike RayCastObjects this takes an explicit
+// origin + direction rather than unprojecting mouse coordinates, so it can
+// be called without a mouse event.
 // ---------------------------------------------------------------------------
 bool GLCanvas::RayCastWorldRay(const glm::vec3& origin, const glm::vec3& dir,
     float maxDist, glm::vec3& outPos)

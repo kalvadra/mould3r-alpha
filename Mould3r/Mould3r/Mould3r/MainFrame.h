@@ -229,23 +229,44 @@ private:
     wxTextCtrl* m_exportPath = nullptr;
 
     // Export button on the top ribbon. Held as a member so OnGenerateMould
-    // can flip it from disabled → enabled once the mould build succeeds.
-    // The button starts visually-disabled in CreateRibbon and toggles via
-    // SetExportAvailable below.
+    // can reach it, even though we no longer toggle its visual state — the
+    // pointer is also useful for any future hover/state experiments.
     RoundedButton* m_btnExport = nullptr;
 
-    // True iff the mould has been generated and nothing has changed since
-    // that would stale it. Drives the Export button's visual state and the
-    // OnExport popup gate. Single source of truth — read by OnExport,
-    // written only by SetExportAvailable below.
-    bool m_canExport = false;
-
-    // Toggle the Export button between available and visually-disabled
-    // states. Single chokepoint so the button visual, the tooltip, and
-    // the m_canExport flag never drift apart. Safe to call before the
-    // ribbon is constructed (m_btnExport may be null) — the flag still
-    // gets set; the visual catches up when CreateRibbon runs.
-    void SetExportAvailable(bool available);
+    // Tri-state model for "is the Export button about to do something
+    // reasonable?". Replaces an earlier bool that conflated the
+    // "never-generated" and "dirty-since-generation" cases — they look
+    // identical to the user but warrant different messages on click.
+    //
+    //   NeverGenerated  - hard block: no mould geometry exists yet, so
+    //                     Export pops "Mould must be generated before it
+    //                     can be exported" and returns.
+    //   Clean           - happy path: export runs without prompting.
+    //   Dirty           - mould exists but an edit happened since the
+    //                     last successful generation; Export pops a
+    //                     Yes/No warning that the output may not reflect
+    //                     the current scene. Yes proceeds, No bails. The
+    //                     state remains Dirty after a Yes — the geometry
+    //                     hasn't actually been refreshed, so a second
+    //                     click warrants a second warning.
+    //
+    // Transitions are direct field assignments at the call sites — no
+    // wrapper methods, since each transition is a one-liner and the
+    // state graph is small enough to scan at a glance:
+    //   *               -> NeverGenerated   on project reset (new / load /
+    //                                       import / fixture swap)
+    //   NeverGenerated  -> Clean            on successful Generate Mould
+    //   Dirty           -> Clean            on successful Generate Mould
+    //   Clean           -> Dirty            on any scene mutation
+    //                                       (canvas callback or an
+    //                                       explicit transition at the
+    //                                       relevant project handler)
+    //   NeverGenerated  -> NeverGenerated   on a scene mutation when no
+    //                                       mould has ever been built —
+    //                                       handled by the if-guard in
+    //                                       the canvas callback below.
+    enum class MouldState { NeverGenerated, Clean, Dirty };
+    MouldState m_mouldState = MouldState::NeverGenerated;
 
     void OnBrowseExport(wxCommandEvent&);
     void OnExport(wxCommandEvent&);
