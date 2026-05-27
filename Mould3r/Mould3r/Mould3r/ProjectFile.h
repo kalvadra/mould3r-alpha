@@ -93,6 +93,7 @@ struct ProjectParameters
 
     float gateDiameter = 3.0f;
     float gateDraftAngle = 1.0f;
+    float gateOverrun = 0.0f;          // mm extension backward into the model
     float subRunnerDiameter = 5.0f;
 
     float ejectorDiameter = 3.0f;

@@ -43,6 +43,7 @@
 
 #include "camera.h"
 #include "FileImporter.h"
+#include "GLLoader.h"
 #include "GridRenderer.h"
 #include "shaders.h"
 #include "MeshUtils.h"
@@ -102,20 +103,15 @@ static GLuint Link(GLuint vs, GLuint fs)
     return p;
 }
 
-static int glArgs[] = {
-    WX_GL_RGBA, WX_GL_DOUBLEBUFFER,
-    WX_GL_DEPTH_SIZE, 24,
-    WX_GL_STENCIL_SIZE, 8,
-    WX_GL_SAMPLE_BUFFERS, 1,
-    WX_GL_SAMPLES, 4,
-    0
-};
+// glArgs[] (pixel-format / context attributes) now lives in GLLoader.h —
+// shared with FixtureCanvas so adding a third viewport doesn't fork the
+// pixel-format request.
 
 // ---------------------------------------------------------------------------
 // Constructor / Destructor
 // ---------------------------------------------------------------------------
 GLCanvas::GLCanvas(wxWindow* parent)
-    : wxGLCanvas(parent, wxID_ANY, glArgs,
+    : wxGLCanvas(parent, wxID_ANY, GLLoader::glArgs,
         wxDefaultPosition, wxDefaultSize,
         wxFULL_REPAINT_ON_RESIZE, "GLCanvas")
 {
@@ -260,6 +256,7 @@ void GLCanvas::ApplyRotation(float xDeg, float yDeg, float zDeg)
     // are independent of object transforms and are left alone.
     ReanchorFeaturesForObjects(m_selectedIndices);
     Refresh(false);
+    NotifySceneMutated();
 }
 
 void GLCanvas::ApplyTranslation(float x, float y, float z)
@@ -273,6 +270,7 @@ void GLCanvas::ApplyTranslation(float x, float y, float z)
     }
     ReanchorFeaturesForObjects(m_selectedIndices);
     Refresh(false);
+    NotifySceneMutated();
 }
 
 void GLCanvas::ApplyScale(float factor)
@@ -285,6 +283,7 @@ void GLCanvas::ApplyScale(float factor)
     }
     ReanchorFeaturesForObjects(m_selectedIndices);
     Refresh(false);
+    NotifySceneMutated();
 }
 
 void GLCanvas::CenterSelectedObject()
@@ -312,6 +311,7 @@ void GLCanvas::CenterSelectedObject()
     }
     ReanchorFeaturesForObjects(m_selectedIndices);
     Refresh(false);
+    NotifySceneMutated();
 }
 
 // ---------------------------------------------------------------------------
@@ -491,6 +491,7 @@ void GLCanvas::ApplyCircularPattern(int count, bool overrideRadius, float radius
     // / RebuildGateSolids internally if either feature list was touched.
     ReanchorFeaturesForObjects(reanchorTargets);
     Refresh(false);
+    NotifySceneMutated();
 }
 
 // ---------------------------------------------------------------------------
@@ -709,6 +710,7 @@ void GLCanvas::ApplyGridPattern(int numH, int numV, bool mirrorH, bool mirrorV,
 
     ReanchorFeaturesForObjects(reanchorTargets);
     Refresh(false);
+    NotifySceneMutated();
 }
 
 void GLCanvas::ClearVentPoints()
@@ -718,6 +720,7 @@ void GLCanvas::ClearVentPoints()
     RebuildPathVBO();
     RebuildCrossSectionVBO();
     Refresh(false);
+    NotifySceneMutated();
 }
 
 // ---------------------------------------------------------------------------
@@ -901,11 +904,13 @@ void GLCanvas::RebuildGateSolids()
     float gateRadius = 1.5f;
     float draftAngle = 1.0f;
     float subRunnerRadius = 2.5f;
+    float overrun = 0.0f;
     if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
     {
         gateRadius = frame->GetGateDiameter() * 0.5f;
         draftAngle = frame->GetGateDraftAngle();
         subRunnerRadius = frame->GetSubRunnerDiameter() * 0.5f;
+        overrun = frame->GetGateOverrun();
     }
 
     const float draftRad = glm::radians(glm::clamp(draftAngle, 0.0f, 45.0f));
@@ -926,16 +931,29 @@ void GLCanvas::RebuildGateSolids()
         if (tanDraft > 1e-6f && subRunnerRadius > gateRadius)
             taperLen = (subRunnerRadius - gateRadius) / tanDraft;
 
+        // Overrun shifts the cylinder's start backward along -pathDir into
+        // the model. The radius at the start is reduced so that the radius
+        // at the original origin (parting surface) still equals gateRadius —
+        // i.e. the user-typed Diameter remains the diameter of the inlet
+        // hole at the parting surface, regardless of overrun. For typical
+        // drafts the start-radius shrinkage is sub-millimetre and the
+        // visible effect is just "the cylinder pokes back into the model".
+        // Clamped to a small floor so aggressive overrun + draft combos
+        // don't degenerate into a zero-radius cap (BuildCylinderMesh
+        // rejects radii below 1e-6).
+        const glm::vec3 startPt = origin - pathDir * overrun;
+        const float startRadius = std::max(0.01f, gateRadius - tanDraft * overrun);
+
         if (taperLen >= totalLen)
         {
             // Gate fills the entire path — no sub-runner section
-            gf.solid = BuildCylinderMesh(origin, gf.pathEnd, gateRadius, draftAngle);
+            gf.solid = BuildCylinderMesh(startPt, gf.pathEnd, startRadius, draftAngle);
         }
         else
         {
             const glm::vec3 transitionPt = origin + pathDir * taperLen;
-            gf.solid = BuildCylinderMesh(origin, transitionPt,
-                gateRadius, draftAngle);
+            gf.solid = BuildCylinderMesh(startPt, transitionPt,
+                startRadius, draftAngle);
             gf.subRunnerSolid = BuildCylinderMesh(transitionPt, gf.pathEnd,
                 subRunnerRadius, 0.0f);
         }
@@ -1310,6 +1328,7 @@ void GLCanvas::PlaceSprue()
     RebuildGatePathVBO();
     RebuildGateSolids();
     Refresh(false);
+    NotifySceneMutated();
 }
 
 void GLCanvas::ClearSprue()
@@ -1326,24 +1345,25 @@ void GLCanvas::ClearSprue()
     RebuildGatePathVBO();
     RebuildGateSolids();
     Refresh(false);
+    NotifySceneMutated();
 }
 
 // ---------------------------------------------------------------------------
 // Generate Mould Operation — Cuts objects, vents, runners, and sprues from blank mold halves
 // ---------------------------------------------------------------------------
-void GLCanvas::GenerateMould()
+bool GLCanvas::GenerateMould()
 {
     if (m_fixtures.empty())
     {
         wxMessageBox("No fixtures loaded.",
             "Generate Mould", wxOK | wxICON_WARNING, this);
-        return;
+        return false;
     }
     if (m_objects.empty())
     {
         wxMessageBox("No imported objects to subtract.",
             "Generate Mould", wxOK | wxICON_WARNING, this);
-        return;
+        return false;
     }
 
     // Steps per fixture: 1 read + 1 transform + (1 per object subtract) + (1 per vent subtract) + (1 per runner subtract) + (1 per gate subtract) + (1 per ejector subtract) + 1 sprue + 1 tessellate + 1 upload
@@ -1618,11 +1638,13 @@ void GLCanvas::GenerateMould()
             float gateRadius = 1.5f;
             float draftAngle = 1.0f;
             float subRunnerRadius = 2.5f;
+            float overrun = 0.0f;
             if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
             {
                 gateRadius = frame->GetGateDiameter() * 0.5f;
                 draftAngle = frame->GetGateDraftAngle();
                 subRunnerRadius = frame->GetSubRunnerDiameter() * 0.5f;
+                overrun = frame->GetGateOverrun();
             }
 
             const float draftRad = glm::radians(glm::clamp(draftAngle, 0.0f, 45.0f));
@@ -1647,13 +1669,31 @@ void GLCanvas::GenerateMould()
                 const gp_Pnt occOrigin(origin.x, origin.y, origin.z);
                 const gp_Dir occDir(pathDir.x, pathDir.y, pathDir.z);
 
-                // Pull the gate origin back by kCutEps so the primitive protrudes
-                // through the part surface and avoids co-planar boundary failures.
+                // Back-extension along -pathDir into the model, combining two
+                // contributions: a small constant kCutEps so the primitive
+                // protrudes through the parting surface and avoids co-planar
+                // boundary failures, plus the user-controlled `overrun` field
+                // (mm) which extends the cut deeper into the model body to
+                // clear irregular perimeter geometry. The two add: overrun=0
+                // recovers the legacy behaviour, while a non-zero overrun
+                // produces the same shape as the preview built in
+                // RebuildGateSolids.
                 static constexpr float kCutEps = 0.1f;
-                const glm::vec3 originExt = origin - pathDir * kCutEps;
-                const float     totalLenExt = totalLen + kCutEps;  // extends into the feed network
+                const float backExt = kCutEps + overrun;
+                const glm::vec3 originExt = origin - pathDir * backExt;
+                const float     totalLenExt = totalLen + backExt;
                 const gp_Pnt    occOriginExt(originExt.x, originExt.y, originExt.z);
                 const gp_Ax2    gateAxExt(occOriginExt, occDir);
+
+                // Radius at originExt, derived so the radius at the original
+                // parting-surface point (origin) is exactly gateRadius — i.e.
+                // the user-typed Diameter is the diameter of the inlet hole
+                // at the parting surface, regardless of overrun. Floor at
+                // 0.01 mm so aggressive overrun + draft combos can't drive
+                // the back radius to zero (BRepPrimAPI rejects degenerate
+                // primitives). Matches the preview math in RebuildGateSolids.
+                const float startRadius = std::max(0.01f,
+                    gateRadius - tanDraft * backExt);
 
                 // Distance along path where draft expands to sub-runner radius
                 float taperLen = std::numeric_limits<float>::max();
@@ -1661,23 +1701,27 @@ void GLCanvas::GenerateMould()
                     taperLen = (subRunnerRadius - gateRadius) / tanDraft;
 
                 // Adjust taperLen relative to the extended origin
-                const float taperLenExt = taperLen + kCutEps;
+                const float taperLenExt = taperLen + backExt;
 
                 if (taperLen >= totalLen)
                 {
-                    // Gate fills the whole path — single cone/cylinder cut
-                    const float endR = gateRadius + totalLenExt * tanDraft;
+                    // Gate fills the whole path — single cone/cylinder cut.
+                    // End radius at pathEnd is the geometric extension from
+                    // startRadius over totalLenExt, which simplifies to
+                    // gateRadius + totalLen*tanDraft (the back-extension
+                    // contributions cancel by construction of startRadius).
+                    const float endR = startRadius + totalLenExt * tanDraft;
                     TopoDS_Shape gateShape;
-                    if (std::abs(endR - gateRadius) > 1e-6f)
+                    if (std::abs(endR - startRadius) > 1e-6f)
                     {
-                        BRepPrimAPI_MakeCone cone(gateAxExt, gateRadius, endR, totalLenExt);
+                        BRepPrimAPI_MakeCone cone(gateAxExt, startRadius, endR, totalLenExt);
                         cone.Build();
                         if (cone.IsDone() && !cone.Shape().IsNull())
                             gateShape = cone.Shape();
                     }
                     else
                     {
-                        BRepPrimAPI_MakeCylinder cyl(gateAxExt, gateRadius, totalLenExt);
+                        BRepPrimAPI_MakeCylinder cyl(gateAxExt, startRadius, totalLenExt);
                         cyl.Build();
                         if (cyl.IsDone() && !cyl.Shape().IsNull())
                             gateShape = cyl.Shape();
@@ -1697,8 +1741,12 @@ void GLCanvas::GenerateMould()
                 else
                 {
                     // --- Gate frustum (extended origin → transition point) ---
+                    // End radius at the transition is exactly subRunnerRadius
+                    // by definition of taperLen — the back-extension shifts
+                    // the start without changing where the taper hits
+                    // subRunnerRadius in world space.
                     {
-                        BRepPrimAPI_MakeCone cone(gateAxExt, gateRadius, subRunnerRadius, taperLenExt);
+                        BRepPrimAPI_MakeCone cone(gateAxExt, startRadius, subRunnerRadius, taperLenExt);
                         cone.Build();
                         if (cone.IsDone() && !cone.Shape().IsNull())
                         {
@@ -1948,6 +1996,7 @@ void GLCanvas::GenerateMould()
     Refresh(false);
     wxMessageBox("Mould generated successfully.",
         "Generate Mould", wxOK | wxICON_INFORMATION, this);
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -2021,10 +2070,33 @@ static bool RayTriangle(const glm::vec3& orig, const glm::vec3& dir,
     const glm::vec3 e2 = v2 - v0;
     const glm::vec3 h = glm::cross(dir, e2);
     const float     a = glm::dot(e1, h);
-    // a < EPS rejects back-facing triangles (standard front-face-only MT).
-    // This prevents hits on the far side of a cavity when the near face is
-    // occluded by the fixture (which has no CPU geometry to block the ray).
-    if (a < EPS) return false;
+    // Double-sided test: |a| < EPS rejects only the degenerate case where
+    // the ray is parallel to the triangle's plane (no intersection or
+    // grazing). Either sign of `a` is accepted, so a ray hitting the
+    // triangle from the back (winding-wise) is treated the same as one
+    // hitting from the front.
+    //
+    // Earlier revisions used `a < EPS` — front-face-only Möller-Trumbore.
+    // That gate caused two pain points: (1) AlignFace / AlignMidplane
+    // couldn't pick cavity-interior walls and any imported triangles with
+    // inconsistent winding, which is the user-visible "I have to put the
+    // camera inside the part to select the face" symptom; (2) when the
+    // camera sat inside a closed object, generic object picking
+    // (RayCastObjects) skipped the near (back-facing) wall and returned
+    // the far front-facing wall on the opposite side — counterintuitive
+    // for placement tools.
+    //
+    // The original comment justified the gate as "prevents hits on the
+    // far side of a cavity when the near face is occluded by the fixture
+    // (which has no CPU geometry to block the ray)". On closer reading,
+    // that scenario is already handled correctly by the closest-T logic
+    // in every caller: a near front face always beats a far back face on
+    // T, so the gate wasn't actually doing the work the comment claimed.
+    // Downstream consumers don't depend on which side was hit — they
+    // either flip the returned normal to face the camera (RayCastObjects)
+    // or use the triangle's own normal independent of pick side
+    // (RayCastFacePick → GrowCoplanarFace).
+    if (std::abs(a) < EPS) return false;
     const float     f = 1.0f / a;
     const glm::vec3 s = orig - v0;
     const float     u = f * glm::dot(s, h);
@@ -2117,9 +2189,10 @@ bool GLCanvas::RayCastObjects(int mouseX, int mouseY,
 
 // ---------------------------------------------------------------------------
 // RayCastWorldRay — fires a pre-built world-space ray against all imported
-// objects (Möller–Trumbore, front-faces only).  Returns the closest hit.
-// Unlike RayCastObjects this takes an explicit origin + direction rather than
-// unprojecting mouse coordinates, so it can be called without a mouse event.
+// objects (Möller–Trumbore, double-sided — see RayTriangle for the rationale).
+// Returns the closest hit. Unlike RayCastObjects this takes an explicit
+// origin + direction rather than unprojecting mouse coordinates, so it can
+// be called without a mouse event.
 // ---------------------------------------------------------------------------
 bool GLCanvas::RayCastWorldRay(const glm::vec3& origin, const glm::vec3& dir,
     float maxDist, glm::vec3& outPos)
@@ -2534,6 +2607,11 @@ void GLCanvas::ApplyPlaneAlignmentToObject(int objIdx,
     obj.pos.x = a_w.x - v_new.x;
     obj.pos.y = -v_new.y;
     obj.pos.z = a_w.z - v_new.z;
+
+    // Both ApplyAlignFaceToObject and ApplyAlignMidplaneToObject delegate
+    // their actual transform write to this method, so notifying once here
+    // covers both entry points.
+    NotifySceneMutated();
 }
 
 // ---------------------------------------------------------------------------
@@ -3086,6 +3164,7 @@ void GLCanvas::ClearRunnerPoints()
     RebuildGatePathVBO();
     RebuildGateSolids();
     Refresh(false);
+    NotifySceneMutated();
 }
 
 void GLCanvas::ClearGatePoints()
@@ -3096,6 +3175,7 @@ void GLCanvas::ClearGatePoints()
     RebuildGatePathVBO();
     RebuildGateSolids();
     Refresh(false);
+    NotifySceneMutated();
 }
 
 void GLCanvas::ClearEjectors()
@@ -3109,6 +3189,7 @@ void GLCanvas::ClearEjectors()
     m_ejectors.clear();
     m_ejectorGhostActive = false;
     Refresh(false);
+    NotifySceneMutated();
 }
 
 // ---------------------------------------------------------------------------
@@ -3184,6 +3265,7 @@ void GLCanvas::RemoveVentAtMouse(int mouseX, int mouseY)
     RebuildPathVBO();
     RebuildCrossSectionVBO();
     Refresh(false);
+    NotifySceneMutated();
 }
 
 // ---------------------------------------------------------------------------
@@ -3220,6 +3302,7 @@ void GLCanvas::RemoveRunnerAtMouse(int mouseX, int mouseY)
     RebuildGatePathVBO();
     RebuildGateSolids();
     Refresh(false);
+    NotifySceneMutated();
 }
 
 // ---------------------------------------------------------------------------
@@ -3254,6 +3337,7 @@ void GLCanvas::RemoveGateAtMouse(int mouseX, int mouseY)
     RebuildGatePathVBO();
     RebuildGateSolids();
     Refresh(false);
+    NotifySceneMutated();
 }
 
 // ---------------------------------------------------------------------------
@@ -3289,6 +3373,7 @@ void GLCanvas::RemoveEjectorAtMouse(int mouseX, int mouseY)
 
     RebuildEjectorSolids();
     Refresh(false);
+    NotifySceneMutated();
 }
 
 // ---------------------------------------------------------------------------
@@ -3613,21 +3698,15 @@ void GLCanvas::RebuildCrossSectionVBO()
 // ---------------------------------------------------------------------------
 // GL init
 // ---------------------------------------------------------------------------
-static void* GetAnyGLFuncAddress(const char* name)
-{
-    void* p = (void*)wglGetProcAddress(name);
-    if (p) return p;
-    static HMODULE module = LoadLibraryA("opengl32.dll");
-    if (!module) return nullptr;
-    return (void*)GetProcAddress(module, name);
-}
+// GetAnyGLFuncAddress() now lives in GLLoader.cpp — shared with
+// FixtureCanvas. Same Win32 wglGetProcAddress + opengl32.dll fallback.
 
 void GLCanvas::InitGLOnce()
 {
     if (m_inited) return;
     SetCurrent(*m_context);
 
-    if (!gladLoadGLLoader((GLADloadproc)GetAnyGLFuncAddress)) {
+    if (!gladLoadGLLoader((GLADloadproc)GLLoader::GetAnyGLFuncAddress)) {
         wxLogError("Failed to load OpenGL functions");
         return;
     }
@@ -4003,7 +4082,8 @@ void GLCanvas::ImportFile(const std::string& path)
     Refresh(false);
 }
 
-void GLCanvas::ImportFileAsFixture(const std::string& path)
+void GLCanvas::ImportFileAsFixture(const std::string& path,
+    const HalfTransform& xform)
 {
     SetCurrent(*m_context);
     InitGLOnce();
@@ -4066,6 +4146,27 @@ void GLCanvas::ImportFileAsFixture(const std::string& path)
         m_fixtures.back().hasSourceShape = true;
     }
     UploadMeshToGPU(res.meshes[0], m_fixtures.back());
+
+    // Apply the per-half pose authored in the FixtureEditor. Axis mapping
+    // mirrors the save side in FixtureEditor::OnGenerateFixture:
+    //   rotation_x  →  pitchDeg   (rotation around world X)
+    //   rotation_y  →  yawDeg     (rotation around world Y)
+    //   rotation_z  →  rollDeg    (rotation around world Z)
+    // HalfTransform stores doubles for round-trip fidelity in the file;
+    // SceneObject is float — narrowing here is fine for runtime display.
+    // Done before BuildFixturePerimeter() below because the perimeter
+    // builder calls fix.BuildModelMatrix() on each fixture, so an
+    // un-applied transform would produce a parting band against the
+    // mesh's local origin instead of its placed pose.
+    SceneObject& fixObj = m_fixtures.back();
+    fixObj.pos = glm::vec3(
+        static_cast<float>(xform.posX),
+        static_cast<float>(xform.posY),
+        static_cast<float>(xform.posZ));
+    fixObj.pitchDeg = static_cast<float>(xform.rotX);
+    fixObj.yawDeg = static_cast<float>(xform.rotY);
+    fixObj.rollDeg = static_cast<float>(xform.rotZ);
+    fixObj.scale = static_cast<float>(xform.scale);
 
     progress.Update(step++, "Done.");
 
@@ -5457,6 +5558,7 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
                 RebuildPathVBO();
                 RebuildCrossSectionVBO();
                 Refresh(false);
+                NotifySceneMutated();
             }
         }
         else if (m_transformMode == TransformMode::PlaceRunner)
@@ -5474,6 +5576,7 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
                     RebuildGatePathVBO();
                     RebuildGateSolids();
                     Refresh(false);
+                    NotifySceneMutated();
                 }
             }
         }
@@ -5505,6 +5608,7 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
                 RebuildGatePathVBO();
                 RebuildGateSolids();
                 Refresh(false);
+                NotifySceneMutated();
             }
         }
         else if (m_transformMode == TransformMode::PlaceEjector)
@@ -5526,6 +5630,7 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
                 // "live update on UI change" feature plug in cleanly).
                 RebuildEjectorSolids();
                 Refresh(false);
+                NotifySceneMutated();
             }
         }
         else if (m_transformMode == TransformMode::RemoveVent)
@@ -6146,18 +6251,18 @@ void GLCanvas::CopySelectedToClipboard()
         const SceneObject& src = m_objects[idx];
 
         ClipboardEntry e;
-        e.cpuVerts       = src.cpuVerts;
-        e.cpuIndices     = src.cpuIndices;
-        e.sourcePath     = src.sourcePath;
-        e.sourceShape    = src.sourceShape;
+        e.cpuVerts = src.cpuVerts;
+        e.cpuIndices = src.cpuIndices;
+        e.sourcePath = src.sourcePath;
+        e.sourceShape = src.sourceShape;
         e.hasSourceShape = src.hasSourceShape;
-        e.role           = src.role;
-        e.yawDeg         = src.yawDeg;
-        e.pitchDeg       = src.pitchDeg;
-        e.rollDeg        = src.rollDeg;
-        e.scale          = src.scale;
-        e.mirrorX        = src.mirrorX;
-        e.mirrorZ        = src.mirrorZ;
+        e.role = src.role;
+        e.yawDeg = src.yawDeg;
+        e.pitchDeg = src.pitchDeg;
+        e.rollDeg = src.rollDeg;
+        e.scale = src.scale;
+        e.mirrorX = src.mirrorX;
+        e.mirrorZ = src.mirrorZ;
         m_clipboard.push_back(std::move(e));
     }
 }
@@ -6189,24 +6294,24 @@ void GLCanvas::PasteFromClipboard()
         m_objects.emplace_back();
         SceneObject& obj = m_objects.back();
 
-        obj.role           = e.role;
-        obj.sourcePath     = e.sourcePath;
-        obj.sourceShape    = e.sourceShape;
+        obj.role = e.role;
+        obj.sourcePath = e.sourcePath;
+        obj.sourceShape = e.sourceShape;
         obj.hasSourceShape = e.hasSourceShape;
-        obj.cpuVerts       = e.cpuVerts;
-        obj.cpuIndices     = e.cpuIndices;
+        obj.cpuVerts = e.cpuVerts;
+        obj.cpuIndices = e.cpuIndices;
         // triNeighbors / adjacencyBuilt left at defaults — rebuilt lazily
         // on first use, identically to the original (same convention as
         // pattern operations).
 
         // Pose: world origin, but keep rotation, scale, and mirror flags.
-        obj.pos      = glm::vec3(0.0f);
-        obj.yawDeg   = e.yawDeg;
+        obj.pos = glm::vec3(0.0f);
+        obj.yawDeg = e.yawDeg;
         obj.pitchDeg = e.pitchDeg;
-        obj.rollDeg  = e.rollDeg;
-        obj.scale    = e.scale;
-        obj.mirrorX  = e.mirrorX;
-        obj.mirrorZ  = e.mirrorZ;
+        obj.rollDeg = e.rollDeg;
+        obj.scale = e.scale;
+        obj.mirrorX = e.mirrorX;
+        obj.mirrorZ = e.mirrorZ;
         // mouldShape / hasMould intentionally left unset — pasted copies
         // are fresh objects without a generated mould (matches pattern-op
         // behavior; the user re-runs Generate Mould as needed).
@@ -6215,7 +6320,7 @@ void GLCanvas::PasteFromClipboard()
         // post-import pipeline in ImportFile() (and the pattern ops).
         FileImporter::MeshData md;
         md.vertices = obj.cpuVerts;
-        md.indices  = obj.cpuIndices;
+        md.indices = obj.cpuIndices;
         ComputeVertexNormals_Pos3(md.vertices, md.indices, md.posNorm);
         auto split = SplitByCreaseAngle_Pos3(md.vertices, md.indices, 35.0f);
         md.posNorm = std::move(split.posNorm);

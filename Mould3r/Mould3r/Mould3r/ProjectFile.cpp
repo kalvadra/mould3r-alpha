@@ -427,5 +427,17 @@ bool ProjectFile::Load(const std::string& path,
     // Commit any trailing item
     commitPending();
 
+    // Enforce the type-from-Y invariant on the active sprue's snapshotted
+    // injection point. Done at end-of-load rather than at the ipType key
+    // handler because the file's key order isn't guaranteed — ipType may
+    // arrive before ipY, so deriving at parse time wouldn't see the final
+    // y value. Older projects with a stale ipType (saved before the rule
+    // existed, or hand-edited) get normalised here.
+    if (out.sprue.placed)
+    {
+        out.sprue.injectionPoint.type =
+            InjectionPoint::TypeFor(out.sprue.injectionPoint.y);
+    }
+
     return true;
 }

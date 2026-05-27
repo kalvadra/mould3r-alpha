@@ -5,15 +5,21 @@
 #include <wx/file.h>
 #include <wx/filefn.h>
 #include <wx/dnd.h>
+#include <wx/graphics.h>   // wxGraphicsContext — rounded-rect paint for icon tool buttons
+#include <wx/dcbuffer.h>   // wxAutoBufferedPaintDC — flicker-free repaint on hover/toggle
 #include <memory>
 
 #include "MainFrame.h"
 #include "GLCanvas.h"
+#include "FixtureEditor.h"
+#include "CreateFixtureDialog.h"
 #include "RotateDialog.h"
 #include "TranslateDialog.h"
 #include "ScaleDialog.h"
 #include "AppConfig.h"
 #include "MeshImportSettings.h"
+#include "RoundedButton.h"     // rounded button for sidebar / toolbar action buttons
+#include "WindowEffects.h"     // DWM corner rounding for the main frame
 #include "style.h"
 
 // ---------------------------------------------------------------------------
@@ -180,12 +186,19 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
     fileMenu->Append(ID_LoadProject, "Open Project...\tCtrl+O");
     fileMenu->Append(ID_SaveProject, "Save Project...\tCtrl+S");
     fileMenu->AppendSeparator();
-    fileMenu->Append(ID_ChangeFixture, "Change Fixture...");
-    fileMenu->AppendSeparator();
     fileMenu->Append(wxID_EXIT, "Exit\tAlt+F4");
 
     auto* menuBar = new wxMenuBar();
     menuBar->Append(fileMenu, "&File");
+
+    // Fixture menu — top-level so the two fixture actions surface together
+    // rather than hiding under File. Create opens the FixtureEditor (the
+    // floating authoring window); Change opens the StartupDialog picker
+    // for swapping between already-saved fixtures.
+    auto* fixtureMenu = new wxMenu();
+    fixtureMenu->Append(ID_CreateFixture, "Create Fixture...");
+    fixtureMenu->Append(ID_ChangeFixture, "Change Fixture...");
+    menuBar->Append(fixtureMenu, "&Fixture");
 
     auto* unitsMenu = new wxMenu();
     unitsMenu->AppendRadioItem(ID_UnitMetric, "Metric (mm)");
@@ -221,6 +234,7 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
 
     Bind(wxEVT_MENU, &MainFrame::OnExit, this, wxID_EXIT);
     Bind(wxEVT_MENU, &MainFrame::OnImport, this, ID_Import);
+    Bind(wxEVT_MENU, &MainFrame::OnCreateFixture, this, ID_CreateFixture);
     Bind(wxEVT_MENU, &MainFrame::OnChangeFixture, this, ID_ChangeFixture);
     Bind(wxEVT_MENU, &MainFrame::OnSaveProject, this, ID_SaveProject);
     Bind(wxEVT_MENU, &MainFrame::OnLoadProject, this, ID_LoadProject);
@@ -264,6 +278,19 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
     // to import them. wxWidgets takes ownership of the drop target.
     m_canvas->SetDropTarget(new ModelFileDropTarget(this));
 
+    // Register the scene-mutation hook. Any time the canvas mutates in a
+    // way that would stale a generated mould — object transforms, feature
+    // place / remove, sprue placement — it fires this callback, which
+    // bumps the mould state from Clean to Dirty. NeverGenerated stays
+    // NeverGenerated (mutating an unbuilt mould isn't meaningful — we
+    // wait for an actual Generate run to leave that state). Project-level
+    // mutations (import, fixture swap, load) handle their own state reset
+    // directly in the relevant handlers below.
+    m_canvas->SetOnSceneMutated([this] {
+        if (m_mouldState == MouldState::Clean)
+            m_mouldState = MouldState::Dirty;
+        });
+
     contentSizer->Add(m_leftPanel, 0, wxEXPAND);
     contentSizer->Add(m_canvas, 1, wxEXPAND);
 
@@ -287,9 +314,9 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
     if (fixture.IsValid())
     {
         if (!fixture.modelAPath.empty())
-            m_canvas->ImportFileAsFixture(fixture.modelAPath);
+            m_canvas->ImportFileAsFixture(fixture.modelAPath, fixture.halfATransform);
         if (!fixture.modelBPath.empty())
-            m_canvas->ImportFileAsFixture(fixture.modelBPath);
+            m_canvas->ImportFileAsFixture(fixture.modelBPath, fixture.halfBTransform);
 
         // Set the active injection point (first in the list for now)
         if (!fixture.injectionPoints.empty())
@@ -303,6 +330,10 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
         // pointers are populated.
         ApplyFixtureDefaults(fixture);
     }
+
+    // Win11 DWM corner rounding for the main frame — matches the rest
+    // of the app's window family.
+    WindowEffects::ApplyRoundedCorners(this);
 }
 
 // ---------------------------------------------------------------------------
@@ -329,7 +360,7 @@ wxPanel* MainFrame::CreateRibbon(wxWindow* parent)
     }
 
     // Import button (accent blue, left-aligned)
-    auto* btnImport = new wxButton(panel, ID_Import, "Import Model",
+    auto* btnImport = new RoundedButton(panel, ID_Import, "Import Model",
         wxDefaultPosition, wxSize(120, 32), wxBORDER_NONE);
     btnImport->SetBackgroundColour(Style::BtnSecondary);
     btnImport->SetForegroundColour(*wxWHITE);
@@ -339,23 +370,37 @@ wxPanel* MainFrame::CreateRibbon(wxWindow* parent)
 
     hSizer->AddStretchSpacer();
 
-    // ---- Export (right-aligned) ---------------------------------------------
-    auto* btnExport = new wxButton(panel, ID_Export, "Export",
-        wxDefaultPosition, wxSize(90, 32), wxBORDER_NONE);
-    btnExport->SetBackgroundColour(Style::InputBg);
-    btnExport->SetForegroundColour(*wxWHITE);
-    btnExport->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
-        wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
-    hSizer->Add(btnExport, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
-
     // ---- Generate Mould (green, right-aligned) --------------------------------
-    auto* btnGenerate = new wxButton(panel, ID_GenerateMould, "Generate Mould",
+    // Order: Generate Mould sits to the LEFT of Export — the workflow is
+    // generate first, then export. Export stays disabled until a Generate
+    // run returns true (see OnGenerateMould below).
+    auto* btnGenerate = new RoundedButton(panel, ID_GenerateMould, "Generate Mould",
         wxDefaultPosition, wxSize(130, 32), wxBORDER_NONE);
     btnGenerate->SetBackgroundColour(Style::BtnGenerate);
     btnGenerate->SetForegroundColour(*wxWHITE);
     btnGenerate->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
-    hSizer->Add(btnGenerate, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 12);
+    hSizer->Add(btnGenerate, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
+
+    // ---- Export (secondary colour, right-aligned) ----------------------------
+    // Sits to the RIGHT of Generate Mould. Background uses Style::BtnSecondary
+    // to match the rest of the secondary-action buttons in the app; the old
+    // Style::InputBg was a darker text-field colour that read as too-quiet
+    // for an actionable button.
+    //
+    // No longer visually-gated: the earlier "muted until mould generated"
+    // affordance was replaced with a click-time warning dialog (see OnExport
+    // for the state machine). Button stays fully coloured at all times; if
+    // the user clicks before generating or after editing, OnExport pops the
+    // appropriate message before reaching the file dialog.
+    auto* btnExport = new RoundedButton(panel, ID_Export, "Export",
+        wxDefaultPosition, wxSize(90, 32), wxBORDER_NONE);
+    btnExport->SetBackgroundColour(Style::BtnSecondary);
+    btnExport->SetForegroundColour(*wxWHITE);
+    btnExport->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
+    m_btnExport = btnExport;
+    hSizer->Add(btnExport, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 12);
 
     panel->SetSizer(hSizer);
 
@@ -430,7 +475,7 @@ wxPanel* MainFrame::CreateSidePanel(wxWindow* parent)
             ctrl->SetBackgroundColour(Style::InputBg);
             ctrl->SetForegroundColour(kTextDefault);
 
-            auto* browse = new wxButton(panel, browseId, "...",
+            auto* browse = new RoundedButton(panel, browseId, "...",
                 wxDefaultPosition, wxSize(28, 24));
             browse->SetBackgroundColour(Style::InputBg);
             browse->SetForegroundColour(kTextDefault);
@@ -970,6 +1015,21 @@ float MainFrame::GetGateDraftAngle() const
     return static_cast<float>(v);   // degrees — no unit conversion
 }
 
+// Distance the gate cylinder is extended backward along -pathDir into the
+// model body. Returns mm regardless of the active unit system, matching the
+// other length accessors. Default 0 means the gate starts exactly at the
+// parting-surface placement point (legacy behaviour). Negative inputs are
+// clamped to 0 — a "shorter than the surface" gate doesn't make sense for
+// the cut-clearance use case.
+float MainFrame::GetGateOverrun() const
+{
+    if (!m_gateOverrun) return 0.0f;
+    double v = 0.0;
+    if (!m_gateOverrun->GetValue().ToDouble(&v)) return 0.0f;
+    if (v < 0.0) v = 0.0;
+    return static_cast<float>(v) * (m_imperial ? 25.4f : 1.0f);
+}
+
 float MainFrame::GetSubRunnerDiameter() const
 {
     if (!m_subRunnerDiameter) return 5.0f;
@@ -1025,6 +1085,50 @@ void MainFrame::OnImport(wxCommandEvent&)
         return;
 
     m_canvas->ImportFile(dlg.GetPath().ToStdString());
+
+    // Treat as a scene mutation, not a project reset: importing adds an
+    // object without wiping any previously-generated mould geometry, so
+    // the prior generation is stale (Dirty) but not gone (NeverGenerated).
+    // ImportFile may not route through the canvas's NotifySceneMutated
+    // hooks, so apply the same Clean→Dirty transition here that the
+    // canvas callback would have applied. (If the user hasn't generated
+    // yet, this is a no-op and state stays NeverGenerated.)
+    if (m_mouldState == MouldState::Clean)
+        m_mouldState = MouldState::Dirty;
+}
+
+// ---------------------------------------------------------------------------
+// Fixture menu handlers
+// ---------------------------------------------------------------------------
+// Create Fixture pops the editor for authoring a new .fixture from scratch.
+// The editor is non-modal (floating wxFrame), so this returns immediately
+// and the user works in parallel with the main app. Once the editor reports
+// a saved fixture back, this handler will likely also reload the new
+// fixture into the canvas — same shape as OnChangeFixture below — but
+// while the editor is scaffolding-only it just opens the window.
+void MainFrame::OnCreateFixture(wxCommandEvent&)
+{
+    // Same two-step flow as StartupDialog::OnNewFixture — see that comment
+    // for the rationale and the editor-lifecycle reasoning.
+    CreateFixtureDialog createDlg(this);
+    FixtureEditor* editor = new FixtureEditor(this);
+
+    createDlg.SetLoadHandler(
+        [editor, &createDlg](CreateFixtureDialog::ProgressFn progress)
+        {
+            editor->SetInitialFixture(createDlg.GetFixtureName(),
+                createDlg.GetModelAPath(),
+                createDlg.GetModelBPath(),
+                progress);
+        });
+
+    if (createDlg.ShowModal() != wxID_OK)
+    {
+        editor->Destroy();
+        return;
+    }
+
+    editor->Show();
 }
 
 void MainFrame::OnChangeFixture(wxCommandEvent&)
@@ -1045,9 +1149,9 @@ void MainFrame::OnChangeFixture(wxCommandEvent&)
     m_canvas->ClearFixtures();
 
     if (!fixture.modelAPath.empty())
-        m_canvas->ImportFileAsFixture(fixture.modelAPath);
+        m_canvas->ImportFileAsFixture(fixture.modelAPath, fixture.halfATransform);
     if (!fixture.modelBPath.empty())
-        m_canvas->ImportFileAsFixture(fixture.modelBPath);
+        m_canvas->ImportFileAsFixture(fixture.modelBPath, fixture.halfBTransform);
 
     if (!fixture.injectionPoints.empty())
     {
@@ -1057,6 +1161,11 @@ void MainFrame::OnChangeFixture(wxCommandEvent&)
 
     // Reset side-panel fields to the new fixture's per-feature defaults.
     ApplyFixtureDefaults(fixture);
+
+    // Fixture swap = scene effectively reset. Any previously-generated
+    // mould was built against the old fixture(s) and is meaningless now —
+    // back to "nothing to export until you Generate".
+    m_mouldState = MouldState::NeverGenerated;
 }
 
 // ---------------------------------------------------------------------------
@@ -1083,9 +1192,9 @@ void MainFrame::PromptForFixtureIfMissing()
 
     // Fresh frame, so no need to ClearFixtures() — just load.
     if (!fixture.modelAPath.empty())
-        m_canvas->ImportFileAsFixture(fixture.modelAPath);
+        m_canvas->ImportFileAsFixture(fixture.modelAPath, fixture.halfATransform);
     if (!fixture.modelBPath.empty())
-        m_canvas->ImportFileAsFixture(fixture.modelBPath);
+        m_canvas->ImportFileAsFixture(fixture.modelBPath, fixture.halfBTransform);
 
     if (!fixture.injectionPoints.empty())
     {
@@ -1131,9 +1240,9 @@ void MainFrame::OnNewProject(wxCommandEvent&)
     m_fixtureDef = fixture;
 
     if (!fixture.modelAPath.empty())
-        m_canvas->ImportFileAsFixture(fixture.modelAPath);
+        m_canvas->ImportFileAsFixture(fixture.modelAPath, fixture.halfATransform);
     if (!fixture.modelBPath.empty())
-        m_canvas->ImportFileAsFixture(fixture.modelBPath);
+        m_canvas->ImportFileAsFixture(fixture.modelBPath, fixture.halfBTransform);
 
     if (!fixture.injectionPoints.empty())
     {
@@ -1146,6 +1255,13 @@ void MainFrame::OnNewProject(wxCommandEvent&)
     // Reset project state
     m_projectPath.clear();
     SetTitle("Mould3r - New Project");
+
+    // Fresh project = nothing has been generated yet. Even though
+    // ClearAll above ran some canvas mutation paths that may have
+    // fired NotifySceneMutated already, lock in the canonical reset
+    // state here so a Generate run is genuinely required before
+    // Export will quietly succeed.
+    m_mouldState = MouldState::NeverGenerated;
 }
 
 // ---------------------------------------------------------------------------
@@ -1208,6 +1324,7 @@ void MainFrame::OnSaveProject(wxCommandEvent&)
         p.runnerColdPlugDist = GetRunnerColdPlugDist();
         p.gateDiameter = GetGateDiameter();
         p.gateDraftAngle = GetGateDraftAngle();
+        p.gateOverrun = GetGateOverrun();
         p.subRunnerDiameter = GetSubRunnerDiameter();
         p.ejectorDiameter = GetEjectorDiameter();
         p.ejectorLength = GetEjectorLength();
@@ -1319,9 +1436,9 @@ void MainFrame::OnLoadProject(wxCommandEvent&)
             AppConfig::SaveLastFixture(fixDef.fixturePath);
 
             if (!fixDef.modelAPath.empty())
-                m_canvas->ImportFileAsFixture(fixDef.modelAPath);
+                m_canvas->ImportFileAsFixture(fixDef.modelAPath, fixDef.halfATransform);
             if (!fixDef.modelBPath.empty())
-                m_canvas->ImportFileAsFixture(fixDef.modelBPath);
+                m_canvas->ImportFileAsFixture(fixDef.modelBPath, fixDef.halfBTransform);
 
             // Set injection point (use the one from the sprue data if available,
             // otherwise fall back to the first in the fixture)
@@ -1394,6 +1511,15 @@ void MainFrame::OnLoadProject(wxCommandEvent&)
 
     m_projectPath = loadPath;
     SetTitle("Mould3r - " + wxFileName(loadPath).GetName());
+
+    // A loaded project starts in the "no mould generated yet" state.
+    // Restoring features through the canvas's Restore* methods (called
+    // above for objects/vents/runners/etc) does not generate the mould
+    // itself — those just rebuild the scene's source geometry — so the
+    // Export gate is correctly closed until the user runs Generate.
+    // The various Restore* paths may have fired NotifySceneMutated
+    // during load already; this explicit set locks the final state.
+    m_mouldState = MouldState::NeverGenerated;
 }
 
 // ---------------------------------------------------------------------------
@@ -1422,6 +1548,7 @@ void MainFrame::SetParameterFields(const ProjectParameters& p)
     setField(m_runnerColdSlugDepth, p.runnerColdPlugDist * conv);
     setField(m_gateDiameter, p.gateDiameter * conv);
     setField(m_gateDraftAngle, p.gateDraftAngle);           // degrees — no conversion
+    setField(m_gateOverrun, p.gateOverrun * conv);
     setField(m_subRunnerDiameter, p.subRunnerDiameter * conv);
     setField(m_ejectorDiameter, p.ejectorDiameter * conv);
     setField(m_ejectorLength, p.ejectorLength * conv);
@@ -1525,6 +1652,39 @@ void MainFrame::OnBrowseExport(wxCommandEvent&)
 
 void MainFrame::OnExport(wxCommandEvent&)
 {
+    // Gate: tri-state model (see MouldState enum in MainFrame.h).
+    //   NeverGenerated  - nothing to export. Hard block with an
+    //                     informational popup, then return.
+    //   Dirty           - mould exists but is stale relative to the
+    //                     current scene. Warn the user; let them decide
+    //                     whether to proceed with the older geometry.
+    //                     State stays Dirty after a Yes — the user
+    //                     accepted this export but the mould isn't
+    //                     refreshed, so a subsequent click warrants
+    //                     another warning.
+    //   Clean           - happy path. Fall through to the file dialog
+    //                     below without prompting.
+    switch (m_mouldState)
+    {
+    case MouldState::NeverGenerated:
+        wxMessageBox("Mould must be generated before it can be exported.",
+            "Export", wxOK | wxICON_INFORMATION, this);
+        return;
+
+    case MouldState::Dirty:
+    {
+        const int ans = wxMessageBox(
+            "An edit has been made since the last Mould Generation, "
+            "some features may not be reflected. Would you like to continue?",
+            "Export", wxYES_NO | wxICON_WARNING, this);
+        if (ans != wxYES) return;
+        break;
+    }
+
+    case MouldState::Clean:
+        break;
+    }
+
     // Filename-driven export. Instead of asking only for an output folder
     // and writing fixed "model_a.step" / "model_b.step" into it, prompt
     // the user for a base filename and append "_a.step" / "_b.step" to
@@ -1602,7 +1762,21 @@ void MainFrame::OnExport(wxCommandEvent&)
 void MainFrame::OnGenerateMould(wxCommandEvent&)
 {
     if (!m_canvas) return;
-    m_canvas->GenerateMould();
+    // GenerateMould returns true only when both up-front validations
+    // (fixtures loaded, objects to subtract) pass and the build pipeline
+    // ran to its natural end. Failure leaves the previous mould state
+    // untouched — the user gets the validation message box from inside
+    // GenerateMould itself.
+    //
+    // Subtle ordering: GenerateMould internally calls into mutating
+    // canvas methods (PlaceSprue at the very least), each of which
+    // fires NotifySceneMutated, which routes through the canvas callback
+    // and may bump Clean → Dirty mid-flight. The state set below runs
+    // AFTER GenerateMould returns and authoritatively reflects "the
+    // mould is now fresh", so it wins regardless of how many
+    // intermediate Clean→Dirty toggles happened inside.
+    if (m_canvas->GenerateMould())
+        m_mouldState = MouldState::Clean;
 }
 
 wxPanel* MainFrame::CreateCollapsibleSection(wxWindow* parent,
@@ -1712,9 +1886,9 @@ wxPanel* MainFrame::CreateVentsContent(wxWindow* parent)
 
     // ---- Edit / Remove / Clear all ------------------------------------------
     auto* actionGrid = new wxGridSizer(1, 3, 0, 4);
-    auto makeSmallBtn = [&](const wxString& label) -> wxButton*
+    auto makeSmallBtn = [&](const wxString& label) -> RoundedButton*
         {
-            auto* btn = new wxButton(panel, wxID_ANY, label,
+            auto* btn = new RoundedButton(panel, wxID_ANY, label,
                 wxDefaultPosition, wxSize(-1, 26), wxBORDER_NONE);
             btn->SetBackgroundColour(Style::BtnSmall);
             btn->SetForegroundColour(Style::TextPrimary);
@@ -1854,7 +2028,7 @@ wxPanel* MainFrame::CreateSpruesContent(wxWindow* parent)
     sizer->AddSpacer(6);
 
     // Place Sprue — regular button (one-shot action, not a toggle mode)
-    auto* btnPlace = new wxButton(panel, ID_PlaceSprue, "Place Sprue",
+    auto* btnPlace = new RoundedButton(panel, ID_PlaceSprue, "Place Sprue",
         wxDefaultPosition, wxSize(-1, 32), wxBORDER_NONE);
     btnPlace->SetBackgroundColour(Style::BtnPlace);
     btnPlace->SetForegroundColour(*wxWHITE);
@@ -1864,8 +2038,8 @@ wxPanel* MainFrame::CreateSpruesContent(wxWindow* parent)
     sizer->AddSpacer(6);
 
     auto* actionGrid = new wxGridSizer(1, 3, 0, 4);
-    auto makeSmallBtn = [&](const wxString& label) -> wxButton* {
-        auto* btn = new wxButton(panel, wxID_ANY, label,
+    auto makeSmallBtn = [&](const wxString& label) -> RoundedButton* {
+        auto* btn = new RoundedButton(panel, wxID_ANY, label,
             wxDefaultPosition, wxSize(-1, 26), wxBORDER_NONE);
         btn->SetBackgroundColour(Style::BtnSmall);
         btn->SetForegroundColour(Style::TextPrimary);
@@ -2004,9 +2178,9 @@ wxPanel* MainFrame::CreateRunnersContent(wxWindow* parent)
     // ---- Edit / Remove / Clear all — equal-width button row -----------------
     auto* actionGrid = new wxGridSizer(1, 3, 0, 4);   // 1 row, 3 cols, 4px h-gap
 
-    auto makeSmallBtn = [&](const wxString& label) -> wxButton*
+    auto makeSmallBtn = [&](const wxString& label) -> RoundedButton*
         {
-            auto* btn = new wxButton(panel, wxID_ANY, label,
+            auto* btn = new RoundedButton(panel, wxID_ANY, label,
                 wxDefaultPosition, wxSize(-1, 26), wxBORDER_NONE);
             btn->SetBackgroundColour(Style::BtnSmall);
             btn->SetForegroundColour(Style::TextPrimary);
@@ -2190,8 +2364,8 @@ wxPanel* MainFrame::CreateGatesContent(wxWindow* parent)
     sizer->AddSpacer(6);
 
     auto* actionGrid = new wxGridSizer(1, 3, 0, 4);
-    auto makeSmallBtn = [&](const wxString& label) -> wxButton* {
-        auto* btn = new wxButton(panel, wxID_ANY, label,
+    auto makeSmallBtn = [&](const wxString& label) -> RoundedButton* {
+        auto* btn = new RoundedButton(panel, wxID_ANY, label,
             wxDefaultPosition, wxSize(-1, 26), wxBORDER_NONE);
         btn->SetBackgroundColour(Style::BtnSmall);
         btn->SetForegroundColour(Style::TextPrimary);
@@ -2275,6 +2449,12 @@ wxPanel* MainFrame::CreateGatesContent(wxWindow* parent)
     auto* dimsSizer = new wxBoxSizer(wxVERTICAL);
     addRow(dimsPanel, dimsSizer, "Diameter:", m_gateDiameter, "3.0", "mm");
     addRow(dimsPanel, dimsSizer, "Draft angle:", m_gateDraftAngle, "1.0", wxString::FromUTF8("\xC2\xB0"));
+    // Overrun extends the gate cylinder backward into the model along the
+    // path direction, so the cut clears irregular geometry near the
+    // parting-line entry. Default 0 = current behaviour (gate starts at
+    // the parting surface). The radius at the parting surface is preserved
+    // — see RebuildGateSolids for the math.
+    addRow(dimsPanel, dimsSizer, "Overrun:", m_gateOverrun, "0.0", "mm");
     dimsPanel->SetSizer(dimsSizer);
     settingsSizer->Add(dimsPanel, 0, wxEXPAND | wxBOTTOM, 6);
 
@@ -2370,8 +2550,8 @@ wxPanel* MainFrame::CreateEjectorsContent(wxWindow* parent)
     sizer->AddSpacer(6);
 
     auto* actionGrid = new wxGridSizer(1, 3, 0, 4);
-    auto makeSmallBtn = [&](const wxString& label) -> wxButton* {
-        auto* btn = new wxButton(panel, wxID_ANY, label,
+    auto makeSmallBtn = [&](const wxString& label) -> RoundedButton* {
+        auto* btn = new RoundedButton(panel, wxID_ANY, label,
             wxDefaultPosition, wxSize(-1, 26), wxBORDER_NONE);
         btn->SetBackgroundColour(Style::BtnSmall);
         btn->SetForegroundColour(Style::TextPrimary);
@@ -2529,8 +2709,6 @@ wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
 
         toolsSizer->AddSpacer(8);
 
-        auto* grid = new wxGridSizer(3, 2, 4, 4);
-
         // ---- SVG icon paths for model tool buttons --------------------------------
         // Fill in the path to each SVG file (relative to the executable, or absolute).
         // Leave a string empty ("") to show the text label only.
@@ -2587,6 +2765,45 @@ wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
                 auto* panel = new wxPanel(toolsPanel, wxID_ANY,
                     wxDefaultPosition, wxSize(-1, 34), wxBORDER_NONE);
                 panel->SetBackgroundColour(Style::BtnSecondary);
+
+                // ---- Rounded-corner repaint -----------------------------------
+                // The panel paints itself: parent bg fills the whole client
+                // area first (so the four corner triangles outside the rounded
+                // shape pick up the toolbar's colour), then a filled rounded
+                // rectangle in the panel's *current* bg colour covers the rest.
+                // applyColours below mutates panel->SetBackgroundColour and
+                // calls Refresh(), so the existing hover / selected / idle
+                // state machine drives the paint with no extra wiring.
+                //
+                // wxBG_STYLE_PAINT promises wxWidgets we'll fill the client
+                // area ourselves — required when pairing with wxAutoBuffered-
+                // PaintDC, otherwise the default erase pass fights the buffer
+                // and the result flickers on hover.
+                //
+                // Matches the pattern used by RoundedButton.cpp; the 4 px
+                // radius keeps these in lockstep with the text-only
+                // RoundedButton's default. One constant to tune if the
+                // design ever wants a different number.
+                constexpr int kToolBtnCornerRadius = 4;
+                panel->SetBackgroundStyle(wxBG_STYLE_PAINT);
+                panel->Bind(wxEVT_PAINT, [panel](wxPaintEvent&) {
+                    wxAutoBufferedPaintDC dc(panel);
+                    const wxColour parentBg = panel->GetParent()
+                        ? panel->GetParent()->GetBackgroundColour()
+                        : panel->GetBackgroundColour();
+                    dc.SetBackground(wxBrush(parentBg));
+                    dc.Clear();
+
+                    std::unique_ptr<wxGraphicsContext> gc(
+                        wxGraphicsContext::Create(dc));
+                    if (!gc) return;
+                    gc->SetAntialiasMode(wxANTIALIAS_DEFAULT);
+                    gc->SetBrush(wxBrush(panel->GetBackgroundColour()));
+                    gc->SetPen(*wxTRANSPARENT_PEN);
+                    const wxSize sz = panel->GetClientSize();
+                    gc->DrawRoundedRectangle(0, 0, sz.x, sz.y,
+                        kToolBtnCornerRadius);
+                    });
 
                 // Inner horizontal sizer: [icon] [gap] [label]
                 auto* hSizer = new wxBoxSizer(wxHORIZONTAL);
@@ -2667,8 +2884,28 @@ wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
                     e.Skip();
                     };
                 auto onLeave = [=](wxMouseEvent& e) {
-                    if (!*toggled)
-                        applyColours(Style::BtnSecondary, Style::TextPrimary);
+                    // Phantom-leave guard: txt and bmpCtrl are real child
+                    // windows of the panel, so the panel fires LEAVE as
+                    // soon as the cursor crosses onto either one — even
+                    // though, from the user's point of view, the cursor is
+                    // still very much on the button. The corollary ENTER
+                    // on the child does fire, but the relative ordering
+                    // between the two isn't guaranteed on Windows and we
+                    // were getting a stuck-off hover from the race.
+                    //
+                    // Fix: hit-test the cursor in screen coords against
+                    // the panel's screen rect. If it's still anywhere over
+                    // the composite, the leave is phantom — suppress it.
+                    // A genuine leave (cursor truly off the button) lands
+                    // outside the rect and falls through to the colour
+                    // reset.
+                    const wxRect screenRect(panel->GetScreenPosition(),
+                        panel->GetSize());
+                    if (!screenRect.Contains(wxGetMousePosition()))
+                    {
+                        if (!*toggled)
+                            applyColours(Style::BtnSecondary, Style::TextPrimary);
+                    }
                     e.Skip();
                     };
 
@@ -2685,15 +2922,55 @@ wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
                 return panel;
             };
 
-        grid->Add(makeToolBtn(ID_ToolTranslate, "Move", true, kIconMove), 0, wxEXPAND);
-        grid->Add(makeToolBtn(ID_ToolRotate, "Rotate", true, kIconRotate), 0, wxEXPAND);
-        grid->Add(makeToolBtn(ID_ToolScale, "Scale", true, kIconScale), 0, wxEXPAND);
-        grid->Add(makeToolBtn(ID_ToolPattern, "Pattern", true, kIconPattern), 0, wxEXPAND);
-        grid->Add(makeToolBtn(ID_ToolCenter, "Center", false, kIconCenter), 0, wxEXPAND);
-        grid->Add(makeToolBtn(ID_ToolAlignFace, "Align Face", true, kIconAlignFace), 0, wxEXPAND);
-        grid->Add(makeToolBtn(ID_ToolAlignMidplane, "Align Midplane", true, kIconAlignMidplane), 0, wxEXPAND);
+        // Row 1 — Move / Rotate / Scale in equal thirds.
+        auto* toolsRow1 = new wxGridSizer(1, 3, 0, 4);
+        toolsRow1->Add(makeToolBtn(ID_ToolTranslate, "Move", true, kIconMove), 0, wxEXPAND);
+        toolsRow1->Add(makeToolBtn(ID_ToolRotate, "Rotate", true, kIconRotate), 0, wxEXPAND);
+        toolsRow1->Add(makeToolBtn(ID_ToolScale, "Scale", true, kIconScale), 0, wxEXPAND);
+        toolsSizer->Add(toolsRow1, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
+        toolsSizer->AddSpacer(4);  // matches the original 4-px inter-row gap
 
-        toolsSizer->Add(grid, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
+        // Row 2 — Center / Pattern in halves. Center is the only non-toggle
+        // (one-shot action); the rest of the model tools are modal toggles.
+        auto* toolsRow2 = new wxGridSizer(1, 2, 0, 4);
+        toolsRow2->Add(makeToolBtn(ID_ToolCenter, "Center", false, kIconCenter), 0, wxEXPAND);
+        toolsRow2->Add(makeToolBtn(ID_ToolPattern, "Pattern", true, kIconPattern), 0, wxEXPAND);
+        toolsSizer->Add(toolsRow2, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
+
+        toolsSizer->AddSpacer(14);  // gap before the next subsection header
+
+        // ---- Model Alignment subsection ------------------------------------
+        // Same MODEL TOOLS header treatment plus an inline help indicator.
+        // The "?" character is a placeholder for the circled-question-mark
+        // glyph in the reference image — see flag in the chat, the final
+        // visual (Unicode glyph vs. SVG icon vs. custom-painted badge) is
+        // intentionally left as a follow-up once the help-text content is
+        // settled.
+        auto* alignHeaderRow = new wxBoxSizer(wxHORIZONTAL);
+
+        auto* alignLabel = new wxStaticText(toolsPanel, wxID_ANY, "MODEL ALIGNMENT");
+        alignLabel->SetForegroundColour(Style::TextPrimary);
+        alignLabel->SetFont(wxFont(7, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_BOLD, false, "Segoe UI"));
+        alignHeaderRow->Add(alignLabel, 0, wxALIGN_CENTER_VERTICAL);
+
+        auto* alignHelp = new wxStaticText(toolsPanel, wxID_ANY, "?");
+        alignHelp->SetForegroundColour(Style::TextMuted);
+        alignHelp->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_BOLD, false, "Segoe UI"));
+        alignHelp->SetToolTip("Align selected geometry to a reference face or "
+            "midplane of another object.");
+        alignHeaderRow->Add(alignHelp, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 6);
+
+        toolsSizer->Add(alignHeaderRow, 0, wxLEFT | wxTOP, 12);
+        toolsSizer->AddSpacer(8);
+
+        // Row 3 — Align Face / Align Midplane in halves.
+        auto* alignRow = new wxGridSizer(1, 2, 0, 4);
+        alignRow->Add(makeToolBtn(ID_ToolAlignFace, "Align Face", true, kIconAlignFace), 0, wxEXPAND);
+        alignRow->Add(makeToolBtn(ID_ToolAlignMidplane, "Align Midplane", true, kIconAlignMidplane), 0, wxEXPAND);
+        toolsSizer->Add(alignRow, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
+
         toolsSizer->AddSpacer(10);
 
         toolsPanel->SetSizer(toolsSizer);

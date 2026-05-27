@@ -1,0 +1,231 @@
+# =============================================================================
+# fixtureGuidelines.fixture
+#
+# Canonical reference for the Mould3r .fixture file format. Every section
+# and every recognised key is enumerated below with its expected value
+# format and a short description.
+#
+# This file is for documentation only — it is not loaded by the application
+# at runtime. It exists so the file-format reader in FixtureFile.cpp and
+# the consumers in MainFrame / FixtureEditor have a single source of truth
+# to check fields against. When you add a new field to FixtureDefinition,
+# add it here too.
+#
+# General rules:
+#   * Lines starting with '#' are comments and are ignored.
+#   * Blank lines are ignored.
+#   * Each section is introduced by a header in square brackets.
+#   * Within a section, key/value pairs use the form  key = value
+#   * Whitespace around '=' and around section names is trimmed.
+#   * Unknown keys and unknown sections are silently dropped — older
+#     builds reading newer files won't crash on fields they don't
+#     recognise.
+#   * Numeric parse failures leave the destination at its prior value
+#     (default for that field) — a single typo doesn't take down the
+#     rest of the file.
+#   * Distance units are millimetres throughout. Angles are degrees.
+#   * Section order is not significant. Keys within a section may be
+#     in any order.
+#
+# Required vs optional:
+#   * [fixture] is required, and must contain modelA and modelB.
+#   * Everything else is optional. A minimal valid fixture file is just
+#     the [fixture] section with the two model paths.
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# [fixture]   (required)
+#
+# Identifies the two STEP/STL/OBJ mould halves that make up this fixture.
+# Paths are stored relative to the .fixture file's own location on save and
+# resolved back to absolute on load — you can move the fixture file plus
+# its referenced models to another machine and the references still work,
+# provided the relative layout is preserved.
+# -----------------------------------------------------------------------------
+[fixture]
+modelA = ../models/half_a.step
+modelB = ../models/half_b.step
+
+
+# -----------------------------------------------------------------------------
+# [half_a_transform]   (optional)
+# [half_b_transform]   (optional)
+#
+# Per-half pose, capturing any positioning the user did in the
+# FixtureEditor (Move, Rotate, Scale, Center, Align Face). Identity pose —
+# all zeros for position/rotation, scale = 1 — is the default and emits no
+# section on save; an absent section is treated as identity on load.
+#
+# Both sections share the same key set:
+#
+#   position_x, position_y, position_z   double, mm
+#       Translation along world X / Y / Z. Applied after the rotation/
+#       scale composition.
+#
+#   rotation_x, rotation_y, rotation_z   double, degrees
+#       Rotation around world X / Y / Z. Applied in YXZ order
+#       (Ry * Rx * Rz) — i.e. yaw is rotation_y, pitch is rotation_x,
+#       roll is rotation_z. This matches FixtureCanvas::FixtureMesh and
+#       SceneObject's BuildModelMatrix conventions.
+#
+#   scale                                double, dimensionless
+#       Uniform scale factor. 1.0 = no scaling. Defaults to 1.0; will
+#       not be set below 0.001 by the editor (FixtureCanvas::ApplyScale
+#       enforces a 0.001 floor).
+# -----------------------------------------------------------------------------
+[half_a_transform]
+position_x = 0.0
+position_y = 0.0
+position_z = 0.0
+rotation_x = 0.0
+rotation_y = 0.0
+rotation_z = 0.0
+scale      = 1.0
+
+[half_b_transform]
+position_x = 0.0
+position_y = 0.0
+position_z = 0.0
+rotation_x = 0.0
+rotation_y = 0.0
+rotation_z = 0.0
+scale      = 1.0
+
+
+# -----------------------------------------------------------------------------
+# [injection_point.N]   (optional, repeatable)
+#
+# Sprue/gate locations relative to the fixture origin. N is an arbitrary
+# integer index that distinguishes multiple points; the indices don't
+# need to be contiguous, and the order in the file is preserved on
+# load. The fixture editor doesn't currently surface injection-point
+# editing — these are typically authored by hand or written by a future
+# placement workflow.
+#
+#   label   string
+#       Free-text human-readable name shown in the UI. May be empty.
+#
+#   type    string, one of "radial" | "axial"
+#       Physical interpretation:
+#         radial — material injected radially inward (e.g. a side gate
+#                  on the parting line).
+#         axial  — material injected along the fixture axis (e.g. a
+#                  top/bottom sprue perpendicular to the parting plane).
+#       Anything other than "axial" is interpreted as "radial".
+#
+#   x, y, z float, mm
+#       Position relative to the fixture origin.
+# -----------------------------------------------------------------------------
+[injection_point.0]
+label = Top center sprue
+type  = axial
+x     = 0.0
+y     = 50.0
+z     = 0.0
+
+[injection_point.1]
+label = Side gate
+type  = radial
+x     = 25.0
+y     = 0.0
+z     = 0.0
+
+
+# -----------------------------------------------------------------------------
+# [sprue_defaults]   (optional)
+#
+# Default field values for the Sprues card on the main side panel. Loaded
+# fixtures pre-populate the corresponding fields in MainFrame's UI so the
+# user doesn't have to re-enter project-specific dimensions every time.
+# Only the keys you specify get applied — anything left out falls back to
+# the application's hardcoded defaults at apply time.
+#
+#   type             string   (e.g. "Cylinder")
+#   diameter         float    mm
+#   draft_angle      float    degrees
+#   cold_slug_length float    mm
+#   length           float    mm
+# -----------------------------------------------------------------------------
+[sprue_defaults]
+type             = Cylinder
+diameter         = 5.0
+draft_angle      = 1.0
+cold_slug_length = 5.0
+length           = 20.0
+
+
+# -----------------------------------------------------------------------------
+# [runner_defaults]   (optional)
+#
+#   type             string   (e.g. "Cylindrical")
+#   diameter         float    mm
+#   cold_slug_length float    mm
+# -----------------------------------------------------------------------------
+[runner_defaults]
+type             = Cylindrical
+diameter         = 4.0
+cold_slug_length = 5.0
+
+
+# -----------------------------------------------------------------------------
+# [gate_defaults]   (optional)
+#
+#   type        string   (e.g. "Tapered Cylinder")
+#   diameter    float    mm
+#   draft_angle float    degrees
+# -----------------------------------------------------------------------------
+[gate_defaults]
+type        = Tapered Cylinder
+diameter    = 3.0
+draft_angle = 1.0
+
+
+# -----------------------------------------------------------------------------
+# [sub_runner_defaults]   (optional)
+#
+# Defaults for the sub-runner that feeds a gate. Lives in its own section
+# (rather than nested inside [gate_defaults]) because it's a separate
+# geometric feature with its own type/dimension axes — the gate card on
+# the main panel just visually groups them together for placement-time
+# convenience.
+#
+#   type     string   (e.g. "Cylinder")
+#   diameter float    mm
+# -----------------------------------------------------------------------------
+[sub_runner_defaults]
+type     = Cylinder
+diameter = 5.0
+
+
+# -----------------------------------------------------------------------------
+# [vent_defaults]   (optional)
+#
+#   type          string   (e.g. "Rectangular")
+#   length        float    mm
+#   width         float    mm
+#   overrun_start float    mm   distance the vent extends past the
+#                               parting-line entry edge (start of the
+#                               vent run, on the cavity side).
+#   overrun_end   float    mm   distance past the exit edge (end of
+#                               the vent run, toward the mould edge).
+# -----------------------------------------------------------------------------
+[vent_defaults]
+type          = Rectangular
+length        = 1.0
+width         = 2.0
+overrun_start = 0.5
+overrun_end   = 0.5
+
+
+# -----------------------------------------------------------------------------
+# [ejector_defaults]   (optional)
+#
+#   type     string   (e.g. "Cylindrical")
+#   diameter float    mm
+#   length   float    mm
+# -----------------------------------------------------------------------------
+[ejector_defaults]
+type     = Cylindrical
+diameter = 3.0
+length   = 25.0

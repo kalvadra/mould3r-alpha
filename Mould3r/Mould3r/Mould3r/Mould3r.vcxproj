@@ -140,10 +140,15 @@
   <ItemGroup>
     <ClCompile Include="AppConfig.cpp" />
     <ClCompile Include="camera.cpp" />
+    <ClCompile Include="CreateFixtureDialog.cpp" />
     <ClCompile Include="FileImporter.cpp" />
+    <ClCompile Include="FixtureCanvas.cpp" />
+    <ClCompile Include="FixtureEditor.cpp" />
     <ClCompile Include="FixtureFile.cpp" />
     <ClCompile Include="GLCanvas.cpp" />
+    <ClCompile Include="GLLoader.cpp" />
     <ClCompile Include="GridRenderer.cpp" />
+    <ClCompile Include="InjectionPointDialog.cpp" />
     <ClCompile Include="MainFrame.cpp" />
     <ClCompile Include="MeshImportSettings.cpp" />
     <ClCompile Include="MeshOps.cpp" />
@@ -155,19 +160,26 @@
     <ClCompile Include="PatternDialog.cpp" />
     <ClCompile Include="ProjectFile.cpp" />
     <ClCompile Include="RotateDialog.cpp" />
+    <ClCompile Include="RoundedButton.cpp" />
     <ClCompile Include="ScaleDialog.cpp" />
     <ClCompile Include="shaders.cpp" />
     <ClCompile Include="StartupDialog.cpp" />
     <ClCompile Include="TranslateDialog.cpp" />
     <ClCompile Include="VentFeature.cpp" />
+    <ClCompile Include="WindowEffects.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="AppConfig.h" />
     <ClInclude Include="camera.h" />
+    <ClInclude Include="CreateFixtureDialog.h" />
     <ClInclude Include="FileImporter.h" />
+    <ClInclude Include="FixtureCanvas.h" />
+    <ClInclude Include="FixtureEditor.h" />
     <ClInclude Include="FixtureFile.h" />
     <ClInclude Include="GLCanvas.h" />
+    <ClInclude Include="GLLoader.h" />
     <ClInclude Include="GridRenderer.h" />
+    <ClInclude Include="InjectionPointDialog.h" />
     <ClInclude Include="MainFrame.h" />
     <ClInclude Include="MeshImportSettings.h" />
     <ClInclude Include="MeshOps.h" />
@@ -178,12 +190,14 @@
     <ClInclude Include="PatternDialog.h" />
     <ClInclude Include="ProjectFile.h" />
     <ClInclude Include="RotateDialog.h" />
+    <ClInclude Include="RoundedButton.h" />
     <ClInclude Include="ScaleDialog.h" />
     <ClInclude Include="shaders.h" />
     <ClInclude Include="StartupDialog.h" />
     <ClInclude Include="style.h" />
     <ClInclude Include="TranslateDialog.h" />
     <ClInclude Include="VentFeature.h" />
+    <ClInclude Include="WindowEffects.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="vcpkg.json" />

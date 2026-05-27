@@ -16,6 +16,8 @@
 #include <unordered_map>
 
 class GLCanvas;
+class RoundedButton;   // forward decl — m_btnExport pointer below; full def
+// is included from MainFrame.cpp where it's used.
 
 enum class TransformMode { Select, Translate, Rotate, Scale, Pattern, PlaceVent, PlaceRunner, PlaceGate, PlaceEjector, RemoveVent, RemoveRunner, RemoveGate, RemoveSprue, RemoveEjector, EditVent, EditRunner, EditGate, EditEjector, SelectInjectionPoint, AlignFace, AlignMidplane };
 
@@ -53,6 +55,7 @@ public:
 
     float GetGateDiameter() const;
     float GetGateDraftAngle() const;
+    float GetGateOverrun() const;
     float GetSubRunnerDiameter() const;
 
     float GetEjectorDiameter() const;
@@ -80,12 +83,13 @@ public:
     // If no fixture has been loaded yet, show the selection dialog and load
     // whatever the user chooses. Intended to be called once, right after the
     // frame is shown on app startup. If the user cancels, the frame stays
-    // open but empty — they can pick a fixture later via File -> Change Fixture.
+    // open but empty — they can pick a fixture later via Fixture -> Change Fixture.
     void PromptForFixtureIfMissing();
 
 private:
     // Menu handlers
     void OnImport(wxCommandEvent& evt);
+    void OnCreateFixture(wxCommandEvent&);
     void OnChangeFixture(wxCommandEvent&);
     void OnExit(wxCommandEvent& evt);
     void OnSaveProject(wxCommandEvent&);
@@ -181,6 +185,7 @@ private:
     wxChoice* m_gateTypeChoice = nullptr;
     wxTextCtrl* m_gateDiameter = nullptr;
     wxTextCtrl* m_gateDraftAngle = nullptr;
+    wxTextCtrl* m_gateOverrun = nullptr;     // mm extension into the model
 
     // Sub-runner field members (within the Gates section)
     wxChoice* m_subRunnerTypeChoice = nullptr;
@@ -223,6 +228,46 @@ private:
     wxPanel* m_sidePanel = nullptr;
     wxTextCtrl* m_exportPath = nullptr;
 
+    // Export button on the top ribbon. Held as a member so OnGenerateMould
+    // can reach it, even though we no longer toggle its visual state — the
+    // pointer is also useful for any future hover/state experiments.
+    RoundedButton* m_btnExport = nullptr;
+
+    // Tri-state model for "is the Export button about to do something
+    // reasonable?". Replaces an earlier bool that conflated the
+    // "never-generated" and "dirty-since-generation" cases — they look
+    // identical to the user but warrant different messages on click.
+    //
+    //   NeverGenerated  - hard block: no mould geometry exists yet, so
+    //                     Export pops "Mould must be generated before it
+    //                     can be exported" and returns.
+    //   Clean           - happy path: export runs without prompting.
+    //   Dirty           - mould exists but an edit happened since the
+    //                     last successful generation; Export pops a
+    //                     Yes/No warning that the output may not reflect
+    //                     the current scene. Yes proceeds, No bails. The
+    //                     state remains Dirty after a Yes — the geometry
+    //                     hasn't actually been refreshed, so a second
+    //                     click warrants a second warning.
+    //
+    // Transitions are direct field assignments at the call sites — no
+    // wrapper methods, since each transition is a one-liner and the
+    // state graph is small enough to scan at a glance:
+    //   *               -> NeverGenerated   on project reset (new / load /
+    //                                       import / fixture swap)
+    //   NeverGenerated  -> Clean            on successful Generate Mould
+    //   Dirty           -> Clean            on successful Generate Mould
+    //   Clean           -> Dirty            on any scene mutation
+    //                                       (canvas callback or an
+    //                                       explicit transition at the
+    //                                       relevant project handler)
+    //   NeverGenerated  -> NeverGenerated   on a scene mutation when no
+    //                                       mould has ever been built —
+    //                                       handled by the if-guard in
+    //                                       the canvas callback below.
+    enum class MouldState { NeverGenerated, Clean, Dirty };
+    MouldState m_mouldState = MouldState::NeverGenerated;
+
     void OnBrowseExport(wxCommandEvent&);
     void OnExport(wxCommandEvent&);
     void OnGenerateMould(wxCommandEvent&);
@@ -244,6 +289,7 @@ private:
         ID_BrowseExport,
         ID_Export,
         ID_GenerateMould,
+        ID_CreateFixture,
         ID_ChangeFixture,
         ID_ClearVentPoints,
         ID_PlaceSprue,
