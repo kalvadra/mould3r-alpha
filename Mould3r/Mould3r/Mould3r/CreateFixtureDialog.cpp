@@ -147,7 +147,7 @@ CreateFixtureDialog::CreateFixtureDialog(wxWindow* parent)
 
     m_nameCtrl = new wxTextCtrl(m_formPanel, wxID_ANY, wxEmptyString,
         wxDefaultPosition, wxSize(-1, 28), wxBORDER_NONE);
-    m_nameCtrl->SetHint("e.g. ASPX Rev 2");
+    m_nameCtrl->SetHint("e.g. MyMould Rev 2");
     m_nameCtrl->SetBackgroundColour(Style::InputBg);
     m_nameCtrl->SetForegroundColour(Style::TextPrimary);
     m_nameCtrl->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
