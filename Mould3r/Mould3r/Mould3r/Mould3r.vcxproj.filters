@@ -87,6 +87,9 @@
     <ClCompile Include="PatternDialog.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="PreviewFrame.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="FixtureCanvas.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -174,6 +177,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="PatternDialog.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="PreviewFrame.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="FixtureCanvas.h">

@@ -1380,6 +1380,11 @@ bool GLCanvas::GenerateMould()
 
     int step = 0;
 
+    // Reset the per-run capture of post-cut half meshes. These are handed to
+    // the preview window after a successful run; the main canvas no longer
+    // displays them itself (it keeps showing the original fixtures).
+    m_lastMouldMeshes.clear();
+
     SetCurrent(*m_context);
     InitGLOnce();
 
@@ -1983,13 +1988,15 @@ bool GLCanvas::GenerateMould()
         meshData.posNorm = std::move(split.posNorm);
         meshData.indices = std::move(split.indices);
 
-        fix.pos = glm::vec3(0.0f);
-        fix.yawDeg = 0.0f;
-        fix.pitchDeg = 0.0f;
-        fix.rollDeg = 0.0f;
-        fix.scale = 1.0f;
-
-        UploadMeshToGPU(meshData, fix);
+        // Hand the tessellated half off to the preview window instead of
+        // replacing this fixture's display mesh. fix.mouldShape / hasMould
+        // were already set above (before the empty-mesh guard) for export.
+        // Per the preview workflow the main canvas keeps showing the original
+        // (pre-cut) fixtures at their authored poses — it must not change the
+        // mould halves after generation. The mesh captured here is already in
+        // world space (the fixture transform was baked into `result` above),
+        // so the preview renders it at an identity pose.
+        m_lastMouldMeshes.push_back(meshData);
     }
 
     progress.Update(totalSteps, "Done.");
@@ -1997,6 +2004,110 @@ bool GLCanvas::GenerateMould()
     wxMessageBox("Mould generated successfully.",
         "Generate Mould", wxOK | wxICON_INFORMATION, this);
     return true;
+}
+
+// ===========================================================================
+// Preview perspective
+//
+// These run on the dedicated preview canvas (m_previewMode == true). The
+// preview reuses this class's GL setup, shaders, grid and orbit camera so the
+// navigation matches the main canvas exactly; it just renders a stripped-down
+// scene (grid + the loaded mould halves) and ignores all editing input.
+// ===========================================================================
+
+void GLCanvas::AddPreviewHalf(const FileImporter::MeshData& mesh,
+    const std::string& label)
+{
+    // Materialise GPU buffers in this canvas's context. The caller (PreviewFrame)
+    // makes the context current before invoking us, but make sure regardless —
+    // UploadMeshToGPU issues GL calls that must hit the right context.
+    SetCurrent(*m_context);
+    InitGLOnce();
+
+    PreviewHalf half;
+    half.label = label;
+    half.visible = true;
+    // Identity pose: the mesh vertices are already in world space.
+    half.obj.pos = glm::vec3(0.0f);
+    half.obj.yawDeg = half.obj.pitchDeg = half.obj.rollDeg = 0.0f;
+    half.obj.scale = 1.0f;
+    half.obj.role = ObjectRole::Fixture;
+
+    UploadMeshToGPU(mesh, half.obj);
+
+    m_previewHalves.push_back(std::move(half));
+    Refresh(false);
+}
+
+std::string GLCanvas::GetPreviewHalfLabel(int index) const
+{
+    if (index < 0 || index >= (int)m_previewHalves.size()) return std::string();
+    return m_previewHalves[index].label;
+}
+
+void GLCanvas::SetPreviewHalfVisible(int index, bool visible)
+{
+    if (index < 0 || index >= (int)m_previewHalves.size()) return;
+    m_previewHalves[index].visible = visible;
+    Refresh(false);
+}
+
+bool GLCanvas::IsPreviewHalfVisible(int index) const
+{
+    if (index < 0 || index >= (int)m_previewHalves.size()) return false;
+    return m_previewHalves[index].visible;
+}
+
+void GLCanvas::ClearPreviewHalves()
+{
+    if (!m_previewHalves.empty() && m_context)
+        SetCurrent(*m_context);
+    for (auto& h : m_previewHalves)
+        h.obj.mesh.Destroy();
+    m_previewHalves.clear();
+    Refresh(false);
+}
+
+void GLCanvas::RenderPreview(const glm::mat4& view, const glm::mat4& proj,
+    const glm::vec3& camPos)
+{
+    // Lit shader uniforms — mirror the main scene pass so the halves are shaded
+    // identically to how objects look in the editor.
+    glUseProgram(m_program);
+
+    const glm::vec3 lightDir = glm::normalize(glm::vec3(0.4f, 0.8f, 0.2f));
+    const glm::vec3 lightColor = glm::vec3(1.0f);
+    const glm::vec3 baseColor = glm::vec3(0.80f, 0.80f, 0.85f);
+
+    glUniform3fv(glGetUniformLocation(m_program, "uCameraPos"), 1, &camPos[0]);
+    glUniform3fv(glGetUniformLocation(m_program, "uLightDir"), 1, &lightDir[0]);
+    glUniform3fv(glGetUniformLocation(m_program, "uLightColor"), 1, &lightColor[0]);
+    glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &baseColor[0]);
+    glUniform1f(glGetUniformLocation(m_program, "uAmbient"), 0.25f);
+    glUniform1f(glGetUniformLocation(m_program, "uDiffuse"), 0.85f);
+    glUniform1f(glGetUniformLocation(m_program, "uSpecular"), 0.20f);
+    glUniform1f(glGetUniformLocation(m_program, "uShininess"), 64.0f);
+    glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 1.0f);
+    glUniformMatrix4fv(glGetUniformLocation(m_program, "uView"), 1, GL_FALSE, &view[0][0]);
+    glUniformMatrix4fv(glGetUniformLocation(m_program, "uProj"), 1, GL_FALSE, &proj[0][0]);
+
+    for (const PreviewHalf& half : m_previewHalves)
+    {
+        if (!half.visible) continue;
+        if (half.obj.mesh.vao == 0 || half.obj.mesh.indexCount == 0) continue;
+
+        const glm::mat4 model = half.obj.BuildModelMatrix();
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &model[0][0]);
+
+        glBindVertexArray(half.obj.mesh.vao);
+        glDrawElements(GL_TRIANGLES, half.obj.mesh.indexCount, GL_UNSIGNED_INT, 0);
+        glBindVertexArray(0);
+    }
+
+    glUseProgram(0);
+
+    // Grid last, same as the main canvas.
+    m_grid.Draw(view, proj);
 }
 
 // ---------------------------------------------------------------------------
@@ -4211,6 +4322,16 @@ void GLCanvas::OnPaint(wxPaintEvent&)
 
     if (!m_program) { SwapBuffers(); return; }
 
+    // Preview canvas: grid + loaded mould halves only. Skip the entire
+    // editing scene (objects, fixture transparency, features, ghosts, picking
+    // and selection outline) — none of it applies here.
+    if (m_previewMode)
+    {
+        RenderPreview(view, proj, camPos);
+        SwapBuffers();
+        return;
+    }
+
     glUseProgram(m_program);
 
     // Shared lighting uniforms
@@ -5455,6 +5576,45 @@ void GLCanvas::OnPaint(wxPaintEvent&)
 // ---------------------------------------------------------------------------
 void GLCanvas::OnMouse(wxMouseEvent& evt)
 {
+    // Preview canvas: navigation only. Orbit (LMB), pan (MMB or Shift+LMB) and
+    // dolly (RMB or Ctrl+LMB) match the main canvas, but there is no picking,
+    // selection, transform, or feature placement.
+    if (m_previewMode)
+    {
+        if (evt.LeftDown())   { m_lmb = true;  m_hasLast = false; }
+        if (evt.LeftUp())     { m_lmb = false; if (HasCapture()) ReleaseMouse(); }
+        if (evt.MiddleDown()) { m_mmb = true;  m_hasLast = false; CaptureMouse(); }
+        if (evt.MiddleUp())   { m_mmb = false; if (HasCapture()) ReleaseMouse(); }
+        if (evt.RightDown())  { m_rmb = true;  m_hasLast = false; CaptureMouse(); }
+        if (evt.RightUp())    { m_rmb = false; if (HasCapture()) ReleaseMouse(); }
+
+        if (evt.Dragging() && m_lmb && !HasCapture())
+            CaptureMouse();
+
+        if (!evt.Moving() && !evt.Dragging()) { evt.Skip(); return; }
+
+        const wxPoint pos = evt.GetPosition();
+        if (!m_hasLast) { m_lastPos = pos; m_hasLast = true; evt.Skip(); return; }
+
+        const float dx = float(pos.x - m_lastPos.x);
+        const float dy = float(pos.y - m_lastPos.y);
+        m_lastPos = pos;
+
+        const bool shift = evt.ShiftDown();
+        const bool ctrl = evt.ControlDown();
+
+        if (m_mmb)        { m_camera.Pan(dx, -dy);       Refresh(false); }
+        else if (m_rmb)   { m_camera.Dolly(dy * 0.05f);  Refresh(false); }
+        else if (m_lmb)
+        {
+            if (shift)      m_camera.Pan(dx, -dy);
+            else if (ctrl)  m_camera.Dolly(dy * 0.05f);
+            else            m_camera.Orbit(dx, dy);
+            Refresh(false);
+        }
+        return;
+    }
+
     if (evt.LeftDown())
     {
         m_lmb = true;
@@ -6131,6 +6291,11 @@ void GLCanvas::OnMouseWheel(wxMouseEvent& evt)
 
 void GLCanvas::OnKeyDown(wxKeyEvent& evt)
 {
+    // Preview canvas has no editing state, so none of the shortcuts below
+    // (Escape mode-exit, Ctrl+A/C/V, Delete) apply. Let the event propagate
+    // so the host frame can still react (e.g. Escape to close).
+    if (m_previewMode) { evt.Skip(); return; }
+
     if (evt.GetKeyCode() == WXK_ESCAPE)
     {
         if (m_transformMode != TransformMode::Select)

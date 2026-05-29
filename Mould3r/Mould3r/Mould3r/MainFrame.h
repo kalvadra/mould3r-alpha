@@ -18,6 +18,8 @@
 class GLCanvas;
 class RoundedButton;   // forward decl — m_btnExport pointer below; full def
 // is included from MainFrame.cpp where it's used.
+class PreviewFrame;    // forward decl — m_previewFrame pointer; full def
+// is included from MainFrame.cpp where the window is created.
 
 enum class TransformMode { Select, Translate, Rotate, Scale, Pattern, PlaceVent, PlaceRunner, PlaceGate, PlaceEjector, RemoveVent, RemoveRunner, RemoveGate, RemoveSprue, RemoveEjector, EditVent, EditRunner, EditGate, EditEjector, SelectInjectionPoint, AlignFace, AlignMidplane };
 
@@ -203,6 +205,12 @@ private:
     wxPanel* CreateRibbon(wxWindow* parent);
 
     GLCanvas* m_canvas = nullptr;
+
+    // The most recent mould-preview window, or nullptr if none is open. Each
+    // successful Generate Mould destroys the previous one and opens a fresh
+    // window seeded with the new post-cut halves. Cleared back to nullptr when
+    // the user closes the window (via the EVT_CLOSE handler bound at creation).
+    PreviewFrame* m_previewFrame = nullptr;
 
     // Stored fixture definition (for project save/load)
     FixtureDefinition m_fixtureDef;

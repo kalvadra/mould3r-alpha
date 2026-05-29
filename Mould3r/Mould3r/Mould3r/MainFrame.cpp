@@ -11,6 +11,7 @@
 
 #include "MainFrame.h"
 #include "GLCanvas.h"
+#include "PreviewFrame.h"     // standalone post-cut mould preview window
 #include "FixtureEditor.h"
 #include "CreateFixtureDialog.h"
 #include "RotateDialog.h"
@@ -1776,7 +1777,34 @@ void MainFrame::OnGenerateMould(wxCommandEvent&)
     // mould is now fresh", so it wins regardless of how many
     // intermediate Clean→Dirty toggles happened inside.
     if (m_canvas->GenerateMould())
+    {
         m_mouldState = MouldState::Clean;
+
+        // Open a fresh preview window showing the post-cut halves. Any
+        // previous preview is destroyed first so the window always reflects
+        // the latest generation. The preview is a non-modal top-level frame —
+        // the main editor stays fully usable alongside it.
+        if (m_previewFrame)
+        {
+            m_previewFrame->Destroy();
+            m_previewFrame = nullptr;
+        }
+
+        const auto& halves = m_canvas->GetLastMouldMeshes();
+        if (!halves.empty())
+        {
+            m_previewFrame = new PreviewFrame(this, halves);
+
+            // Reset our pointer when the user closes the window so we never
+            // touch a destroyed frame (e.g. on the next generation).
+            m_previewFrame->Bind(wxEVT_CLOSE_WINDOW,
+                [this](wxCloseEvent& evt)
+                {
+                    m_previewFrame = nullptr;
+                    evt.Skip();   // let the frame proceed with the close
+                });
+        }
+    }
 }
 
 wxPanel* MainFrame::CreateCollapsibleSection(wxWindow* parent,

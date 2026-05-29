@@ -186,6 +186,52 @@ public:
     bool GenerateMould();
     void ExportFixtures(const std::string& pathA, const std::string& pathB);
 
+    // ---- Preview perspective ------------------------------------------------
+    // A second GLCanvas instance (hosted by PreviewFrame) is put into preview
+    // mode to show the post-cut mould halves on their own. Preview mode strips
+    // the canvas down to: grid + the loaded mould halves, with the standard
+    // orbit / pan / dolly navigation but no picking, selection, transform
+    // modes, feature placement, or keyboard shortcuts. The main canvas is
+    // never in preview mode.
+
+    // Switch this canvas into (or out of) preview mode. Idempotent.
+    void SetPreviewMode(bool on) { m_previewMode = on; }
+    bool IsPreviewMode() const { return m_previewMode; }
+
+    // Append one mould half to the preview from a world-space mesh (position
+    // + normal interleaved, plus indices — exactly the MeshData produced by
+    // GenerateMould). The mesh is uploaded to this canvas's own GL context and
+    // stored with an identity pose, since the fixture transform is already
+    // baked into the world-space vertices. `label` is shown on the half's
+    // show/hide toggle (e.g. "Half A"). Halves start visible. Must be called
+    // with this canvas's GL context current — PreviewFrame arranges that.
+    void AddPreviewHalf(const FileImporter::MeshData& mesh,
+        const std::string& label);
+
+    // Number of mould halves currently loaded into the preview.
+    int  GetPreviewHalfCount() const { return (int)m_previewHalves.size(); }
+
+    // Label of half `index` (empty string if out of range).
+    std::string GetPreviewHalfLabel(int index) const;
+
+    // Show / hide an individual half. Out-of-range indices are ignored.
+    void SetPreviewHalfVisible(int index, bool visible);
+    bool IsPreviewHalfVisible(int index) const;
+
+    // Drop every loaded preview half (frees their GPU resources). Safe to call
+    // with no context current only if nothing has been uploaded yet.
+    void ClearPreviewHalves();
+
+    // Read-only access to the meshes produced by the most recent successful
+    // GenerateMould run, one per fixture, in fixture order. World-space,
+    // interleaved position+normal with indices. PreviewFrame consumes these
+    // to populate a fresh preview window. Cleared at the start of every
+    // GenerateMould call.
+    const std::vector<FileImporter::MeshData>& GetLastMouldMeshes() const
+    {
+        return m_lastMouldMeshes;
+    }
+
     // Scene-mutation callback. MainFrame registers a callback that
     // invalidates the Export button when anything that would stale a
     // previously generated mould happens — transforms, feature place /
@@ -294,6 +340,13 @@ private:
     void OnMouse(wxMouseEvent& evt);
     void OnMouseWheel(wxMouseEvent& evt);
     void OnKeyDown(wxKeyEvent& evt);
+
+    // Preview-mode render path: grid + loaded mould halves only, all opaque,
+    // honouring each half's visibility flag. Called from OnPaint after the
+    // clear + camera setup when m_previewMode is true; the normal scene/
+    // feature passes are skipped entirely.
+    void RenderPreview(const glm::mat4& view, const glm::mat4& proj,
+        const glm::vec3& camPos);
 
     void InitGLOnce();
     void DestroyGL();
@@ -504,6 +557,31 @@ private:
         bool  mirrorZ = false;
     };
     std::vector<ClipboardEntry> m_clipboard;
+
+    // ---- Preview perspective state -----------------------------------------
+    // True only for the dedicated preview canvas hosted by PreviewFrame. The
+    // main editing canvas leaves this false and behaves exactly as before.
+    bool m_previewMode = false;
+
+    // One entry per mould half shown in the preview. The SceneObject carries
+    // its own GPU mesh (uploaded into the preview canvas's context) at an
+    // identity pose — the fixture transform is already baked into the
+    // world-space vertices handed to AddPreviewHalf. `label` drives the
+    // half's show/hide toggle text; `visible` is flipped by that toggle.
+    struct PreviewHalf
+    {
+        SceneObject obj;
+        std::string label;
+        bool        visible = true;
+    };
+    std::vector<PreviewHalf> m_previewHalves;
+
+    // Meshes from the most recent successful GenerateMould (one per fixture,
+    // world-space, position+normal interleaved with indices). Populated in
+    // GenerateMould and consumed by PreviewFrame via GetLastMouldMeshes().
+    // The main canvas no longer swaps these into its own fixtures — they live
+    // here purely to seed the preview window.
+    std::vector<FileImporter::MeshData> m_lastMouldMeshes;
 
     // Vent features (consolidated: point + path + cross-section + solid)
     std::vector<VentInstance> m_vents;
