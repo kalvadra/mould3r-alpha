@@ -198,27 +198,30 @@ public:
     void SetPreviewMode(bool on) { m_previewMode = on; }
     bool IsPreviewMode() const { return m_previewMode; }
 
-    // Append one mould half to the preview from a world-space mesh (position
-    // + normal interleaved, plus indices — exactly the MeshData produced by
+    // Append one part to the preview from a world-space mesh (position +
+    // normal interleaved, plus indices — exactly the MeshData produced by
     // GenerateMould). The mesh is uploaded to this canvas's own GL context and
     // stored with an identity pose, since the fixture transform is already
-    // baked into the world-space vertices. `label` is shown on the half's
-    // show/hide toggle (e.g. "Half A"). Halves start visible. Must be called
-    // with this canvas's GL context current — PreviewFrame arranges that.
+    // baked into the world-space vertices. `label` is shown on the part's
+    // show/hide toggle (e.g. "Half A", "Shot"). `baseColor` lets the shot
+    // model read distinctly from the grey mould halves. Parts start visible.
+    // Must be called with this canvas's GL context current — PreviewFrame
+    // arranges that.
     void AddPreviewHalf(const FileImporter::MeshData& mesh,
-        const std::string& label);
+        const std::string& label,
+        const glm::vec3& baseColor = glm::vec3(0.80f, 0.80f, 0.85f));
 
-    // Number of mould halves currently loaded into the preview.
+    // Number of preview parts (mould halves + shot) currently loaded.
     int  GetPreviewHalfCount() const { return (int)m_previewHalves.size(); }
 
-    // Label of half `index` (empty string if out of range).
+    // Label of part `index` (empty string if out of range).
     std::string GetPreviewHalfLabel(int index) const;
 
-    // Show / hide an individual half. Out-of-range indices are ignored.
+    // Show / hide an individual part. Out-of-range indices are ignored.
     void SetPreviewHalfVisible(int index, bool visible);
     bool IsPreviewHalfVisible(int index) const;
 
-    // Drop every loaded preview half (frees their GPU resources). Safe to call
+    // Drop every loaded preview part (frees their GPU resources). Safe to call
     // with no context current only if nothing has been uploaded yet.
     void ClearPreviewHalves();
 
@@ -231,6 +234,27 @@ public:
     {
         return m_lastMouldMeshes;
     }
+
+    // The "shot" model from the most recent successful GenerateMould: the
+    // boolean union of every imported object and the feed-system features
+    // (sprue, runners, gates and their sub-parts) — i.e. all placed features
+    // except vents and ejectors. World-space, interleaved position+normal
+    // with indices. This is the material body that fills the cavity; it is
+    // also the geometry that downstream simulation will operate on. Valid only
+    // when HasLastShotMesh() returns true (the union can legitimately be empty
+    // when no objects/feed features exist or the fuse failed).
+    bool HasLastShotMesh() const { return m_hasLastShotMesh; }
+    const FileImporter::MeshData& GetLastShotMesh() const
+    {
+        return m_lastShotMesh;
+    }
+
+    // Volume of the shot solid from the most recent successful GenerateMould,
+    // in cubic millimetres (the scene's modelling unit). Computed from the
+    // fused BREP — overlaps between fused primitives are counted once — so it
+    // is the true material volume, not a mesh approximation. Zero when no shot
+    // was built (HasLastShotMesh() == false).
+    double GetLastShotVolumeMm3() const { return m_lastShotVolumeMm3; }
 
     // Scene-mutation callback. MainFrame registers a callback that
     // invalidates the Export button when anything that would stale a
@@ -347,6 +371,22 @@ private:
     // feature passes are skipped entirely.
     void RenderPreview(const glm::mat4& view, const glm::mat4& proj,
         const glm::vec3& camPos);
+
+    // Build the "shot" solid: the boolean union of every imported object
+    // (transformed to world space) and the feed-system features — sprue +
+    // cold slug, runners + cold plugs, gates + sub-runners — but NOT vents or
+    // ejectors. All contributing primitives are constructed in world space
+    // with the same geometry the cut loop uses, then fused pairwise. Returns
+    // true and fills `out` when a non-null union results; returns false when
+    // nothing contributed or the fuse failed outright. Read by GenerateMould.
+    bool BuildShotModel(TopoDS_Shape& out);
+
+    // Tessellate an OCC shape into a render-ready MeshData (vertices meshed,
+    // per-vertex normals computed, crease-split applied so the interleaved
+    // posNorm + indices upload cleanly). Mirrors the inline tessellation used
+    // for the mould halves. `mesh` is cleared first.
+    void TessellateShapeToMesh(const TopoDS_Shape& shape,
+        FileImporter::MeshData& mesh);
 
     void InitGLOnce();
     void DestroyGL();
@@ -563,16 +603,18 @@ private:
     // main editing canvas leaves this false and behaves exactly as before.
     bool m_previewMode = false;
 
-    // One entry per mould half shown in the preview. The SceneObject carries
-    // its own GPU mesh (uploaded into the preview canvas's context) at an
-    // identity pose — the fixture transform is already baked into the
-    // world-space vertices handed to AddPreviewHalf. `label` drives the
-    // half's show/hide toggle text; `visible` is flipped by that toggle.
+    // One entry per part shown in the preview (mould halves + the shot). The
+    // SceneObject carries its own GPU mesh (uploaded into the preview canvas's
+    // context) at an identity pose — the fixture transform is already baked
+    // into the world-space vertices handed to AddPreviewHalf. `label` drives
+    // the part's show/hide toggle text; `visible` is flipped by that toggle;
+    // `baseColor` lets the shot read distinctly from the grey mould halves.
     struct PreviewHalf
     {
         SceneObject obj;
         std::string label;
         bool        visible = true;
+        glm::vec3   baseColor{ 0.80f, 0.80f, 0.85f };
     };
     std::vector<PreviewHalf> m_previewHalves;
 
@@ -582,6 +624,18 @@ private:
     // The main canvas no longer swaps these into its own fixtures — they live
     // here purely to seed the preview window.
     std::vector<FileImporter::MeshData> m_lastMouldMeshes;
+
+    // The shot model from the most recent successful GenerateMould: union of
+    // all imported objects + feed features (sprue / runners / gates), minus
+    // vents and ejectors. World-space, position+normal interleaved with
+    // indices. m_hasLastShotMesh is false when no shot could be built (no
+    // contributing geometry, or the boolean union produced nothing usable).
+    FileImporter::MeshData m_lastShotMesh;
+    bool                   m_hasLastShotMesh = false;
+
+    // Volume of the shot solid (cubic mm), computed from the fused BREP at
+    // generation time. Zero when no shot was built.
+    double                 m_lastShotVolumeMm3 = 0.0;
 
     // Vent features (consolidated: point + path + cross-section + solid)
     std::vector<VentInstance> m_vents;

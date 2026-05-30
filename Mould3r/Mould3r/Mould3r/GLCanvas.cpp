@@ -22,6 +22,9 @@
 #include <opencascade/gp_Mat.hxx>
 #include <opencascade/gp_XYZ.hxx>
 #include <opencascade/BRepAlgoAPI_Cut.hxx>
+#include <opencascade/BRepAlgoAPI_Fuse.hxx>
+#include <opencascade/BRepGProp.hxx>
+#include <opencascade/GProp_GProps.hxx>
 #include <opencascade/BRepMesh_IncrementalMesh.hxx>
 #include <opencascade/BRepBuilderAPI_MakeEdge.hxx>
 #include <opencascade/BRepBuilderAPI_MakeWire.hxx>
@@ -36,6 +39,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -1384,6 +1388,9 @@ bool GLCanvas::GenerateMould()
     // the preview window after a successful run; the main canvas no longer
     // displays them itself (it keeps showing the original fixtures).
     m_lastMouldMeshes.clear();
+    m_lastShotMesh = FileImporter::MeshData{};
+    m_hasLastShotMesh = false;
+    m_lastShotVolumeMm3 = 0.0;
 
     SetCurrent(*m_context);
     InitGLOnce();
@@ -1999,6 +2006,29 @@ bool GLCanvas::GenerateMould()
         m_lastMouldMeshes.push_back(meshData);
     }
 
+    // ---- Shot model -------------------------------------------------------
+    // Build the body of injected material (objects + feed system, excluding
+    // vents and ejectors) and tessellate it for the preview / future
+    // simulation. Done once after the per-fixture loop since the shot is a
+    // single world-space body independent of which half it sits between. A
+    // failed or empty build just leaves m_hasLastShotMesh false — generation
+    // still succeeds; the preview simply won't show a "Shot" part.
+    {
+        TopoDS_Shape shotShape;
+        if (BuildShotModel(shotShape))
+        {
+            // Volume straight off the fused BREP (not the mesh) — accurate and
+            // overlap-safe. Geometry is in mm, so this is cubic mm.
+            GProp_GProps volProps;
+            BRepGProp::VolumeProperties(shotShape, volProps);
+            m_lastShotVolumeMm3 = std::abs(volProps.Mass());
+
+            TessellateShapeToMesh(shotShape, m_lastShotMesh);
+            m_hasLastShotMesh =
+                !m_lastShotMesh.posNorm.empty() && !m_lastShotMesh.indices.empty();
+        }
+    }
+
     progress.Update(totalSteps, "Done.");
     Refresh(false);
     wxMessageBox("Mould generated successfully.",
@@ -2016,7 +2046,8 @@ bool GLCanvas::GenerateMould()
 // ===========================================================================
 
 void GLCanvas::AddPreviewHalf(const FileImporter::MeshData& mesh,
-    const std::string& label)
+    const std::string& label,
+    const glm::vec3& baseColor)
 {
     // Materialise GPU buffers in this canvas's context. The caller (PreviewFrame)
     // makes the context current before invoking us, but make sure regardless —
@@ -2027,6 +2058,7 @@ void GLCanvas::AddPreviewHalf(const FileImporter::MeshData& mesh,
     PreviewHalf half;
     half.label = label;
     half.visible = true;
+    half.baseColor = baseColor;
     // Identity pose: the mesh vertices are already in world space.
     half.obj.pos = glm::vec3(0.0f);
     half.obj.yawDeg = half.obj.pitchDeg = half.obj.rollDeg = 0.0f;
@@ -2077,12 +2109,10 @@ void GLCanvas::RenderPreview(const glm::mat4& view, const glm::mat4& proj,
 
     const glm::vec3 lightDir = glm::normalize(glm::vec3(0.4f, 0.8f, 0.2f));
     const glm::vec3 lightColor = glm::vec3(1.0f);
-    const glm::vec3 baseColor = glm::vec3(0.80f, 0.80f, 0.85f);
 
     glUniform3fv(glGetUniformLocation(m_program, "uCameraPos"), 1, &camPos[0]);
     glUniform3fv(glGetUniformLocation(m_program, "uLightDir"), 1, &lightDir[0]);
     glUniform3fv(glGetUniformLocation(m_program, "uLightColor"), 1, &lightColor[0]);
-    glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &baseColor[0]);
     glUniform1f(glGetUniformLocation(m_program, "uAmbient"), 0.25f);
     glUniform1f(glGetUniformLocation(m_program, "uDiffuse"), 0.85f);
     glUniform1f(glGetUniformLocation(m_program, "uSpecular"), 0.20f);
@@ -2096,6 +2126,10 @@ void GLCanvas::RenderPreview(const glm::mat4& view, const glm::mat4& proj,
         if (!half.visible) continue;
         if (half.obj.mesh.vao == 0 || half.obj.mesh.indexCount == 0) continue;
 
+        // Per-part base colour — mould halves render grey, the shot reads
+        // distinctly (set by its AddPreviewHalf caller).
+        glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &half.baseColor[0]);
+
         const glm::mat4 model = half.obj.BuildModelMatrix();
         glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &model[0][0]);
 
@@ -2108,6 +2142,287 @@ void GLCanvas::RenderPreview(const glm::mat4& view, const glm::mat4& proj,
 
     // Grid last, same as the main canvas.
     m_grid.Draw(view, proj);
+}
+
+// ---------------------------------------------------------------------------
+// BuildShotModel — fuse imported objects + feed-system features into the shot.
+//
+// The shot is the body of material that fills the cavity and feed network: it
+// is the union of everything the cut loop subtracts from the mould EXCEPT the
+// vents and ejectors. Each primitive is built in world space with the same
+// geometry the cut loop uses (kCutEps overlaps included, which only help the
+// fuse), then fused pairwise.
+//
+// NOTE (known duplication): the per-feature geometry below intentionally
+// mirrors the construction in GenerateMould's cut loop. They are kept separate
+// for now so this addition can't regress mould generation; a future pass could
+// factor the shared primitive builders out and have both call them.
+// ---------------------------------------------------------------------------
+bool GLCanvas::BuildShotModel(TopoDS_Shape& out)
+{
+    std::vector<TopoDS_Shape> shapes;
+
+    // ---- Imported objects (transformed to world space) --------------------
+    for (const SceneObject& obj : m_objects)
+    {
+        if (obj.sourcePath.empty() && !obj.hasSourceShape) continue;
+
+        TopoDS_Shape objShape;
+        if (obj.hasSourceShape)
+        {
+            objShape = obj.sourceShape;
+        }
+        else
+        {
+            STEPControl_Reader objReader;
+            if (objReader.ReadFile(obj.sourcePath.c_str()) != IFSelect_RetDone)
+                continue;
+            objReader.TransferRoots();
+            objShape = objReader.OneShape();
+        }
+        if (objShape.IsNull()) continue;
+
+        gp_Trsf objTrsf;
+        glm::mat4 om = obj.BuildModelMatrix();
+        objTrsf.SetValues(
+            om[0][0], om[1][0], om[2][0], om[3][0],
+            om[0][1], om[1][1], om[2][1], om[3][1],
+            om[0][2], om[1][2], om[2][2], om[3][2]
+        );
+        BRepBuilderAPI_Transform objXform(objShape, objTrsf, true);
+        if (!objXform.Shape().IsNull())
+            shapes.push_back(objXform.Shape());
+    }
+
+    static constexpr float kCutEps = 0.1f;
+
+    // ---- Sprue frustum + cold slug ----------------------------------------
+    if (m_sprue.hasPoint)
+    {
+        const glm::vec3 sprueAxis = m_sprue.pathEnd - m_sprue.pathStart;
+        const float     sprueLen = glm::length(sprueAxis);
+        if (sprueLen > 1e-6f)
+        {
+            const glm::vec3 dir = sprueAxis / sprueLen;
+            const glm::vec3 sprueStartExt = m_sprue.pathStart - dir * kCutEps;
+            const float     sprueExtLen = sprueLen + kCutEps;
+
+            gp_Ax2 sprueAx(
+                gp_Pnt(sprueStartExt.x, sprueStartExt.y, sprueStartExt.z),
+                gp_Dir(dir.x, dir.y, dir.z));
+
+            const float draftRad = glm::radians(glm::clamp(m_sprue.draftAngleDeg, 0.0f, 45.0f));
+            const float startR = m_sprue.radius;
+            const float endR = m_sprue.radius + sprueExtLen * std::tan(draftRad);
+
+            if (std::abs(endR - startR) > 1e-6f)
+            {
+                BRepPrimAPI_MakeCone cone(sprueAx, startR, endR, sprueExtLen);
+                cone.Build();
+                if (cone.IsDone() && !cone.Shape().IsNull())
+                    shapes.push_back(cone.Shape());
+            }
+            else
+            {
+                BRepPrimAPI_MakeCylinder cyl(sprueAx, startR, sprueExtLen);
+                cyl.Build();
+                if (cyl.IsDone() && !cyl.Shape().IsNull())
+                    shapes.push_back(cyl.Shape());
+            }
+
+            if (!m_sprue.isDirectInjection && m_sprue.coldSlugDepth > 1e-6f)
+            {
+                gp_Ax2 slugAx(
+                    gp_Pnt(m_sprue.pathEnd.x, m_sprue.pathEnd.y, m_sprue.pathEnd.z),
+                    gp_Dir(dir.x, dir.y, dir.z));
+                BRepPrimAPI_MakeCylinder slugCyl(slugAx, endR, m_sprue.coldSlugDepth);
+                slugCyl.Build();
+                if (slugCyl.IsDone() && !slugCyl.Shape().IsNull())
+                    shapes.push_back(slugCyl.Shape());
+            }
+        }
+    }
+
+    // Feed dimensions from the side panel — same source as the cut loop.
+    float runnerRadius = 2.5f, coldPlugDist = 5.0f;
+    float gateRadius = 1.5f, draftAngle = 1.0f, subRunnerRadius = 2.5f, overrun = 0.0f;
+    if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+    {
+        runnerRadius = frame->GetRunnerDiameter() * 0.5f;
+        coldPlugDist = frame->GetRunnerColdPlugDist();
+        gateRadius = frame->GetGateDiameter() * 0.5f;
+        draftAngle = frame->GetGateDraftAngle();
+        subRunnerRadius = frame->GetSubRunnerDiameter() * 0.5f;
+        overrun = frame->GetGateOverrun();
+    }
+
+    // ---- Runner cylinders + cold plugs ------------------------------------
+    if (m_sprue.hasPartingPoint && runnerRadius > 1e-6f)
+    {
+        for (const RunnerFeature& rf : m_runners)
+        {
+            const glm::vec3 runnerAxis = rf.point - m_sprue.partingPos;
+            const float runnerLen = glm::length(runnerAxis);
+            if (runnerLen < 1e-6f) continue;
+            const glm::vec3 runnerDir = runnerAxis / runnerLen;
+
+            const glm::vec3 runnerOriginExt = m_sprue.partingPos - runnerDir * kCutEps;
+            gp_Ax2 runnerAx(
+                gp_Pnt(runnerOriginExt.x, runnerOriginExt.y, runnerOriginExt.z),
+                gp_Dir(runnerDir.x, runnerDir.y, runnerDir.z));
+            BRepPrimAPI_MakeCylinder runnerCyl(runnerAx, runnerRadius, runnerLen + 2.0f * kCutEps);
+            runnerCyl.Build();
+            if (runnerCyl.IsDone() && !runnerCyl.Shape().IsNull())
+                shapes.push_back(runnerCyl.Shape());
+
+            if (coldPlugDist > 1e-6f)
+            {
+                gp_Ax2 plugAx(
+                    gp_Pnt(rf.point.x, rf.point.y, rf.point.z),
+                    gp_Dir(runnerDir.x, runnerDir.y, runnerDir.z));
+                BRepPrimAPI_MakeCylinder plugCyl(plugAx, runnerRadius, coldPlugDist);
+                plugCyl.Build();
+                if (plugCyl.IsDone() && !plugCyl.Shape().IsNull())
+                    shapes.push_back(plugCyl.Shape());
+            }
+        }
+    }
+
+    // ---- Gate frustums + sub-runners --------------------------------------
+    {
+        const float draftRad = glm::radians(glm::clamp(draftAngle, 0.0f, 45.0f));
+        const float tanDraft = std::tan(draftRad);
+
+        for (const GateFeature& gf : m_gates)
+        {
+            if (!gf.hasPath) continue;
+
+            const glm::vec3 origin = gf.point.worldPos;
+            const glm::vec3 pathVec = gf.pathEnd - origin;
+            const float     totalLen = glm::length(pathVec);
+            if (totalLen < 1e-6f || gateRadius < 1e-6f) continue;
+            const glm::vec3 pathDir = pathVec / totalLen;
+            const gp_Dir occDir(pathDir.x, pathDir.y, pathDir.z);
+
+            const float backExt = kCutEps + overrun;
+            const glm::vec3 originExt = origin - pathDir * backExt;
+            const float     totalLenExt = totalLen + backExt;
+            const gp_Ax2    gateAxExt(gp_Pnt(originExt.x, originExt.y, originExt.z), occDir);
+
+            const float startRadius = std::max(0.01f, gateRadius - tanDraft * backExt);
+
+            float taperLen = std::numeric_limits<float>::max();
+            if (tanDraft > 1e-6f && subRunnerRadius > gateRadius)
+                taperLen = (subRunnerRadius - gateRadius) / tanDraft;
+            const float taperLenExt = taperLen + backExt;
+
+            if (taperLen >= totalLen)
+            {
+                const float endR = startRadius + totalLenExt * tanDraft;
+                if (std::abs(endR - startRadius) > 1e-6f)
+                {
+                    BRepPrimAPI_MakeCone cone(gateAxExt, startRadius, endR, totalLenExt);
+                    cone.Build();
+                    if (cone.IsDone() && !cone.Shape().IsNull())
+                        shapes.push_back(cone.Shape());
+                }
+                else
+                {
+                    BRepPrimAPI_MakeCylinder cyl(gateAxExt, startRadius, totalLenExt);
+                    cyl.Build();
+                    if (cyl.IsDone() && !cyl.Shape().IsNull())
+                        shapes.push_back(cyl.Shape());
+                }
+            }
+            else
+            {
+                BRepPrimAPI_MakeCone cone(gateAxExt, startRadius, subRunnerRadius, taperLenExt);
+                cone.Build();
+                if (cone.IsDone() && !cone.Shape().IsNull())
+                    shapes.push_back(cone.Shape());
+
+                const glm::vec3 transitionPt = originExt + pathDir * taperLenExt;
+                const float     subLen = totalLenExt - taperLenExt;
+                if (subLen > 1e-6f)
+                {
+                    gp_Ax2 subAx(gp_Pnt(transitionPt.x, transitionPt.y, transitionPt.z), occDir);
+                    BRepPrimAPI_MakeCylinder subCyl(subAx, subRunnerRadius, subLen);
+                    subCyl.Build();
+                    if (subCyl.IsDone() && !subCyl.Shape().IsNull())
+                        shapes.push_back(subCyl.Shape());
+                }
+            }
+        }
+    }
+
+    if (shapes.empty()) return false;
+
+    // ---- Fuse everything --------------------------------------------------
+    // Pairwise fuse. Disjoint pieces fuse into a valid compound, so this stays
+    // robust even when (say) a gate doesn't quite touch its feed point. A
+    // failed individual fuse drops that one piece rather than aborting the
+    // whole shot.
+    TopoDS_Shape acc = shapes[0];
+    for (size_t i = 1; i < shapes.size(); ++i)
+    {
+        BRepAlgoAPI_Fuse fuse(acc, shapes[i]);
+        fuse.Build();
+        if (fuse.IsDone() && !fuse.Shape().IsNull())
+            acc = fuse.Shape();
+        // else: keep acc, skip this piece.
+    }
+
+    if (acc.IsNull()) return false;
+    out = acc;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// TessellateShapeToMesh — OCC shape → render-ready MeshData (posNorm+indices).
+// Mirrors the inline tessellation used for the mould halves.
+// ---------------------------------------------------------------------------
+void GLCanvas::TessellateShapeToMesh(const TopoDS_Shape& shape,
+    FileImporter::MeshData& mesh)
+{
+    mesh = FileImporter::MeshData{};
+    if (shape.IsNull()) return;
+
+    BRepMesh_IncrementalMesh mesher(shape, 0.05, false, 0.5, true);
+
+    for (TopExp_Explorer ex(shape, TopAbs_FACE); ex.More(); ex.Next())
+    {
+        const TopoDS_Face face = TopoDS::Face(ex.Current());
+        TopLoc_Location loc;
+        Handle(Poly_Triangulation) tri = BRep_Tool::Triangulation(face, loc);
+        if (tri.IsNull()) continue;
+
+        const gp_Trsf tr = loc.Transformation();
+        const uint32_t baseIndex = (uint32_t)(mesh.vertices.size() / 3);
+
+        for (int i = 1; i <= tri->NbNodes(); ++i)
+        {
+            gp_Pnt p = tri->Node(i);
+            p.Transform(tr);
+            mesh.vertices.push_back((float)p.X());
+            mesh.vertices.push_back((float)p.Y());
+            mesh.vertices.push_back((float)p.Z());
+        }
+        for (int t = 1; t <= tri->NbTriangles(); ++t)
+        {
+            int n1, n2, n3;
+            tri->Triangle(t).Get(n1, n2, n3);
+            mesh.indices.push_back(baseIndex + (uint32_t)(n1 - 1));
+            mesh.indices.push_back(baseIndex + (uint32_t)(n2 - 1));
+            mesh.indices.push_back(baseIndex + (uint32_t)(n3 - 1));
+        }
+    }
+
+    if (mesh.vertices.empty() || mesh.indices.empty()) return;
+
+    ComputeVertexNormals_Pos3(mesh.vertices, mesh.indices, mesh.posNorm);
+    auto split = SplitByCreaseAngle_Pos3(mesh.vertices, mesh.indices, 35.0f);
+    mesh.posNorm = std::move(split.posNorm);
+    mesh.indices = std::move(split.indices);
 }
 
 // ---------------------------------------------------------------------------
