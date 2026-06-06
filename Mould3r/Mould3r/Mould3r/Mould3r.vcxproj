@@ -141,6 +141,7 @@
     <ClCompile Include="AppConfig.cpp" />
     <ClCompile Include="camera.cpp" />
     <ClCompile Include="CreateFixtureDialog.cpp" />
+    <ClCompile Include="DesignChecks.cpp" />
     <ClCompile Include="FileImporter.cpp" />
     <ClCompile Include="FixtureCanvas.cpp" />
     <ClCompile Include="FixtureEditor.cpp" />
@@ -173,6 +174,7 @@
     <ClInclude Include="AppConfig.h" />
     <ClInclude Include="camera.h" />
     <ClInclude Include="CreateFixtureDialog.h" />
+    <ClInclude Include="DesignChecks.h" />
     <ClInclude Include="FileImporter.h" />
     <ClInclude Include="FixtureCanvas.h" />
     <ClInclude Include="FixtureEditor.h" />

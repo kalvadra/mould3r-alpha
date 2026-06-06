@@ -26,6 +26,8 @@
 #include <opencascade/BRepGProp.hxx>
 #include <opencascade/GProp_GProps.hxx>
 #include <opencascade/BRepMesh_IncrementalMesh.hxx>
+#include <opencascade/TopExp.hxx>
+#include <opencascade/TopTools_IndexedMapOfShape.hxx>
 #include <opencascade/BRepBuilderAPI_MakeEdge.hxx>
 #include <opencascade/BRepBuilderAPI_MakeWire.hxx>
 #include <opencascade/BRepBuilderAPI_MakeFace.hxx>
@@ -1391,6 +1393,9 @@ bool GLCanvas::GenerateMould()
     m_lastShotMesh = FileImporter::MeshData{};
     m_hasLastShotMesh = false;
     m_lastShotVolumeMm3 = 0.0;
+    m_lastShotShape = TopoDS_Shape();
+    m_lastShotFaceIds.clear();
+    m_lastHalfShapes.clear();
 
     SetCurrent(*m_context);
     InitGLOnce();
@@ -2004,6 +2009,10 @@ bool GLCanvas::GenerateMould()
         // world space (the fixture transform was baked into `result` above),
         // so the preview renders it at an identity pose.
         m_lastMouldMeshes.push_back(meshData);
+
+        // Retain the half solid (world space, post-cut) for the separation
+        // demoldability check, kept in lockstep with m_lastMouldMeshes.
+        m_lastHalfShapes.push_back(result);
     }
 
     // ---- Shot model -------------------------------------------------------
@@ -2023,7 +2032,10 @@ bool GLCanvas::GenerateMould()
             BRepGProp::VolumeProperties(shotShape, volProps);
             m_lastShotVolumeMm3 = std::abs(volProps.Mass());
 
-            TessellateShapeToMesh(shotShape, m_lastShotMesh);
+            // Retain the BREP for face-level design checks, and tessellate with
+            // a per-triangle face map so face results map back to display tris.
+            m_lastShotShape = shotShape;
+            TessellateShapeToMesh(shotShape, m_lastShotMesh, &m_lastShotFaceIds);
             m_hasLastShotMesh =
                 !m_lastShotMesh.posNorm.empty() && !m_lastShotMesh.indices.empty();
         }
@@ -2100,6 +2112,145 @@ void GLCanvas::ClearPreviewHalves()
     Refresh(false);
 }
 
+void GLCanvas::SetShotDebugGroups(int halfIndex,
+    const std::vector<ShotDebugGroup>& groups)
+{
+    if (halfIndex < 0 || halfIndex >= (int)m_previewHalves.size()) return;
+    const GPUMesh& src = m_previewHalves[halfIndex].obj.mesh;
+    if (src.vbo == 0) return;
+
+    SetCurrent(*m_context);
+    InitGLOnce();
+
+    // Tear down any previous debug buffers so repeated calls don't leak.
+    for (auto& g : m_shotDebug.groups)
+        if (g.ebo) { glDeleteBuffers(1, &g.ebo); g.ebo = 0; }
+    m_shotDebug.groups.clear();
+    if (m_shotDebug.vao) { glDeleteVertexArrays(1, &m_shotDebug.vao); m_shotDebug.vao = 0; }
+
+    // Debug VAO references the part's existing vertex buffer (pos + normal,
+    // 6-float stride) so lighting matches the normal pass; only the element
+    // buffer changes between groups.
+    glGenVertexArrays(1, &m_shotDebug.vao);
+    glBindVertexArray(m_shotDebug.vao);
+    glBindBuffer(GL_ARRAY_BUFFER, src.vbo);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * (GLsizei)sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * (GLsizei)sizeof(float),
+        (void*)(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+
+    for (const ShotDebugGroup& grp : groups)
+    {
+        if (grp.indices.empty()) continue;
+        DebugGroupGPU gpu;
+        gpu.color = grp.color;
+        gpu.count = (GLsizei)grp.indices.size();
+        glGenBuffers(1, &gpu.ebo);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gpu.ebo);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+            (GLsizeiptr)(grp.indices.size() * sizeof(uint32_t)),
+            grp.indices.data(), GL_STATIC_DRAW);
+        m_shotDebug.groups.push_back(gpu);
+    }
+
+    glBindVertexArray(0);
+
+    m_shotDebug.halfIndex = halfIndex;
+    m_shotDebug.active = true;
+    Refresh(false);
+}
+
+void GLCanvas::ClearShotDebugColoring()
+{
+    m_shotDebug.active = false;
+    m_shotDebug.halfIndex = -1;
+    Refresh(false);
+}
+
+void GLCanvas::SetShotDebugRays(const std::vector<glm::vec3>& rayLineVerts,
+    const std::vector<glm::vec3>& contactVerts)
+{
+    SetCurrent(*m_context);
+    InitGLOnce();
+
+    auto upload = [&](GLuint& vao, GLuint& vbo, GLsizei& count,
+        const std::vector<glm::vec3>& verts)
+    {
+        if (vao == 0) glGenVertexArrays(1, &vao);
+        if (vbo == 0) glGenBuffers(1, &vbo);
+        glBindVertexArray(vao);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        glBufferData(GL_ARRAY_BUFFER,
+            (GLsizeiptr)(verts.size() * sizeof(glm::vec3)),
+            verts.empty() ? nullptr : verts.data(), GL_DYNAMIC_DRAW);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * (GLsizei)sizeof(float), (void*)0);
+        glEnableVertexAttribArray(0);
+        glBindVertexArray(0);
+        count = (GLsizei)verts.size();
+    };
+
+    upload(m_debugRayVao, m_debugRayVbo, m_debugRayVertCount, rayLineVerts);
+    upload(m_debugContactVao, m_debugContactVbo, m_debugContactVertCount, contactVerts);
+    Refresh(false);
+}
+
+void GLCanvas::ShowShotDebugRays(bool on)
+{
+    m_showDebugRays = on;
+    Refresh(false);
+}
+
+void GLCanvas::ShowShotDebugContacts(bool on)
+{
+    m_showDebugContacts = on;
+    Refresh(false);
+}
+
+void GLCanvas::ClearShotDebugRays()
+{
+    m_showDebugRays = false;
+    m_showDebugContacts = false;
+    m_debugRayVertCount = 0;
+    m_debugContactVertCount = 0;
+    Refresh(false);
+}
+
+void GLCanvas::SetShotDebugSolid(const TopoDS_Shape& shape, const glm::vec3& color)
+{
+    SetCurrent(*m_context);
+    InitGLOnce();
+
+    m_debugSolidObj.mesh.Destroy();
+    m_debugSolidColor = color;
+
+    if (shape.IsNull()) { m_showDebugSolid = false; Refresh(false); return; }
+
+    FileImporter::MeshData mesh;
+    TessellateShapeToMesh(shape, mesh);
+    if (mesh.posNorm.empty() || mesh.indices.empty())
+    {
+        m_showDebugSolid = false;
+        Refresh(false);
+        return;
+    }
+    UploadMeshToGPU(mesh, m_debugSolidObj);
+    Refresh(false);
+}
+
+void GLCanvas::ShowShotDebugSolid(bool on)
+{
+    m_showDebugSolid = on;
+    Refresh(false);
+}
+
+void GLCanvas::ClearShotDebugSolid()
+{
+    m_showDebugSolid = false;
+    m_debugSolidObj.mesh.Destroy();
+    Refresh(false);
+}
+
 void GLCanvas::RenderPreview(const glm::mat4& view, const glm::mat4& proj,
     const glm::vec3& camPos)
 {
@@ -2121,24 +2272,88 @@ void GLCanvas::RenderPreview(const glm::mat4& view, const glm::mat4& proj,
     glUniformMatrix4fv(glGetUniformLocation(m_program, "uView"), 1, GL_FALSE, &view[0][0]);
     glUniformMatrix4fv(glGetUniformLocation(m_program, "uProj"), 1, GL_FALSE, &proj[0][0]);
 
-    for (const PreviewHalf& half : m_previewHalves)
+    const GLint locBase = glGetUniformLocation(m_program, "uBaseColor");
+    const GLint locModel = glGetUniformLocation(m_program, "uModel");
+
+    for (int hi = 0; hi < (int)m_previewHalves.size(); ++hi)
     {
+        const PreviewHalf& half = m_previewHalves[hi];
         if (!half.visible) continue;
         if (half.obj.mesh.vao == 0 || half.obj.mesh.indexCount == 0) continue;
 
+        const glm::mat4 model = half.obj.BuildModelMatrix();
+        glUniformMatrix4fv(locModel, 1, GL_FALSE, &model[0][0]);
+
+        // Debug colouring: draw this part as flat-coloured groups over a debug
+        // VAO instead of its normal single colour.
+        if (m_shotDebug.active && hi == m_shotDebug.halfIndex && m_shotDebug.vao)
+        {
+            glBindVertexArray(m_shotDebug.vao);
+            for (const DebugGroupGPU& g : m_shotDebug.groups)
+            {
+                if (g.count <= 0) continue;
+                glUniform3fv(locBase, 1, &g.color[0]);
+                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g.ebo);
+                glDrawElements(GL_TRIANGLES, g.count, GL_UNSIGNED_INT, 0);
+            }
+            glBindVertexArray(0);
+            continue;
+        }
+
         // Per-part base colour — mould halves render grey, the shot reads
         // distinctly (set by its AddPreviewHalf caller).
-        glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &half.baseColor[0]);
-
-        const glm::mat4 model = half.obj.BuildModelMatrix();
-        glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &model[0][0]);
+        glUniform3fv(locBase, 1, &half.baseColor[0]);
 
         glBindVertexArray(half.obj.mesh.vao);
         glDrawElements(GL_TRIANGLES, half.obj.mesh.indexCount, GL_UNSIGNED_INT, 0);
         glBindVertexArray(0);
     }
 
+    // Free-standing lit debug solid (separation-test interference region).
+    if (m_showDebugSolid && m_debugSolidObj.mesh.vao &&
+        m_debugSolidObj.mesh.indexCount > 0)
+    {
+        const glm::mat4 model(1.0f);  // already world space
+        glUniformMatrix4fv(locModel, 1, GL_FALSE, &model[0][0]);
+        glUniform3fv(locBase, 1, &m_debugSolidColor[0]);
+        glBindVertexArray(m_debugSolidObj.mesh.vao);
+        glDrawElements(GL_TRIANGLES, m_debugSolidObj.mesh.indexCount, GL_UNSIGNED_INT, 0);
+        glBindVertexArray(0);
+    }
+
     glUseProgram(0);
+
+    // Accessibility-ray debug overlay (flat shader): ray segments + contacts.
+    if (m_flatProgram &&
+        ((m_showDebugRays && m_debugRayVertCount > 0) ||
+         (m_showDebugContacts && m_debugContactVertCount > 0)))
+    {
+        glUseProgram(m_flatProgram);
+        const glm::mat4 VP = proj * view;
+        glUniformMatrix4fv(m_flat_uVP, 1, GL_FALSE, &VP[0][0]);
+
+        if (m_showDebugRays && m_debugRayVao && m_debugRayVertCount > 0)
+        {
+            const glm::vec4 rayColor(1.0f, 0.85f, 0.10f, 1.0f);  // yellow
+            glUniform4fv(m_flat_uColor, 1, &rayColor[0]);
+            glLineWidth(2.0f);
+            glBindVertexArray(m_debugRayVao);
+            glDrawArrays(GL_LINES, 0, m_debugRayVertCount);
+            glBindVertexArray(0);
+            glLineWidth(1.0f);
+        }
+        if (m_showDebugContacts && m_debugContactVao && m_debugContactVertCount > 0)
+        {
+            const glm::vec4 contactColor(0.95f, 0.12f, 0.12f, 1.0f);  // red
+            glUniform4fv(m_flat_uColor, 1, &contactColor[0]);
+            glPointSize(9.0f);
+            glBindVertexArray(m_debugContactVao);
+            glDrawArrays(GL_POINTS, 0, m_debugContactVertCount);
+            glBindVertexArray(0);
+            glPointSize(1.0f);
+        }
+        glUseProgram(0);
+    }
 
     // Grid last, same as the main canvas.
     m_grid.Draw(view, proj);
@@ -2378,16 +2593,22 @@ bool GLCanvas::BuildShotModel(TopoDS_Shape& out)
 }
 
 // ---------------------------------------------------------------------------
-// TessellateShapeToMesh — OCC shape → render-ready MeshData (posNorm+indices).
-// Mirrors the inline tessellation used for the mould halves.
+// TessellateShapeToMesh — OCC shape → render-ready MeshData (posNorm+indices),
+// optionally recording each triangle's source-face index.
 // ---------------------------------------------------------------------------
 void GLCanvas::TessellateShapeToMesh(const TopoDS_Shape& shape,
-    FileImporter::MeshData& mesh)
+    FileImporter::MeshData& mesh, std::vector<int>* faceIds)
 {
     mesh = FileImporter::MeshData{};
+    if (faceIds) faceIds->clear();
     if (shape.IsNull()) return;
 
     BRepMesh_IncrementalMesh mesher(shape, 0.05, false, 0.5, true);
+
+    // Stable 1-based face indexing, matching what DesignChecks rebuilds via
+    // TopExp::MapShapes — so a face-level result maps back to these triangles.
+    TopTools_IndexedMapOfShape faceMap;
+    if (faceIds) TopExp::MapShapes(shape, TopAbs_FACE, faceMap);
 
     for (TopExp_Explorer ex(shape, TopAbs_FACE); ex.More(); ex.Next())
     {
@@ -2396,8 +2617,17 @@ void GLCanvas::TessellateShapeToMesh(const TopoDS_Shape& shape,
         Handle(Poly_Triangulation) tri = BRep_Tool::Triangulation(face, loc);
         if (tri.IsNull()) continue;
 
+        const int faceIndex = faceIds ? faceMap.FindIndex(face) : 0;
+
         const gp_Trsf tr = loc.Transformation();
         const uint32_t baseIndex = (uint32_t)(mesh.vertices.size() / 3);
+
+        // OCC triangulates each face for its FORWARD sense. When the face is
+        // REVERSED within the solid, its true outward normal is the opposite
+        // of the triangulation winding, so swap two indices to flip the
+        // winding back to outward. This keeps geometric (cross-product)
+        // normals reliably outward — which the demoldability check depends on.
+        const bool reversed = (face.Orientation() == TopAbs_REVERSED);
 
         for (int i = 1; i <= tri->NbNodes(); ++i)
         {
@@ -2411,9 +2641,11 @@ void GLCanvas::TessellateShapeToMesh(const TopoDS_Shape& shape,
         {
             int n1, n2, n3;
             tri->Triangle(t).Get(n1, n2, n3);
+            if (reversed) std::swap(n2, n3);
             mesh.indices.push_back(baseIndex + (uint32_t)(n1 - 1));
             mesh.indices.push_back(baseIndex + (uint32_t)(n2 - 1));
             mesh.indices.push_back(baseIndex + (uint32_t)(n3 - 1));
+            if (faceIds) faceIds->push_back(faceIndex);
         }
     }
 
@@ -2423,6 +2655,7 @@ void GLCanvas::TessellateShapeToMesh(const TopoDS_Shape& shape,
     auto split = SplitByCreaseAngle_Pos3(mesh.vertices, mesh.indices, 35.0f);
     mesh.posNorm = std::move(split.posNorm);
     mesh.indices = std::move(split.indices);
+    // faceIds stays aligned: the crease split preserves triangle order/count.
 }
 
 // ---------------------------------------------------------------------------
@@ -4294,6 +4527,16 @@ void GLCanvas::DestroyGL()
     if (m_sphereEBO) { glDeleteBuffers(1, &m_sphereEBO);          m_sphereEBO = 0; }
     if (m_sphereVBO) { glDeleteBuffers(1, &m_sphereVBO);          m_sphereVBO = 0; }
     if (m_sphereVAO) { glDeleteVertexArrays(1, &m_sphereVAO);     m_sphereVAO = 0; }
+    // Preview debug overlays (shot colouring groups + ray/contact geometry).
+    for (auto& g : m_shotDebug.groups)
+        if (g.ebo) { glDeleteBuffers(1, &g.ebo); g.ebo = 0; }
+    m_shotDebug.groups.clear();
+    if (m_shotDebug.vao) { glDeleteVertexArrays(1, &m_shotDebug.vao); m_shotDebug.vao = 0; }
+    if (m_debugRayVbo) { glDeleteBuffers(1, &m_debugRayVbo);          m_debugRayVbo = 0; }
+    if (m_debugRayVao) { glDeleteVertexArrays(1, &m_debugRayVao);     m_debugRayVao = 0; }
+    if (m_debugContactVbo) { glDeleteBuffers(1, &m_debugContactVbo);      m_debugContactVbo = 0; }
+    if (m_debugContactVao) { glDeleteVertexArrays(1, &m_debugContactVao); m_debugContactVao = 0; }
+    m_debugSolidObj.mesh.Destroy();
     if (m_vbo) { glDeleteBuffers(1, &m_vbo);               m_vbo = 0; }
     if (m_vao) { glDeleteVertexArrays(1, &m_vao);          m_vao = 0; }
     if (m_ebo) { glDeleteBuffers(1, &m_ebo);               m_ebo = 0; }

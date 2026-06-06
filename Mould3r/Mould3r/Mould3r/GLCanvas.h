@@ -225,6 +225,50 @@ public:
     // with no context current only if nothing has been uploaded yet.
     void ClearPreviewHalves();
 
+    // ---- Design-check debug colouring --------------------------------------
+    // One flat-coloured group of facets for the debug overlay: every triangle
+    // in `indices` (vertex-index triples into the part's own vertex buffer)
+    // draws in `color`. The caller partitions the part's triangles into groups.
+    struct ShotDebugGroup
+    {
+        glm::vec3             color{ 0.5f };
+        std::vector<uint32_t> indices;
+    };
+
+    // Recolour a preview part's facets using the given groups, for debugging
+    // (each group drawn flat in its colour over a dedicated debug VAO that
+    // reuses the part's existing vertices + the lit shader). Replaces any
+    // previous debug colouring. Used to visualise check categories or, e.g.,
+    // draft sign across the shot.
+    void SetShotDebugGroups(int halfIndex,
+        const std::vector<ShotDebugGroup>& groups);
+
+    // Turn debug colouring off — the shot returns to its normal single colour.
+    void ClearShotDebugColoring();
+
+    // ---- Design-check debug rays -------------------------------------------
+    // Upload accessibility-ray debug geometry for the preview: `rayLineVerts`
+    // is GL_LINES vertex pairs (world space) for the ray segments, and
+    // `contactVerts` is GL_POINTS world positions for the contact markers.
+    // Rendered with the flat (unlit) shader. Replaces any previous ray geometry.
+    void SetShotDebugRays(const std::vector<glm::vec3>& rayLineVerts,
+        const std::vector<glm::vec3>& contactVerts);
+
+    // Toggle visibility of the ray segments / contact markers independently.
+    void ShowShotDebugRays(bool on);
+    void ShowShotDebugContacts(bool on);
+
+    // Forget ray geometry and hide both overlays.
+    void ClearShotDebugRays();
+
+    // ---- Design-check debug solid ------------------------------------------
+    // Upload a free-standing solid (e.g. the interference region from the
+    // separation test) and show it in the preview, lit, in `color`. Replaces
+    // any previous debug solid. Rendered at identity pose (world space).
+    void SetShotDebugSolid(const TopoDS_Shape& shape, const glm::vec3& color);
+    void ShowShotDebugSolid(bool on);
+    void ClearShotDebugSolid();
+
     // Read-only access to the meshes produced by the most recent successful
     // GenerateMould run, one per fixture, in fixture order. World-space,
     // interleaved position+normal with indices. PreviewFrame consumes these
@@ -255,6 +299,25 @@ public:
     // is the true material volume, not a mesh approximation. Zero when no shot
     // was built (HasLastShotMesh() == false).
     double GetLastShotVolumeMm3() const { return m_lastShotVolumeMm3; }
+
+    // The shot solid as a BREP, for design-check analysis at the face level.
+    // Valid only when HasLastShotMesh() is true.
+    const TopoDS_Shape& GetLastShotShape() const { return m_lastShotShape; }
+
+    // Per display-triangle source-face index (1-based, into a
+    // TopExp::MapShapes(shot, TopAbs_FACE) map of GetLastShotShape()). One
+    // entry per triangle of GetLastShotMesh(); lets a face-level result be
+    // mapped back to the shot's display triangles for colouring.
+    const std::vector<int>& GetLastShotFaceIds() const { return m_lastShotFaceIds; }
+
+    // The post-cut mould-half solids (BREP) from the most recent successful
+    // GenerateMould, in fixture order. Used by the separation-based
+    // demoldability check (translate each half off the shot and test for
+    // interference). Empty when no mould was generated.
+    const std::vector<TopoDS_Shape>& GetLastHalfShapes() const
+    {
+        return m_lastHalfShapes;
+    }
 
     // Scene-mutation callback. MainFrame registers a callback that
     // invalidates the Export button when anything that would stale a
@@ -383,10 +446,14 @@ private:
 
     // Tessellate an OCC shape into a render-ready MeshData (vertices meshed,
     // per-vertex normals computed, crease-split applied so the interleaved
-    // posNorm + indices upload cleanly). Mirrors the inline tessellation used
-    // for the mould halves. `mesh` is cleared first.
+    // posNorm + indices upload cleanly), with orientation-aware winding.
+    // `mesh` is cleared first. When `faceIds` is non-null it is filled with one
+    // entry per output triangle: the 1-based index of that triangle's source
+    // face in a TopExp::MapShapes(shape, TopAbs_FACE) map (the crease split
+    // preserves triangle order, so the map stays aligned with mesh.indices).
     void TessellateShapeToMesh(const TopoDS_Shape& shape,
-        FileImporter::MeshData& mesh);
+        FileImporter::MeshData& mesh,
+        std::vector<int>* faceIds = nullptr);
 
     void InitGLOnce();
     void DestroyGL();
@@ -618,6 +685,44 @@ private:
     };
     std::vector<PreviewHalf> m_previewHalves;
 
+    // Debug colouring overlay for one preview part (the shot). When active, the
+    // named part is drawn as a set of flat-coloured groups instead of its
+    // normal single colour. The debug VAO references the part's existing vertex
+    // buffer, so only the per-group index buffers are owned here. GPU objects
+    // are freed on the next SetShotDebugGroups call or by context teardown.
+    struct DebugGroupGPU
+    {
+        GLuint    ebo = 0;
+        GLsizei   count = 0;
+        glm::vec3 color{ 0.5f };
+    };
+    struct ShotDebugView
+    {
+        bool    active = false;
+        int     halfIndex = -1;
+        GLuint  vao = 0;
+        std::vector<DebugGroupGPU> groups;
+    };
+    ShotDebugView m_shotDebug;
+
+    // Accessibility-ray debug overlay (preview): ray segments drawn as GL_LINES
+    // and contact points as GL_POINTS via the flat shader. Geometry is world
+    // space; visibility of each is toggled independently.
+    GLuint  m_debugRayVao = 0;
+    GLuint  m_debugRayVbo = 0;
+    GLsizei m_debugRayVertCount = 0;
+    GLuint  m_debugContactVao = 0;
+    GLuint  m_debugContactVbo = 0;
+    GLsizei m_debugContactVertCount = 0;
+    bool    m_showDebugRays = false;
+    bool    m_showDebugContacts = false;
+
+    // Free-standing lit debug solid (the separation test's interference region).
+    // Stored as a SceneObject so the normal mesh upload/render path applies.
+    SceneObject m_debugSolidObj;
+    bool        m_showDebugSolid = false;
+    glm::vec3   m_debugSolidColor{ 0.90f, 0.15f, 0.15f };
+
     // Meshes from the most recent successful GenerateMould (one per fixture,
     // world-space, position+normal interleaved with indices). Populated in
     // GenerateMould and consumed by PreviewFrame via GetLastMouldMeshes().
@@ -636,6 +741,17 @@ private:
     // Volume of the shot solid (cubic mm), computed from the fused BREP at
     // generation time. Zero when no shot was built.
     double                 m_lastShotVolumeMm3 = 0.0;
+
+    // The shot solid (BREP) and a per-display-triangle face-index map, kept so
+    // design checks can run at the face level and map results back to the
+    // display triangles. Face indices are 1-based into a TopExp::MapShapes
+    // face map of m_lastShotShape, matching what DesignChecks rebuilds.
+    TopoDS_Shape           m_lastShotShape;
+    std::vector<int>       m_lastShotFaceIds;
+
+    // The post-cut mould-half solids (BREP), in fixture order, retained for the
+    // separation-based demoldability check.
+    std::vector<TopoDS_Shape> m_lastHalfShapes;
 
     // Vent features (consolidated: point + path + cross-section + solid)
     std::vector<VentInstance> m_vents;

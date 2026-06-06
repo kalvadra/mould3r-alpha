@@ -1793,14 +1793,20 @@ void MainFrame::OnGenerateMould(wxCommandEvent&)
         const auto& halves = m_canvas->GetLastMouldMeshes();
         if (!halves.empty())
         {
-            // Pass the shot model alongside the halves when one was built —
-            // it shows up as its own "Shot" toggle in the preview.
-            const FileImporter::MeshData* shot =
-                m_canvas->HasLastShotMesh() ? &m_canvas->GetLastShotMesh()
-                                            : nullptr;
+            // Bundle the shot artefacts (mesh + BREP + face map + volume) when
+            // one was built — it shows up as its own "Shot" toggle in the
+            // preview and feeds the design checks.
+            ShotPreviewInput shot;
+            if (m_canvas->HasLastShotMesh())
+            {
+                shot.mesh      = &m_canvas->GetLastShotMesh();
+                shot.shape     = &m_canvas->GetLastShotShape();
+                shot.faceIds   = &m_canvas->GetLastShotFaceIds();
+                shot.volumeMm3 = m_canvas->GetLastShotVolumeMm3();
+                shot.halves    = &m_canvas->GetLastHalfShapes();
+            }
 
-            m_previewFrame = new PreviewFrame(this, halves, shot,
-                m_canvas->GetLastShotVolumeMm3());
+            m_previewFrame = new PreviewFrame(this, halves, shot);
 
             // Reset our pointer when the user closes the window so we never
             // touch a destroyed frame (e.g. on the next generation).
