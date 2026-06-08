@@ -66,6 +66,12 @@ namespace DesignChecks
         float failDraftDeg = 1.0f;   // worst-draft below this => fail
         float warnDraftDeg = 3.0f;   // ... below this (but >= fail) => warning
 
+        // When false, the accessibility (undercut) analysis is skipped entirely
+        // — only the draft assessment runs. Used by the "Draft Angle Checks"
+        // simulation, which is concerned solely with draft; the separate
+        // demoulding (separation) test covers trapping/undercuts.
+        bool checkUndercuts = true;
+
         // Ray start offset along the pull axis (world units) to skip the
         // originating surface when testing accessibility.
         float rayEpsilon = 1.0e-3f;

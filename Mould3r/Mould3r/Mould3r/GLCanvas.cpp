@@ -2061,7 +2061,7 @@ void GLCanvas::AddPreviewHalf(const FileImporter::MeshData& mesh,
     const std::string& label,
     const glm::vec3& baseColor)
 {
-    // Materialise GPU buffers in this canvas's context. The caller (PreviewFrame)
+    // Materialise GPU buffers in this canvas's context. The caller (PreviewPanel)
     // makes the context current before invoking us, but make sure regardless —
     // UploadMeshToGPU issues GL calls that must hit the right context.
     SetCurrent(*m_context);

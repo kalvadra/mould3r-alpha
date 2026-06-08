@@ -90,7 +90,7 @@
     <ClCompile Include="PatternDialog.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="PreviewFrame.cpp">
+    <ClCompile Include="PreviewPanel.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="FixtureCanvas.cpp">
@@ -109,6 +109,9 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="RoundedButton.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="PerspectiveButton.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="WindowEffects.cpp">
@@ -185,7 +188,7 @@
     <ClInclude Include="PatternDialog.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="PreviewFrame.h">
+    <ClInclude Include="PreviewPanel.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="FixtureCanvas.h">
@@ -204,6 +207,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="RoundedButton.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="PerspectiveButton.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="WindowEffects.h">

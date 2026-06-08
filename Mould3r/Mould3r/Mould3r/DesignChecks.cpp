@@ -61,9 +61,11 @@ namespace DesignChecks
         // Sampling tessellation (coarse — accessibility itself is analytic).
         BRepMesh_IncrementalMesh mesher(shot, params.sampleDeflection, false, 0.5, true);
 
-        // Analytic ray/solid intersector, loaded once.
+        // Analytic ray/solid intersector, loaded once (only when accessibility
+        // is being tested — skipped for draft-only runs).
         IntCurvesFace_ShapeIntersector intersector;
-        intersector.Load(shot, 1.0e-6);
+        if (params.checkUndercuts)
+            intersector.Load(shot, 1.0e-6);
 
         const gp_Dir drawDir(params.drawAxis.x, params.drawAxis.y, params.drawAxis.z);
         const double eps = (double)params.rayEpsilon;
@@ -131,8 +133,9 @@ namespace DesignChecks
                 }
 
                 // Accessibility: only facets with a definite pull side can be
-                // trapped. Cast along the side the surface faces.
-                if (!faceUndercut && std::fabs(d) > kVerticalEps)
+                // trapped. Cast along the side the surface faces. Skipped on
+                // draft-only runs (params.checkUndercuts == false).
+                if (params.checkUndercuts && !faceUndercut && std::fabs(d) > kVerticalEps)
                 {
                     gp_Dir pull = drawDir;
                     if (d < 0.0) pull.Reverse();   // faces -draw => pull -draw

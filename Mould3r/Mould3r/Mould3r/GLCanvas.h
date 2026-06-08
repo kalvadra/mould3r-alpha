@@ -187,7 +187,7 @@ public:
     void ExportFixtures(const std::string& pathA, const std::string& pathB);
 
     // ---- Preview perspective ------------------------------------------------
-    // A second GLCanvas instance (hosted by PreviewFrame) is put into preview
+    // A second GLCanvas instance (hosted by PreviewPanel) is put into preview
     // mode to show the post-cut mould halves on their own. Preview mode strips
     // the canvas down to: grid + the loaded mould halves, with the standard
     // orbit / pan / dolly navigation but no picking, selection, transform
@@ -205,7 +205,7 @@ public:
     // baked into the world-space vertices. `label` is shown on the part's
     // show/hide toggle (e.g. "Half A", "Shot"). `baseColor` lets the shot
     // model read distinctly from the grey mould halves. Parts start visible.
-    // Must be called with this canvas's GL context current — PreviewFrame
+    // Must be called with this canvas's GL context current — PreviewPanel
     // arranges that.
     void AddPreviewHalf(const FileImporter::MeshData& mesh,
         const std::string& label,
@@ -271,7 +271,7 @@ public:
 
     // Read-only access to the meshes produced by the most recent successful
     // GenerateMould run, one per fixture, in fixture order. World-space,
-    // interleaved position+normal with indices. PreviewFrame consumes these
+    // interleaved position+normal with indices. PreviewPanel consumes these
     // to populate a fresh preview window. Cleared at the start of every
     // GenerateMould call.
     const std::vector<FileImporter::MeshData>& GetLastMouldMeshes() const
@@ -666,7 +666,7 @@ private:
     std::vector<ClipboardEntry> m_clipboard;
 
     // ---- Preview perspective state -----------------------------------------
-    // True only for the dedicated preview canvas hosted by PreviewFrame. The
+    // True only for the dedicated preview canvas hosted by PreviewPanel. The
     // main editing canvas leaves this false and behaves exactly as before.
     bool m_previewMode = false;
 
@@ -725,7 +725,7 @@ private:
 
     // Meshes from the most recent successful GenerateMould (one per fixture,
     // world-space, position+normal interleaved with indices). Populated in
-    // GenerateMould and consumed by PreviewFrame via GetLastMouldMeshes().
+    // GenerateMould and consumed by PreviewPanel via GetLastMouldMeshes().
     // The main canvas no longer swaps these into its own fixtures — they live
     // here purely to seed the preview window.
     std::vector<FileImporter::MeshData> m_lastMouldMeshes;

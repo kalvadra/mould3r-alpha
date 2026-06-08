@@ -7,11 +7,12 @@
 #include <wx/dnd.h>
 #include <wx/graphics.h>   // wxGraphicsContext — rounded-rect paint for icon tool buttons
 #include <wx/dcbuffer.h>   // wxAutoBufferedPaintDC — flicker-free repaint on hover/toggle
+#include <wx/simplebook.h> // wxSimplebook — the Prepare/Preview perspective pager
 #include <memory>
 
 #include "MainFrame.h"
 #include "GLCanvas.h"
-#include "PreviewFrame.h"     // standalone post-cut mould preview window
+#include "PreviewPanel.h"    // embedded post-cut mould preview perspective
 #include "FixtureEditor.h"
 #include "CreateFixtureDialog.h"
 #include "RotateDialog.h"
@@ -20,6 +21,7 @@
 #include "AppConfig.h"
 #include "MeshImportSettings.h"
 #include "RoundedButton.h"     // rounded button for sidebar / toolbar action buttons
+#include "PerspectiveButton.h" // flat tab-style perspective switch
 #include "WindowEffects.h"     // DWM corner rounding for the main frame
 #include "style.h"
 
@@ -181,7 +183,164 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
         }
     }
 
-    // ---- Menu bar ----------------------------------------------------------
+    // ---- Menu bars (per perspective) ---------------------------------------
+    // Both are built up front and swapped by SetPerspective. The frame starts
+    // in the Prepare perspective below, so attach its bar now.
+    m_prepareMenuBar = BuildPrepareMenuBar();
+    m_previewMenuBar = BuildPreviewMenuBar();
+    SetMenuBar(m_prepareMenuBar);
+
+    Bind(wxEVT_MENU, &MainFrame::OnExit, this, wxID_EXIT);
+    Bind(wxEVT_MENU, &MainFrame::OnImport, this, ID_Import);
+    Bind(wxEVT_MENU, &MainFrame::OnCreateFixture, this, ID_CreateFixture);
+    Bind(wxEVT_MENU, &MainFrame::OnChangeFixture, this, ID_ChangeFixture);
+    Bind(wxEVT_MENU, &MainFrame::OnSaveProject, this, ID_SaveProject);
+    Bind(wxEVT_MENU, &MainFrame::OnLoadProject, this, ID_LoadProject);
+    Bind(wxEVT_MENU, &MainFrame::OnNewProject, this, ID_NewProject);
+    Bind(wxEVT_MENU, &MainFrame::OnSetMetric, this, ID_UnitMetric);
+    Bind(wxEVT_MENU, &MainFrame::OnSetImperial, this, ID_UnitImperial);
+
+    // Mesh quality radio items just persist the chosen preset; the next
+    // import picks it up via MeshImportSettings::GetQuality().
+    Bind(wxEVT_MENU,
+        [](wxCommandEvent&) { MeshImportSettings::SetQuality(MeshImportSettings::Quality::Off); },
+        ID_MeshQualityOff);
+    Bind(wxEVT_MENU,
+        [](wxCommandEvent&) { MeshImportSettings::SetQuality(MeshImportSettings::Quality::Draft); },
+        ID_MeshQualityDraft);
+    Bind(wxEVT_MENU,
+        [](wxCommandEvent&) { MeshImportSettings::SetQuality(MeshImportSettings::Quality::Normal); },
+        ID_MeshQualityNormal);
+    Bind(wxEVT_MENU,
+        [](wxCommandEvent&) { MeshImportSettings::SetQuality(MeshImportSettings::Quality::High); },
+        ID_MeshQualityHigh);
+
+    // ---- Layout: ribbon on top, canvas below --------------------------------
+    auto* root = new wxPanel(this, wxID_ANY);
+    root->SetBackgroundColour(kRibbonBg);
+
+    auto* vSizer = new wxBoxSizer(wxVERTICAL);
+
+    wxPanel* ribbon = CreateRibbon(root);
+
+    // 1-px separator line
+    auto* sep = new wxPanel(root, wxID_ANY, wxDefaultPosition, wxSize(-1, 1));
+    sep->SetBackgroundColour(Style::Accent);
+
+    // ---- Perspective pager -------------------------------------------------
+    // A wxSimplebook stacks the two workflow perspectives; only one is shown at
+    // a time. Page 0 = Prepare (left panel + main canvas), page 1 = Preview
+    // (the embedded PreviewPanel). The ribbon's Prepare/Preview buttons drive
+    // the selection via SetPerspective.
+    m_book = new wxSimplebook(root, wxID_ANY);
+    m_book->SetBackgroundColour(kRibbonBg);
+
+    // ---- Prepare page: left panel + main canvas ----------------------------
+    m_preparePage = new wxPanel(m_book, wxID_ANY);
+    m_preparePage->SetBackgroundColour(kRibbonBg);
+    auto* contentSizer = new wxBoxSizer(wxHORIZONTAL);
+    m_canvas = new GLCanvas(m_preparePage);
+    m_leftPanel = CreateLeftPanel(m_preparePage);
+
+    // Drag-and-drop import: drop STEP/STL/OBJ files onto the 3D viewport
+    // to import them. wxWidgets takes ownership of the drop target.
+    m_canvas->SetDropTarget(new ModelFileDropTarget(this));
+
+    // Register the scene-mutation hook. Any time the canvas mutates in a
+    // way that would stale a generated mould — object transforms, feature
+    // place / remove, sprue placement — it fires this callback, which
+    // bumps the mould state from Clean to Dirty. NeverGenerated stays
+    // NeverGenerated (mutating an unbuilt mould isn't meaningful — we
+    // wait for an actual Generate run to leave that state). Project-level
+    // mutations (import, fixture swap, load) handle their own state reset
+    // directly in the relevant handlers below.
+    m_canvas->SetOnSceneMutated([this] {
+        if (m_mouldState == MouldState::Clean)
+            m_mouldState = MouldState::Dirty;
+        });
+
+    contentSizer->Add(m_leftPanel, 0, wxEXPAND);
+    contentSizer->Add(m_canvas, 1, wxEXPAND);
+    m_preparePage->SetSizer(contentSizer);
+
+    // ---- Preview page: the embedded preview perspective --------------------
+    m_previewPanel = new PreviewPanel(m_book);
+
+    m_book->AddPage(m_preparePage, "Prepare");
+    m_book->AddPage(m_previewPanel, "Preview");
+    m_book->SetSelection(0);
+
+    vSizer->Add(ribbon, 0, wxEXPAND);
+    vSizer->Add(sep, 0, wxEXPAND);
+    vSizer->Add(m_book, 1, wxEXPAND);
+
+    root->SetSizer(vSizer);
+
+    // Reflect the initial (Prepare) perspective: page, menu bar, ribbon
+    // buttons, and the Generate/Export visibility are all set consistently.
+    SetPerspective(Perspective::Prepare);
+
+    // Frame sizer
+    auto* frameSizer = new wxBoxSizer(wxVERTICAL);
+    frameSizer->Add(root, 1, wxEXPAND);
+    SetSizer(frameSizer);
+
+    // Start with Select active
+    SetActiveTool(TransformMode::Select);
+
+    // Load models from startup config (may be absent on first launch — the
+    // app now opens an empty frame and prompts for a fixture afterward via
+    // PromptForFixtureIfMissing()).
+    if (fixture.IsValid())
+    {
+        if (!fixture.modelAPath.empty())
+            m_canvas->ImportFileAsFixture(fixture.modelAPath, fixture.halfATransform);
+        if (!fixture.modelBPath.empty())
+            m_canvas->ImportFileAsFixture(fixture.modelBPath, fixture.halfBTransform);
+
+        // Set the active injection point (first in the list for now)
+        if (!fixture.injectionPoints.empty())
+        {
+            m_canvas->SetActiveInjectionPoint(fixture.injectionPoints[0]);
+            m_canvas->SetInjectionPoints(fixture.injectionPoints);
+        }
+
+        // Apply any per-feature default overrides the fixture supplied.
+        // Safe here because CreateLeftPanel ran above, so all field/choice
+        // pointers are populated.
+        ApplyFixtureDefaults(fixture);
+    }
+
+    // Win11 DWM corner rounding for the main frame — matches the rest
+    // of the app's window family.
+    WindowEffects::ApplyRoundedCorners(this);
+}
+
+// ---------------------------------------------------------------------------
+// Destructor — the frame auto-destroys whichever menu bar is currently
+// attached; the other (detached) one is ours to free.
+// ---------------------------------------------------------------------------
+MainFrame::~MainFrame()
+{
+    wxMenuBar* attached = GetMenuBar();
+    if (m_prepareMenuBar && m_prepareMenuBar != attached)
+    {
+        delete m_prepareMenuBar;
+        m_prepareMenuBar = nullptr;
+    }
+    if (m_previewMenuBar && m_previewMenuBar != attached)
+    {
+        delete m_previewMenuBar;
+        m_previewMenuBar = nullptr;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BuildPrepareMenuBar — the full editing menu set (File / Fixture / Units /
+// Import). Reflects persisted settings in the radio state.
+// ---------------------------------------------------------------------------
+wxMenuBar* MainFrame::BuildPrepareMenuBar()
+{
     auto* fileMenu = new wxMenu();
     fileMenu->Append(ID_NewProject, "New Project...\tCtrl+N");
     fileMenu->Append(ID_LoadProject, "Open Project...\tCtrl+O");
@@ -231,111 +390,73 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
         importMenu->Check(ID_MeshQualityHigh, q == MeshImportSettings::Quality::High);
     }
 
-    SetMenuBar(menuBar);
-
-    Bind(wxEVT_MENU, &MainFrame::OnExit, this, wxID_EXIT);
-    Bind(wxEVT_MENU, &MainFrame::OnImport, this, ID_Import);
-    Bind(wxEVT_MENU, &MainFrame::OnCreateFixture, this, ID_CreateFixture);
-    Bind(wxEVT_MENU, &MainFrame::OnChangeFixture, this, ID_ChangeFixture);
-    Bind(wxEVT_MENU, &MainFrame::OnSaveProject, this, ID_SaveProject);
-    Bind(wxEVT_MENU, &MainFrame::OnLoadProject, this, ID_LoadProject);
-    Bind(wxEVT_MENU, &MainFrame::OnNewProject, this, ID_NewProject);
-    Bind(wxEVT_MENU, &MainFrame::OnSetMetric, this, ID_UnitMetric);
-    Bind(wxEVT_MENU, &MainFrame::OnSetImperial, this, ID_UnitImperial);
-
-    // Mesh quality radio items just persist the chosen preset; the next
-    // import picks it up via MeshImportSettings::GetQuality().
-    Bind(wxEVT_MENU,
-        [](wxCommandEvent&) { MeshImportSettings::SetQuality(MeshImportSettings::Quality::Off); },
-        ID_MeshQualityOff);
-    Bind(wxEVT_MENU,
-        [](wxCommandEvent&) { MeshImportSettings::SetQuality(MeshImportSettings::Quality::Draft); },
-        ID_MeshQualityDraft);
-    Bind(wxEVT_MENU,
-        [](wxCommandEvent&) { MeshImportSettings::SetQuality(MeshImportSettings::Quality::Normal); },
-        ID_MeshQualityNormal);
-    Bind(wxEVT_MENU,
-        [](wxCommandEvent&) { MeshImportSettings::SetQuality(MeshImportSettings::Quality::High); },
-        ID_MeshQualityHigh);
-
-    // ---- Layout: ribbon on top, canvas below --------------------------------
-    auto* root = new wxPanel(this, wxID_ANY);
-    root->SetBackgroundColour(kRibbonBg);
-
-    auto* vSizer = new wxBoxSizer(wxVERTICAL);
-
-    wxPanel* ribbon = CreateRibbon(root);
-
-    // 1-px separator line
-    auto* sep = new wxPanel(root, wxID_ANY, wxDefaultPosition, wxSize(-1, 1));
-    sep->SetBackgroundColour(Style::Accent);
-
-    // In MainFrame constructor, replace the vSizer canvas Add with:
-    auto* contentSizer = new wxBoxSizer(wxHORIZONTAL);
-    m_canvas = new GLCanvas(root);
-    m_leftPanel = CreateLeftPanel(root);
-
-    // Drag-and-drop import: drop STEP/STL/OBJ files onto the 3D viewport
-    // to import them. wxWidgets takes ownership of the drop target.
-    m_canvas->SetDropTarget(new ModelFileDropTarget(this));
-
-    // Register the scene-mutation hook. Any time the canvas mutates in a
-    // way that would stale a generated mould — object transforms, feature
-    // place / remove, sprue placement — it fires this callback, which
-    // bumps the mould state from Clean to Dirty. NeverGenerated stays
-    // NeverGenerated (mutating an unbuilt mould isn't meaningful — we
-    // wait for an actual Generate run to leave that state). Project-level
-    // mutations (import, fixture swap, load) handle their own state reset
-    // directly in the relevant handlers below.
-    m_canvas->SetOnSceneMutated([this] {
-        if (m_mouldState == MouldState::Clean)
-            m_mouldState = MouldState::Dirty;
-        });
-
-    contentSizer->Add(m_leftPanel, 0, wxEXPAND);
-    contentSizer->Add(m_canvas, 1, wxEXPAND);
-
-    vSizer->Add(ribbon, 0, wxEXPAND);
-    vSizer->Add(sep, 0, wxEXPAND);
-    vSizer->Add(contentSizer, 1, wxEXPAND);
-
-    root->SetSizer(vSizer);
-
-    // Frame sizer
-    auto* frameSizer = new wxBoxSizer(wxVERTICAL);
-    frameSizer->Add(root, 1, wxEXPAND);
-    SetSizer(frameSizer);
-
-    // Start with Select active
-    SetActiveTool(TransformMode::Select);
-
-    // Load models from startup config (may be absent on first launch — the
-    // app now opens an empty frame and prompts for a fixture afterward via
-    // PromptForFixtureIfMissing()).
-    if (fixture.IsValid())
-    {
-        if (!fixture.modelAPath.empty())
-            m_canvas->ImportFileAsFixture(fixture.modelAPath, fixture.halfATransform);
-        if (!fixture.modelBPath.empty())
-            m_canvas->ImportFileAsFixture(fixture.modelBPath, fixture.halfBTransform);
-
-        // Set the active injection point (first in the list for now)
-        if (!fixture.injectionPoints.empty())
-        {
-            m_canvas->SetActiveInjectionPoint(fixture.injectionPoints[0]);
-            m_canvas->SetInjectionPoints(fixture.injectionPoints);
-        }
-
-        // Apply any per-feature default overrides the fixture supplied.
-        // Safe here because CreateLeftPanel ran above, so all field/choice
-        // pointers are populated.
-        ApplyFixtureDefaults(fixture);
-    }
-
-    // Win11 DWM corner rounding for the main frame — matches the rest
-    // of the app's window family.
-    WindowEffects::ApplyRoundedCorners(this);
+    return menuBar;
 }
+
+// ---------------------------------------------------------------------------
+// BuildPreviewMenuBar — minimal for now (File -> Exit). Grows as preview-
+// specific actions (e.g. a View menu for the debug overlays) are added.
+// ---------------------------------------------------------------------------
+wxMenuBar* MainFrame::BuildPreviewMenuBar()
+{
+    auto* fileMenu = new wxMenu();
+    fileMenu->Append(wxID_EXIT, "Exit\tAlt+F4");
+
+    auto* menuBar = new wxMenuBar();
+    menuBar->Append(fileMenu, "&File");
+    return menuBar;
+}
+
+// ---------------------------------------------------------------------------
+// SetPerspective — switch the active workflow perspective: flip the book page,
+// swap in the matching menu bar, recolour the ribbon buttons, and (for Preview)
+// flush any pending GL upload now that the page is visible.
+// ---------------------------------------------------------------------------
+void MainFrame::SetPerspective(Perspective which)
+{
+    m_perspective = which;
+
+    if (m_book)
+        m_book->SetSelection(which == Perspective::Preview ? 1 : 0);
+
+    SetMenuBar(which == Perspective::Preview ? m_previewMenuBar
+                                             : m_prepareMenuBar);
+
+    // Primary action is perspective-specific: Generate Mould in Prepare,
+    // Export in Preview. They share the top-right slot, so show one and hide
+    // the other, then relayout the ribbon so the visible one sits flush right.
+    const bool preview = (which == Perspective::Preview);
+    if (m_btnGenerate) m_btnGenerate->Show(!preview);
+    if (m_btnExport)   m_btnExport->Show(preview);
+    if (m_btnGenerate && m_btnGenerate->GetParent())
+        m_btnGenerate->GetParent()->Layout();
+
+    UpdatePerspectiveButtons();
+
+    if (which == Perspective::Preview && m_previewPanel)
+        m_previewPanel->FlushIfDirty();
+}
+
+void MainFrame::OnPerspectivePrepare(wxCommandEvent&)
+{
+    SetPerspective(Perspective::Prepare);
+}
+
+void MainFrame::OnPerspectivePreview(wxCommandEvent&)
+{
+    SetPerspective(Perspective::Preview);
+}
+
+// ---------------------------------------------------------------------------
+// Recolour the ribbon perspective buttons so the active one reads as selected.
+// ---------------------------------------------------------------------------
+void MainFrame::UpdatePerspectiveButtons()
+{
+    const bool preview = (m_perspective == Perspective::Preview);
+    if (m_btnPrepare) m_btnPrepare->SetActive(!preview);
+    if (m_btnPreview) m_btnPreview->SetActive(preview);
+}
+
 
 // ---------------------------------------------------------------------------
 // CreateRibbon  – horizontal panel with labelled tool groups
@@ -360,53 +481,59 @@ wxPanel* MainFrame::CreateRibbon(wxWindow* parent)
         }
     }
 
-    // Import button (accent blue, left-aligned)
-    auto* btnImport = new RoundedButton(panel, ID_Import, "Import Model",
-        wxDefaultPosition, wxSize(120, 32), wxBORDER_NONE);
-    btnImport->SetBackgroundColour(Style::BtnSecondary);
-    btnImport->SetForegroundColour(*wxWHITE);
-    btnImport->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
-        wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
-    hSizer->Add(btnImport, 0, wxALIGN_CENTER_VERTICAL);
+    // ---- Perspective switch (Prepare / Preview) ----------------------------
+    // Flat tab strip leading the ribbon: two adjacent square tabs. The active
+    // one fills with the lighter card colour + a bottom accent line; the
+    // inactive blends into the bar. Full bar height, no gap between them.
+    // SetPerspective drives the active state via UpdatePerspectiveButtons.
+    auto makePerspectiveBtn = [&](int id, const wxString& label) -> PerspectiveButton*
+    {
+        auto* b = new PerspectiveButton(panel, id, label,
+            wxDefaultPosition, wxSize(120, -1));
+        b->SetBackgroundColour(Style::CardBg);   // active-tab fill
+        b->SetForegroundColour(*wxWHITE);
+        b->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
+        return b;
+    };
+    m_btnPrepare = makePerspectiveBtn(ID_PerspectivePrepare, "Prepare");
+    m_btnPreview = makePerspectiveBtn(ID_PerspectivePreview, "Preview");
+    hSizer->Add(m_btnPrepare, 0, wxEXPAND | wxLEFT, 8);
+    hSizer->Add(m_btnPreview, 0, wxEXPAND);
 
     hSizer->AddStretchSpacer();
 
-    // ---- Generate Mould (green, right-aligned) --------------------------------
-    // Order: Generate Mould sits to the LEFT of Export — the workflow is
-    // generate first, then export. Export stays disabled until a Generate
-    // run returns true (see OnGenerateMould below).
+    // ---- Primary action (right-aligned) ------------------------------------
+    // Perspective-specific and mutually exclusive: "Generate Mould" shows in the
+    // Prepare perspective, "Export" shows in Preview. They occupy the same
+    // top-right slot (only one is ever visible — SetPerspective toggles them)
+    // and share the green primary-action style. Both are added after the
+    // stretch spacer, so whichever is shown sits at the far right.
     auto* btnGenerate = new RoundedButton(panel, ID_GenerateMould, "Generate Mould",
         wxDefaultPosition, wxSize(130, 32), wxBORDER_NONE);
     btnGenerate->SetBackgroundColour(Style::BtnGenerate);
     btnGenerate->SetForegroundColour(*wxWHITE);
     btnGenerate->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
-    hSizer->Add(btnGenerate, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
+    m_btnGenerate = btnGenerate;
+    hSizer->Add(btnGenerate, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 12);
 
-    // ---- Export (secondary colour, right-aligned) ----------------------------
-    // Sits to the RIGHT of Generate Mould. Background uses Style::BtnSecondary
-    // to match the rest of the secondary-action buttons in the app; the old
-    // Style::InputBg was a darker text-field colour that read as too-quiet
-    // for an actionable button.
-    //
-    // No longer visually-gated: the earlier "muted until mould generated"
-    // affordance was replaced with a click-time warning dialog (see OnExport
-    // for the state machine). Button stays fully coloured at all times; if
-    // the user clicks before generating or after editing, OnExport pops the
-    // appropriate message before reaching the file dialog.
     auto* btnExport = new RoundedButton(panel, ID_Export, "Export",
-        wxDefaultPosition, wxSize(90, 32), wxBORDER_NONE);
-    btnExport->SetBackgroundColour(Style::BtnSecondary);
+        wxDefaultPosition, wxSize(130, 32), wxBORDER_NONE);
+    btnExport->SetBackgroundColour(Style::BtnGenerate);
     btnExport->SetForegroundColour(*wxWHITE);
     btnExport->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
     m_btnExport = btnExport;
+    btnExport->Hide();   // Prepare is the initial perspective
     hSizer->Add(btnExport, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 12);
 
     panel->SetSizer(hSizer);
 
     // ---- Bind events -------------------------------------------------------
     Bind(wxEVT_BUTTON, &MainFrame::OnImport, this, ID_Import);
+    Bind(wxEVT_BUTTON, &MainFrame::OnPerspectivePrepare, this, ID_PerspectivePrepare);
+    Bind(wxEVT_BUTTON, &MainFrame::OnPerspectivePreview, this, ID_PerspectivePreview);
     Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolTranslate, this, ID_ToolTranslate);
     Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolRotate, this, ID_ToolRotate);
     Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolScale, this, ID_ToolScale);
@@ -414,16 +541,16 @@ wxPanel* MainFrame::CreateRibbon(wxWindow* parent)
     Bind(wxEVT_BUTTON, &MainFrame::OnToolCenter, this, ID_ToolCenter);
     Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolAlignFace, this, ID_ToolAlignFace);
     Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolAlignMidplane, this, ID_ToolAlignMidplane);
-    Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolPlaceVent, this, ID_ToolPlaceVent);
+    Bind(wxEVT_BUTTON, &MainFrame::OnToolPlaceVent, this, ID_ToolPlaceVent);
     Bind(wxEVT_BUTTON, &MainFrame::OnClearVentPoints, this, ID_ClearVentPoints);
     Bind(wxEVT_BUTTON, &MainFrame::OnPlaceSprue, this, ID_PlaceSprue);
     Bind(wxEVT_BUTTON, &MainFrame::OnClearSprue, this, ID_ClearSprue);
     Bind(wxEVT_BUTTON, &MainFrame::OnEditSprue, this, ID_EditSprue);
-    Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnPlaceRunner, this, ID_PlaceRunner);
+    Bind(wxEVT_BUTTON, &MainFrame::OnPlaceRunner, this, ID_PlaceRunner);
     Bind(wxEVT_BUTTON, &MainFrame::OnClearRunners, this, ID_ClearRunners);
-    Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnPlaceGate, this, ID_PlaceGate);
+    Bind(wxEVT_BUTTON, &MainFrame::OnPlaceGate, this, ID_PlaceGate);
     Bind(wxEVT_BUTTON, &MainFrame::OnClearGates, this, ID_ClearGates);
-    Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnPlaceEjector, this, ID_PlaceEjector);
+    Bind(wxEVT_BUTTON, &MainFrame::OnPlaceEjector, this, ID_PlaceEjector);
     Bind(wxEVT_BUTTON, &MainFrame::OnClearEjectors, this, ID_ClearEjectors);
     Bind(wxEVT_BUTTON, &MainFrame::OnRemoveVent, this, ID_RemoveVent);
     Bind(wxEVT_BUTTON, &MainFrame::OnRemoveSprue, this, ID_RemoveSprue);
@@ -1780,22 +1907,15 @@ void MainFrame::OnGenerateMould(wxCommandEvent&)
     {
         m_mouldState = MouldState::Clean;
 
-        // Open a fresh preview window showing the post-cut halves. Any
-        // previous preview is destroyed first so the window always reflects
-        // the latest generation. The preview is a non-modal top-level frame —
-        // the main editor stays fully usable alongside it.
-        if (m_previewFrame)
-        {
-            m_previewFrame->Destroy();
-            m_previewFrame = nullptr;
-        }
-
+        // Seed the embedded preview perspective with the post-cut halves and,
+        // when one was built, the shot artefacts (mesh + BREP + face map +
+        // volume) — the shot gets its own "Shot" toggle and feeds the design
+        // checks. SetData clears the previous generation's parts first, so the
+        // preview always reflects the latest run. The actual GL upload is
+        // deferred until the Preview page is visible (see PreviewPanel).
         const auto& halves = m_canvas->GetLastMouldMeshes();
-        if (!halves.empty())
+        if (m_previewPanel && !halves.empty())
         {
-            // Bundle the shot artefacts (mesh + BREP + face map + volume) when
-            // one was built — it shows up as its own "Shot" toggle in the
-            // preview and feeds the design checks.
             ShotPreviewInput shot;
             if (m_canvas->HasLastShotMesh())
             {
@@ -1806,17 +1926,12 @@ void MainFrame::OnGenerateMould(wxCommandEvent&)
                 shot.halves    = &m_canvas->GetLastHalfShapes();
             }
 
-            m_previewFrame = new PreviewFrame(this, halves, shot);
-
-            // Reset our pointer when the user closes the window so we never
-            // touch a destroyed frame (e.g. on the next generation).
-            m_previewFrame->Bind(wxEVT_CLOSE_WINDOW,
-                [this](wxCloseEvent& evt)
-                {
-                    m_previewFrame = nullptr;
-                    evt.Skip();   // let the frame proceed with the close
-                });
+            m_previewPanel->SetData(halves, shot);
         }
+
+        // Jump to the Preview perspective so the freshly generated mould is
+        // shown — mirrors the old behaviour of the preview window popping open.
+        SetPerspective(Perspective::Preview);
     }
 }
 
@@ -1878,24 +1993,26 @@ wxPanel* MainFrame::CreateCollapsibleSection(wxWindow* parent,
     return content;
 }
 
-wxToggleButton* MainFrame::MakePlaceButton(wxWindow* parent, int id,
+RoundedButton* MainFrame::MakePlaceButton(wxWindow* parent, int id,
     const wxString& label)
 {
-    auto* btn = new wxToggleButton(parent, id, label,
+    // Matches the "Place Sprue" button: rounded corners (RoundedButton),
+    // BtnPlace background, white semibold text, 32px tall. The Sprue button is
+    // a one-shot action; these are placement-mode toggles, so the handlers
+    // (bound to wxEVT_BUTTON) flip in/out of the mode based on the canvas's
+    // current TransformMode, and the visual selected state is driven externally
+    // via the setter registered below.
+    auto* btn = new RoundedButton(parent, id, label,
         wxDefaultPosition, wxSize(-1, 32), wxBORDER_NONE);
     btn->SetBackgroundColour(Style::BtnPlace);
     btn->SetForegroundColour(*wxWHITE);
     btn->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
 
-    // Register a setter so SetActiveTool can drive this button's visual
-    // state externally (e.g. when Escape clears the mode, or when the
-    // canvas finishes a placement and snaps back to Select). The setter
-    // also keeps the wxToggleButton's internal value in sync so the next
-    // user click toggles correctly.
+    // Register a setter so SetActiveTool can drive this button's visual state
+    // externally (button click, Escape clearing the mode, or the canvas
+    // snapping back to Select after a placement completes).
     m_toolBtnSetters[id] = [btn](bool active) {
-        if (btn->GetValue() == active) return;     // already in target state
-        btn->SetValue(active);
         btn->SetBackgroundColour(active ? Style::BtnSecondarySelected
             : Style::BtnPlace);
         btn->Refresh();
@@ -2728,6 +2845,20 @@ wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
     auto* column = new wxPanel(outer, wxID_ANY);
     column->SetBackgroundColour(kRibbonBg);
     auto* colSizer = new wxBoxSizer(wxVERTICAL);
+
+    // ---- Import Model (sits above Model Tools) ------------------------------
+    // Moved here from the top ribbon: importing is a Prepare-time action, so it
+    // lives at the top of the Prepare workspace. Bound to ID_Import (the
+    // existing OnImport binding in CreateRibbon catches it via propagation).
+    {
+        auto* btnImport = new RoundedButton(column, ID_Import, "Import Model",
+            wxDefaultPosition, wxSize(-1, 32), wxBORDER_NONE);
+        btnImport->SetBackgroundColour(Style::BtnSecondary);
+        btnImport->SetForegroundColour(*wxWHITE);
+        btnImport->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
+        colSizer->Add(btnImport, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 12);
+    }
 
     // ---- Model Tools section (fixed, non-scrolling) -------------------------
     {

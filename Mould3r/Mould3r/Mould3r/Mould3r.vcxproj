@@ -159,10 +159,11 @@
     <ClCompile Include="main.cpp" />
     <ClCompile Include="MouldFeature.cpp" />
     <ClCompile Include="PatternDialog.cpp" />
-    <ClCompile Include="PreviewFrame.cpp" />
+    <ClCompile Include="PreviewPanel.cpp" />
     <ClCompile Include="ProjectFile.cpp" />
     <ClCompile Include="RotateDialog.cpp" />
     <ClCompile Include="RoundedButton.cpp" />
+    <ClCompile Include="PerspectiveButton.cpp" />
     <ClCompile Include="ScaleDialog.cpp" />
     <ClCompile Include="shaders.cpp" />
     <ClCompile Include="StartupDialog.cpp" />
@@ -191,10 +192,11 @@
     <ClInclude Include="Mould3r.h" />
     <ClInclude Include="MouldFeature.h" />
     <ClInclude Include="PatternDialog.h" />
-    <ClInclude Include="PreviewFrame.h" />
+    <ClInclude Include="PreviewPanel.h" />
     <ClInclude Include="ProjectFile.h" />
     <ClInclude Include="RotateDialog.h" />
     <ClInclude Include="RoundedButton.h" />
+    <ClInclude Include="PerspectiveButton.h" />
     <ClInclude Include="ScaleDialog.h" />
     <ClInclude Include="shaders.h" />
     <ClInclude Include="StartupDialog.h" />
