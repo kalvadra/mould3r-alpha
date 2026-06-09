@@ -184,6 +184,9 @@ void PreviewPanel::SetData(const std::vector<FileImporter::MeshData>& halves,
     m_showRays = false;
     m_showContacts = false;
     m_undercutRays.clear();
+    m_hasSepOverlay = false;
+    if (m_draftOverlayCheck) m_draftOverlayCheck->SetValue(false);
+    if (m_sepOverlayCheck)   m_sepOverlayCheck->SetValue(false);
 
     // Drop the previous generation's GPU parts now (clears its own context).
     if (m_canvas)
@@ -225,6 +228,9 @@ void PreviewPanel::ClearData()
     m_showRays = false;
     m_showContacts = false;
     m_undercutRays.clear();
+    m_hasSepOverlay = false;
+    if (m_draftOverlayCheck) m_draftOverlayCheck->SetValue(false);
+    if (m_sepOverlayCheck)   m_sepOverlayCheck->SetValue(false);
 
     if (m_canvas)
     {
@@ -382,9 +388,10 @@ wxPanel* PreviewPanel::BuildSimPanel(wxWindow* parent)
     };
 
     // ---- Draft Angle Checks -------------------------------------------------
-    // Draft thresholds (fail/warn), then Start, then the result-overlay toggles
-    // (1 = warnings, 2 = fails). Undercuts are NOT assessed here — see the
-    // Separation Test.
+    // Draft thresholds (fail/warn), then Start, then a single "Show mould
+    // overlay" checkbox that collapses warnings + fails into one highlighted
+    // view (fails red, warnings yellow). Undercuts are NOT assessed here — see
+    // the Separation Test.
     makeCard("Draft Angle Checks", [this, &addStart](wxWindow* body, wxBoxSizer* bs)
     {
         const wxString deg = wxString::FromUTF8("\xC2\xB0");
@@ -393,28 +400,33 @@ wxPanel* PreviewPanel::BuildSimPanel(wxWindow* parent)
 
         addStart(body, bs, "Draft Angle Checks");
 
-        auto addOverlayBtn = [this, body, bs](const wxString& label, int category)
-        {
-            auto* b = new RoundedButton(body, wxID_ANY, label,
-                wxDefaultPosition, wxSize(-1, 26), wxBORDER_NONE);
-            b->SetBackgroundColour(Style::BtnSmall);
-            b->SetForegroundColour(Style::TextPrimary);
-            b->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
-                wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
-            b->Bind(wxEVT_BUTTON,
-                [this, category](wxCommandEvent&) { ShowDebugCategory(category); });
-            bs->Add(b, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
-        };
-        addOverlayBtn("Show Warnings", 1);
-        addOverlayBtn("Show Fails", 2);
+        m_draftOverlayCheck = new wxCheckBox(body, wxID_ANY, "Show mould overlay");
+        m_draftOverlayCheck->SetForegroundColour(Style::TextPrimary);
+        m_draftOverlayCheck->SetBackgroundColour(Style::CardBg);
+        m_draftOverlayCheck->SetToolTip(
+            "Highlight fail faces (red) and warning faces (yellow) on the shot");
+        m_draftOverlayCheck->Bind(wxEVT_CHECKBOX,
+            [this](wxCommandEvent&) { UpdateDraftOverlay(); });
+        bs->Add(m_draftOverlayCheck, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
     });
 
     // ---- Separation Test ----------------------------------------------------
-    // Lift distance, then Start. Covers trapping/undercuts via collision.
+    // Lift distance, then Start, then a "Show mould overlay" checkbox that
+    // shows the interference region from the last run. Covers trapping /
+    // undercuts via collision.
     makeCard("Separation Test", [this, &addStart](wxWindow* body, wxBoxSizer* bs)
     {
         m_liftCtrl = AddFieldRow(body, bs, "Lift:", "1.0", "mm");
         addStart(body, bs, "Separation Test");
+
+        m_sepOverlayCheck = new wxCheckBox(body, wxID_ANY, "Show mould overlay");
+        m_sepOverlayCheck->SetForegroundColour(Style::TextPrimary);
+        m_sepOverlayCheck->SetBackgroundColour(Style::CardBg);
+        m_sepOverlayCheck->SetToolTip(
+            "Show the interference region (red) where the halves collide with the shot");
+        m_sepOverlayCheck->Bind(wxEVT_CHECKBOX,
+            [this](wxCommandEvent&) { UpdateSeparationOverlay(); });
+        bs->Add(m_sepOverlayCheck, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
     });
 
     sizer->AddSpacer(12);
@@ -437,8 +449,9 @@ wxPanel* PreviewPanel::BuildSimPanel(wxWindow* parent)
 
 // ---------------------------------------------------------------------------
 // Right panel — read-only results, styled to match the Prepare side: an AppBg
-// column with a left divider border and a stack of CardBg cards. An
-// "Information" card (shot volume) plus one result card per simulation.
+// column with a left divider border. An "Information" section header over a
+// shot-volume card, then a "Results" section header (same style) over one
+// verdict card per simulation.
 // ---------------------------------------------------------------------------
 wxPanel* PreviewPanel::BuildInfoPanel(wxWindow* parent)
 {
@@ -458,28 +471,44 @@ wxPanel* PreviewPanel::BuildInfoPanel(wxWindow* parent)
     column->SetBackgroundColour(Style::AppBg);
     auto* colSizer = new wxBoxSizer(wxVERTICAL);
 
-    // Card factory: a CardBg card with a bold white title; returns the card so
-    // the caller can drop content beneath the title.
+    // Section header (standalone, above its card[s]) — matches the left
+    // column's "SIMULATIONS" / "PREVIEW OUTPUT BODIES" section titles.
+    auto addSectionHeader = [&](const wxString& text)
+    {
+        auto* h = new wxStaticText(column, wxID_ANY, text);
+        h->SetForegroundColour(Style::TextPrimary);
+        h->SetFont(wxFont(7, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_BOLD, false, "Segoe UI"));
+        colSizer->Add(h, 0, wxLEFT | wxRIGHT | wxTOP, 12);
+    };
+
+    // Card factory: a CardBg card; when titleText is non-empty it gets a bold
+    // white in-card title (used by the per-simulation result cards). Returns
+    // the card so the caller can drop content beneath.
     auto makeCard = [&](const wxString& titleText) -> std::pair<wxPanel*, wxBoxSizer*>
     {
         auto* card = new wxPanel(column, wxID_ANY);
         card->SetBackgroundColour(Style::CardBg);
         auto* cs = new wxBoxSizer(wxVERTICAL);
 
-        auto* t = new wxStaticText(card, wxID_ANY, titleText);
-        t->SetForegroundColour(*wxWHITE);
-        t->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
-            wxFONTWEIGHT_BOLD, false, "Segoe UI"));
-        cs->Add(t, 0, wxLEFT | wxRIGHT | wxTOP, 10);
+        if (!titleText.IsEmpty())
+        {
+            auto* t = new wxStaticText(card, wxID_ANY, titleText);
+            t->SetForegroundColour(*wxWHITE);
+            t->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+                wxFONTWEIGHT_BOLD, false, "Segoe UI"));
+            cs->Add(t, 0, wxLEFT | wxRIGHT | wxTOP, 10);
+        }
 
         card->SetSizer(cs);
-        colSizer->Add(card, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 8);
+        colSizer->Add(card, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 6);
         return { card, cs };
     };
 
-    // ---- Information card: shot volume ------------------------------------
+    // ---- Information: shot volume -----------------------------------------
+    addSectionHeader("INFORMATION");
     {
-        auto [card, cs] = makeCard("Information");
+        auto [card, cs] = makeCard(wxEmptyString);
 
         auto* volLabel = new wxStaticText(card, wxID_ANY, "Shot Volume");
         volLabel->SetForegroundColour(Style::TextSubtle);
@@ -500,7 +529,8 @@ wxPanel* PreviewPanel::BuildInfoPanel(wxWindow* parent)
         cs->Add(m_volSecondary, 0, wxLEFT | wxRIGHT | wxBOTTOM, 10);
     }
 
-    // ---- Result cards: one per simulation ---------------------------------
+    // ---- Results: one verdict card per simulation -------------------------
+    addSectionHeader("RESULTS");
     auto makeVerdictCard = [&](const wxString& titleText) -> wxStaticText*
     {
         auto [card, cs] = makeCard(titleText);
@@ -513,7 +543,7 @@ wxPanel* PreviewPanel::BuildInfoPanel(wxWindow* parent)
     };
 
     m_draftStatus = makeVerdictCard("Draft Angle Checks");
-    m_demouldStatus = makeVerdictCard("Demoulding");
+    m_demouldStatus = makeVerdictCard("Separation Test");
 
     column->SetSizer(colSizer);
     outerSizer->Add(column, 1, wxEXPAND);
@@ -659,6 +689,9 @@ void PreviewPanel::RunDemoldabilityCheck()
         if (m_infoPanel) m_infoPanel->Layout();
     }
 
+    // If the overlay is showing, refresh it against this run's faces/thresholds.
+    UpdateDraftOverlay();
+
     // ---- Detailed dialog --------------------------------------------------
     const wxString deg = wxString::FromUTF8("\xC2\xB0");
     wxString msg;
@@ -703,20 +736,13 @@ void PreviewPanel::RunSeparationCheck()
     const DesignChecks::SeparationResult res =
         DesignChecks::CheckSeparation(m_shotShape, m_halfShapes, params, &overlap);
 
-    // Show the interference region (red), and clear the analytic overlays so
-    // the separation view stands on its own for comparison.
+    // Upload the interference region (red). Its visibility follows this card's
+    // "Show mould overlay" checkbox; the draft overlay (if shown) is left
+    // untouched so the two views stay independent.
+    m_hasSepOverlay = !overlap.IsNull();
     if (m_canvas)
-    {
-        m_canvas->ClearShotDebugColoring();
-        m_canvas->ShowShotDebugRays(false);
-        m_canvas->ShowShotDebugContacts(false);
-        m_showRays = false;
-        m_showContacts = false;
-        m_activeDebugCategory = -1;
-
         m_canvas->SetShotDebugSolid(overlap, glm::vec3(0.90f, 0.15f, 0.15f));
-        m_canvas->ShowShotDebugSolid(!overlap.IsNull());
-    }
+    UpdateSeparationOverlay();
 
     // ---- Verdict + status -------------------------------------------------
     wxString verdict;
@@ -765,8 +791,8 @@ void PreviewPanel::RunSeparationCheck()
     }
 
     if (res.halvesCollided > 0)
-        msg << "\nRed overlay shows where steel drives into the body. Hide the "
-               "Shot toggle to see it clearly.";
+        msg << "\nEnable \"Show mould overlay\" to see the interference region "
+               "(red); hide the Shot toggle to view it clearly.";
 
     wxMessageBox(msg, "Separation Test", wxOK | iconFlag, this);
 }
@@ -776,12 +802,17 @@ void PreviewPanel::RunSeparationCheck()
 // group and hand the groups to the canvas.
 // ---------------------------------------------------------------------------
 void PreviewPanel::ApplyFaceGroups(const std::unordered_map<int, int>& groupOfFace,
-    const std::vector<glm::vec3>& colors, int defaultGroup)
+    const std::vector<glm::vec3>& colors, int defaultGroup,
+    const std::vector<bool>& emissive)
 {
     if (!m_canvas || colors.empty()) return;
 
     std::vector<GLCanvas::ShotDebugGroup> groups(colors.size());
-    for (size_t g = 0; g < colors.size(); ++g) groups[g].color = colors[g];
+    for (size_t g = 0; g < colors.size(); ++g)
+    {
+        groups[g].color = colors[g];
+        groups[g].emissive = (g < emissive.size()) ? emissive[g] : false;
+    }
 
     const std::vector<uint32_t>& I = m_shotMesh.indices;
     const size_t numTris = I.size() / 3;
@@ -797,6 +828,62 @@ void PreviewPanel::ApplyFaceGroups(const std::unordered_map<int, int>& groupOfFa
     }
 
     m_canvas->SetShotDebugGroups(m_shotHalfIndex, groups);
+}
+
+// ---------------------------------------------------------------------------
+// Draft Angle Checks "Show mould overlay" — collapse warnings + fails into one
+// highlighted view (fail red, warn yellow), or clear it. Recomputes against
+// the current thresholds so the overlay always matches the fields.
+// ---------------------------------------------------------------------------
+void PreviewPanel::UpdateDraftOverlay()
+{
+    if (!m_canvas) return;
+
+    const bool show = m_draftOverlayCheck && m_draftOverlayCheck->GetValue();
+    if (!show)
+    {
+        m_canvas->ClearShotDebugColoring();
+        m_activeDebugCategory = -1;
+        return;
+    }
+
+    if (m_shotHalfIndex < 0 || !ComputeDemoldability())
+    {
+        // Nothing to analyse yet — leave the box checked, show nothing.
+        m_canvas->ClearShotDebugColoring();
+        return;
+    }
+
+    // Group 0 = fails (red), 1 = warnings (yellow), 2 = everything else
+    // (default, neutral shot colour). The fail/warn face lists are disjoint
+    // (DesignChecks classifies each face into at most one bucket), so no
+    // precedence handling is needed.
+    std::unordered_map<int, int> groupOfFace;
+    for (int f : m_lastResult.failDraftFaces) if (f > 0) groupOfFace[f] = 0;
+    for (int f : m_lastResult.warnDraftFaces) if (f > 0) groupOfFace[f] = 1;
+
+    const std::vector<glm::vec3> colors = {
+        glm::vec3(0.92f, 0.16f, 0.16f),   // red    — fail
+        glm::vec3(0.95f, 0.80f, 0.10f),   // yellow — warn
+        glm::vec3(0.80f, 0.80f, 0.85f),   // rest   — neutral (stays shaded)
+    };
+    // Highlight the flagged faces (groups 0 + 1) at full intensity; leave the
+    // rest shaded so the shot keeps its 3D form.
+    const std::vector<bool> emissive = { true, true, false };
+
+    ApplyFaceGroups(groupOfFace, colors, /*defaultGroup*/ 2, emissive);
+    m_activeDebugCategory = -1;  // this combined view isn't one of the categories
+}
+
+// ---------------------------------------------------------------------------
+// Separation Test "Show mould overlay" — show or hide the interference solid
+// produced by the last run. A no-op when no run has produced one.
+// ---------------------------------------------------------------------------
+void PreviewPanel::UpdateSeparationOverlay()
+{
+    if (!m_canvas) return;
+    const bool show = m_sepOverlayCheck && m_sepOverlayCheck->GetValue();
+    m_canvas->ShowShotDebugSolid(show && m_hasSepOverlay);
 }
 
 // ---------------------------------------------------------------------------

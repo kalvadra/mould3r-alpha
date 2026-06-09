@@ -233,13 +233,16 @@ public:
     {
         glm::vec3             color{ 0.5f };
         std::vector<uint32_t> indices;
+        bool                  emissive = false;  // draw flat (highlight) vs lit
     };
 
     // Recolour a preview part's facets using the given groups, for debugging
-    // (each group drawn flat in its colour over a dedicated debug VAO that
-    // reuses the part's existing vertices + the lit shader). Replaces any
-    // previous debug colouring. Used to visualise check categories or, e.g.,
-    // draft sign across the shot.
+    // (each group drawn over a dedicated debug VAO that reuses the part's
+    // existing vertices). Replaces any previous debug colouring. Used to
+    // visualise check categories or, e.g., draft sign across the shot. A group
+    // flagged `emissive` draws at full intensity (lighting flattened to its
+    // flat colour) so it reads as a highlight; other groups stay shaded by the
+    // normal lit pass, preserving the surface's 3D form.
     void SetShotDebugGroups(int halfIndex,
         const std::vector<ShotDebugGroup>& groups);
 
@@ -695,6 +698,7 @@ private:
         GLuint    ebo = 0;
         GLsizei   count = 0;
         glm::vec3 color{ 0.5f };
+        bool      emissive = false;
     };
     struct ShotDebugView
     {

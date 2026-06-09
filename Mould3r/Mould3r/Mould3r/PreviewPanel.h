@@ -102,6 +102,18 @@ private:
     // without any UI. Returns false when there is no shot to analyse.
     bool ComputeDemoldability();
 
+    // Apply or clear the Draft Angle Checks mould overlay according to the
+    // "Show mould overlay" checkbox on that card. When shown, the shot is
+    // recoloured (against the current thresholds) into one combined view:
+    // fail faces red, warn faces yellow, everything else its normal colour,
+    // drawn as highlights (flat/full-intensity) rather than shaded.
+    void UpdateDraftOverlay();
+
+    // Show or hide the Separation Test mould overlay (the red interference
+    // solid produced by the last run) according to that card's "Show mould
+    // overlay" checkbox. A no-op when no interference solid is available.
+    void UpdateSeparationOverlay();
+
     // Debug visualisation: recolour the shot so the facets flagged by one
     // category draw red and all others green. category: 0 = undercuts,
     // 1 = warnings, 2 = fails. Pressing the active category again clears it.
@@ -126,9 +138,12 @@ private:
     // Push a debug overlay to the canvas: partition the shot's display
     // triangles by their source face's group (groupOfFace maps a 1-based face
     // index to a group index; faces not present use defaultGroup), one colour
-    // per group.
+    // per group. `emissive` (optional, per group) flags which groups draw as
+    // flat full-intensity highlights instead of shaded; missing entries are
+    // treated as not emissive.
     void ApplyFaceGroups(const std::unordered_map<int, int>& groupOfFace,
-        const std::vector<glm::vec3>& colors, int defaultGroup);
+        const std::vector<glm::vec3>& colors, int defaultGroup,
+        const std::vector<bool>& emissive = {});
 
     // Upload the captured meshes into the canvas's context (halves first, then
     // the shot) and enable the toggles. Run via CallAfter so the canvas window
@@ -153,7 +168,15 @@ private:
     wxTextCtrl* m_warnDraftCtrl = nullptr;   // draft warn threshold (deg)
     wxTextCtrl* m_liftCtrl = nullptr;        // separation lift (mm)
     wxStaticText* m_draftStatus = nullptr;   // "Draft Angle Checks" verdict
-    wxStaticText* m_demouldStatus = nullptr; // "Demoulding" verdict
+    wxStaticText* m_demouldStatus = nullptr; // "Separation Test" verdict
+
+    // "Show mould overlay" checkboxes under each simulation's Start button, and
+    // whether the separation run has produced an interference solid to show.
+    // The checkbox state itself is read from the controls; m_hasSepOverlay
+    // gates the separation toggle so checking it before a run does nothing.
+    wxCheckBox* m_draftOverlayCheck = nullptr;
+    wxCheckBox* m_sepOverlayCheck = nullptr;
+    bool        m_hasSepOverlay = false;
 
     // Right-hand information panel (outer), relaid out by UpdateInfoPanel, and
     // its shot-volume value labels (cm³ primary, in³ secondary).

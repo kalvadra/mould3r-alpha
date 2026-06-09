@@ -2145,6 +2145,7 @@ void GLCanvas::SetShotDebugGroups(int halfIndex,
         if (grp.indices.empty()) continue;
         DebugGroupGPU gpu;
         gpu.color = grp.color;
+        gpu.emissive = grp.emissive;
         gpu.count = (GLsizei)grp.indices.size();
         glGenBuffers(1, &gpu.ebo);
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gpu.ebo);
@@ -2288,15 +2289,49 @@ void GLCanvas::RenderPreview(const glm::mat4& view, const glm::mat4& proj,
         // VAO instead of its normal single colour.
         if (m_shotDebug.active && hi == m_shotDebug.halfIndex && m_shotDebug.vao)
         {
+            const GLint locAmb = glGetUniformLocation(m_program, "uAmbient");
+            const GLint locDif = glGetUniformLocation(m_program, "uDiffuse");
+            const GLint locSpe = glGetUniformLocation(m_program, "uSpecular");
+
             glBindVertexArray(m_shotDebug.vao);
+            bool flattened = false;
             for (const DebugGroupGPU& g : m_shotDebug.groups)
             {
                 if (g.count <= 0) continue;
+
+                // Emissive groups draw at full intensity (ambient 1, no
+                // diffuse/specular) so flagged faces read as highlights;
+                // non-emissive groups keep the shaded look so surface form
+                // stays legible. Track which mode is set to minimise uniform
+                // churn across groups.
+                if (g.emissive && !flattened)
+                {
+                    glUniform1f(locAmb, 1.0f);
+                    glUniform1f(locDif, 0.0f);
+                    glUniform1f(locSpe, 0.0f);
+                    flattened = true;
+                }
+                else if (!g.emissive && flattened)
+                {
+                    glUniform1f(locAmb, 0.25f);
+                    glUniform1f(locDif, 0.85f);
+                    glUniform1f(locSpe, 0.20f);
+                    flattened = false;
+                }
+
                 glUniform3fv(locBase, 1, &g.color[0]);
                 glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g.ebo);
                 glDrawElements(GL_TRIANGLES, g.count, GL_UNSIGNED_INT, 0);
             }
             glBindVertexArray(0);
+
+            // Restore the shaded lighting for any subsequently drawn parts.
+            if (flattened)
+            {
+                glUniform1f(locAmb, 0.25f);
+                glUniform1f(locDif, 0.85f);
+                glUniform1f(locSpe, 0.20f);
+            }
             continue;
         }
 
