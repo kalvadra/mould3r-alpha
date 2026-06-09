@@ -22,7 +22,12 @@
 #include <opencascade/gp_Mat.hxx>
 #include <opencascade/gp_XYZ.hxx>
 #include <opencascade/BRepAlgoAPI_Cut.hxx>
+#include <opencascade/BRepAlgoAPI_Fuse.hxx>
+#include <opencascade/BRepGProp.hxx>
+#include <opencascade/GProp_GProps.hxx>
 #include <opencascade/BRepMesh_IncrementalMesh.hxx>
+#include <opencascade/TopExp.hxx>
+#include <opencascade/TopTools_IndexedMapOfShape.hxx>
 #include <opencascade/BRepBuilderAPI_MakeEdge.hxx>
 #include <opencascade/BRepBuilderAPI_MakeWire.hxx>
 #include <opencascade/BRepBuilderAPI_MakeFace.hxx>
@@ -36,6 +41,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -1380,6 +1386,17 @@ bool GLCanvas::GenerateMould()
 
     int step = 0;
 
+    // Reset the per-run capture of post-cut half meshes. These are handed to
+    // the preview window after a successful run; the main canvas no longer
+    // displays them itself (it keeps showing the original fixtures).
+    m_lastMouldMeshes.clear();
+    m_lastShotMesh = FileImporter::MeshData{};
+    m_hasLastShotMesh = false;
+    m_lastShotVolumeMm3 = 0.0;
+    m_lastShotShape = TopoDS_Shape();
+    m_lastShotFaceIds.clear();
+    m_lastHalfShapes.clear();
+
     SetCurrent(*m_context);
     InitGLOnce();
 
@@ -1983,13 +2000,45 @@ bool GLCanvas::GenerateMould()
         meshData.posNorm = std::move(split.posNorm);
         meshData.indices = std::move(split.indices);
 
-        fix.pos = glm::vec3(0.0f);
-        fix.yawDeg = 0.0f;
-        fix.pitchDeg = 0.0f;
-        fix.rollDeg = 0.0f;
-        fix.scale = 1.0f;
+        // Hand the tessellated half off to the preview window instead of
+        // replacing this fixture's display mesh. fix.mouldShape / hasMould
+        // were already set above (before the empty-mesh guard) for export.
+        // Per the preview workflow the main canvas keeps showing the original
+        // (pre-cut) fixtures at their authored poses — it must not change the
+        // mould halves after generation. The mesh captured here is already in
+        // world space (the fixture transform was baked into `result` above),
+        // so the preview renders it at an identity pose.
+        m_lastMouldMeshes.push_back(meshData);
 
-        UploadMeshToGPU(meshData, fix);
+        // Retain the half solid (world space, post-cut) for the separation
+        // demoldability check, kept in lockstep with m_lastMouldMeshes.
+        m_lastHalfShapes.push_back(result);
+    }
+
+    // ---- Shot model -------------------------------------------------------
+    // Build the body of injected material (objects + feed system, excluding
+    // vents and ejectors) and tessellate it for the preview / future
+    // simulation. Done once after the per-fixture loop since the shot is a
+    // single world-space body independent of which half it sits between. A
+    // failed or empty build just leaves m_hasLastShotMesh false — generation
+    // still succeeds; the preview simply won't show a "Shot" part.
+    {
+        TopoDS_Shape shotShape;
+        if (BuildShotModel(shotShape))
+        {
+            // Volume straight off the fused BREP (not the mesh) — accurate and
+            // overlap-safe. Geometry is in mm, so this is cubic mm.
+            GProp_GProps volProps;
+            BRepGProp::VolumeProperties(shotShape, volProps);
+            m_lastShotVolumeMm3 = std::abs(volProps.Mass());
+
+            // Retain the BREP for face-level design checks, and tessellate with
+            // a per-triangle face map so face results map back to display tris.
+            m_lastShotShape = shotShape;
+            TessellateShapeToMesh(shotShape, m_lastShotMesh, &m_lastShotFaceIds);
+            m_hasLastShotMesh =
+                !m_lastShotMesh.posNorm.empty() && !m_lastShotMesh.indices.empty();
+        }
     }
 
     progress.Update(totalSteps, "Done.");
@@ -1997,6 +2046,651 @@ bool GLCanvas::GenerateMould()
     wxMessageBox("Mould generated successfully.",
         "Generate Mould", wxOK | wxICON_INFORMATION, this);
     return true;
+}
+
+// ===========================================================================
+// Preview perspective
+//
+// These run on the dedicated preview canvas (m_previewMode == true). The
+// preview reuses this class's GL setup, shaders, grid and orbit camera so the
+// navigation matches the main canvas exactly; it just renders a stripped-down
+// scene (grid + the loaded mould halves) and ignores all editing input.
+// ===========================================================================
+
+void GLCanvas::AddPreviewHalf(const FileImporter::MeshData& mesh,
+    const std::string& label,
+    const glm::vec3& baseColor)
+{
+    // Materialise GPU buffers in this canvas's context. The caller (PreviewPanel)
+    // makes the context current before invoking us, but make sure regardless —
+    // UploadMeshToGPU issues GL calls that must hit the right context.
+    SetCurrent(*m_context);
+    InitGLOnce();
+
+    PreviewHalf half;
+    half.label = label;
+    half.visible = true;
+    half.baseColor = baseColor;
+    // Identity pose: the mesh vertices are already in world space.
+    half.obj.pos = glm::vec3(0.0f);
+    half.obj.yawDeg = half.obj.pitchDeg = half.obj.rollDeg = 0.0f;
+    half.obj.scale = 1.0f;
+    half.obj.role = ObjectRole::Fixture;
+
+    UploadMeshToGPU(mesh, half.obj);
+
+    m_previewHalves.push_back(std::move(half));
+    Refresh(false);
+}
+
+std::string GLCanvas::GetPreviewHalfLabel(int index) const
+{
+    if (index < 0 || index >= (int)m_previewHalves.size()) return std::string();
+    return m_previewHalves[index].label;
+}
+
+void GLCanvas::SetPreviewHalfVisible(int index, bool visible)
+{
+    if (index < 0 || index >= (int)m_previewHalves.size()) return;
+    m_previewHalves[index].visible = visible;
+    Refresh(false);
+}
+
+bool GLCanvas::IsPreviewHalfVisible(int index) const
+{
+    if (index < 0 || index >= (int)m_previewHalves.size()) return false;
+    return m_previewHalves[index].visible;
+}
+
+void GLCanvas::ClearPreviewHalves()
+{
+    if (!m_previewHalves.empty() && m_context)
+        SetCurrent(*m_context);
+    for (auto& h : m_previewHalves)
+        h.obj.mesh.Destroy();
+    m_previewHalves.clear();
+    Refresh(false);
+}
+
+void GLCanvas::SetShotDebugGroups(int halfIndex,
+    const std::vector<ShotDebugGroup>& groups)
+{
+    if (halfIndex < 0 || halfIndex >= (int)m_previewHalves.size()) return;
+    const GPUMesh& src = m_previewHalves[halfIndex].obj.mesh;
+    if (src.vbo == 0) return;
+
+    SetCurrent(*m_context);
+    InitGLOnce();
+
+    // Tear down any previous debug buffers so repeated calls don't leak.
+    for (auto& g : m_shotDebug.groups)
+        if (g.ebo) { glDeleteBuffers(1, &g.ebo); g.ebo = 0; }
+    m_shotDebug.groups.clear();
+    if (m_shotDebug.vao) { glDeleteVertexArrays(1, &m_shotDebug.vao); m_shotDebug.vao = 0; }
+
+    // Debug VAO references the part's existing vertex buffer (pos + normal,
+    // 6-float stride) so lighting matches the normal pass; only the element
+    // buffer changes between groups.
+    glGenVertexArrays(1, &m_shotDebug.vao);
+    glBindVertexArray(m_shotDebug.vao);
+    glBindBuffer(GL_ARRAY_BUFFER, src.vbo);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * (GLsizei)sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * (GLsizei)sizeof(float),
+        (void*)(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+
+    for (const ShotDebugGroup& grp : groups)
+    {
+        if (grp.indices.empty()) continue;
+        DebugGroupGPU gpu;
+        gpu.color = grp.color;
+        gpu.emissive = grp.emissive;
+        gpu.count = (GLsizei)grp.indices.size();
+        glGenBuffers(1, &gpu.ebo);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gpu.ebo);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+            (GLsizeiptr)(grp.indices.size() * sizeof(uint32_t)),
+            grp.indices.data(), GL_STATIC_DRAW);
+        m_shotDebug.groups.push_back(gpu);
+    }
+
+    glBindVertexArray(0);
+
+    m_shotDebug.halfIndex = halfIndex;
+    m_shotDebug.active = true;
+    Refresh(false);
+}
+
+void GLCanvas::ClearShotDebugColoring()
+{
+    m_shotDebug.active = false;
+    m_shotDebug.halfIndex = -1;
+    Refresh(false);
+}
+
+void GLCanvas::SetShotDebugRays(const std::vector<glm::vec3>& rayLineVerts,
+    const std::vector<glm::vec3>& contactVerts)
+{
+    SetCurrent(*m_context);
+    InitGLOnce();
+
+    auto upload = [&](GLuint& vao, GLuint& vbo, GLsizei& count,
+        const std::vector<glm::vec3>& verts)
+    {
+        if (vao == 0) glGenVertexArrays(1, &vao);
+        if (vbo == 0) glGenBuffers(1, &vbo);
+        glBindVertexArray(vao);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        glBufferData(GL_ARRAY_BUFFER,
+            (GLsizeiptr)(verts.size() * sizeof(glm::vec3)),
+            verts.empty() ? nullptr : verts.data(), GL_DYNAMIC_DRAW);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * (GLsizei)sizeof(float), (void*)0);
+        glEnableVertexAttribArray(0);
+        glBindVertexArray(0);
+        count = (GLsizei)verts.size();
+    };
+
+    upload(m_debugRayVao, m_debugRayVbo, m_debugRayVertCount, rayLineVerts);
+    upload(m_debugContactVao, m_debugContactVbo, m_debugContactVertCount, contactVerts);
+    Refresh(false);
+}
+
+void GLCanvas::ShowShotDebugRays(bool on)
+{
+    m_showDebugRays = on;
+    Refresh(false);
+}
+
+void GLCanvas::ShowShotDebugContacts(bool on)
+{
+    m_showDebugContacts = on;
+    Refresh(false);
+}
+
+void GLCanvas::ClearShotDebugRays()
+{
+    m_showDebugRays = false;
+    m_showDebugContacts = false;
+    m_debugRayVertCount = 0;
+    m_debugContactVertCount = 0;
+    Refresh(false);
+}
+
+void GLCanvas::SetShotDebugSolid(const TopoDS_Shape& shape, const glm::vec3& color)
+{
+    SetCurrent(*m_context);
+    InitGLOnce();
+
+    m_debugSolidObj.mesh.Destroy();
+    m_debugSolidColor = color;
+
+    if (shape.IsNull()) { m_showDebugSolid = false; Refresh(false); return; }
+
+    FileImporter::MeshData mesh;
+    TessellateShapeToMesh(shape, mesh);
+    if (mesh.posNorm.empty() || mesh.indices.empty())
+    {
+        m_showDebugSolid = false;
+        Refresh(false);
+        return;
+    }
+    UploadMeshToGPU(mesh, m_debugSolidObj);
+    Refresh(false);
+}
+
+void GLCanvas::ShowShotDebugSolid(bool on)
+{
+    m_showDebugSolid = on;
+    Refresh(false);
+}
+
+void GLCanvas::ClearShotDebugSolid()
+{
+    m_showDebugSolid = false;
+    m_debugSolidObj.mesh.Destroy();
+    Refresh(false);
+}
+
+void GLCanvas::RenderPreview(const glm::mat4& view, const glm::mat4& proj,
+    const glm::vec3& camPos)
+{
+    // Lit shader uniforms — mirror the main scene pass so the halves are shaded
+    // identically to how objects look in the editor.
+    glUseProgram(m_program);
+
+    const glm::vec3 lightDir = glm::normalize(glm::vec3(0.4f, 0.8f, 0.2f));
+    const glm::vec3 lightColor = glm::vec3(1.0f);
+
+    glUniform3fv(glGetUniformLocation(m_program, "uCameraPos"), 1, &camPos[0]);
+    glUniform3fv(glGetUniformLocation(m_program, "uLightDir"), 1, &lightDir[0]);
+    glUniform3fv(glGetUniformLocation(m_program, "uLightColor"), 1, &lightColor[0]);
+    glUniform1f(glGetUniformLocation(m_program, "uAmbient"), 0.25f);
+    glUniform1f(glGetUniformLocation(m_program, "uDiffuse"), 0.85f);
+    glUniform1f(glGetUniformLocation(m_program, "uSpecular"), 0.20f);
+    glUniform1f(glGetUniformLocation(m_program, "uShininess"), 64.0f);
+    glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 1.0f);
+    glUniformMatrix4fv(glGetUniformLocation(m_program, "uView"), 1, GL_FALSE, &view[0][0]);
+    glUniformMatrix4fv(glGetUniformLocation(m_program, "uProj"), 1, GL_FALSE, &proj[0][0]);
+
+    const GLint locBase = glGetUniformLocation(m_program, "uBaseColor");
+    const GLint locModel = glGetUniformLocation(m_program, "uModel");
+
+    for (int hi = 0; hi < (int)m_previewHalves.size(); ++hi)
+    {
+        const PreviewHalf& half = m_previewHalves[hi];
+        if (!half.visible) continue;
+        if (half.obj.mesh.vao == 0 || half.obj.mesh.indexCount == 0) continue;
+
+        const glm::mat4 model = half.obj.BuildModelMatrix();
+        glUniformMatrix4fv(locModel, 1, GL_FALSE, &model[0][0]);
+
+        // Debug colouring: draw this part as flat-coloured groups over a debug
+        // VAO instead of its normal single colour.
+        if (m_shotDebug.active && hi == m_shotDebug.halfIndex && m_shotDebug.vao)
+        {
+            const GLint locAmb = glGetUniformLocation(m_program, "uAmbient");
+            const GLint locDif = glGetUniformLocation(m_program, "uDiffuse");
+            const GLint locSpe = glGetUniformLocation(m_program, "uSpecular");
+
+            glBindVertexArray(m_shotDebug.vao);
+            bool flattened = false;
+            for (const DebugGroupGPU& g : m_shotDebug.groups)
+            {
+                if (g.count <= 0) continue;
+
+                // Emissive groups draw at full intensity (ambient 1, no
+                // diffuse/specular) so flagged faces read as highlights;
+                // non-emissive groups keep the shaded look so surface form
+                // stays legible. Track which mode is set to minimise uniform
+                // churn across groups.
+                if (g.emissive && !flattened)
+                {
+                    glUniform1f(locAmb, 1.0f);
+                    glUniform1f(locDif, 0.0f);
+                    glUniform1f(locSpe, 0.0f);
+                    flattened = true;
+                }
+                else if (!g.emissive && flattened)
+                {
+                    glUniform1f(locAmb, 0.25f);
+                    glUniform1f(locDif, 0.85f);
+                    glUniform1f(locSpe, 0.20f);
+                    flattened = false;
+                }
+
+                glUniform3fv(locBase, 1, &g.color[0]);
+                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g.ebo);
+                glDrawElements(GL_TRIANGLES, g.count, GL_UNSIGNED_INT, 0);
+            }
+            glBindVertexArray(0);
+
+            // Restore the shaded lighting for any subsequently drawn parts.
+            if (flattened)
+            {
+                glUniform1f(locAmb, 0.25f);
+                glUniform1f(locDif, 0.85f);
+                glUniform1f(locSpe, 0.20f);
+            }
+            continue;
+        }
+
+        // Per-part base colour — mould halves render grey, the shot reads
+        // distinctly (set by its AddPreviewHalf caller).
+        glUniform3fv(locBase, 1, &half.baseColor[0]);
+
+        glBindVertexArray(half.obj.mesh.vao);
+        glDrawElements(GL_TRIANGLES, half.obj.mesh.indexCount, GL_UNSIGNED_INT, 0);
+        glBindVertexArray(0);
+    }
+
+    // Free-standing lit debug solid (separation-test interference region).
+    if (m_showDebugSolid && m_debugSolidObj.mesh.vao &&
+        m_debugSolidObj.mesh.indexCount > 0)
+    {
+        const glm::mat4 model(1.0f);  // already world space
+        glUniformMatrix4fv(locModel, 1, GL_FALSE, &model[0][0]);
+        glUniform3fv(locBase, 1, &m_debugSolidColor[0]);
+        glBindVertexArray(m_debugSolidObj.mesh.vao);
+        glDrawElements(GL_TRIANGLES, m_debugSolidObj.mesh.indexCount, GL_UNSIGNED_INT, 0);
+        glBindVertexArray(0);
+    }
+
+    glUseProgram(0);
+
+    // Accessibility-ray debug overlay (flat shader): ray segments + contacts.
+    if (m_flatProgram &&
+        ((m_showDebugRays && m_debugRayVertCount > 0) ||
+         (m_showDebugContacts && m_debugContactVertCount > 0)))
+    {
+        glUseProgram(m_flatProgram);
+        const glm::mat4 VP = proj * view;
+        glUniformMatrix4fv(m_flat_uVP, 1, GL_FALSE, &VP[0][0]);
+
+        if (m_showDebugRays && m_debugRayVao && m_debugRayVertCount > 0)
+        {
+            const glm::vec4 rayColor(1.0f, 0.85f, 0.10f, 1.0f);  // yellow
+            glUniform4fv(m_flat_uColor, 1, &rayColor[0]);
+            glLineWidth(2.0f);
+            glBindVertexArray(m_debugRayVao);
+            glDrawArrays(GL_LINES, 0, m_debugRayVertCount);
+            glBindVertexArray(0);
+            glLineWidth(1.0f);
+        }
+        if (m_showDebugContacts && m_debugContactVao && m_debugContactVertCount > 0)
+        {
+            const glm::vec4 contactColor(0.95f, 0.12f, 0.12f, 1.0f);  // red
+            glUniform4fv(m_flat_uColor, 1, &contactColor[0]);
+            glPointSize(9.0f);
+            glBindVertexArray(m_debugContactVao);
+            glDrawArrays(GL_POINTS, 0, m_debugContactVertCount);
+            glBindVertexArray(0);
+            glPointSize(1.0f);
+        }
+        glUseProgram(0);
+    }
+
+    // Grid last, same as the main canvas.
+    m_grid.Draw(view, proj);
+}
+
+// ---------------------------------------------------------------------------
+// BuildShotModel — fuse imported objects + feed-system features into the shot.
+//
+// The shot is the body of material that fills the cavity and feed network: it
+// is the union of everything the cut loop subtracts from the mould EXCEPT the
+// vents and ejectors. Each primitive is built in world space with the same
+// geometry the cut loop uses (kCutEps overlaps included, which only help the
+// fuse), then fused pairwise.
+//
+// NOTE (known duplication): the per-feature geometry below intentionally
+// mirrors the construction in GenerateMould's cut loop. They are kept separate
+// for now so this addition can't regress mould generation; a future pass could
+// factor the shared primitive builders out and have both call them.
+// ---------------------------------------------------------------------------
+bool GLCanvas::BuildShotModel(TopoDS_Shape& out)
+{
+    std::vector<TopoDS_Shape> shapes;
+
+    // ---- Imported objects (transformed to world space) --------------------
+    for (const SceneObject& obj : m_objects)
+    {
+        if (obj.sourcePath.empty() && !obj.hasSourceShape) continue;
+
+        TopoDS_Shape objShape;
+        if (obj.hasSourceShape)
+        {
+            objShape = obj.sourceShape;
+        }
+        else
+        {
+            STEPControl_Reader objReader;
+            if (objReader.ReadFile(obj.sourcePath.c_str()) != IFSelect_RetDone)
+                continue;
+            objReader.TransferRoots();
+            objShape = objReader.OneShape();
+        }
+        if (objShape.IsNull()) continue;
+
+        gp_Trsf objTrsf;
+        glm::mat4 om = obj.BuildModelMatrix();
+        objTrsf.SetValues(
+            om[0][0], om[1][0], om[2][0], om[3][0],
+            om[0][1], om[1][1], om[2][1], om[3][1],
+            om[0][2], om[1][2], om[2][2], om[3][2]
+        );
+        BRepBuilderAPI_Transform objXform(objShape, objTrsf, true);
+        if (!objXform.Shape().IsNull())
+            shapes.push_back(objXform.Shape());
+    }
+
+    static constexpr float kCutEps = 0.1f;
+
+    // ---- Sprue frustum + cold slug ----------------------------------------
+    if (m_sprue.hasPoint)
+    {
+        const glm::vec3 sprueAxis = m_sprue.pathEnd - m_sprue.pathStart;
+        const float     sprueLen = glm::length(sprueAxis);
+        if (sprueLen > 1e-6f)
+        {
+            const glm::vec3 dir = sprueAxis / sprueLen;
+            const glm::vec3 sprueStartExt = m_sprue.pathStart - dir * kCutEps;
+            const float     sprueExtLen = sprueLen + kCutEps;
+
+            gp_Ax2 sprueAx(
+                gp_Pnt(sprueStartExt.x, sprueStartExt.y, sprueStartExt.z),
+                gp_Dir(dir.x, dir.y, dir.z));
+
+            const float draftRad = glm::radians(glm::clamp(m_sprue.draftAngleDeg, 0.0f, 45.0f));
+            const float startR = m_sprue.radius;
+            const float endR = m_sprue.radius + sprueExtLen * std::tan(draftRad);
+
+            if (std::abs(endR - startR) > 1e-6f)
+            {
+                BRepPrimAPI_MakeCone cone(sprueAx, startR, endR, sprueExtLen);
+                cone.Build();
+                if (cone.IsDone() && !cone.Shape().IsNull())
+                    shapes.push_back(cone.Shape());
+            }
+            else
+            {
+                BRepPrimAPI_MakeCylinder cyl(sprueAx, startR, sprueExtLen);
+                cyl.Build();
+                if (cyl.IsDone() && !cyl.Shape().IsNull())
+                    shapes.push_back(cyl.Shape());
+            }
+
+            if (!m_sprue.isDirectInjection && m_sprue.coldSlugDepth > 1e-6f)
+            {
+                gp_Ax2 slugAx(
+                    gp_Pnt(m_sprue.pathEnd.x, m_sprue.pathEnd.y, m_sprue.pathEnd.z),
+                    gp_Dir(dir.x, dir.y, dir.z));
+                BRepPrimAPI_MakeCylinder slugCyl(slugAx, endR, m_sprue.coldSlugDepth);
+                slugCyl.Build();
+                if (slugCyl.IsDone() && !slugCyl.Shape().IsNull())
+                    shapes.push_back(slugCyl.Shape());
+            }
+        }
+    }
+
+    // Feed dimensions from the side panel — same source as the cut loop.
+    float runnerRadius = 2.5f, coldPlugDist = 5.0f;
+    float gateRadius = 1.5f, draftAngle = 1.0f, subRunnerRadius = 2.5f, overrun = 0.0f;
+    if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+    {
+        runnerRadius = frame->GetRunnerDiameter() * 0.5f;
+        coldPlugDist = frame->GetRunnerColdPlugDist();
+        gateRadius = frame->GetGateDiameter() * 0.5f;
+        draftAngle = frame->GetGateDraftAngle();
+        subRunnerRadius = frame->GetSubRunnerDiameter() * 0.5f;
+        overrun = frame->GetGateOverrun();
+    }
+
+    // ---- Runner cylinders + cold plugs ------------------------------------
+    if (m_sprue.hasPartingPoint && runnerRadius > 1e-6f)
+    {
+        for (const RunnerFeature& rf : m_runners)
+        {
+            const glm::vec3 runnerAxis = rf.point - m_sprue.partingPos;
+            const float runnerLen = glm::length(runnerAxis);
+            if (runnerLen < 1e-6f) continue;
+            const glm::vec3 runnerDir = runnerAxis / runnerLen;
+
+            const glm::vec3 runnerOriginExt = m_sprue.partingPos - runnerDir * kCutEps;
+            gp_Ax2 runnerAx(
+                gp_Pnt(runnerOriginExt.x, runnerOriginExt.y, runnerOriginExt.z),
+                gp_Dir(runnerDir.x, runnerDir.y, runnerDir.z));
+            BRepPrimAPI_MakeCylinder runnerCyl(runnerAx, runnerRadius, runnerLen + 2.0f * kCutEps);
+            runnerCyl.Build();
+            if (runnerCyl.IsDone() && !runnerCyl.Shape().IsNull())
+                shapes.push_back(runnerCyl.Shape());
+
+            if (coldPlugDist > 1e-6f)
+            {
+                gp_Ax2 plugAx(
+                    gp_Pnt(rf.point.x, rf.point.y, rf.point.z),
+                    gp_Dir(runnerDir.x, runnerDir.y, runnerDir.z));
+                BRepPrimAPI_MakeCylinder plugCyl(plugAx, runnerRadius, coldPlugDist);
+                plugCyl.Build();
+                if (plugCyl.IsDone() && !plugCyl.Shape().IsNull())
+                    shapes.push_back(plugCyl.Shape());
+            }
+        }
+    }
+
+    // ---- Gate frustums + sub-runners --------------------------------------
+    {
+        const float draftRad = glm::radians(glm::clamp(draftAngle, 0.0f, 45.0f));
+        const float tanDraft = std::tan(draftRad);
+
+        for (const GateFeature& gf : m_gates)
+        {
+            if (!gf.hasPath) continue;
+
+            const glm::vec3 origin = gf.point.worldPos;
+            const glm::vec3 pathVec = gf.pathEnd - origin;
+            const float     totalLen = glm::length(pathVec);
+            if (totalLen < 1e-6f || gateRadius < 1e-6f) continue;
+            const glm::vec3 pathDir = pathVec / totalLen;
+            const gp_Dir occDir(pathDir.x, pathDir.y, pathDir.z);
+
+            const float backExt = kCutEps + overrun;
+            const glm::vec3 originExt = origin - pathDir * backExt;
+            const float     totalLenExt = totalLen + backExt;
+            const gp_Ax2    gateAxExt(gp_Pnt(originExt.x, originExt.y, originExt.z), occDir);
+
+            const float startRadius = std::max(0.01f, gateRadius - tanDraft * backExt);
+
+            float taperLen = std::numeric_limits<float>::max();
+            if (tanDraft > 1e-6f && subRunnerRadius > gateRadius)
+                taperLen = (subRunnerRadius - gateRadius) / tanDraft;
+            const float taperLenExt = taperLen + backExt;
+
+            if (taperLen >= totalLen)
+            {
+                const float endR = startRadius + totalLenExt * tanDraft;
+                if (std::abs(endR - startRadius) > 1e-6f)
+                {
+                    BRepPrimAPI_MakeCone cone(gateAxExt, startRadius, endR, totalLenExt);
+                    cone.Build();
+                    if (cone.IsDone() && !cone.Shape().IsNull())
+                        shapes.push_back(cone.Shape());
+                }
+                else
+                {
+                    BRepPrimAPI_MakeCylinder cyl(gateAxExt, startRadius, totalLenExt);
+                    cyl.Build();
+                    if (cyl.IsDone() && !cyl.Shape().IsNull())
+                        shapes.push_back(cyl.Shape());
+                }
+            }
+            else
+            {
+                BRepPrimAPI_MakeCone cone(gateAxExt, startRadius, subRunnerRadius, taperLenExt);
+                cone.Build();
+                if (cone.IsDone() && !cone.Shape().IsNull())
+                    shapes.push_back(cone.Shape());
+
+                const glm::vec3 transitionPt = originExt + pathDir * taperLenExt;
+                const float     subLen = totalLenExt - taperLenExt;
+                if (subLen > 1e-6f)
+                {
+                    gp_Ax2 subAx(gp_Pnt(transitionPt.x, transitionPt.y, transitionPt.z), occDir);
+                    BRepPrimAPI_MakeCylinder subCyl(subAx, subRunnerRadius, subLen);
+                    subCyl.Build();
+                    if (subCyl.IsDone() && !subCyl.Shape().IsNull())
+                        shapes.push_back(subCyl.Shape());
+                }
+            }
+        }
+    }
+
+    if (shapes.empty()) return false;
+
+    // ---- Fuse everything --------------------------------------------------
+    // Pairwise fuse. Disjoint pieces fuse into a valid compound, so this stays
+    // robust even when (say) a gate doesn't quite touch its feed point. A
+    // failed individual fuse drops that one piece rather than aborting the
+    // whole shot.
+    TopoDS_Shape acc = shapes[0];
+    for (size_t i = 1; i < shapes.size(); ++i)
+    {
+        BRepAlgoAPI_Fuse fuse(acc, shapes[i]);
+        fuse.Build();
+        if (fuse.IsDone() && !fuse.Shape().IsNull())
+            acc = fuse.Shape();
+        // else: keep acc, skip this piece.
+    }
+
+    if (acc.IsNull()) return false;
+    out = acc;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// TessellateShapeToMesh — OCC shape → render-ready MeshData (posNorm+indices),
+// optionally recording each triangle's source-face index.
+// ---------------------------------------------------------------------------
+void GLCanvas::TessellateShapeToMesh(const TopoDS_Shape& shape,
+    FileImporter::MeshData& mesh, std::vector<int>* faceIds)
+{
+    mesh = FileImporter::MeshData{};
+    if (faceIds) faceIds->clear();
+    if (shape.IsNull()) return;
+
+    BRepMesh_IncrementalMesh mesher(shape, 0.05, false, 0.5, true);
+
+    // Stable 1-based face indexing, matching what DesignChecks rebuilds via
+    // TopExp::MapShapes — so a face-level result maps back to these triangles.
+    TopTools_IndexedMapOfShape faceMap;
+    if (faceIds) TopExp::MapShapes(shape, TopAbs_FACE, faceMap);
+
+    for (TopExp_Explorer ex(shape, TopAbs_FACE); ex.More(); ex.Next())
+    {
+        const TopoDS_Face face = TopoDS::Face(ex.Current());
+        TopLoc_Location loc;
+        Handle(Poly_Triangulation) tri = BRep_Tool::Triangulation(face, loc);
+        if (tri.IsNull()) continue;
+
+        const int faceIndex = faceIds ? faceMap.FindIndex(face) : 0;
+
+        const gp_Trsf tr = loc.Transformation();
+        const uint32_t baseIndex = (uint32_t)(mesh.vertices.size() / 3);
+
+        // OCC triangulates each face for its FORWARD sense. When the face is
+        // REVERSED within the solid, its true outward normal is the opposite
+        // of the triangulation winding, so swap two indices to flip the
+        // winding back to outward. This keeps geometric (cross-product)
+        // normals reliably outward — which the demoldability check depends on.
+        const bool reversed = (face.Orientation() == TopAbs_REVERSED);
+
+        for (int i = 1; i <= tri->NbNodes(); ++i)
+        {
+            gp_Pnt p = tri->Node(i);
+            p.Transform(tr);
+            mesh.vertices.push_back((float)p.X());
+            mesh.vertices.push_back((float)p.Y());
+            mesh.vertices.push_back((float)p.Z());
+        }
+        for (int t = 1; t <= tri->NbTriangles(); ++t)
+        {
+            int n1, n2, n3;
+            tri->Triangle(t).Get(n1, n2, n3);
+            if (reversed) std::swap(n2, n3);
+            mesh.indices.push_back(baseIndex + (uint32_t)(n1 - 1));
+            mesh.indices.push_back(baseIndex + (uint32_t)(n2 - 1));
+            mesh.indices.push_back(baseIndex + (uint32_t)(n3 - 1));
+            if (faceIds) faceIds->push_back(faceIndex);
+        }
+    }
+
+    if (mesh.vertices.empty() || mesh.indices.empty()) return;
+
+    ComputeVertexNormals_Pos3(mesh.vertices, mesh.indices, mesh.posNorm);
+    auto split = SplitByCreaseAngle_Pos3(mesh.vertices, mesh.indices, 35.0f);
+    mesh.posNorm = std::move(split.posNorm);
+    mesh.indices = std::move(split.indices);
+    // faceIds stays aligned: the crease split preserves triangle order/count.
 }
 
 // ---------------------------------------------------------------------------
@@ -3868,6 +4562,16 @@ void GLCanvas::DestroyGL()
     if (m_sphereEBO) { glDeleteBuffers(1, &m_sphereEBO);          m_sphereEBO = 0; }
     if (m_sphereVBO) { glDeleteBuffers(1, &m_sphereVBO);          m_sphereVBO = 0; }
     if (m_sphereVAO) { glDeleteVertexArrays(1, &m_sphereVAO);     m_sphereVAO = 0; }
+    // Preview debug overlays (shot colouring groups + ray/contact geometry).
+    for (auto& g : m_shotDebug.groups)
+        if (g.ebo) { glDeleteBuffers(1, &g.ebo); g.ebo = 0; }
+    m_shotDebug.groups.clear();
+    if (m_shotDebug.vao) { glDeleteVertexArrays(1, &m_shotDebug.vao); m_shotDebug.vao = 0; }
+    if (m_debugRayVbo) { glDeleteBuffers(1, &m_debugRayVbo);          m_debugRayVbo = 0; }
+    if (m_debugRayVao) { glDeleteVertexArrays(1, &m_debugRayVao);     m_debugRayVao = 0; }
+    if (m_debugContactVbo) { glDeleteBuffers(1, &m_debugContactVbo);      m_debugContactVbo = 0; }
+    if (m_debugContactVao) { glDeleteVertexArrays(1, &m_debugContactVao); m_debugContactVao = 0; }
+    m_debugSolidObj.mesh.Destroy();
     if (m_vbo) { glDeleteBuffers(1, &m_vbo);               m_vbo = 0; }
     if (m_vao) { glDeleteVertexArrays(1, &m_vao);          m_vao = 0; }
     if (m_ebo) { glDeleteBuffers(1, &m_ebo);               m_ebo = 0; }
@@ -4210,6 +4914,16 @@ void GLCanvas::OnPaint(wxPaintEvent&)
     const glm::vec3 camPos = m_camera.Position();
 
     if (!m_program) { SwapBuffers(); return; }
+
+    // Preview canvas: grid + loaded mould halves only. Skip the entire
+    // editing scene (objects, fixture transparency, features, ghosts, picking
+    // and selection outline) — none of it applies here.
+    if (m_previewMode)
+    {
+        RenderPreview(view, proj, camPos);
+        SwapBuffers();
+        return;
+    }
 
     glUseProgram(m_program);
 
@@ -5455,6 +6169,45 @@ void GLCanvas::OnPaint(wxPaintEvent&)
 // ---------------------------------------------------------------------------
 void GLCanvas::OnMouse(wxMouseEvent& evt)
 {
+    // Preview canvas: navigation only. Orbit (LMB), pan (MMB or Shift+LMB) and
+    // dolly (RMB or Ctrl+LMB) match the main canvas, but there is no picking,
+    // selection, transform, or feature placement.
+    if (m_previewMode)
+    {
+        if (evt.LeftDown())   { m_lmb = true;  m_hasLast = false; }
+        if (evt.LeftUp())     { m_lmb = false; if (HasCapture()) ReleaseMouse(); }
+        if (evt.MiddleDown()) { m_mmb = true;  m_hasLast = false; CaptureMouse(); }
+        if (evt.MiddleUp())   { m_mmb = false; if (HasCapture()) ReleaseMouse(); }
+        if (evt.RightDown())  { m_rmb = true;  m_hasLast = false; CaptureMouse(); }
+        if (evt.RightUp())    { m_rmb = false; if (HasCapture()) ReleaseMouse(); }
+
+        if (evt.Dragging() && m_lmb && !HasCapture())
+            CaptureMouse();
+
+        if (!evt.Moving() && !evt.Dragging()) { evt.Skip(); return; }
+
+        const wxPoint pos = evt.GetPosition();
+        if (!m_hasLast) { m_lastPos = pos; m_hasLast = true; evt.Skip(); return; }
+
+        const float dx = float(pos.x - m_lastPos.x);
+        const float dy = float(pos.y - m_lastPos.y);
+        m_lastPos = pos;
+
+        const bool shift = evt.ShiftDown();
+        const bool ctrl = evt.ControlDown();
+
+        if (m_mmb)        { m_camera.Pan(dx, -dy);       Refresh(false); }
+        else if (m_rmb)   { m_camera.Dolly(dy * 0.05f);  Refresh(false); }
+        else if (m_lmb)
+        {
+            if (shift)      m_camera.Pan(dx, -dy);
+            else if (ctrl)  m_camera.Dolly(dy * 0.05f);
+            else            m_camera.Orbit(dx, dy);
+            Refresh(false);
+        }
+        return;
+    }
+
     if (evt.LeftDown())
     {
         m_lmb = true;
@@ -6131,6 +6884,11 @@ void GLCanvas::OnMouseWheel(wxMouseEvent& evt)
 
 void GLCanvas::OnKeyDown(wxKeyEvent& evt)
 {
+    // Preview canvas has no editing state, so none of the shortcuts below
+    // (Escape mode-exit, Ctrl+A/C/V, Delete) apply. Let the event propagate
+    // so the host frame can still react (e.g. Escape to close).
+    if (m_previewMode) { evt.Skip(); return; }
+
     if (evt.GetKeyCode() == WXK_ESCAPE)
     {
         if (m_transformMode != TransformMode::Select)

@@ -141,6 +141,7 @@
     <ClCompile Include="AppConfig.cpp" />
     <ClCompile Include="camera.cpp" />
     <ClCompile Include="CreateFixtureDialog.cpp" />
+    <ClCompile Include="DesignChecks.cpp" />
     <ClCompile Include="FileImporter.cpp" />
     <ClCompile Include="FixtureCanvas.cpp" />
     <ClCompile Include="FixtureEditor.cpp" />
@@ -158,9 +159,11 @@
     <ClCompile Include="main.cpp" />
     <ClCompile Include="MouldFeature.cpp" />
     <ClCompile Include="PatternDialog.cpp" />
+    <ClCompile Include="PreviewPanel.cpp" />
     <ClCompile Include="ProjectFile.cpp" />
     <ClCompile Include="RotateDialog.cpp" />
     <ClCompile Include="RoundedButton.cpp" />
+    <ClCompile Include="PerspectiveButton.cpp" />
     <ClCompile Include="ScaleDialog.cpp" />
     <ClCompile Include="shaders.cpp" />
     <ClCompile Include="StartupDialog.cpp" />
@@ -172,6 +175,7 @@
     <ClInclude Include="AppConfig.h" />
     <ClInclude Include="camera.h" />
     <ClInclude Include="CreateFixtureDialog.h" />
+    <ClInclude Include="DesignChecks.h" />
     <ClInclude Include="FileImporter.h" />
     <ClInclude Include="FixtureCanvas.h" />
     <ClInclude Include="FixtureEditor.h" />
@@ -188,9 +192,11 @@
     <ClInclude Include="Mould3r.h" />
     <ClInclude Include="MouldFeature.h" />
     <ClInclude Include="PatternDialog.h" />
+    <ClInclude Include="PreviewPanel.h" />
     <ClInclude Include="ProjectFile.h" />
     <ClInclude Include="RotateDialog.h" />
     <ClInclude Include="RoundedButton.h" />
+    <ClInclude Include="PerspectiveButton.h" />
     <ClInclude Include="ScaleDialog.h" />
     <ClInclude Include="shaders.h" />
     <ClInclude Include="StartupDialog.h" />

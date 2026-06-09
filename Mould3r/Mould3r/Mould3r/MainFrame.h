@@ -18,6 +18,10 @@
 class GLCanvas;
 class RoundedButton;   // forward decl — m_btnExport pointer below; full def
 // is included from MainFrame.cpp where it's used.
+class PreviewPanel;    // forward decl — m_previewPanel pointer; full def
+// is included from MainFrame.cpp where the panel is created.
+class wxSimplebook;    // forward decl — m_book pointer; the perspective pager.
+class PerspectiveButton; // forward decl — m_btnPrepare/m_btnPreview tabs.
 
 enum class TransformMode { Select, Translate, Rotate, Scale, Pattern, PlaceVent, PlaceRunner, PlaceGate, PlaceEjector, RemoveVent, RemoveRunner, RemoveGate, RemoveSprue, RemoveEjector, EditVent, EditRunner, EditGate, EditEjector, SelectInjectionPoint, AlignFace, AlignMidplane };
 
@@ -25,6 +29,7 @@ class MainFrame : public wxFrame
 {
 public:
     MainFrame(const FixtureDefinition& FixtureDefinition);
+    ~MainFrame() override;
 
     // Called by GLCanvas when Escape is pressed to sync button state
     void SetActiveTool(TransformMode mode);
@@ -139,6 +144,27 @@ private:
     void OnSetMetric(wxCommandEvent&);
     void OnSetImperial(wxCommandEvent&);
 
+    // ---- Workflow perspectives ---------------------------------------------
+    // The window hosts two stacked perspectives in a wxSimplebook: "Prepare"
+    // (the editing view — left panel + main canvas) and "Preview" (the post-cut
+    // mould review — PreviewPanel). The ribbon's Prepare / Preview buttons (and
+    // any future callers) switch between them via SetPerspective; each
+    // perspective swaps in its own menu bar, while the ribbon stays shared.
+    enum class Perspective { Prepare, Preview };
+    void SetPerspective(Perspective which);
+    void OnPerspectivePrepare(wxCommandEvent&);
+    void OnPerspectivePreview(wxCommandEvent&);
+
+    // Builds the two menu bars once at construction. Prepare carries the full
+    // File / Fixture / Units / Import set; Preview is minimal (File -> Exit)
+    // for now and grows as preview-specific actions are added.
+    wxMenuBar* BuildPrepareMenuBar();
+    wxMenuBar* BuildPreviewMenuBar();
+
+    // Drive the two ribbon perspective tabs so the active one reads as
+    // selected. Safe to call before either tab exists (no-ops).
+    void UpdatePerspectiveButtons();
+
     // Activates a tool button and deactivates the others (also called by GLCanvas on Escape)
 
     //Creates the left panel
@@ -154,11 +180,11 @@ private:
     wxPanel* CreateGatesContent(wxWindow* parent);
     wxPanel* CreateEjectorsContent(wxWindow* parent);
 
-    // Builds a "Place …" toggle button with the standard side-panel styling
-    // and registers a setter into m_toolBtnSetters so SetActiveTool can
-    // drive its visual state externally (button click, Escape, canvas-
-    // internal mode transitions).
-    wxToggleButton* MakePlaceButton(wxWindow* parent, int id,
+    // Builds a "Place …" button with the standard side-panel styling (rounded
+    // corners, BtnPlace fill — matching the Sprue feature button) and registers
+    // a setter into m_toolBtnSetters so SetActiveTool can drive its visual
+    // state externally (button click, Escape, canvas-internal mode transitions).
+    RoundedButton* MakePlaceButton(wxWindow* parent, int id,
         const wxString& label);
 
     // Vent field members
@@ -204,6 +230,25 @@ private:
 
     GLCanvas* m_canvas = nullptr;
 
+    // The two stacked workflow perspectives and the pager that switches between
+    // them. m_preparePage wraps the left panel + main canvas; m_previewPanel is
+    // the embedded preview perspective (replaces the old breakout PreviewFrame).
+    wxSimplebook* m_book = nullptr;
+    wxPanel* m_preparePage = nullptr;
+    PreviewPanel* m_previewPanel = nullptr;
+    Perspective m_perspective = Perspective::Prepare;
+
+    // Per-perspective menu bars, both built once in the constructor and swapped
+    // via SetMenuBar on perspective change. The frame only auto-destroys the
+    // currently-attached bar at teardown, so ~MainFrame deletes the detached one.
+    wxMenuBar* m_prepareMenuBar = nullptr;
+    wxMenuBar* m_previewMenuBar = nullptr;
+
+    // Ribbon perspective-switch tabs (shared top bar). Held so SetPerspective
+    // can drive their selected styling.
+    PerspectiveButton* m_btnPrepare = nullptr;
+    PerspectiveButton* m_btnPreview = nullptr;
+
     // Stored fixture definition (for project save/load)
     FixtureDefinition m_fixtureDef;
 
@@ -228,9 +273,10 @@ private:
     wxPanel* m_sidePanel = nullptr;
     wxTextCtrl* m_exportPath = nullptr;
 
-    // Export button on the top ribbon. Held as a member so OnGenerateMould
-    // can reach it, even though we no longer toggle its visual state — the
-    // pointer is also useful for any future hover/state experiments.
+    // Top-ribbon primary-action buttons. Generate Mould shows in the Prepare
+    // perspective and Export in Preview; SetPerspective toggles their
+    // visibility so exactly one occupies the top-right slot at a time.
+    RoundedButton* m_btnGenerate = nullptr;
     RoundedButton* m_btnExport = nullptr;
 
     // Tri-state model for "is the Export button about to do something
@@ -277,6 +323,8 @@ private:
 
     enum {
         ID_Import = wxID_HIGHEST + 100,
+        ID_PerspectivePrepare,
+        ID_PerspectivePreview,
         ID_ToolSelect,
         ID_ToolTranslate,
         ID_ToolRotate,

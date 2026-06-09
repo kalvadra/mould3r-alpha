@@ -186,6 +186,142 @@ public:
     bool GenerateMould();
     void ExportFixtures(const std::string& pathA, const std::string& pathB);
 
+    // ---- Preview perspective ------------------------------------------------
+    // A second GLCanvas instance (hosted by PreviewPanel) is put into preview
+    // mode to show the post-cut mould halves on their own. Preview mode strips
+    // the canvas down to: grid + the loaded mould halves, with the standard
+    // orbit / pan / dolly navigation but no picking, selection, transform
+    // modes, feature placement, or keyboard shortcuts. The main canvas is
+    // never in preview mode.
+
+    // Switch this canvas into (or out of) preview mode. Idempotent.
+    void SetPreviewMode(bool on) { m_previewMode = on; }
+    bool IsPreviewMode() const { return m_previewMode; }
+
+    // Append one part to the preview from a world-space mesh (position +
+    // normal interleaved, plus indices — exactly the MeshData produced by
+    // GenerateMould). The mesh is uploaded to this canvas's own GL context and
+    // stored with an identity pose, since the fixture transform is already
+    // baked into the world-space vertices. `label` is shown on the part's
+    // show/hide toggle (e.g. "Half A", "Shot"). `baseColor` lets the shot
+    // model read distinctly from the grey mould halves. Parts start visible.
+    // Must be called with this canvas's GL context current — PreviewPanel
+    // arranges that.
+    void AddPreviewHalf(const FileImporter::MeshData& mesh,
+        const std::string& label,
+        const glm::vec3& baseColor = glm::vec3(0.80f, 0.80f, 0.85f));
+
+    // Number of preview parts (mould halves + shot) currently loaded.
+    int  GetPreviewHalfCount() const { return (int)m_previewHalves.size(); }
+
+    // Label of part `index` (empty string if out of range).
+    std::string GetPreviewHalfLabel(int index) const;
+
+    // Show / hide an individual part. Out-of-range indices are ignored.
+    void SetPreviewHalfVisible(int index, bool visible);
+    bool IsPreviewHalfVisible(int index) const;
+
+    // Drop every loaded preview part (frees their GPU resources). Safe to call
+    // with no context current only if nothing has been uploaded yet.
+    void ClearPreviewHalves();
+
+    // ---- Design-check debug colouring --------------------------------------
+    // One flat-coloured group of facets for the debug overlay: every triangle
+    // in `indices` (vertex-index triples into the part's own vertex buffer)
+    // draws in `color`. The caller partitions the part's triangles into groups.
+    struct ShotDebugGroup
+    {
+        glm::vec3             color{ 0.5f };
+        std::vector<uint32_t> indices;
+        bool                  emissive = false;  // draw flat (highlight) vs lit
+    };
+
+    // Recolour a preview part's facets using the given groups, for debugging
+    // (each group drawn over a dedicated debug VAO that reuses the part's
+    // existing vertices). Replaces any previous debug colouring. Used to
+    // visualise check categories or, e.g., draft sign across the shot. A group
+    // flagged `emissive` draws at full intensity (lighting flattened to its
+    // flat colour) so it reads as a highlight; other groups stay shaded by the
+    // normal lit pass, preserving the surface's 3D form.
+    void SetShotDebugGroups(int halfIndex,
+        const std::vector<ShotDebugGroup>& groups);
+
+    // Turn debug colouring off — the shot returns to its normal single colour.
+    void ClearShotDebugColoring();
+
+    // ---- Design-check debug rays -------------------------------------------
+    // Upload accessibility-ray debug geometry for the preview: `rayLineVerts`
+    // is GL_LINES vertex pairs (world space) for the ray segments, and
+    // `contactVerts` is GL_POINTS world positions for the contact markers.
+    // Rendered with the flat (unlit) shader. Replaces any previous ray geometry.
+    void SetShotDebugRays(const std::vector<glm::vec3>& rayLineVerts,
+        const std::vector<glm::vec3>& contactVerts);
+
+    // Toggle visibility of the ray segments / contact markers independently.
+    void ShowShotDebugRays(bool on);
+    void ShowShotDebugContacts(bool on);
+
+    // Forget ray geometry and hide both overlays.
+    void ClearShotDebugRays();
+
+    // ---- Design-check debug solid ------------------------------------------
+    // Upload a free-standing solid (e.g. the interference region from the
+    // separation test) and show it in the preview, lit, in `color`. Replaces
+    // any previous debug solid. Rendered at identity pose (world space).
+    void SetShotDebugSolid(const TopoDS_Shape& shape, const glm::vec3& color);
+    void ShowShotDebugSolid(bool on);
+    void ClearShotDebugSolid();
+
+    // Read-only access to the meshes produced by the most recent successful
+    // GenerateMould run, one per fixture, in fixture order. World-space,
+    // interleaved position+normal with indices. PreviewPanel consumes these
+    // to populate a fresh preview window. Cleared at the start of every
+    // GenerateMould call.
+    const std::vector<FileImporter::MeshData>& GetLastMouldMeshes() const
+    {
+        return m_lastMouldMeshes;
+    }
+
+    // The "shot" model from the most recent successful GenerateMould: the
+    // boolean union of every imported object and the feed-system features
+    // (sprue, runners, gates and their sub-parts) — i.e. all placed features
+    // except vents and ejectors. World-space, interleaved position+normal
+    // with indices. This is the material body that fills the cavity; it is
+    // also the geometry that downstream simulation will operate on. Valid only
+    // when HasLastShotMesh() returns true (the union can legitimately be empty
+    // when no objects/feed features exist or the fuse failed).
+    bool HasLastShotMesh() const { return m_hasLastShotMesh; }
+    const FileImporter::MeshData& GetLastShotMesh() const
+    {
+        return m_lastShotMesh;
+    }
+
+    // Volume of the shot solid from the most recent successful GenerateMould,
+    // in cubic millimetres (the scene's modelling unit). Computed from the
+    // fused BREP — overlaps between fused primitives are counted once — so it
+    // is the true material volume, not a mesh approximation. Zero when no shot
+    // was built (HasLastShotMesh() == false).
+    double GetLastShotVolumeMm3() const { return m_lastShotVolumeMm3; }
+
+    // The shot solid as a BREP, for design-check analysis at the face level.
+    // Valid only when HasLastShotMesh() is true.
+    const TopoDS_Shape& GetLastShotShape() const { return m_lastShotShape; }
+
+    // Per display-triangle source-face index (1-based, into a
+    // TopExp::MapShapes(shot, TopAbs_FACE) map of GetLastShotShape()). One
+    // entry per triangle of GetLastShotMesh(); lets a face-level result be
+    // mapped back to the shot's display triangles for colouring.
+    const std::vector<int>& GetLastShotFaceIds() const { return m_lastShotFaceIds; }
+
+    // The post-cut mould-half solids (BREP) from the most recent successful
+    // GenerateMould, in fixture order. Used by the separation-based
+    // demoldability check (translate each half off the shot and test for
+    // interference). Empty when no mould was generated.
+    const std::vector<TopoDS_Shape>& GetLastHalfShapes() const
+    {
+        return m_lastHalfShapes;
+    }
+
     // Scene-mutation callback. MainFrame registers a callback that
     // invalidates the Export button when anything that would stale a
     // previously generated mould happens — transforms, feature place /
@@ -294,6 +430,33 @@ private:
     void OnMouse(wxMouseEvent& evt);
     void OnMouseWheel(wxMouseEvent& evt);
     void OnKeyDown(wxKeyEvent& evt);
+
+    // Preview-mode render path: grid + loaded mould halves only, all opaque,
+    // honouring each half's visibility flag. Called from OnPaint after the
+    // clear + camera setup when m_previewMode is true; the normal scene/
+    // feature passes are skipped entirely.
+    void RenderPreview(const glm::mat4& view, const glm::mat4& proj,
+        const glm::vec3& camPos);
+
+    // Build the "shot" solid: the boolean union of every imported object
+    // (transformed to world space) and the feed-system features — sprue +
+    // cold slug, runners + cold plugs, gates + sub-runners — but NOT vents or
+    // ejectors. All contributing primitives are constructed in world space
+    // with the same geometry the cut loop uses, then fused pairwise. Returns
+    // true and fills `out` when a non-null union results; returns false when
+    // nothing contributed or the fuse failed outright. Read by GenerateMould.
+    bool BuildShotModel(TopoDS_Shape& out);
+
+    // Tessellate an OCC shape into a render-ready MeshData (vertices meshed,
+    // per-vertex normals computed, crease-split applied so the interleaved
+    // posNorm + indices upload cleanly), with orientation-aware winding.
+    // `mesh` is cleared first. When `faceIds` is non-null it is filled with one
+    // entry per output triangle: the 1-based index of that triangle's source
+    // face in a TopExp::MapShapes(shape, TopAbs_FACE) map (the crease split
+    // preserves triangle order, so the map stays aligned with mesh.indices).
+    void TessellateShapeToMesh(const TopoDS_Shape& shape,
+        FileImporter::MeshData& mesh,
+        std::vector<int>* faceIds = nullptr);
 
     void InitGLOnce();
     void DestroyGL();
@@ -504,6 +667,95 @@ private:
         bool  mirrorZ = false;
     };
     std::vector<ClipboardEntry> m_clipboard;
+
+    // ---- Preview perspective state -----------------------------------------
+    // True only for the dedicated preview canvas hosted by PreviewPanel. The
+    // main editing canvas leaves this false and behaves exactly as before.
+    bool m_previewMode = false;
+
+    // One entry per part shown in the preview (mould halves + the shot). The
+    // SceneObject carries its own GPU mesh (uploaded into the preview canvas's
+    // context) at an identity pose — the fixture transform is already baked
+    // into the world-space vertices handed to AddPreviewHalf. `label` drives
+    // the part's show/hide toggle text; `visible` is flipped by that toggle;
+    // `baseColor` lets the shot read distinctly from the grey mould halves.
+    struct PreviewHalf
+    {
+        SceneObject obj;
+        std::string label;
+        bool        visible = true;
+        glm::vec3   baseColor{ 0.80f, 0.80f, 0.85f };
+    };
+    std::vector<PreviewHalf> m_previewHalves;
+
+    // Debug colouring overlay for one preview part (the shot). When active, the
+    // named part is drawn as a set of flat-coloured groups instead of its
+    // normal single colour. The debug VAO references the part's existing vertex
+    // buffer, so only the per-group index buffers are owned here. GPU objects
+    // are freed on the next SetShotDebugGroups call or by context teardown.
+    struct DebugGroupGPU
+    {
+        GLuint    ebo = 0;
+        GLsizei   count = 0;
+        glm::vec3 color{ 0.5f };
+        bool      emissive = false;
+    };
+    struct ShotDebugView
+    {
+        bool    active = false;
+        int     halfIndex = -1;
+        GLuint  vao = 0;
+        std::vector<DebugGroupGPU> groups;
+    };
+    ShotDebugView m_shotDebug;
+
+    // Accessibility-ray debug overlay (preview): ray segments drawn as GL_LINES
+    // and contact points as GL_POINTS via the flat shader. Geometry is world
+    // space; visibility of each is toggled independently.
+    GLuint  m_debugRayVao = 0;
+    GLuint  m_debugRayVbo = 0;
+    GLsizei m_debugRayVertCount = 0;
+    GLuint  m_debugContactVao = 0;
+    GLuint  m_debugContactVbo = 0;
+    GLsizei m_debugContactVertCount = 0;
+    bool    m_showDebugRays = false;
+    bool    m_showDebugContacts = false;
+
+    // Free-standing lit debug solid (the separation test's interference region).
+    // Stored as a SceneObject so the normal mesh upload/render path applies.
+    SceneObject m_debugSolidObj;
+    bool        m_showDebugSolid = false;
+    glm::vec3   m_debugSolidColor{ 0.90f, 0.15f, 0.15f };
+
+    // Meshes from the most recent successful GenerateMould (one per fixture,
+    // world-space, position+normal interleaved with indices). Populated in
+    // GenerateMould and consumed by PreviewPanel via GetLastMouldMeshes().
+    // The main canvas no longer swaps these into its own fixtures — they live
+    // here purely to seed the preview window.
+    std::vector<FileImporter::MeshData> m_lastMouldMeshes;
+
+    // The shot model from the most recent successful GenerateMould: union of
+    // all imported objects + feed features (sprue / runners / gates), minus
+    // vents and ejectors. World-space, position+normal interleaved with
+    // indices. m_hasLastShotMesh is false when no shot could be built (no
+    // contributing geometry, or the boolean union produced nothing usable).
+    FileImporter::MeshData m_lastShotMesh;
+    bool                   m_hasLastShotMesh = false;
+
+    // Volume of the shot solid (cubic mm), computed from the fused BREP at
+    // generation time. Zero when no shot was built.
+    double                 m_lastShotVolumeMm3 = 0.0;
+
+    // The shot solid (BREP) and a per-display-triangle face-index map, kept so
+    // design checks can run at the face level and map results back to the
+    // display triangles. Face indices are 1-based into a TopExp::MapShapes
+    // face map of m_lastShotShape, matching what DesignChecks rebuilds.
+    TopoDS_Shape           m_lastShotShape;
+    std::vector<int>       m_lastShotFaceIds;
+
+    // The post-cut mould-half solids (BREP), in fixture order, retained for the
+    // separation-based demoldability check.
+    std::vector<TopoDS_Shape> m_lastHalfShapes;
 
     // Vent features (consolidated: point + path + cross-section + solid)
     std::vector<VentInstance> m_vents;
