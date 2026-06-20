@@ -110,6 +110,10 @@ struct SceneObject
     }
 };
 
+// PathEditTool (the EditVent sub-tool enum) is declared in MainFrame.h next to
+// TransformMode so the lightweight VentEditToolbar header can use it without
+// pulling in this heavy canvas header.
+
 class GLCanvas : public wxGLCanvas
 {
 public:
@@ -138,6 +142,19 @@ public:
     void ApplyTranslation(float x, float y, float z);
     void ApplyScale(float factor);
     void CenterSelectedObject();
+
+    // Precision Place — move the current selection to an absolute world XZ
+    // position, preserving each member's Y (height) and the selection's
+    // internal arrangement. For a single object this is a direct
+    // "pos.x = x, pos.z = z"; for a multi-selection the whole group is
+    // shifted so its XZ centroid lands on the target (same convention as
+    // CenterSelectedObject).
+    void MoveSelectionToXZ(float x, float z);
+
+    // Report the XZ centroid of the current selection (the value the
+    // Precision Place dialog pre-fills). Returns false (leaving outputs
+    // untouched) when nothing is selected.
+    bool GetSelectionCenterXZ(float& outX, float& outZ) const;
 
     // Circular pattern around the world origin in the XZ plane.
     //   count          - total instances including the original (no-op if <= 1)
@@ -339,6 +356,39 @@ public:
         m_onSceneMutated = std::move(cb);
     }
 
+    // ---- Part 5: complex vent-path authoring hooks -------------------------
+    // Fired whenever the EditVent selection or path-edit state changes (a vent
+    // is picked / deselected, a Simple<->Complex conversion happens, the
+    // smooth flag flips, or a node is added / removed). The MainFrame uses it
+    // to reconfigure and reposition the floating VentEditToolbar.
+    void SetOnPathEditChanged(std::function<void()> cb)
+    {
+        m_onPathEditChanged = std::move(cb);
+    }
+
+    // Register the floating toolbar window (a child of this canvas). The canvas
+    // treats it as an opaque wxWindow* — it only needs to reposition it on
+    // resize so it stays pinned to the top-centre of the viewport.
+    void SetPathToolbar(wxWindow* w) { m_pathToolbar = w; RepositionPathToolbar(); }
+
+    // State queried by the floating toolbar.
+    bool         IsEditingVent()       const { return m_transformMode == TransformMode::EditVent; }
+    bool         HasEditVentSelected() const
+    {
+        return m_transformMode == TransformMode::EditVent &&
+            m_editFeatureIndex >= 0 && m_editFeatureIndex < (int)m_vents.size();
+    }
+    bool         IsEditVentComplex()   const;
+    bool         IsEditVentSmooth()    const;
+    int          EditVentNodeCount()   const;
+    PathEditTool GetPathEditTool()     const { return m_pathEditTool; }
+
+    // Commands invoked by the floating toolbar.
+    void SetPathEditTool(PathEditTool t);
+    void ConvertEditVentToComplex();   // seed nodes from the Simple path; no-op if already Complex
+    void ConvertEditVentToSimple();    // drop nodes, re-derive the Simple path
+    void SetEditVentSmooth(bool smooth);
+
     void ClearFixtures();
 
     // Vent point placement
@@ -412,6 +462,18 @@ public:
         const glm::vec3& localPos = glm::vec3(0.0f),
         const glm::vec3& localNormal = glm::vec3(0.0f, 0.0f, 1.0f));
 
+    // Restore a vent whose path was authored as a complex (multi-node) path.
+    // Unlike RestoreVent, the path is NOT re-derived — it is rebuilt verbatim
+    // from `nodes` (>= 2, on the parting plane) and `smooth`. pos/normal are
+    // the vent origin (matches nodes.front()).
+    void RestoreVentComplex(const glm::vec3& pos, const glm::vec3& normal,
+        const std::vector<PathNode>& nodes, bool smooth,
+        float ventWidth, float ventLength,
+        float overrunStart, float overrunEnd,
+        int parentIndex = -1,
+        const glm::vec3& localPos = glm::vec3(0.0f),
+        const glm::vec3& localNormal = glm::vec3(0.0f, 0.0f, 1.0f));
+
     // Restore an ejector during project load. No batch rebuild is performed
     // here — the caller is expected to invoke RebuildAllFeatures() once at
     // the end of the load to materialise GPU resources for every restored
@@ -428,6 +490,7 @@ private:
     void OnPaint(wxPaintEvent& evt);
     void OnResize(wxSizeEvent& evt);
     void OnMouse(wxMouseEvent& evt);
+    void OnMouseDClick(wxMouseEvent& evt);
     void OnMouseWheel(wxMouseEvent& evt);
     void OnKeyDown(wxKeyEvent& evt);
 
@@ -509,6 +572,66 @@ private:
     // Vent path computation and GPU upload
     VentPath         ComputeVentPath(const VentPoint& vp);
     void             RebuildPathVBO();
+
+    // ---- Part 5: complex vent-path authoring internals ---------------------
+    // Rebuild the currently edited vent's cross-section, preview solid and the
+    // start/end mirror from its (already mutated) path.nodes, reading width /
+    // length / overrun from the MainFrame UI. Recomputes auto handles first
+    // when the path is smooth. Refreshes path + cross-section VBOs.
+    void RebuildEditVentGeometry();
+
+    // Closest point (XZ, y=0) on the fixture perimeter polygon to p. Returns p
+    // unchanged when no perimeter is available.
+    glm::vec3 SnapToFixturePerimeter(const glm::vec3& p) const;
+
+    // Pick the nearest node marker of the currently edited Complex vent to the
+    // mouse ray; returns its node index or -1 if none is within the marker hit
+    // radius.
+    int  PickEditVentNode(int mouseX, int mouseY) const;
+
+    // ---- Part 6: tangent-handle editing (smooth complex vents, Move tool) ---
+    // Pick the nearest tangent-handle endpoint of the edited smooth vent to the
+    // mouse ray. Returns the owning node index (and sets outIsOut = true for the
+    // outgoing arm, false for the incoming arm) or -1 if none is in range.
+    int  PickEditVentHandle(int mouseX, int mouseY, bool& outIsOut) const;
+
+    // Drag a tangent handle to follow the cursor on the parting plane. Marks the
+    // node hand-edited. breakLink (Alt) moves only the dragged arm and unlinks
+    // the node; otherwise a linked node mirrors the opposite arm (symmetric).
+    void MoveEditVentHandle(int node, bool isOut, int mouseX, int mouseY, bool breakLink);
+
+    // Rebuild the GL line buffer that draws node->handle stems for the edited
+    // smooth vent (called per frame while the handles are visible).
+    void RebuildHandleLineVBO();
+
+    // Insert a new node into the path of vent `ventIndex` at world point
+    // `worldPt` (which the caller has snapped onto that vent's path). Selects
+    // the vent, auto-converts Simple -> Complex, and splices the node into the
+    // nearest segment so it lands between the two nodes that section spans.
+    void InsertNodeOnVentAt(int ventIndex, const glm::vec3& worldPt);
+
+    // Screen-space snap of the cursor onto an existing vent path (Add Node
+    // tool). Mirrors RayCastEjectorSnap's runner snapping: returns the closest
+    // point on any vent's RENDERED polyline within kEjectorSnapRadiusPx, plus
+    // which vent it belongs to. Lets the user only place nodes on existing
+    // paths, associating each new node with the path it snapped to.
+    bool RayCastPathNodeSnap(int mouseX, int mouseY,
+        glm::vec3& outPos, int& outVentIndex) const;
+
+    // Remove node `idx` from the edited Complex vent. Origin (0) and endpoint
+    // (last) are protected; interior nodes only. No-op if it would drop below
+    // two nodes or idx is out of range.
+    void RemoveEditVentNode(int idx);
+
+    // Move node `idx` of the edited Complex vent to follow the mouse on the
+    // parting plane. Origin re-snaps to a part edge (and recaptures parent),
+    // the endpoint snaps to the fixture perimeter, interior nodes move freely.
+    void MoveEditVentNode(int idx, int mouseX, int mouseY);
+
+    // Reposition the floating toolbar to the top-centre of the viewport.
+    void RepositionPathToolbar();
+
+    void NotifyPathEditChanged() { if (m_onPathEditChanged) m_onPathEditChanged(); }
 
     // Vent cross-section geometry
     VentCrossSection BuildVentCrossSection(const VentPath& path,
@@ -866,6 +989,25 @@ private:
     int     m_editFeatureIndex = -1;
     wxPoint m_editMousePos;              // deferred mouse position for edit drag
     bool    m_editNeedsUpdate = false;   // true when edit drag needs processing in OnPaint
+
+    // ---- Part 5: complex vent-path authoring state -------------------------
+    PathEditTool m_pathEditTool = PathEditTool::Move;  // active EditVent sub-tool
+    int          m_editVentNode = -1;   // node being dragged (Move tool), -1 = none
+    wxWindow*    m_pathToolbar  = nullptr;  // floating toolbar overlay (opaque)
+    std::function<void()> m_onPathEditChanged;  // toolbar reconfigure hook
+
+    // Add Node ghost — snaps onto an existing vent path under the cursor.
+    glm::vec3 m_pathNodeGhostPos{ 0.0f };
+    bool      m_pathNodeGhostActive = false;
+    wxPoint   m_pathNodeGhostMousePos;
+
+    // ---- Part 6: tangent-handle drag state ---------------------------------
+    int    m_editHandleNode = -1;     // node whose handle is grabbed (-1 = none)
+    bool   m_editHandleIsOut = false; // true = outgoing arm, false = incoming
+    bool   m_editHandleBreak = false; // Alt held during the current handle drag
+    GLuint  m_handleLineVAO = 0;      // node->handle stems (flat program)
+    GLuint  m_handleLineVBO = 0;
+    GLsizei m_handleLineVertexCount = 0;
 
     // Picking FBO
     GLuint m_pickFBO = 0;

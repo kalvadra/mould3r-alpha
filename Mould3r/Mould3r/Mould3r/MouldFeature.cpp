@@ -8,6 +8,7 @@
 #include <glm/gtc/constants.hpp>
 
 #include <array>
+#include <algorithm>
 #include <cmath>
 #include <vector>
 
@@ -144,10 +145,220 @@ SolidMesh BuildCylinderMesh(const glm::vec3& start, const glm::vec3& end,
 }
 
 // ---------------------------------------------------------------------------
+// SamplePath — turn a FeaturePath into an ordered list of cross-section frames
+// (stations). This is the single source of truth for a path's route: the
+// preview sweep below consumes it, and the OCC cut (Part 3) will consume the
+// same function, so the preview can never disagree with what gets cut.
+//
+// Everything is planar (constant Y), so each station only needs a position, a
+// forward tangent, and the in-plane perpendicular — no Frenet frame.
+// ---------------------------------------------------------------------------
+namespace {
+
+    // In-plane perpendicular of a forward tangent, matching the legacy
+    // sideAxis handedness so the Simple case stays geometrically identical:
+    // for tangent t in XZ, side = normalize(t.z, 0, -t.x).
+    glm::vec3 SideAxisOf(const glm::vec3& tangent)
+    {
+        glm::vec3 s(tangent.z, 0.0f, -tangent.x);
+        const float l = glm::length(s);
+        return (l > 1e-6f) ? s / l : glm::vec3(1.0f, 0.0f, 0.0f);
+    }
+
+    glm::vec3 SafeNormalize(const glm::vec3& v, const glm::vec3& fallback)
+    {
+        const float l = glm::length(v);
+        return (l > 1e-6f) ? v / l : fallback;
+    }
+
+    // Cubic Bezier position / derivative at t in [0,1].
+    glm::vec3 BezierPos(const glm::vec3& p0, const glm::vec3& p1,
+        const glm::vec3& p2, const glm::vec3& p3, float t)
+    {
+        const float u = 1.0f - t;
+        return u * u * u * p0
+            + 3.0f * u * u * t * p1
+            + 3.0f * u * t * t * p2
+            + t * t * t * p3;
+    }
+    glm::vec3 BezierDeriv(const glm::vec3& p0, const glm::vec3& p1,
+        const glm::vec3& p2, const glm::vec3& p3, float t)
+    {
+        const float u = 1.0f - t;
+        return 3.0f * u * u * (p1 - p0)
+            + 6.0f * u * t * (p2 - p1)
+            + 3.0f * t * t * (p3 - p2);
+    }
+
+} // namespace
+
+std::vector<PathStation> SamplePath(const FeaturePath& path, float spacing)
+{
+    std::vector<PathStation> out;
+    if (spacing < 1e-3f) spacing = 1.5f;
+
+    auto inPlaneTangent = [](glm::vec3 t) -> glm::vec3
+        {
+            t.y = 0.0f;
+            return SafeNormalize(t, glm::vec3(0.0f, 0.0f, 1.0f));
+        };
+
+    // ---- Simple: two stations, straight channel (legacy behavior) ----------
+    if (path.kind == PathKind::Simple)
+    {
+        const glm::vec3 d(path.end.x - path.start.x, 0.0f, path.end.z - path.start.z);
+        if (glm::length(d) < 1e-6f) return out;           // degenerate
+        const glm::vec3 fwd = inPlaneTangent(d);
+
+        PathStation a, b;
+        a.pos = path.start; a.tangent = fwd; a.sideAxis = SideAxisOf(fwd);
+        b.pos = path.end;   b.tangent = fwd; b.sideAxis = SideAxisOf(fwd);
+        out.push_back(a);
+        out.push_back(b);
+        return out;
+    }
+
+    // ---- Complex ----------------------------------------------------------
+    const std::vector<PathNode>& nodes = path.nodes;
+    if (nodes.size() < 2) return out;
+
+    if (!path.smooth)
+    {
+        // Straight A->B->C polyline through the node positions. Interior nodes
+        // are mitered (ring oriented to the averaged tangent) so the swept box
+        // bends through a corner without tearing.
+        const int n = (int)nodes.size();
+        for (int i = 0; i < n; ++i)
+        {
+            glm::vec3 inDir(0.0f), outDir(0.0f);
+            if (i > 0)     inDir = SafeNormalize(nodes[i].pos - nodes[i - 1].pos, glm::vec3(0.0f));
+            if (i < n - 1) outDir = SafeNormalize(nodes[i + 1].pos - nodes[i].pos, glm::vec3(0.0f));
+
+            glm::vec3 t;
+            if (i == 0)          t = outDir;
+            else if (i == n - 1) t = inDir;
+            else                 t = SafeNormalize(inDir + outDir, outDir); // miter
+
+            PathStation s;
+            s.pos = nodes[i].pos;
+            s.tangent = inPlaneTangent(t);
+            s.sideAxis = SideAxisOf(s.tangent);
+            out.push_back(s);
+        }
+        return out;
+    }
+
+    // ---- Complex + smooth: cubic Bezier per segment, arc-length resampled ---
+    auto pushStation = [&](const glm::vec3& pos, const glm::vec3& tanRaw)
+        {
+            PathStation s;
+            s.pos = pos;
+            s.tangent = inPlaneTangent(tanRaw);
+            s.sideAxis = SideAxisOf(s.tangent);
+            out.push_back(s);
+        };
+
+    const int segCount = (int)nodes.size() - 1;
+    for (int seg = 0; seg < segCount; ++seg)
+    {
+        const PathNode& n0 = nodes[seg];
+        const PathNode& n1 = nodes[seg + 1];
+
+        // Independent tangent handles: outgoing control point of n0 = pos +
+        // handleOut, incoming control point of n1 = pos + handleIn. For a linked
+        // (symmetric) node handleIn == -handleOut, which keeps the tangent
+        // continuous across the node; a broken node can corner. Handles are
+        // populated by AutoComputeComplexHandles before sampling.
+        const glm::vec3 p0 = n0.pos;
+        const glm::vec3 p3 = n1.pos;
+        const glm::vec3 p1 = n0.pos + n0.handleOut;
+        const glm::vec3 p2 = n1.pos + n1.handleIn;
+
+        // Fine forward pass -> cumulative arc-length table for this segment.
+        const int kFine = 32;
+        std::vector<glm::vec3> fp(kFine + 1);
+        std::vector<float>     fl(kFine + 1, 0.0f);
+        for (int k = 0; k <= kFine; ++k)
+            fp[k] = BezierPos(p0, p1, p2, p3, (float)k / (float)kFine);
+        for (int k = 1; k <= kFine; ++k)
+            fl[k] = fl[k - 1] + glm::length(fp[k] - fp[k - 1]);
+        const float segLen = fl[kFine];
+
+        // Place stations at uniform arc-length steps. Skip the shared start
+        // node for every segment after the first (already emitted as the
+        // previous segment's last station) to avoid duplicates.
+        const int steps = std::max(1, (int)std::ceil(segLen / spacing));
+        const int startStep = (seg == 0) ? 0 : 1;
+        for (int st = startStep; st <= steps; ++st)
+        {
+            const float targetLen = segLen * ((float)st / (float)steps);
+            int k = 1;
+            while (k < kFine && fl[k] < targetLen) ++k;
+            const float l0 = fl[k - 1], l1 = fl[k];
+            const float frac = (l1 > l0) ? (targetLen - l0) / (l1 - l0) : 0.0f;
+            const float t = ((float)(k - 1) + frac) / (float)kFine;
+            pushStation(BezierPos(p0, p1, p2, p3, t),
+                        BezierDeriv(p0, p1, p2, p3, t));
+        }
+    }
+
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// AutoComputeComplexHandles — derive symmetric Catmull-Rom tangent handles
+// for every node from the node positions. See header for the rule.
+// ---------------------------------------------------------------------------
+void AutoComputeComplexHandles(FeaturePath& path)
+{
+    if (path.kind != PathKind::Complex) return;
+    const int n = (int)path.nodes.size();
+    if (n < 2) return;
+
+    auto chordLen = [&](int a, int b) -> float
+        {
+            return glm::length(path.nodes[b].pos - path.nodes[a].pos);
+        };
+
+    for (int i = 0; i < n; ++i)
+    {
+        // Hand-edited nodes keep their explicit handles (which are offsets, so
+        // they ride along when the node or its neighbours move).
+        if (path.nodes[i].handlesManual) continue;
+
+        glm::vec3 dir(0.0f);
+        if (i == 0)
+            dir = path.nodes[1].pos - path.nodes[0].pos;          // forward chord
+        else if (i == n - 1)
+            dir = path.nodes[n - 1].pos - path.nodes[n - 2].pos;  // backward chord
+        else
+            dir = path.nodes[i + 1].pos - path.nodes[i - 1].pos;  // centred
+
+        dir.y = 0.0f;   // stay on the parting plane
+        const float l = glm::length(dir);
+        path.nodes[i].dir = (l > 1e-6f) ? dir / l : glm::vec3(0.0f, 0.0f, 1.0f);
+
+        // 1/3 of the shorter adjacent chord keeps the spline taut.
+        float arm;
+        if (i == 0)            arm = chordLen(0, 1);
+        else if (i == n - 1)   arm = chordLen(n - 2, n - 1);
+        else                   arm = std::min(chordLen(i - 1, i), chordLen(i, i + 1));
+        path.nodes[i].handleLen = arm / 3.0f;
+
+        // Mirror the symmetric arms into the explicit-handle fields the sampler
+        // reads. Linked, so handleIn == -handleOut.
+        const glm::vec3 arm3 = path.nodes[i].dir * path.nodes[i].handleLen;
+        path.nodes[i].handleOut = arm3;
+        path.nodes[i].handleIn = -arm3;
+        path.nodes[i].handlesLinked = true;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // BuildBoxSweepMesh — sweeps a rectangular cross-section along a vent path.
 // Vertex layout: [px, py, pz, nx, ny, nz] — compatible with the vsLit shader.
 // ---------------------------------------------------------------------------
-SolidMesh BuildBoxSweepMesh(const VentPath& path, float width, float depth,
+SolidMesh BuildBoxSweepMesh(const FeaturePath& path, float width, float depth,
     float overrunStart, float overrunEnd)
 {
     SolidMesh solid;
@@ -155,34 +366,31 @@ SolidMesh BuildBoxSweepMesh(const VentPath& path, float width, float depth,
 
     if (!path.valid) return solid;
 
-    const glm::vec3 diff = path.end - path.start;
-    const float     len = glm::length(glm::vec2(diff.x, diff.z));
-    if (len < 1e-6f) return solid;
+    // One station list drives the whole sweep (Simple -> 2 stations, so this
+    // stays geometrically identical to the old straight box).
+    std::vector<PathStation> stations = SamplePath(path);
+    if (stations.size() < 2) return solid;
 
-    const glm::vec3 pathDir(-diff.x / len, 0.0f, -diff.z / len);
-    const glm::vec3 sideAxis(-pathDir.z, 0.0f, pathDir.x);
+    // Overruns extend the channel past its first/last station along the local
+    // tangent — the same effect as the old extendedStart / extendedEnd. The
+    // stations carry no overrun, so apply it here on this local copy.
+    stations.front().pos -= stations.front().tangent * overrunStart;
+    stations.back().pos += stations.back().tangent * overrunEnd;
+
     const glm::vec3 upAxis(0.0f, 1.0f, 0.0f);
-
     const float hw = width * 0.5f;
     const float hd = depth * 0.5f;
 
-    const glm::vec3 sweepDir = -pathDir;
-
-    const glm::vec3 extendedStart = path.start - sweepDir * overrunStart;
-    const glm::vec3 extendedEnd = path.end + sweepDir * overrunEnd;
-
-    auto makeCorners = [&](const glm::vec3& centre) -> std::array<glm::vec3, 4>
+    // Ring of 4 corners at a station: BL, BR, TR, TL (matches legacy order).
+    auto ringOf = [&](const PathStation& s) -> std::array<glm::vec3, 4>
         {
             return { {
-                centre - sideAxis * hw - upAxis * hd,
-                centre + sideAxis * hw - upAxis * hd,
-                centre + sideAxis * hw + upAxis * hd,
-                centre - sideAxis * hw + upAxis * hd
+                s.pos - s.sideAxis * hw - upAxis * hd,
+                s.pos + s.sideAxis * hw - upAxis * hd,
+                s.pos + s.sideAxis * hw + upAxis * hd,
+                s.pos - s.sideAxis * hw + upAxis * hd
             } };
         };
-
-    const auto startC = makeCorners(extendedStart);
-    const auto endC = makeCorners(extendedEnd);
 
     std::vector<float>    verts;
     std::vector<uint32_t> idx;
@@ -201,12 +409,29 @@ SolidMesh BuildBoxSweepMesh(const VentPath& path, float width, float depth,
             idx.push_back(base + 0); idx.push_back(base + 2); idx.push_back(base + 3);
         };
 
-    addQuad(startC[0], startC[3], startC[2], startC[1], -sweepDir);
-    addQuad(endC[0], endC[1], endC[2], endC[3], sweepDir);
-    addQuad(startC[0], startC[1], endC[1], endC[0], -upAxis);
-    addQuad(startC[1], startC[2], endC[2], endC[1], sideAxis);
-    addQuad(startC[2], startC[3], endC[3], endC[2], upAxis);
-    addQuad(startC[3], startC[0], endC[0], endC[3], -sideAxis);
+    // Start cap — faces backward along the first station's tangent.
+    const auto firstRing = ringOf(stations.front());
+    addQuad(firstRing[0], firstRing[3], firstRing[2], firstRing[1],
+        -stations.front().tangent);
+
+    // Side walls — four quads per segment between consecutive stations. For a
+    // Simple path (one segment) these are exactly the old bottom/right/top/left.
+    for (size_t i = 0; i + 1 < stations.size(); ++i)
+    {
+        const auto A = ringOf(stations[i]);
+        const auto B = ringOf(stations[i + 1]);
+        const glm::vec3 side = stations[i].sideAxis;
+
+        addQuad(A[0], A[1], B[1], B[0], -upAxis);   // bottom
+        addQuad(A[1], A[2], B[2], B[1], side);      // right
+        addQuad(A[2], A[3], B[3], B[2], upAxis);    // top
+        addQuad(A[3], A[0], B[0], B[3], -side);     // left
+    }
+
+    // End cap — faces forward along the last station's tangent.
+    const auto lastRing = ringOf(stations.back());
+    addQuad(lastRing[0], lastRing[1], lastRing[2], lastRing[3],
+        stations.back().tangent);
 
     // ---- Upload to GPU ----
     glGenVertexArrays(1, &solid.vao);

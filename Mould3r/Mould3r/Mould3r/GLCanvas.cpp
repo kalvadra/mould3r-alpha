@@ -32,6 +32,7 @@
 #include <opencascade/BRepBuilderAPI_MakeWire.hxx>
 #include <opencascade/BRepBuilderAPI_MakeFace.hxx>
 #include <opencascade/BRepPrimAPI_MakePrism.hxx>
+#include <opencascade/BRepOffsetAPI_ThruSections.hxx>
 #include <opencascade/BRepPrimAPI_MakeCylinder.hxx>
 #include <opencascade/BRepPrimAPI_MakeCone.hxx>
 #include <opencascade/gp_Ax2.hxx>
@@ -145,6 +146,7 @@ GLCanvas::GLCanvas(wxWindow* parent)
     Bind(wxEVT_PAINT, &GLCanvas::OnPaint, this);
     Bind(wxEVT_SIZE, &GLCanvas::OnResize, this);
     Bind(wxEVT_LEFT_DOWN, &GLCanvas::OnMouse, this);
+    Bind(wxEVT_LEFT_DCLICK, &GLCanvas::OnMouseDClick, this);
     Bind(wxEVT_LEFT_UP, &GLCanvas::OnMouse, this);
     Bind(wxEVT_MIDDLE_DOWN, &GLCanvas::OnMouse, this);
     Bind(wxEVT_MIDDLE_UP, &GLCanvas::OnMouse, this);
@@ -176,6 +178,10 @@ void GLCanvas::SetTransformMode(TransformMode mode)
     {
         m_editFeatureIndex = -1;
         m_editNeedsUpdate = false;
+        m_editVentNode = -1;
+        m_pathEditTool = PathEditTool::Move;   // Part 5: reset sub-tool
+        m_pathNodeGhostActive = false;         // Part 5: drop Add Node ghost
+        m_editHandleNode = -1;                 // Part 6: drop handle grab
     }
 
     // Clear AlignFace hover state and highlight VBO when leaving AlignFace.
@@ -241,6 +247,10 @@ void GLCanvas::SetTransformMode(TransformMode mode)
     case TransformMode::AlignMidplane:
         SetCursor(wxCursor(wxCURSOR_HAND));     break;
     }
+
+    // Part 5: let the floating vent-path toolbar show / hide itself for the new
+    // mode (visible only in EditVent).
+    NotifyPathEditChanged();
 
     Refresh(false);
 }
@@ -314,6 +324,49 @@ void GLCanvas::CenterSelectedObject()
     {
         if (idx < 0 || idx >= (int)m_objects.size()) continue;
         m_objects[idx].pos -= centroid;
+    }
+    ReanchorFeaturesForObjects(m_selectedIndices);
+    Refresh(false);
+    NotifySceneMutated();
+}
+
+bool GLCanvas::GetSelectionCenterXZ(float& outX, float& outZ) const
+{
+    if (m_selectedIndices.empty()) return false;
+
+    glm::vec3 centroid(0.0f);
+    int n = 0;
+    for (int idx : m_selectedIndices)
+    {
+        if (idx < 0 || idx >= (int)m_objects.size()) continue;
+        centroid += m_objects[idx].pos;
+        ++n;
+    }
+    if (n == 0) return false;
+    centroid /= static_cast<float>(n);
+
+    outX = centroid.x;
+    outZ = centroid.z;
+    return true;
+}
+
+void GLCanvas::MoveSelectionToXZ(float x, float z)
+{
+    if (!HasSelection()) return;
+
+    // Find the current XZ centroid, then shift every member by the delta
+    // needed to land that centroid on the target. Y is left untouched so the
+    // tool only repositions in the ground plane, and the per-member offsets
+    // are preserved so a multi-selection keeps its arrangement (single
+    // selection degenerates to "set pos.x/z = target").
+    float curX = 0.0f, curZ = 0.0f;
+    if (!GetSelectionCenterXZ(curX, curZ)) return;
+
+    const glm::vec3 d(x - curX, 0.0f, z - curZ);
+    for (int idx : m_selectedIndices)
+    {
+        if (idx < 0 || idx >= (int)m_objects.size()) continue;
+        m_objects[idx].pos += d;
     }
     ReanchorFeaturesForObjects(m_selectedIndices);
     Refresh(false);
@@ -593,15 +646,15 @@ void GLCanvas::ApplyGridPattern(int numH, int numV, bool mirrorH, bool mirrorV,
     // Cell-centre coordinates for indices (i, j). Linear interpolation from
     // -halfX..+halfX (or just 0 when numH == 1); same for Z.
     auto cellPos = [&](int i, int j) -> glm::vec3
-        {
-            const float cx = (numH == 1) ? 0.0f
-                : -halfX + static_cast<float>(i) * (2.0f * halfX) /
-                static_cast<float>(numH - 1);
-            const float cz = (numV == 1) ? 0.0f
-                : -halfZ + static_cast<float>(j) * (2.0f * halfZ) /
-                static_cast<float>(numV - 1);
-            return glm::vec3(cx, orig.pos.y, cz);
-        };
+    {
+        const float cx = (numH == 1) ? 0.0f
+            : -halfX + static_cast<float>(i) * (2.0f * halfX) /
+            static_cast<float>(numH - 1);
+        const float cz = (numV == 1) ? 0.0f
+            : -halfZ + static_cast<float>(j) * (2.0f * halfZ) /
+            static_cast<float>(numV - 1);
+        return glm::vec3(cx, orig.pos.y, cz);
+    };
 
     for (int i = 0; i < numH; ++i)
     {
@@ -795,9 +848,9 @@ void GLCanvas::RebuildSprueXsecVBO()
     verts.reserve(N * 6);   // 2 verts per segment × 3 floats
 
     auto push = [&](const glm::vec3& v)
-        {
-            verts.push_back(v.x); verts.push_back(v.y); verts.push_back(v.z);
-        };
+    {
+        verts.push_back(v.x); verts.push_back(v.y); verts.push_back(v.z);
+    };
 
     for (int i = 0; i < N; ++i)
     {
@@ -1355,6 +1408,129 @@ void GLCanvas::ClearSprue()
 }
 
 // ---------------------------------------------------------------------------
+// BuildVentCutTool — produce the solid to subtract for one vent.
+//
+//   Simple path  : a single straight prism — identical to the original cut
+//                  (cross-section face shifted back by overrunStart, then
+//                  extruded along the path by rawLen + overruns).
+//   Complex path : loft a solid through the per-station cross-section rings
+//                  from SamplePath, so the cut follows the same route the
+//                  preview sweep draws. ThruSections (ruled, solid) is the OCC
+//                  analog of the preview's ring-to-ring quad strip: it connects
+//                  corresponding corners of consecutive rings and caps the
+//                  ends. Chosen over BRepOffsetAPI_MakePipeShell — faceted like
+//                  the preview, robust on tight bends, and preview==cut by
+//                  construction. (A pipe-shell along a BSpline spine could give
+//                  smoother cut walls on smooth paths later if wanted.)
+//
+// Returns a null shape on any failure; the caller skips the cut and warns.
+// ---------------------------------------------------------------------------
+static TopoDS_Shape BuildVentCutTool(const VentInstance& vent)
+{
+    const VentCrossSection& xs = vent.crossSection;
+    const FeaturePath& vp = vent.path;
+    if (!xs.valid || !vp.valid) return TopoDS_Shape();
+
+    auto toOCC = [](const glm::vec3& v) { return gp_Pnt(v.x, v.y, v.z); };
+
+    // ---- Simple: straight prism (unchanged from the original cut) ----------
+    if (vp.kind == PathKind::Simple)
+    {
+        const gp_Pnt p0 = toOCC(xs.corners[0]);
+        const gp_Pnt p1 = toOCC(xs.corners[1]);
+        const gp_Pnt p2 = toOCC(xs.corners[2]);
+        const gp_Pnt p3 = toOCC(xs.corners[3]);
+
+        BRepBuilderAPI_MakeEdge e0(p0, p1);
+        BRepBuilderAPI_MakeEdge e1(p1, p2);
+        BRepBuilderAPI_MakeEdge e2(p2, p3);
+        BRepBuilderAPI_MakeEdge e3(p3, p0);
+        if (!e0.IsDone() || !e1.IsDone() || !e2.IsDone() || !e3.IsDone())
+            return TopoDS_Shape();
+
+        BRepBuilderAPI_MakeWire wire;
+        wire.Add(e0.Edge()); wire.Add(e1.Edge());
+        wire.Add(e2.Edge()); wire.Add(e3.Edge());
+        if (!wire.IsDone()) return TopoDS_Shape();
+
+        BRepBuilderAPI_MakeFace face(wire.Wire(), /*onlyPlane=*/true);
+        if (!face.IsDone()) return TopoDS_Shape();
+
+        const glm::vec3 rawSweep = vp.end - vp.start;
+        const float     rawLen = glm::length(rawSweep);
+        if (rawLen < 1e-6f) return TopoDS_Shape();
+        const glm::vec3 sweepDir = rawSweep / rawLen;
+
+        const glm::vec3 originOffset = -sweepDir * vp.overrunStart;
+        gp_Trsf offsetTrsf;
+        offsetTrsf.SetTranslation(gp_Vec(originOffset.x, originOffset.y, originOffset.z));
+        const TopoDS_Shape offsetFace =
+            BRepBuilderAPI_Transform(face.Face(), offsetTrsf, /*copy=*/true).Shape();
+
+        const float     totalLen = rawLen + vp.overrunStart + vp.overrunEnd;
+        const glm::vec3 totalSweep = sweepDir * totalLen;
+        const gp_Vec    sweepVec(totalSweep.x, totalSweep.y, totalSweep.z);
+
+        BRepPrimAPI_MakePrism prism(offsetFace, sweepVec);
+        if (!prism.IsDone() || prism.Shape().IsNull()) return TopoDS_Shape();
+        return prism.Shape();
+    }
+
+    // ---- Complex: loft through the sampled cross-section rings -------------
+    std::vector<PathStation> stations = SamplePath(vp);
+    if (stations.size() < 2) return TopoDS_Shape();
+
+    // Extend the ends past the surface, same as the preview and Simple prism.
+    stations.front().pos -= stations.front().tangent * vp.overrunStart;
+    stations.back().pos += stations.back().tangent * vp.overrunEnd;
+
+    // Recover the rectangular profile half-extents from the baked cross-section
+    // (symmetric, so the sideAxis sign is irrelevant) so the swept tube matches
+    // whatever width/depth the vent was built with — and the preview.
+    const float hw = 0.5f * glm::length(xs.corners[1] - xs.corners[0]); // along sideAxis
+    const float hd = 0.5f * glm::length(xs.corners[3] - xs.corners[0]); // along +Y
+    const glm::vec3 up(0.0f, 1.0f, 0.0f);
+
+    BRepOffsetAPI_ThruSections gen(true /*isSolid*/, true /*ruled*/);
+
+    int       added = 0;
+    bool      havePrev = false;
+    glm::vec3 prevPos(0.0f);
+    for (const PathStation& s : stations)
+    {
+        // Coincident stations make duplicate section wires, which ThruSections
+        // rejects — skip them.
+        if (havePrev && glm::length(s.pos - prevPos) < 1e-5f) continue;
+
+        const glm::vec3 c0 = s.pos - s.sideAxis * hw - up * hd;
+        const glm::vec3 c1 = s.pos + s.sideAxis * hw - up * hd;
+        const glm::vec3 c2 = s.pos + s.sideAxis * hw + up * hd;
+        const glm::vec3 c3 = s.pos - s.sideAxis * hw + up * hd;
+
+        BRepBuilderAPI_MakeEdge e0(toOCC(c0), toOCC(c1));
+        BRepBuilderAPI_MakeEdge e1(toOCC(c1), toOCC(c2));
+        BRepBuilderAPI_MakeEdge e2(toOCC(c2), toOCC(c3));
+        BRepBuilderAPI_MakeEdge e3(toOCC(c3), toOCC(c0));
+        if (!e0.IsDone() || !e1.IsDone() || !e2.IsDone() || !e3.IsDone()) continue;
+
+        BRepBuilderAPI_MakeWire w;
+        w.Add(e0.Edge()); w.Add(e1.Edge());
+        w.Add(e2.Edge()); w.Add(e3.Edge());
+        if (!w.IsDone()) continue;
+
+        gen.AddWire(w.Wire());
+        ++added;
+        havePrev = true;
+        prevPos = s.pos;
+    }
+    if (added < 2) return TopoDS_Shape();
+
+    gen.Build();
+    if (!gen.IsDone() || gen.Shape().IsNull()) return TopoDS_Shape();
+    return gen.Shape();
+}
+
+// ---------------------------------------------------------------------------
 // Generate Mould Operation — Cuts objects, vents, runners, and sprues from blank mold halves
 // ---------------------------------------------------------------------------
 bool GLCanvas::GenerateMould()
@@ -1497,68 +1673,27 @@ bool GLCanvas::GenerateMould()
         // Steps: subtract each vent
         for (int vi = 0; vi < (int)m_vents.size(); ++vi)
         {
-            const VentCrossSection& xs = m_vents[vi].crossSection;
-            const VentPath& vp = m_vents[vi].path;
+            const VentInstance& vent = m_vents[vi];
 
             progress.Update(step++,
                 fixLabel + ": cutting vent " +
                 std::to_string(vi + 1) + " of " +
                 std::to_string((int)m_vents.size()) + "...");
 
-            if (!xs.valid || !vp.valid) continue;
+            if (!vent.crossSection.valid || !vent.path.valid) continue;
 
-            // Build a planar wire from the 4 cross-section corners
-            auto toOCC = [](const glm::vec3& v) { return gp_Pnt(v.x, v.y, v.z); };
+            // Build the cut solid for this vent. Simple paths give the original
+            // straight prism; complex paths loft along the sampled route so the
+            // cut matches the swept preview.
+            const TopoDS_Shape cutTool = BuildVentCutTool(vent);
+            if (cutTool.IsNull())
+            {
+                wxMessageBox("Vent cut tool build failed for vent " + std::to_string(vi + 1),
+                    "Generate Mould", wxOK | wxICON_WARNING, this);
+                continue;
+            }
 
-            const gp_Pnt p0 = toOCC(xs.corners[0]);
-            const gp_Pnt p1 = toOCC(xs.corners[1]);
-            const gp_Pnt p2 = toOCC(xs.corners[2]);
-            const gp_Pnt p3 = toOCC(xs.corners[3]);
-
-            BRepBuilderAPI_MakeEdge e0(p0, p1);
-            BRepBuilderAPI_MakeEdge e1(p1, p2);
-            BRepBuilderAPI_MakeEdge e2(p2, p3);
-            BRepBuilderAPI_MakeEdge e3(p3, p0);
-
-            if (!e0.IsDone() || !e1.IsDone() || !e2.IsDone() || !e3.IsDone()) continue;
-
-            BRepBuilderAPI_MakeWire wire;
-            wire.Add(e0.Edge());
-            wire.Add(e1.Edge());
-            wire.Add(e2.Edge());
-            wire.Add(e3.Edge());
-            if (!wire.IsDone()) continue;
-
-            BRepBuilderAPI_MakeFace face(wire.Wire(), /*onlyPlane=*/true);
-            if (!face.IsDone()) continue;
-
-            // Extrude face along the vent path vector, extended by the stored overruns.
-            // The cross-section sits at path.start; shift it back by overrunStart,
-            // then extend the sweep by overrunStart + overrunEnd so both ends clear
-            // any surface co-planarity artifacts.
-            const glm::vec3 rawSweep = vp.end - vp.start;
-            const float     rawLen = glm::length(rawSweep);
-            if (rawLen < 1e-6f) continue;
-            const glm::vec3 sweepDir = rawSweep / rawLen;
-
-            // Translate the face back by overrunStart before extruding
-            const glm::vec3 originOffset = -sweepDir * vp.overrunStart;
-            const gp_Trsf   offsetTrsf = [&]() {
-                gp_Trsf t;
-                t.SetTranslation(gp_Vec(originOffset.x, originOffset.y, originOffset.z));
-                return t;
-                }();
-            const TopoDS_Shape offsetFace =
-                BRepBuilderAPI_Transform(face.Face(), offsetTrsf, /*copy=*/true).Shape();
-
-            const float     totalLen = rawLen + vp.overrunStart + vp.overrunEnd;
-            const glm::vec3 totalSweep = sweepDir * totalLen;
-            const gp_Vec    sweepVec(totalSweep.x, totalSweep.y, totalSweep.z);
-
-            BRepPrimAPI_MakePrism prism(offsetFace, sweepVec);
-            if (!prism.IsDone() || prism.Shape().IsNull()) continue;
-
-            BRepAlgoAPI_Cut ventCut(result, prism.Shape());
+            BRepAlgoAPI_Cut ventCut(result, cutTool);
             ventCut.Build();
             if (!ventCut.IsDone() || ventCut.Shape().IsNull())
             {
@@ -2361,7 +2496,7 @@ void GLCanvas::RenderPreview(const glm::mat4& view, const glm::mat4& proj,
     // Accessibility-ray debug overlay (flat shader): ray segments + contacts.
     if (m_flatProgram &&
         ((m_showDebugRays && m_debugRayVertCount > 0) ||
-         (m_showDebugContacts && m_debugContactVertCount > 0)))
+            (m_showDebugContacts && m_debugContactVertCount > 0)))
     {
         glUseProgram(m_flatProgram);
         const glm::mat4 VP = proj * view;
@@ -3033,7 +3168,7 @@ void GLCanvas::EnsureTriAdjacency(SceneObject& obj)
     auto pack = [](uint32_t a, uint32_t b) -> uint64_t {
         if (a > b) std::swap(a, b);
         return (uint64_t(a) << 32) | uint64_t(b);
-        };
+    };
 
     std::unordered_map<uint64_t, std::pair<int, int>> edgeMap;
     edgeMap.reserve(triCount * 3);
@@ -3092,7 +3227,7 @@ void GLCanvas::GrowCoplanarFace(const SceneObject& obj, int seedTri,
         const glm::vec3 n = glm::cross(v1 - v0, v2 - v0);
         const float     len = glm::length(n);
         return (len > 1e-12f) ? (n / len) : glm::vec3(0.0f, 1.0f, 0.0f);
-        };
+    };
 
     const glm::vec3 seedNormal = triNormal(seedTri);
     outNormalLocal = seedNormal;
@@ -3757,38 +3892,38 @@ bool GLCanvas::RayCastEjectorSnap(int mouseX, int mouseY, glm::vec3& outPos)
     // the parser of a following statement; both helpers are written as
     // void/bool returners with the type in front via the declared return.
     auto worldToScreen = [&](const glm::vec3& world, glm::vec2& outPx)
-        {
-            const glm::vec4 clip = viewProj * glm::vec4(world, 1.0f);
-            if (clip.w <= 1e-6f) return false;
-            const glm::vec3 ndc(clip.x / clip.w, clip.y / clip.w, clip.z / clip.w);
-            outPx.x = (ndc.x * 0.5f + 0.5f) * float(w);
-            outPx.y = (1.0f - (ndc.y * 0.5f + 0.5f)) * float(h);
-            return true;
-        };
+    {
+        const glm::vec4 clip = viewProj * glm::vec4(world, 1.0f);
+        if (clip.w <= 1e-6f) return false;
+        const glm::vec3 ndc(clip.x / clip.w, clip.y / clip.w, clip.z / clip.w);
+        outPx.x = (ndc.x * 0.5f + 0.5f) * float(w);
+        outPx.y = (1.0f - (ndc.y * 0.5f + 0.5f)) * float(h);
+        return true;
+    };
 
     // Helper: closest point on segment AB to the picking ray. Computes the
     // common perpendicular's foot on AB and clamps to [0,1]. Degenerate
     // segments collapse to A.
     auto closestOnSegment = [&](const glm::vec3& A, const glm::vec3& B)
-        {
-            const glm::vec3 AB = B - A;
-            const float lenAB2 = glm::dot(AB, AB);
-            if (lenAB2 < 1e-10f) return A;
+    {
+        const glm::vec3 AB = B - A;
+        const float lenAB2 = glm::dot(AB, AB);
+        if (lenAB2 < 1e-10f) return A;
 
-            const glm::vec3 w0 = A - rayOrig;
-            const float aSq = lenAB2;
-            const float bDot = glm::dot(AB, rayDir);
-            const float cSq = glm::dot(rayDir, rayDir);   // == 1 (rayDir is normalised)
-            const float dDot = glm::dot(AB, w0);
-            const float eDot = glm::dot(rayDir, w0);
-            const float denom = aSq * cSq - bDot * bDot;  // 0 iff AB || ray
+        const glm::vec3 w0 = A - rayOrig;
+        const float aSq = lenAB2;
+        const float bDot = glm::dot(AB, rayDir);
+        const float cSq = glm::dot(rayDir, rayDir);   // == 1 (rayDir is normalised)
+        const float dDot = glm::dot(AB, w0);
+        const float eDot = glm::dot(rayDir, w0);
+        const float denom = aSq * cSq - bDot * bDot;  // 0 iff AB || ray
 
-            float tSeg = 0.0f;
-            if (denom >= 1e-10f)
-                tSeg = (bDot * eDot - cSq * dDot) / denom;
-            tSeg = glm::clamp(tSeg, 0.0f, 1.0f);
-            return A + AB * tSeg;
-        };
+        float tSeg = 0.0f;
+        if (denom >= 1e-10f)
+            tSeg = (bDot * eDot - cSq * dDot) / denom;
+        tSeg = glm::clamp(tSeg, 0.0f, 1.0f);
+        return A + AB * tSeg;
+    };
 
     float     bestPx = kEjectorSnapRadiusPx;
     glm::vec3 bestWorld(0.0f);
@@ -3798,18 +3933,18 @@ bool GLCanvas::RayCastEjectorSnap(int mouseX, int mouseY, glm::vec3& outPos)
     // to each candidate and avoids any chance of parser confusion from
     // back-to-back captured lambdas.
     auto consider = [&](const glm::vec3& candidate)
+    {
+        glm::vec2 px;
+        if (!worldToScreen(candidate, px)) return;
+        const glm::vec2 delta = px - cursorPx;
+        const float distPx = glm::length(delta);
+        if (distPx < bestPx)
         {
-            glm::vec2 px;
-            if (!worldToScreen(candidate, px)) return;
-            const glm::vec2 delta = px - cursorPx;
-            const float distPx = glm::length(delta);
-            if (distPx < bestPx)
-            {
-                bestPx = distPx;
-                bestWorld = candidate;
-                hit = true;
-            }
-        };
+            bestPx = distPx;
+            bestWorld = candidate;
+            hit = true;
+        }
+    };
 
     // 1. Sprue parting point (single-point candidate).
     if (m_sprue.hasPartingPoint)
@@ -4123,7 +4258,7 @@ static std::vector<glm::vec2> ConvexHull(std::vector<glm::vec2> pts)
     // Sort by x, then y
     std::sort(pts.begin(), pts.end(), [](const glm::vec2& a, const glm::vec2& b) {
         return a.x < b.x || (a.x == b.x && a.y < b.y);
-        });
+    });
 
     std::vector<glm::vec2> hull;
     hull.reserve(2 * n);
@@ -4165,7 +4300,7 @@ void GLCanvas::BuildFixturePerimeter()
         if (y < -kBand) return Side::Below;
         if (y > kBand) return Side::Above;
         return Side::Band;
-        };
+    };
 
     std::vector<glm::vec2> pts;
 
@@ -4287,8 +4422,26 @@ void GLCanvas::RebuildPathVBO()
     for (const VentInstance& v : m_vents)
     {
         if (!v.path.valid) continue;
-        verts.push_back(v.path.start.x); verts.push_back(v.path.start.y); verts.push_back(v.path.start.z);
-        verts.push_back(v.path.end.x);   verts.push_back(v.path.end.y);   verts.push_back(v.path.end.z);
+
+        if (v.path.kind == PathKind::Complex)
+        {
+            // Draw the actual sampled route so the on-screen line follows the
+            // same curve the sweep and OCC cut use (preview == cut). Emit it as
+            // consecutive GL_LINES segment pairs.
+            const std::vector<PathStation> stations = SamplePath(v.path);
+            for (size_t s = 0; s + 1 < stations.size(); ++s)
+            {
+                const glm::vec3& a = stations[s].pos;
+                const glm::vec3& b = stations[s + 1].pos;
+                verts.push_back(a.x); verts.push_back(a.y); verts.push_back(a.z);
+                verts.push_back(b.x); verts.push_back(b.y); verts.push_back(b.z);
+            }
+        }
+        else
+        {
+            verts.push_back(v.path.start.x); verts.push_back(v.path.start.y); verts.push_back(v.path.start.z);
+            verts.push_back(v.path.end.x);   verts.push_back(v.path.end.y);   verts.push_back(v.path.end.z);
+        }
     }
 
     m_pathVertexCount = (GLsizei)verts.size() / 3;
@@ -4302,6 +4455,579 @@ void GLCanvas::RebuildPathVBO()
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
     glEnableVertexAttribArray(0);
     glBindVertexArray(0);
+}
+
+// ===========================================================================
+// Part 5 — complex vent-path authoring (floating-toolbar driven)
+// ===========================================================================
+
+bool GLCanvas::IsEditVentComplex() const
+{
+    return HasEditVentSelected() &&
+        m_vents[m_editFeatureIndex].path.kind == PathKind::Complex;
+}
+
+bool GLCanvas::IsEditVentSmooth() const
+{
+    return HasEditVentSelected() && m_vents[m_editFeatureIndex].path.smooth;
+}
+
+int GLCanvas::EditVentNodeCount() const
+{
+    if (!IsEditVentComplex()) return 0;
+    return (int)m_vents[m_editFeatureIndex].path.nodes.size();
+}
+
+void GLCanvas::SetPathEditTool(PathEditTool t)
+{
+    if (m_pathEditTool == t) return;
+    m_pathEditTool = t;
+    m_editVentNode = -1;
+    NotifyPathEditChanged();
+    Refresh(false);
+}
+
+// ---------------------------------------------------------------------------
+// SnapToFixturePerimeter — nearest point (XZ, y=0) on the perimeter polygon.
+// Mirrors the nearest-edge loop in ComputeVentPath.
+// ---------------------------------------------------------------------------
+glm::vec3 GLCanvas::SnapToFixturePerimeter(const glm::vec3& p) const
+{
+    if (m_fixturePerimeter.size() < 2) return glm::vec3(p.x, 0.0f, p.z);
+
+    const glm::vec2 origin(p.x, p.z);
+    float     bestDist = std::numeric_limits<float>::max();
+    glm::vec2 bestPt(origin);
+
+    const int n = (int)m_fixturePerimeter.size();
+    for (int i = 0; i < n; ++i)
+    {
+        const glm::vec2& A = m_fixturePerimeter[i];
+        const glm::vec2& B = m_fixturePerimeter[(i + 1) % n];
+        const glm::vec2 AB = B - A;
+        const float     len2 = glm::dot(AB, AB);
+        float           t = 0.0f;
+        if (len2 > 1e-10f)
+            t = glm::clamp(glm::dot(origin - A, AB) / len2, 0.0f, 1.0f);
+        const glm::vec2 closest = A + t * AB;
+        const float     dist = glm::length(closest - origin);
+        if (dist < bestDist) { bestDist = dist; bestPt = closest; }
+    }
+    return glm::vec3(bestPt.x, 0.0f, bestPt.y);
+}
+
+// ---------------------------------------------------------------------------
+// RebuildEditVentGeometry — rebuild the edited vent's preview from its current
+// path.nodes (already mutated by the caller). Recomputes auto handles when
+// smooth, mirrors start/end, reads dimensions from the MainFrame UI, and
+// refreshes the path + cross-section VBOs. Fires the scene-mutated hook.
+// ---------------------------------------------------------------------------
+void GLCanvas::RebuildEditVentGeometry()
+{
+    if (!HasEditVentSelected()) return;
+    VentInstance& vi = m_vents[m_editFeatureIndex];
+    if (vi.path.kind != PathKind::Complex) return;
+
+    FeaturePath& path = vi.path;
+    const int nodeCount = (int)path.nodes.size();
+    path.valid = (nodeCount >= 2);
+
+    if (nodeCount >= 1)
+    {
+        path.start = path.nodes.front().pos;
+        path.end = path.nodes.back().pos;
+    }
+    if (path.smooth)
+        AutoComputeComplexHandles(path);
+
+    float ventLength = 5.0f, ventWidth = 2.0f,
+        ventOverrunStart = 0.5f, ventOverrunEnd = 0.5f;
+    if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+        frame->GetVentDimensions(ventLength, ventWidth,
+            ventOverrunStart, ventOverrunEnd);
+
+    path.overrunStart = ventOverrunStart;
+    path.overrunEnd = ventOverrunEnd;
+
+    vi.Destroy();
+
+    // Cross-section marker oriented to the first segment (matches
+    // RestoreVentComplex) rather than the start->end chord, which can point the
+    // wrong way or be degenerate on a curved path.
+    if (nodeCount >= 2)
+    {
+        FeaturePath xsPath;
+        xsPath.kind = PathKind::Simple;
+        xsPath.start = path.nodes[0].pos;
+        xsPath.end = path.nodes[1].pos;
+        xsPath.valid = true;
+        vi.crossSection = BuildVentCrossSection(xsPath, ventWidth, ventLength);
+    }
+
+    vi.solid = BuildBoxSweepMesh(path, ventWidth, ventLength,
+        ventOverrunStart, ventOverrunEnd);
+
+    RebuildPathVBO();
+    RebuildCrossSectionVBO();
+    NotifySceneMutated();
+}
+
+// ---------------------------------------------------------------------------
+// ConvertEditVentToComplex — seed a 2-node path (origin + endpoint) from the
+// current Simple path so the result is geometrically identical, then flip the
+// vent to Complex. No-op if there is no selection or it is already Complex.
+// ---------------------------------------------------------------------------
+void GLCanvas::ConvertEditVentToComplex()
+{
+    if (!HasEditVentSelected()) return;
+    VentInstance& vi = m_vents[m_editFeatureIndex];
+    if (vi.path.kind == PathKind::Complex) return;
+
+    // The Simple path may have been derived already; if not, derive it now so
+    // the start/end are meaningful.
+    if (!vi.path.valid)
+    {
+        FeaturePath derived = ComputeVentPath(vi.point);
+        derived.overrunStart = vi.path.overrunStart;
+        derived.overrunEnd = vi.path.overrunEnd;
+        vi.path = derived;
+    }
+
+    const glm::vec3 origin(vi.path.start.x, 0.0f, vi.path.start.z);
+    const glm::vec3 endpt(vi.path.end.x, 0.0f, vi.path.end.z);
+
+    vi.path.kind = PathKind::Complex;
+    vi.path.nodes.clear();
+    PathNode a; a.pos = origin;
+    PathNode b; b.pos = endpt;
+    vi.path.nodes.push_back(a);
+    vi.path.nodes.push_back(b);
+    // smooth stays whatever it was (defaults false); handles auto-filled in
+    // RebuildEditVentGeometry when smooth.
+
+    RebuildEditVentGeometry();
+    NotifyPathEditChanged();
+    Refresh(false);
+}
+
+// ---------------------------------------------------------------------------
+// ConvertEditVentToSimple — drop the authored nodes and re-derive the straight
+// Simple path from the vent point. No-op if not Complex.
+// ---------------------------------------------------------------------------
+void GLCanvas::ConvertEditVentToSimple()
+{
+    if (!HasEditVentSelected()) return;
+    VentInstance& vi = m_vents[m_editFeatureIndex];
+    if (vi.path.kind != PathKind::Complex) return;
+
+    const float ovS = vi.path.overrunStart;
+    const float ovE = vi.path.overrunEnd;
+
+    float ventLength = 5.0f, ventWidth = 2.0f, oS = ovS, oE = ovE;
+    if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+        frame->GetVentDimensions(ventLength, ventWidth, oS, oE);
+
+    vi.Destroy();
+    vi.path = ComputeVentPath(vi.point);   // kind = Simple, nodes cleared
+    vi.path.overrunStart = ovS;
+    vi.path.overrunEnd = ovE;
+    vi.crossSection = BuildVentCrossSection(vi.path, ventWidth, ventLength);
+    vi.solid = BuildBoxSweepMesh(vi.path, ventWidth, ventLength, ovS, ovE);
+
+    RebuildPathVBO();
+    RebuildCrossSectionVBO();
+    NotifySceneMutated();
+    NotifyPathEditChanged();
+    Refresh(false);
+}
+
+// ---------------------------------------------------------------------------
+// SetEditVentSmooth — toggle the spline/polyline flag on the edited vent.
+// ---------------------------------------------------------------------------
+void GLCanvas::SetEditVentSmooth(bool smooth)
+{
+    if (!IsEditVentComplex()) return;
+    VentInstance& vi = m_vents[m_editFeatureIndex];
+    if (vi.path.smooth == smooth) return;
+    vi.path.smooth = smooth;
+    RebuildEditVentGeometry();
+    NotifyPathEditChanged();
+    Refresh(false);
+}
+
+// ---------------------------------------------------------------------------
+// PickEditVentNode — nearest node marker of the edited Complex vent to the
+// mouse ray, within the marker hit radius. Returns node index or -1.
+// ---------------------------------------------------------------------------
+int GLCanvas::PickEditVentNode(int mouseX, int mouseY) const
+{
+    if (!IsEditVentComplex()) return -1;
+    glm::vec3 rayOrig, rayDir;
+    const_cast<GLCanvas*>(this)->BuildMouseRay(mouseX, mouseY, rayOrig, rayDir);
+
+    const std::vector<PathNode>& nodes = m_vents[m_editFeatureIndex].path.nodes;
+    const float hitRadius = kVentMarkerRadius * 1.6f;   // node markers are smaller
+    float bestDist = hitRadius;
+    int   bestIdx = -1;
+    for (int i = 0; i < (int)nodes.size(); ++i)
+    {
+        const float d = PointRayDistance(nodes[i].pos, rayOrig, rayDir);
+        if (d < bestDist) { bestDist = d; bestIdx = i; }
+    }
+    return bestIdx;
+}
+
+// ---------------------------------------------------------------------------
+// PickEditVentHandle — nearest tangent-handle endpoint of the edited smooth
+// vent to the mouse ray. Origin has only an outgoing arm, the endpoint only an
+// incoming arm; interior nodes have both. Returns node index (+ outIsOut) or -1.
+// ---------------------------------------------------------------------------
+int GLCanvas::PickEditVentHandle(int mouseX, int mouseY, bool& outIsOut) const
+{
+    outIsOut = false;
+    if (!IsEditVentComplex() || !IsEditVentSmooth()) return -1;
+
+    glm::vec3 rayOrig, rayDir;
+    const_cast<GLCanvas*>(this)->BuildMouseRay(mouseX, mouseY, rayOrig, rayDir);
+
+    const std::vector<PathNode>& nodes = m_vents[m_editFeatureIndex].path.nodes;
+    const int last = (int)nodes.size() - 1;
+    const float hitRadius = kVentMarkerRadius * 1.3f;   // handle dots are small
+    float bestDist = hitRadius;
+    int   bestIdx = -1;
+
+    for (int i = 0; i <= last; ++i)
+    {
+        if (i != 0)   // incoming arm exists for everything except the origin
+        {
+            const float d = PointRayDistance(nodes[i].pos + nodes[i].handleIn, rayOrig, rayDir);
+            if (d < bestDist) { bestDist = d; bestIdx = i; outIsOut = false; }
+        }
+        if (i != last)   // outgoing arm exists for everything except the endpoint
+        {
+            const float d = PointRayDistance(nodes[i].pos + nodes[i].handleOut, rayOrig, rayDir);
+            if (d < bestDist) { bestDist = d; bestIdx = i; outIsOut = true; }
+        }
+    }
+    return bestIdx;
+}
+
+// ---------------------------------------------------------------------------
+// MoveEditVentHandle — drag a tangent arm on the parting plane. Sets the
+// dragged arm to (cursor - node.pos); marks the node manual. A linked node (and
+// no Alt) mirrors the opposite arm to keep it symmetric; Alt — or an already
+// broken node — moves only the dragged arm independently.
+// ---------------------------------------------------------------------------
+void GLCanvas::MoveEditVentHandle(int node, bool isOut, int mouseX, int mouseY, bool breakLink)
+{
+    if (!IsEditVentComplex() || !IsEditVentSmooth()) return;
+    std::vector<PathNode>& nodes = m_vents[m_editFeatureIndex].path.nodes;
+    if (node < 0 || node >= (int)nodes.size()) return;
+
+    glm::vec3 plane;
+    if (!RayCastToPartingPlane(mouseX, mouseY, plane)) return;
+
+    PathNode& nd = nodes[node];
+    glm::vec3 arm(plane.x - nd.pos.x, 0.0f, plane.z - nd.pos.z);
+
+    if (breakLink) nd.handlesLinked = false;   // Alt splits the node
+
+    if (isOut) nd.handleOut = arm;
+    else       nd.handleIn = arm;
+
+    // A still-linked node keeps the opposite arm mirrored (equal length,
+    // opposite direction) so the curve stays smooth across it.
+    if (nd.handlesLinked)
+    {
+        if (isOut) nd.handleIn = -arm;
+        else       nd.handleOut = -arm;
+    }
+
+    nd.handlesManual = true;   // freeze against AutoCompute
+    RebuildEditVentGeometry();
+    Refresh(false);
+}
+
+// ---------------------------------------------------------------------------
+// RebuildHandleLineVBO — fill the stem buffer with node->handle segments for
+// the edited smooth vent (one GL_LINES pair per visible arm).
+// ---------------------------------------------------------------------------
+void GLCanvas::RebuildHandleLineVBO()
+{
+    if (!m_handleLineVAO) return;
+
+    std::vector<float> v;
+    if (IsEditVentComplex() && IsEditVentSmooth())
+    {
+        const std::vector<PathNode>& nodes = m_vents[m_editFeatureIndex].path.nodes;
+        const int last = (int)nodes.size() - 1;
+        auto seg = [&](const glm::vec3& a, const glm::vec3& b)
+            {
+                v.push_back(a.x); v.push_back(a.y); v.push_back(a.z);
+                v.push_back(b.x); v.push_back(b.y); v.push_back(b.z);
+            };
+        for (int i = 0; i <= last; ++i)
+        {
+            if (i != 0)    seg(nodes[i].pos, nodes[i].pos + nodes[i].handleIn);
+            if (i != last) seg(nodes[i].pos, nodes[i].pos + nodes[i].handleOut);
+        }
+    }
+
+    m_handleLineVertexCount = (GLsizei)v.size() / 3;
+    glBindVertexArray(m_handleLineVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, m_handleLineVBO);
+    glBufferData(GL_ARRAY_BUFFER,
+        (GLsizeiptr)(v.size() * sizeof(float)),
+        v.empty() ? nullptr : v.data(), GL_DYNAMIC_DRAW);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glBindVertexArray(0);
+}
+
+// ---------------------------------------------------------------------------
+// InsertNodeOnVentAt — splice a new node into vent `ventIndex` at the
+// (already path-snapped) world point. Selects the vent, auto-converts Simple
+// -> Complex, and inserts into the nearest segment so the node lands between
+// the two nodes that section spans.
+// ---------------------------------------------------------------------------
+void GLCanvas::InsertNodeOnVentAt(int ventIndex, const glm::vec3& worldPt)
+{
+    if (ventIndex < 0 || ventIndex >= (int)m_vents.size()) return;
+
+    // Make this the edited vent so the convert / rebuild helpers act on it.
+    if (m_editFeatureIndex != ventIndex)
+    {
+        m_editFeatureIndex = ventIndex;
+        NotifyPathEditChanged();
+    }
+
+    // A Simple vent becomes Complex (origin + endpoint) before its first
+    // waypoint can be inserted.
+    if (m_vents[ventIndex].path.kind != PathKind::Complex)
+        ConvertEditVentToComplex();
+    if (!IsEditVentComplex()) return;
+
+    const glm::vec3 hit(worldPt.x, 0.0f, worldPt.z);   // lock to parting plane
+
+    std::vector<PathNode>& nodes = m_vents[ventIndex].path.nodes;
+    if (nodes.size() < 2) return;
+
+    // Insert into the segment whose closest point to the snapped hit is
+    // nearest — the section the cursor was riding.
+    int   bestSeg = 0;
+    float bestDist = std::numeric_limits<float>::max();
+    for (int s = 0; s + 1 < (int)nodes.size(); ++s)
+    {
+        const glm::vec3 c = ClosestPointOnSegment(nodes[s].pos, nodes[s + 1].pos, hit);
+        const float d = glm::length(glm::vec2(c.x - hit.x, c.z - hit.z));
+        if (d < bestDist) { bestDist = d; bestSeg = s; }
+    }
+
+    PathNode nn; nn.pos = hit;
+    nodes.insert(nodes.begin() + bestSeg + 1, nn);
+
+    RebuildEditVentGeometry();
+    NotifyPathEditChanged();
+    Refresh(false);
+}
+
+// ---------------------------------------------------------------------------
+// RayCastPathNodeSnap — snap the cursor onto an existing vent path. Screen-
+// space nearest point across every vent's RENDERED polyline (Simple: start->
+// end; Complex: the sampled curve), within kEjectorSnapRadiusPx — the same
+// snap feel as ejector-to-runner placement. Returns the snapped world point
+// and the owning vent index.
+// ---------------------------------------------------------------------------
+bool GLCanvas::RayCastPathNodeSnap(int mouseX, int mouseY,
+    glm::vec3& outPos, int& outVentIndex) const
+{
+    const wxSize sz = const_cast<GLCanvas*>(this)->GetClientSize();
+    const int    w = std::max(1, sz.x);
+    const int    h = std::max(1, sz.y);
+
+    // Camera matrices (const-correct local copy; mirrors RayCastEjectorSnap).
+    OrbitCamera cam = m_camera;
+    cam.SetAspect(float(w) / float(h));
+    const glm::mat4 view = cam.View();
+    const glm::mat4 proj = cam.Projection();
+    const glm::mat4 viewProj = proj * view;
+
+    const float ndcX = (2.0f * float(mouseX)) / float(w) - 1.0f;
+    const float ndcY = 1.0f - (2.0f * float(mouseY)) / float(h);
+    const glm::mat4 invVP = glm::inverse(viewProj);
+    glm::vec4 nearH = invVP * glm::vec4(ndcX, ndcY, -1.0f, 1.0f);
+    glm::vec4 farH = invVP * glm::vec4(ndcX, ndcY, 1.0f, 1.0f);
+    nearH /= nearH.w;
+    farH /= farH.w;
+    const glm::vec3 rayOrig = glm::vec3(nearH);
+    const glm::vec3 rayDir = glm::normalize(glm::vec3(farH) - glm::vec3(nearH));
+
+    const glm::vec2 cursorPx{ float(mouseX), float(mouseY) };
+
+    auto worldToScreen = [&](const glm::vec3& world, glm::vec2& outPx)
+    {
+        const glm::vec4 clip = viewProj * glm::vec4(world, 1.0f);
+        if (clip.w <= 1e-6f) return false;
+        outPx.x = ((clip.x / clip.w) * 0.5f + 0.5f) * float(w);
+        outPx.y = (1.0f - ((clip.y / clip.w) * 0.5f + 0.5f)) * float(h);
+        return true;
+    };
+
+    auto closestOnSegment = [&](const glm::vec3& A, const glm::vec3& B)
+    {
+        const glm::vec3 AB = B - A;
+        const float lenAB2 = glm::dot(AB, AB);
+        if (lenAB2 < 1e-10f) return A;
+        const glm::vec3 w0 = A - rayOrig;
+        const float bDot = glm::dot(AB, rayDir);
+        const float dDot = glm::dot(AB, w0);
+        const float eDot = glm::dot(rayDir, w0);
+        const float denom = lenAB2 - bDot * bDot;     // cSq == 1 (rayDir unit)
+        float tSeg = 0.0f;
+        if (denom >= 1e-10f) tSeg = (bDot * eDot - dDot) / denom;
+        tSeg = glm::clamp(tSeg, 0.0f, 1.0f);
+        return A + AB * tSeg;
+    };
+
+    float bestPx = kEjectorSnapRadiusPx;
+    bool  hit = false;
+    outVentIndex = -1;
+
+    for (int vi = 0; vi < (int)m_vents.size(); ++vi)
+    {
+        const FeaturePath& path = m_vents[vi].path;
+        if (!path.valid) continue;
+
+        // Build the rendered polyline for this vent.
+        std::vector<glm::vec3> poly;
+        if (path.kind == PathKind::Complex)
+        {
+            const std::vector<PathStation> st = SamplePath(path);
+            poly.reserve(st.size());
+            for (const PathStation& s : st) poly.push_back(s.pos);
+        }
+        else
+        {
+            poly.push_back(path.start);
+            poly.push_back(path.end);
+        }
+
+        for (size_t s = 0; s + 1 < poly.size(); ++s)
+        {
+            const glm::vec3 cand = closestOnSegment(poly[s], poly[s + 1]);
+            glm::vec2 px;
+            if (!worldToScreen(cand, px)) continue;
+            const float distPx = glm::length(px - cursorPx);
+            if (distPx < bestPx)
+            {
+                bestPx = distPx;
+                outPos = cand;
+                outVentIndex = vi;
+                hit = true;
+            }
+        }
+    }
+    return hit;
+}
+
+// ---------------------------------------------------------------------------
+// RemoveEditVentNode — delete an interior node. Origin (0) and endpoint (last)
+// are protected; a Complex path must keep at least two nodes.
+// ---------------------------------------------------------------------------
+void GLCanvas::RemoveEditVentNode(int idx)
+{
+    if (!IsEditVentComplex()) return;
+    std::vector<PathNode>& nodes = m_vents[m_editFeatureIndex].path.nodes;
+    const int last = (int)nodes.size() - 1;
+    if (idx <= 0 || idx >= last) return;   // protect origin + endpoint, ignore -1
+
+    nodes.erase(nodes.begin() + idx);
+
+    RebuildEditVentGeometry();
+    NotifyPathEditChanged();
+    Refresh(false);
+}
+
+// ---------------------------------------------------------------------------
+// MoveEditVentNode — drag a node on the parting plane.
+//   origin (0)   : re-snaps to a part edge (recapturing parent), else the raw
+//                  plane point unparented — mirrors the Simple body drag.
+//   endpoint (n) : snaps to the fixture perimeter.
+//   interior     : free on the plane.
+// ---------------------------------------------------------------------------
+void GLCanvas::MoveEditVentNode(int idx, int mouseX, int mouseY)
+{
+    if (!IsEditVentComplex()) return;
+    VentInstance& vi = m_vents[m_editFeatureIndex];
+    std::vector<PathNode>& nodes = vi.path.nodes;
+    if (idx < 0 || idx >= (int)nodes.size()) return;
+    const int last = (int)nodes.size() - 1;
+
+    if (idx == 0)
+    {
+        // Origin tracks the vent point. Prefer snapping to a part's parting
+        // silhouette (and recapture parent); fall back to the raw plane.
+        glm::vec3 hitPos, hitNormal;
+        int       hitObj = -1;
+        if (RayCastParting(mouseX, mouseY, hitPos, hitNormal, &hitObj))
+        {
+            vi.point = VentPoint{ hitPos, hitNormal };
+            if (hitObj >= 0 && hitObj < (int)m_objects.size())
+            {
+                const glm::mat4 m = m_objects[hitObj].BuildModelMatrix();
+                const glm::mat4 invM = glm::inverse(m);
+                vi.parentIndex = hitObj;
+                vi.localPos = glm::vec3(invM * glm::vec4(hitPos, 1.0f));
+                glm::vec3 ln = glm::transpose(glm::mat3(m)) * hitNormal;
+                const float lnLen = glm::length(ln);
+                vi.localNormal = (lnLen > 1e-6f) ? ln / lnLen : glm::vec3(0, 0, 1);
+            }
+            else vi.parentIndex = -1;
+            nodes[0].pos = glm::vec3(hitPos.x, 0.0f, hitPos.z);
+        }
+        else
+        {
+            glm::vec3 plane;
+            if (!RayCastToPartingPlane(mouseX, mouseY, plane)) return;
+            vi.parentIndex = -1;
+            vi.point = VentPoint{ glm::vec3(plane.x, 0.0f, plane.z), glm::vec3(0,0,1) };
+            nodes[0].pos = glm::vec3(plane.x, 0.0f, plane.z);
+        }
+    }
+    else if (idx == last)
+    {
+        glm::vec3 plane;
+        if (!RayCastToPartingPlane(mouseX, mouseY, plane)) return;
+        nodes[last].pos = SnapToFixturePerimeter(plane);
+    }
+    else
+    {
+        glm::vec3 plane;
+        if (!RayCastToPartingPlane(mouseX, mouseY, plane)) return;
+        nodes[idx].pos = glm::vec3(plane.x, 0.0f, plane.z);
+    }
+
+    RebuildEditVentGeometry();
+    Refresh(false);
+}
+
+// ---------------------------------------------------------------------------
+// RepositionPathToolbar — pin the floating toolbar to the top-centre of the
+// viewport. Safe to call with no toolbar registered.
+// ---------------------------------------------------------------------------
+void GLCanvas::RepositionPathToolbar()
+{
+    if (!m_pathToolbar) return;
+    // The toolbar is a SIBLING of this canvas (a child of the shared parent),
+    // raised above it — the robust way to overlay wx controls on a GL surface,
+    // since SwapBuffers can overdraw a true child window. Position it in the
+    // parent's coordinate space at the top-centre of the canvas rect.
+    const wxPoint cpos = GetPosition();            // canvas pos within parent
+    const wxSize  canvas = GetClientSize();
+    const wxSize  bar = m_pathToolbar->GetSize();
+    const int x = cpos.x + std::max(8, (canvas.x - bar.x) / 2);
+    const int y = cpos.y + 12;
+    m_pathToolbar->Move(x, y);
 }
 
 // ---------------------------------------------------------------------------
@@ -4368,7 +5094,7 @@ void GLCanvas::RebuildCrossSectionVBO()
         if (!xs.valid) continue;
         auto push = [&](const glm::vec3& v) {
             verts.push_back(v.x); verts.push_back(v.y); verts.push_back(v.z);
-            };
+        };
         push(xs.corners[0]); push(xs.corners[1]);
         push(xs.corners[1]); push(xs.corners[2]);
         push(xs.corners[2]); push(xs.corners[3]);
@@ -4480,6 +5206,15 @@ void GLCanvas::InitGLOnce()
     glEnableVertexAttribArray(0);
     glBindVertexArray(0);
 
+    // Part 6: tangent-handle stem VBO (dynamic, rebuilt while handles show)
+    glGenVertexArrays(1, &m_handleLineVAO);
+    glGenBuffers(1, &m_handleLineVBO);
+    glBindVertexArray(m_handleLineVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, m_handleLineVBO);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glBindVertexArray(0);
+
     // Vent cross-section VBO (dynamic)
     glGenVertexArrays(1, &m_xsecVAO);
     glGenBuffers(1, &m_xsecVBO);
@@ -4547,6 +5282,8 @@ void GLCanvas::DestroyGL()
     if (m_fullscreenVAO) { glDeleteVertexArrays(1, &m_fullscreenVAO); m_fullscreenVAO = 0; }
     if (m_pathVBO) { glDeleteBuffers(1, &m_pathVBO);              m_pathVBO = 0; }
     if (m_pathVAO) { glDeleteVertexArrays(1, &m_pathVAO);         m_pathVAO = 0; }
+    if (m_handleLineVBO) { glDeleteBuffers(1, &m_handleLineVBO);  m_handleLineVBO = 0; }
+    if (m_handleLineVAO) { glDeleteVertexArrays(1, &m_handleLineVAO); m_handleLineVAO = 0; }
     if (m_xsecVBO) { glDeleteBuffers(1, &m_xsecVBO);              m_xsecVBO = 0; }
     if (m_xsecVAO) { glDeleteVertexArrays(1, &m_xsecVAO);         m_xsecVAO = 0; }
     if (m_runnerPathVBO) { glDeleteBuffers(1, &m_runnerPathVBO);         m_runnerPathVBO = 0; }
@@ -4714,7 +5451,7 @@ void GLCanvas::ImportFile(const std::string& path)
     auto lower = [](std::string s) {
         for (char& c : s) c = (char)std::tolower((unsigned char)c);
         return s;
-        };
+    };
     const std::string ext = (path.find_last_of('.') == std::string::npos)
         ? std::string()
         : lower(path.substr(path.find_last_of('.') + 1));
@@ -4795,7 +5532,7 @@ void GLCanvas::ImportFileAsFixture(const std::string& path,
     auto lower = [](std::string s) {
         for (char& c : s) c = (char)std::tolower((unsigned char)c);
         return s;
-        };
+    };
     const std::string ext = (path.find_last_of('.') == std::string::npos)
         ? std::string()
         : lower(path.substr(path.find_last_of('.') + 1));
@@ -5167,48 +5904,64 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         if (m_transformMode == TransformMode::EditVent &&
             m_editFeatureIndex >= 0 && m_editFeatureIndex < (int)m_vents.size())
         {
-            glm::vec3 hitPos, hitNormal;
-            int       hitObj = -1;
-            if (RayCastParting(m_editMousePos.x, m_editMousePos.y, hitPos, hitNormal, &hitObj))
+            // Complex vents are authored, not derived: a drag moves the grabbed
+            // node only (MoveEditVentNode applies origin/endpoint constraints)
+            // and must never run ComputeVentPath, which would discard the
+            // authored interior nodes. Simple vents keep the legacy
+            // drag-to-re-derive behaviour below.
+            if (m_vents[m_editFeatureIndex].path.kind == PathKind::Complex)
             {
-                VentInstance& vi = m_vents[m_editFeatureIndex];
-                vi.Destroy();
-                vi.point = VentPoint{ hitPos, hitNormal };
-
-                // Edit-drag re-captures parent association: if the user drags
-                // a vent onto a different object's surface, the new object
-                // becomes its parent. Snapping to no object resets to
-                // unparented (vent stops following any object).
-                if (hitObj >= 0 && hitObj < (int)m_objects.size())
+                if (m_editHandleNode >= 0)
+                    MoveEditVentHandle(m_editHandleNode, m_editHandleIsOut,
+                        m_editMousePos.x, m_editMousePos.y, m_editHandleBreak);
+                else if (m_editVentNode >= 0)
+                    MoveEditVentNode(m_editVentNode, m_editMousePos.x, m_editMousePos.y);
+            }
+            else
+            {
+                glm::vec3 hitPos, hitNormal;
+                int       hitObj = -1;
+                if (RayCastParting(m_editMousePos.x, m_editMousePos.y, hitPos, hitNormal, &hitObj))
                 {
-                    const glm::mat4 m = m_objects[hitObj].BuildModelMatrix();
-                    const glm::mat4 invM = glm::inverse(m);
-                    vi.parentIndex = hitObj;
-                    vi.localPos = glm::vec3(invM * glm::vec4(hitPos, 1.0f));
-                    glm::vec3 ln = glm::transpose(glm::mat3(m)) * hitNormal;
-                    const float lnLen = glm::length(ln);
-                    vi.localNormal = (lnLen > 1e-6f) ? ln / lnLen : glm::vec3(0, 0, 1);
-                }
-                else
-                {
-                    vi.parentIndex = -1;
-                }
+                    VentInstance& vi = m_vents[m_editFeatureIndex];
+                    vi.Destroy();
+                    vi.point = VentPoint{ hitPos, hitNormal };
 
-                float ventLength = 5.0f, ventWidth = 2.0f,
-                    ventOverrunStart = 0.5f, ventOverrunEnd = 0.5f;
-                if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
-                    frame->GetVentDimensions(ventLength, ventWidth,
+                    // Edit-drag re-captures parent association: if the user drags
+                    // a vent onto a different object's surface, the new object
+                    // becomes its parent. Snapping to no object resets to
+                    // unparented (vent stops following any object).
+                    if (hitObj >= 0 && hitObj < (int)m_objects.size())
+                    {
+                        const glm::mat4 m = m_objects[hitObj].BuildModelMatrix();
+                        const glm::mat4 invM = glm::inverse(m);
+                        vi.parentIndex = hitObj;
+                        vi.localPos = glm::vec3(invM * glm::vec4(hitPos, 1.0f));
+                        glm::vec3 ln = glm::transpose(glm::mat3(m)) * hitNormal;
+                        const float lnLen = glm::length(ln);
+                        vi.localNormal = (lnLen > 1e-6f) ? ln / lnLen : glm::vec3(0, 0, 1);
+                    }
+                    else
+                    {
+                        vi.parentIndex = -1;
+                    }
+
+                    float ventLength = 5.0f, ventWidth = 2.0f,
+                        ventOverrunStart = 0.5f, ventOverrunEnd = 0.5f;
+                    if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+                        frame->GetVentDimensions(ventLength, ventWidth,
+                            ventOverrunStart, ventOverrunEnd);
+
+                    vi.path = ComputeVentPath(vi.point);
+                    vi.path.overrunStart = ventOverrunStart;
+                    vi.path.overrunEnd = ventOverrunEnd;
+                    vi.crossSection = BuildVentCrossSection(vi.path, ventWidth, ventLength);
+                    vi.solid = BuildBoxSweepMesh(vi.path, ventWidth, ventLength,
                         ventOverrunStart, ventOverrunEnd);
 
-                vi.path = ComputeVentPath(vi.point);
-                vi.path.overrunStart = ventOverrunStart;
-                vi.path.overrunEnd = ventOverrunEnd;
-                vi.crossSection = BuildVentCrossSection(vi.path, ventWidth, ventLength);
-                vi.solid = BuildBoxSweepMesh(vi.path, ventWidth, ventLength,
-                    ventOverrunStart, ventOverrunEnd);
-
-                RebuildPathVBO();
-                RebuildCrossSectionVBO();
+                    RebuildPathVBO();
+                    RebuildCrossSectionVBO();
+                }
             }
         }
         else if (m_transformMode == TransformMode::EditRunner &&
@@ -5291,6 +6044,20 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         m_ventGhost.worldPos = hitPos;
         m_ventGhost.worldNormal = hitNormal;
     }
+    // Add Node ghost: snap onto an existing vent path under the cursor.
+    if (m_transformMode == TransformMode::EditVent &&
+        m_pathEditTool == PathEditTool::AddNode)
+    {
+        glm::vec3 snapPos;
+        int       snapVent = -1;
+        m_pathNodeGhostActive = RayCastPathNodeSnap(
+            m_pathNodeGhostMousePos.x, m_pathNodeGhostMousePos.y, snapPos, snapVent);
+        m_pathNodeGhostPos = snapPos;
+    }
+    else
+    {
+        m_pathNodeGhostActive = false;
+    }
     if (m_program && m_sphereVAO && m_sphereIndexCount > 0 &&
         (!m_vents.empty() || m_ventGhostActive))
     {
@@ -5321,6 +6088,26 @@ void GLCanvas::OnPaint(wxPaintEvent&)
 
             glm::mat4 model = glm::translate(glm::mat4(1.0f), m_ventGhost.worldPos);
             model = glm::scale(model, glm::vec3(kVentMarkerRadius * 1.15f));
+            glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &model[0][0]);
+            glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
+
+            glDepthMask(GL_TRUE);
+            glDisable(GL_BLEND);
+        }
+
+        // Add Node ghost — translucent amber bead riding the snapped path,
+        // signalling the node will be placed there (only ever on a path).
+        if (m_pathNodeGhostActive)
+        {
+            const glm::vec3 ghostColor(1.0f, 0.82f, 0.10f);   // amber
+            glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &ghostColor[0]);
+            glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 0.55f);
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glDepthMask(GL_FALSE);
+
+            glm::mat4 model = glm::translate(glm::mat4(1.0f), m_pathNodeGhostPos);
+            model = glm::scale(model, glm::vec3(kVentMarkerRadius * 0.8f));
             glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &model[0][0]);
             glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
 
@@ -5363,6 +6150,66 @@ void GLCanvas::OnPaint(wxPaintEvent&)
                 model = glm::scale(model, glm::vec3(kVentMarkerRadius));
                 glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &model[0][0]);
                 glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
+            }
+
+            // Part 5: node handles for the vent being edited (Complex only).
+            // Origin = cyan, endpoint = orange, interior = white; the node
+            // currently grabbed for dragging pulses brighter. Markers are
+            // slightly smaller than the vent point so they read as sub-handles.
+            if (m_transformMode == TransformMode::EditVent &&
+                m_editFeatureIndex >= 0 && m_editFeatureIndex < (int)m_vents.size() &&
+                m_vents[m_editFeatureIndex].path.kind == PathKind::Complex)
+            {
+                const std::vector<PathNode>& nodes =
+                    m_vents[m_editFeatureIndex].path.nodes;
+                const int last = (int)nodes.size() - 1;
+                const float nodeR = kVentMarkerRadius * 0.7f;
+
+                for (int n = 0; n < (int)nodes.size(); ++n)
+                {
+                    glm::vec3 c(0.95f, 0.95f, 0.95f);        // interior = white
+                    if (n == 0)         c = glm::vec3(0.20f, 0.85f, 0.95f);  // origin = cyan
+                    else if (n == last) c = glm::vec3(1.00f, 0.55f, 0.00f);  // endpoint = orange
+
+                    float scale = nodeR;
+                    if (n == m_editVentNode) { scale = nodeR * 1.35f; }      // grabbed = larger
+
+                    glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &c[0]);
+                    glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 1.0f);
+
+                    glm::mat4 model = glm::translate(glm::mat4(1.0f), nodes[n].pos);
+                    model = glm::scale(model, glm::vec3(scale));
+                    glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &model[0][0]);
+                    glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
+                }
+
+                // Part 6: tangent-handle endpoints (smooth + Move tool only).
+                // Magenta beads at pos+handleIn / pos+handleOut; the grabbed arm
+                // reads larger. Origin shows only its outgoing arm, endpoint only
+                // its incoming arm.
+                if (m_pathEditTool == PathEditTool::Move &&
+                    m_vents[m_editFeatureIndex].path.smooth)
+                {
+                    const float hR = kVentMarkerRadius * 0.5f;
+                    auto drawHandle = [&](int ni, bool isOut, const glm::vec3& at)
+                        {
+                            glm::vec3 c(0.95f, 0.35f, 0.90f);   // magenta
+                            float scale = hR;
+                            if (ni == m_editHandleNode && isOut == m_editHandleIsOut)
+                                scale = hR * 1.4f;
+                            glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &c[0]);
+                            glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 1.0f);
+                            glm::mat4 m = glm::translate(glm::mat4(1.0f), at);
+                            m = glm::scale(m, glm::vec3(scale));
+                            glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &m[0][0]);
+                            glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
+                        };
+                    for (int ni = 0; ni <= last; ++ni)
+                    {
+                        if (ni != 0)    drawHandle(ni, false, nodes[ni].pos + nodes[ni].handleIn);
+                        if (ni != last) drawHandle(ni, true, nodes[ni].pos + nodes[ni].handleOut);
+                    }
+                }
             }
         }
 
@@ -5848,6 +6695,35 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         glUseProgram(0);
     }
 
+    // ---- Tangent-handle stems (Part 6) -------------------------------------
+    // Magenta node->handle lines for the edited smooth vent while the Move tool
+    // is active. Rebuilt each frame (tiny) so they track live handle drags.
+    if (m_flatProgram && m_handleLineVAO &&
+        m_transformMode == TransformMode::EditVent &&
+        m_pathEditTool == PathEditTool::Move &&
+        IsEditVentComplex() && IsEditVentSmooth())
+    {
+        RebuildHandleLineVBO();
+        if (m_handleLineVertexCount > 0)
+        {
+            glEnable(GL_DEPTH_TEST);
+            glLineWidth(1.5f);
+            glUseProgram(m_flatProgram);
+
+            const glm::mat4 VP = proj * view;
+            glUniformMatrix4fv(m_flat_uVP, 1, GL_FALSE, &VP[0][0]);
+
+            const glm::vec4 handleColor(0.85f, 0.40f, 0.85f, 1.0f);   // magenta
+            glUniform4fv(m_flat_uColor, 1, &handleColor[0]);
+
+            glBindVertexArray(m_handleLineVAO);
+            glDrawArrays(GL_LINES, 0, m_handleLineVertexCount);
+            glBindVertexArray(0);
+            glLineWidth(1.0f);
+            glUseProgram(0);
+        }
+    }
+
     // ---- Vent cross-sections -----------------------------------------------
     if (m_flatProgram && m_xsecVAO && m_xsecVertexCount > 0)
     {
@@ -6174,12 +7050,12 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
     // selection, transform, or feature placement.
     if (m_previewMode)
     {
-        if (evt.LeftDown())   { m_lmb = true;  m_hasLast = false; }
-        if (evt.LeftUp())     { m_lmb = false; if (HasCapture()) ReleaseMouse(); }
+        if (evt.LeftDown()) { m_lmb = true;  m_hasLast = false; }
+        if (evt.LeftUp()) { m_lmb = false; if (HasCapture()) ReleaseMouse(); }
         if (evt.MiddleDown()) { m_mmb = true;  m_hasLast = false; CaptureMouse(); }
-        if (evt.MiddleUp())   { m_mmb = false; if (HasCapture()) ReleaseMouse(); }
-        if (evt.RightDown())  { m_rmb = true;  m_hasLast = false; CaptureMouse(); }
-        if (evt.RightUp())    { m_rmb = false; if (HasCapture()) ReleaseMouse(); }
+        if (evt.MiddleUp()) { m_mmb = false; if (HasCapture()) ReleaseMouse(); }
+        if (evt.RightDown()) { m_rmb = true;  m_hasLast = false; CaptureMouse(); }
+        if (evt.RightUp()) { m_rmb = false; if (HasCapture()) ReleaseMouse(); }
 
         if (evt.Dragging() && m_lmb && !HasCapture())
             CaptureMouse();
@@ -6196,8 +7072,8 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
         const bool shift = evt.ShiftDown();
         const bool ctrl = evt.ControlDown();
 
-        if (m_mmb)        { m_camera.Pan(dx, -dy);       Refresh(false); }
-        else if (m_rmb)   { m_camera.Dolly(dy * 0.05f);  Refresh(false); }
+        if (m_mmb) { m_camera.Pan(dx, -dy);       Refresh(false); }
+        else if (m_rmb) { m_camera.Dolly(dy * 0.05f);  Refresh(false); }
         else if (m_lmb)
         {
             if (shift)      m_camera.Pan(dx, -dy);
@@ -6559,19 +7435,75 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
         else if (m_transformMode == TransformMode::EditVent)
         {
             const wxPoint p = evt.GetPosition();
-            glm::vec3 rayOrig, rayDir;
-            BuildMouseRay(p.x, p.y, rayOrig, rayDir);
 
-            const float hitRadius = kVentMarkerRadius * 2.0f;
-            float bestDist = hitRadius;
-            int   bestIdx = -1;
-            for (int i = 0; i < (int)m_vents.size(); ++i)
+            const bool haveSel =
+                m_editFeatureIndex >= 0 && m_editFeatureIndex < (int)m_vents.size();
+            const bool selComplex =
+                haveSel && m_vents[m_editFeatureIndex].path.kind == PathKind::Complex;
+
+            if (m_pathEditTool == PathEditTool::AddNode)
             {
-                const float d = PointRayDistance(m_vents[i].point.worldPos, rayOrig, rayDir);
-                if (d < bestDist) { bestDist = d; bestIdx = i; }
+                // Add Node only places ON an existing path: snap the cursor to
+                // the nearest vent path and splice a node into that section.
+                // No snap -> no placement (cursor isn't over a path).
+                glm::vec3 snapPos;
+                int       snapVent = -1;
+                if (RayCastPathNodeSnap(p.x, p.y, snapPos, snapVent))
+                    InsertNodeOnVentAt(snapVent, snapPos);
+                m_editVentNode = -1;
+                Refresh(false);
             }
-            m_editFeatureIndex = bestIdx;
-            Refresh(false);
+            else if (selComplex && m_pathEditTool == PathEditTool::RemoveNode)
+            {
+                // Delete the clicked interior node (origin / endpoint protected).
+                RemoveEditVentNode(PickEditVentNode(p.x, p.y));
+                m_editVentNode = -1;
+                Refresh(false);
+            }
+            else
+            {
+                // Move tool (and all interaction with a Simple vent). Pick
+                // priority: a tangent handle (smooth only, drawn on top) ->
+                // a node -> (re)select the nearest vent marker.
+                bool handleIsOut = false;
+                int  handleNode = selComplex
+                    ? PickEditVentHandle(p.x, p.y, handleIsOut) : -1;
+                int  grab = (handleNode < 0 && selComplex)
+                    ? PickEditVentNode(p.x, p.y) : -1;
+
+                if (handleNode >= 0)
+                {
+                    m_editHandleNode = handleNode;   // begin handle drag
+                    m_editHandleIsOut = handleIsOut;
+                    m_editHandleBreak = evt.AltDown();
+                    m_editVentNode = -1;
+                }
+                else if (grab >= 0)
+                {
+                    m_editVentNode = grab;       // begin node drag
+                    m_editHandleNode = -1;
+                }
+                else
+                {
+                    glm::vec3 rayOrig, rayDir;
+                    BuildMouseRay(p.x, p.y, rayOrig, rayDir);
+
+                    const float hitRadius = kVentMarkerRadius * 2.0f;
+                    float bestDist = hitRadius;
+                    int   bestIdx = -1;
+                    for (int i = 0; i < (int)m_vents.size(); ++i)
+                    {
+                        const float d = PointRayDistance(m_vents[i].point.worldPos, rayOrig, rayDir);
+                        if (d < bestDist) { bestDist = d; bestIdx = i; }
+                    }
+                    const bool selectionChanged = (bestIdx != m_editFeatureIndex);
+                    m_editFeatureIndex = bestIdx;
+                    m_editVentNode = -1;
+                    m_editHandleNode = -1;
+                    if (selectionChanged) NotifyPathEditChanged();
+                }
+                Refresh(false);
+            }
         }
         else if (m_transformMode == TransformMode::EditRunner)
         {
@@ -6628,7 +7560,7 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
         }
     }
 
-    if (evt.LeftUp()) { m_lmb = false; if (HasCapture()) ReleaseMouse(); }
+    if (evt.LeftUp()) { m_lmb = false; m_editVentNode = -1; m_editHandleNode = -1; if (HasCapture()) ReleaseMouse(); }
     if (evt.MiddleDown()) { m_mmb = true;  m_hasLast = false; CaptureMouse(); }
     if (evt.MiddleUp()) { m_mmb = false; if (HasCapture()) ReleaseMouse(); }
     if (evt.RightDown()) { m_rmb = true;  m_hasLast = false; CaptureMouse(); }
@@ -6800,7 +7732,25 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
         m_transformMode == TransformMode::EditGate ||
         m_transformMode == TransformMode::EditEjector))
     {
-        if (m_editFeatureIndex >= 0)
+        // For a Complex vent, dragging only does something when a node was
+        // grabbed on mouse-down; otherwise the gesture orbits. Simple vents and
+        // the other edit modes keep the legacy "selected feature follows the
+        // cursor" body drag.
+        bool deferDrag;
+        if (m_transformMode == TransformMode::EditVent &&
+            m_editFeatureIndex >= 0 && m_editFeatureIndex < (int)m_vents.size() &&
+            m_vents[m_editFeatureIndex].path.kind == PathKind::Complex)
+        {
+            deferDrag = (m_editVentNode >= 0 || m_editHandleNode >= 0);
+            if (m_editHandleNode >= 0)
+                m_editHandleBreak = evt.AltDown();   // live Alt = independent
+        }
+        else
+        {
+            deferDrag = (m_editFeatureIndex >= 0);
+        }
+
+        if (deferDrag)
         {
             // Defer ray cast + geometry rebuild to OnPaint so only one
             // update runs per rendered frame regardless of queued events.
@@ -6810,7 +7760,7 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
         }
         else
         {
-            // No feature selected — orbit
+            // Nothing grabbed — orbit
             if (shift) m_camera.Pan(dx, -dy);
             else if (ctrl) m_camera.Dolly(dy * 0.05f);
             else m_camera.Orbit(dx, dy);
@@ -6860,6 +7810,13 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
         m_alignMousePos = evt.GetPosition();
         Refresh(false);
     }
+    else if (m_transformMode == TransformMode::EditVent &&
+        m_pathEditTool == PathEditTool::AddNode)
+    {
+        // Add Node ghost: snap-to-path preview, cast deferred to OnPaint.
+        m_pathNodeGhostMousePos = evt.GetPosition();
+        Refresh(false);
+    }
     else if (m_ventGhostActive || m_runnerGhostActive || m_gateGhostActive ||
         m_ejectorGhostActive)
     {
@@ -6871,6 +7828,45 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
     }
 
     evt.Skip();
+}
+
+// ---------------------------------------------------------------------------
+// Double-click — shortcut into the Precision Place tool.
+//
+// A double-click on a body selects it and opens the Precision Place dialog so
+// the user can type an exact XZ target without first reaching for the ribbon.
+//
+// Scope: Select mode only. In a placement mode (PlaceVent, etc.) the first
+// LEFT_DOWN of the gesture has already placed a feature, and hijacking the
+// trailing double-click to pop a transform dialog would be jarring — so we
+// leave those modes alone and let the event fall through. (Flagged for review:
+// if you'd rather double-click open Precision Place from any mode, drop the
+// guard below.)
+//
+// Note on the event sequence: a double-click arrives as LEFT_DOWN, LEFT_UP,
+// LEFT_DCLICK, LEFT_UP. The leading LEFT_DOWN runs the normal Select pick in
+// OnMouse, so by the time we get here the clicked body is usually already
+// selected; we re-pick anyway to be robust and to collapse to a single
+// object. The modal dialog runs its own loop; the trailing LEFT_UP is
+// delivered to OnMouse afterwards and clears m_lmb, so no state is left stuck.
+// ---------------------------------------------------------------------------
+void GLCanvas::OnMouseDClick(wxMouseEvent& evt)
+{
+    if (m_previewMode) { evt.Skip(); return; }
+    if (m_transformMode != TransformMode::Select) { evt.Skip(); return; }
+
+    const wxPoint p = evt.GetPosition();
+    const int hit = PickObjectAt(p.x, p.y);
+    if (hit < 0) { evt.Skip(); return; }
+
+    // Collapse to a single-object selection (the body that was double-clicked)
+    // so the dialog pre-fills from one unambiguous position.
+    m_selectedIndices.clear();
+    m_selectedIndices.push_back(hit);
+    Refresh(false);
+
+    if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+        frame->PrecisionPlaceSelected();
 }
 
 void GLCanvas::OnMouseWheel(wxMouseEvent& evt)
@@ -6949,14 +7945,14 @@ void GLCanvas::OnKeyDown(wxKeyEvent& evt)
             // parentIndex > idx is still valid in the now-shrunk m_objects.
             m_vents.erase(std::remove_if(m_vents.begin(), m_vents.end(),
                 [idx](VentInstance& vi) {
-                    if (vi.parentIndex == idx) { vi.Destroy(); return true; }
-                    return false;
-                }), m_vents.end());
+                if (vi.parentIndex == idx) { vi.Destroy(); return true; }
+                return false;
+            }), m_vents.end());
             m_gates.erase(std::remove_if(m_gates.begin(), m_gates.end(),
                 [idx](GateFeature& gf) {
-                    if (gf.parentIndex == idx) { gf.Destroy(); return true; }
-                    return false;
-                }), m_gates.end());
+                if (gf.parentIndex == idx) { gf.Destroy(); return true; }
+                return false;
+            }), m_gates.end());
             for (auto& vi : m_vents) if (vi.parentIndex > idx) --vi.parentIndex;
             for (auto& gf : m_gates) if (gf.parentIndex > idx) --gf.parentIndex;
 
@@ -7101,6 +8097,7 @@ void GLCanvas::PasteFromClipboard()
 
 void GLCanvas::OnResize(wxSizeEvent& evt)
 {
+    RepositionPathToolbar();   // Part 5: keep the overlay pinned top-centre
     Refresh(false);
     evt.Skip();
 }
@@ -7424,6 +8421,65 @@ void GLCanvas::RestoreVent(const glm::vec3& pos, const glm::vec3& normal,
     m_vents.push_back(std::move(vi));
 }
 
+void GLCanvas::RestoreVentComplex(const glm::vec3& pos, const glm::vec3& normal,
+    const std::vector<PathNode>& nodes, bool smooth,
+    float ventWidth, float ventLength,
+    float overrunStart, float overrunEnd,
+    int parentIndex,
+    const glm::vec3& localPos,
+    const glm::vec3& localNormal)
+{
+    SetCurrent(*m_context);
+
+    VentInstance vi;
+    vi.point = VentPoint{ pos, normal };
+
+    // Rebuild the authored path verbatim — no ComputeVentPath re-derivation.
+    FeaturePath path;
+    path.kind = PathKind::Complex;
+    path.nodes = nodes;
+    path.smooth = smooth;
+    path.overrunStart = overrunStart;
+    path.overrunEnd = overrunEnd;
+    path.valid = (nodes.size() >= 2);
+    if (!nodes.empty())
+    {
+        // Mirror first/last node into start/end so anything reading the Simple
+        // fields stays consistent (the sweep/cut use the nodes, not these).
+        path.start = nodes.front().pos;
+        path.end = nodes.back().pos;
+    }
+    vi.path = path;
+
+    // Ensure tangent handles exist before sampling: AutoCompute fills any
+    // non-manual node from dir/handleLen (reproducing v3 behaviour for older
+    // files, which carry no explicit handles) while leaving hand-edited nodes'
+    // saved handles intact.
+    if (vi.path.smooth)
+        AutoComputeComplexHandles(vi.path);
+
+    // Orient the origin cross-section marker to the FIRST segment rather than
+    // the start->end chord (which on a curved path points the wrong way and can
+    // be degenerate). The cut recovers width/depth from this profile by length,
+    // so orientation here is only cosmetic for the marker.
+    if (nodes.size() >= 2)
+    {
+        FeaturePath xsPath;
+        xsPath.kind = PathKind::Simple;
+        xsPath.start = nodes[0].pos;
+        xsPath.end = nodes[1].pos;
+        xsPath.valid = true;
+        vi.crossSection = BuildVentCrossSection(xsPath, ventWidth, ventLength);
+    }
+
+    vi.solid = BuildBoxSweepMesh(vi.path, ventWidth, ventLength,
+        overrunStart, overrunEnd);
+    vi.parentIndex = parentIndex;
+    vi.localPos = localPos;
+    vi.localNormal = localNormal;
+    m_vents.push_back(std::move(vi));
+}
+
 void GLCanvas::RestoreEjector(const glm::vec3& point)
 {
     // Programmatic placement during project load. Mirrors RestoreGate /
@@ -7476,6 +8532,39 @@ void GLCanvas::ReanchorVent(VentInstance& vi)
     if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
         frame->GetVentDimensions(ventLength, ventWidth,
             ventOverrunStart, ventOverrunEnd);
+
+    // Complex (authored) paths must NOT be re-derived — that would discard the
+    // user's nodes. Instead rigidly shift every node by the origin's new
+    // world-space delta so the authored shape stays attached to the part under
+    // translation. (Per-node parent-rotation tracking is a later refinement;
+    // a first cut preserves the path rather than destroying it.)
+    if (vi.path.kind == PathKind::Complex && vi.path.nodes.size() >= 2)
+    {
+        const glm::vec3 newOrigin(vi.point.worldPos.x, 0.0f, vi.point.worldPos.z);
+        const glm::vec3 delta = newOrigin - vi.path.nodes.front().pos;
+
+        for (PathNode& nd : vi.path.nodes)
+            nd.pos += delta;
+        vi.path.start = vi.path.nodes.front().pos;
+        vi.path.end = vi.path.nodes.back().pos;
+        vi.path.overrunStart = ventOverrunStart;
+        vi.path.overrunEnd = ventOverrunEnd;
+        if (vi.path.smooth)
+            AutoComputeComplexHandles(vi.path);
+
+        vi.Destroy();
+
+        FeaturePath xsPath;
+        xsPath.kind = PathKind::Simple;
+        xsPath.start = vi.path.nodes[0].pos;
+        xsPath.end = vi.path.nodes[1].pos;
+        xsPath.valid = true;
+        vi.crossSection = BuildVentCrossSection(xsPath, ventWidth, ventLength);
+
+        vi.solid = BuildBoxSweepMesh(vi.path, ventWidth, ventLength,
+            ventOverrunStart, ventOverrunEnd);
+        return;
+    }
 
     // Destroy and rebuild the GPU mesh — vi.solid currently references the
     // pre-reanchor geometry which is now stale.

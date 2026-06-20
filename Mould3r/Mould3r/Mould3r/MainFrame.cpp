@@ -18,10 +18,12 @@
 #include "RotateDialog.h"
 #include "TranslateDialog.h"
 #include "ScaleDialog.h"
+#include "PrecisionPlaceDialog.h"
 #include "AppConfig.h"
 #include "MeshImportSettings.h"
 #include "RoundedButton.h"     // rounded button for sidebar / toolbar action buttons
 #include "PerspectiveButton.h" // flat tab-style perspective switch
+#include "VentEditToolbar.h"   // Part 5: floating complex-vent-path toolbar
 #include "WindowEffects.h"     // DWM corner rounding for the main frame
 #include "style.h"
 
@@ -258,6 +260,27 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
         if (m_mouldState == MouldState::Clean)
             m_mouldState = MouldState::Dirty;
         });
+
+    // ---- Part 5: floating complex-vent-path toolbar ------------------------
+    // Created as a SIBLING of the canvas (child of the Prepare page) and raised
+    // above it, then pinned over the viewport by the canvas. A true child of a
+    // wxGLCanvas can be overdrawn by SwapBuffers on some drivers; a raised
+    // sibling clips reliably. Shown only while a vent is being edited.
+    m_ventEditToolbar = new VentEditToolbar(m_preparePage);
+    m_ventEditToolbar->SetOnTool([this](PathEditTool t) {
+        if (m_canvas) m_canvas->SetPathEditTool(t);
+        });
+    m_ventEditToolbar->SetOnSmooth([this](bool on) {
+        if (m_canvas) m_canvas->SetEditVentSmooth(on);
+        });
+    m_ventEditToolbar->SetOnToggleComplex([this](bool wantComplex) {
+        if (!m_canvas) return;
+        if (wantComplex) m_canvas->ConvertEditVentToComplex();
+        else             m_canvas->ConvertEditVentToSimple();
+        });
+    m_canvas->SetPathToolbar(m_ventEditToolbar);
+    m_canvas->SetOnPathEditChanged([this] { UpdateVentEditToolbar(); });
+    UpdateVentEditToolbar();   // initial (hidden) state
 
     contentSizer->Add(m_leftPanel, 0, wxEXPAND);
     contentSizer->Add(m_canvas, 1, wxEXPAND);
@@ -538,6 +561,7 @@ wxPanel* MainFrame::CreateRibbon(wxWindow* parent)
     Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolRotate, this, ID_ToolRotate);
     Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolScale, this, ID_ToolScale);
     Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolPattern, this, ID_ToolPattern);
+    Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolPrecisionPlace, this, ID_ToolPrecisionPlace);
     Bind(wxEVT_BUTTON, &MainFrame::OnToolCenter, this, ID_ToolCenter);
     Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolAlignFace, this, ID_ToolAlignFace);
     Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolAlignMidplane, this, ID_ToolAlignMidplane);
@@ -763,6 +787,41 @@ void MainFrame::OnToolPattern(wxCommandEvent&)
     }
 }
 
+// ---------------------------------------------------------------------------
+// Precision Place — opens a dialog for an absolute XZ target and moves the
+// selection there. A dialog tool (not a placement-mode toggle), so the button
+// clears its toggle the moment the dialog opens, matching Translate/Rotate/
+// Scale/Pattern. Also reachable by double-clicking a body on the canvas.
+// ---------------------------------------------------------------------------
+void MainFrame::OnToolPrecisionPlace(wxCommandEvent&)
+{
+    SetActiveTool(TransformMode::Select);
+    PrecisionPlaceSelected();
+}
+
+void MainFrame::PrecisionPlaceSelected()
+{
+    if (!m_canvas) return;
+
+    // Pre-fill the dialog with the selection's current XZ so the fields show
+    // where the object is now. Falls back to (0, 0) when nothing is selected
+    // (e.g. the button was pressed with an empty selection); the post-OK
+    // HasSelection guard then makes the dialog a no-op, matching the other
+    // transform tools.
+    float curX = 0.0f, curZ = 0.0f;
+    m_canvas->GetSelectionCenterXZ(curX, curZ);
+
+    PrecisionPlaceDialog dlg(this, curX, curZ);
+    if (dlg.ShowModal() != wxID_OK)
+        return;
+
+    if (!m_canvas->HasSelection())
+        return;
+
+    const PrecisionPlaceValues v = dlg.GetValues();
+    m_canvas->MoveSelectionToXZ(v.x, v.z);
+}
+
 void MainFrame::OnToolCenter(wxCommandEvent&)
 {
     if (!m_canvas) return;
@@ -898,6 +957,38 @@ void MainFrame::OnEditVent(wxCommandEvent&)
         SetActiveTool(TransformMode::Select);
     else
         SetActiveTool(TransformMode::EditVent);
+}
+
+// ---------------------------------------------------------------------------
+// UpdateVentEditToolbar — sync the floating toolbar to the canvas's current
+// vent-edit state. Bound to the canvas path-edit-changed hook, so it fires on
+// mode changes, vent (de)selection, Simple<->Complex conversion, smooth toggle,
+// and node add / remove.
+// ---------------------------------------------------------------------------
+void MainFrame::UpdateVentEditToolbar()
+{
+    if (!m_canvas || !m_ventEditToolbar) return;
+
+    if (m_canvas->IsEditingVent())
+    {
+        // Visible as soon as Edit Vent mode is entered — even with nothing
+        // selected — so Add Node (which snaps onto any path) is reachable and
+        // the tools are discoverable. Per-cell enabling reflects the selection.
+        m_ventEditToolbar->Configure(
+            m_canvas->HasEditVentSelected(),
+            m_canvas->IsEditVentComplex(),
+            m_canvas->IsEditVentSmooth(),
+            m_canvas->EditVentNodeCount(),
+            m_canvas->GetPathEditTool());
+        if (!m_ventEditToolbar->IsShown())
+            m_ventEditToolbar->Show();
+        m_ventEditToolbar->Raise();   // keep above the GL surface
+    }
+    else
+    {
+        if (m_ventEditToolbar->IsShown())
+            m_ventEditToolbar->Hide();
+    }
 }
 
 void MainFrame::OnEditRunner(wxCommandEvent&)
@@ -1502,6 +1593,27 @@ void MainFrame::OnSaveProject(wxCommandEvent&)
         pv.parentIndex = vi.parentIndex;
         pv.localPos = vi.localPos;
         pv.localNormal = vi.localNormal;
+
+        // Persist an authored complex path verbatim; simple paths re-derive.
+        if (vi.path.kind == PathKind::Complex)
+        {
+            pv.isComplex = true;
+            pv.smooth = vi.path.smooth;
+            pv.nodes.reserve(vi.path.nodes.size());
+            for (const auto& n : vi.path.nodes)
+            {
+                ProjectPathNode pn;
+                pn.pos = n.pos;
+                pn.dir = n.dir;
+                pn.handleLen = n.handleLen;
+                pn.handleIn = n.handleIn;
+                pn.handleOut = n.handleOut;
+                pn.handlesLinked = n.handlesLinked;
+                pn.handlesManual = n.handlesManual;
+                pv.nodes.push_back(pn);
+            }
+        }
+
         data.vents.push_back(pv);
     }
 
@@ -1619,12 +1731,39 @@ void MainFrame::OnLoadProject(wxCommandEvent&)
     // ---- Restore vents -----------------------------------------------------
     for (const auto& vn : data.vents)
     {
-        m_canvas->RestoreVent(vn.pos, vn.normal,
-            data.params.ventWidth,
-            data.params.ventLength,
-            data.params.ventOverrunStart,
-            data.params.ventOverrunEnd,
-            vn.parentIndex, vn.localPos, vn.localNormal);
+        if (vn.isComplex && vn.nodes.size() >= 2)
+        {
+            std::vector<PathNode> nodes;
+            nodes.reserve(vn.nodes.size());
+            for (const auto& pn : vn.nodes)
+            {
+                PathNode nd;
+                nd.pos = pn.pos;
+                nd.dir = pn.dir;
+                nd.handleLen = pn.handleLen;
+                nd.handleIn = pn.handleIn;
+                nd.handleOut = pn.handleOut;
+                nd.handlesLinked = pn.handlesLinked;
+                nd.handlesManual = pn.handlesManual;
+                nodes.push_back(nd);
+            }
+
+            m_canvas->RestoreVentComplex(vn.pos, vn.normal, nodes, vn.smooth,
+                data.params.ventWidth,
+                data.params.ventLength,
+                data.params.ventOverrunStart,
+                data.params.ventOverrunEnd,
+                vn.parentIndex, vn.localPos, vn.localNormal);
+        }
+        else
+        {
+            m_canvas->RestoreVent(vn.pos, vn.normal,
+                data.params.ventWidth,
+                data.params.ventLength,
+                data.params.ventOverrunStart,
+                data.params.ventOverrunEnd,
+                vn.parentIndex, vn.localPos, vn.localNormal);
+        }
     }
 
     // ---- Restore ejectors --------------------------------------------------
@@ -2888,6 +3027,7 @@ wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
         static const wxString kIconRotate = "res/icons/rotate-2.svg";
         static const wxString kIconScale = "res/icons/resize.svg";
         static const wxString kIconPattern = "res/icons/pattern.svg";
+        static const wxString kIconPrecisionPlace = "";
         static const wxString kIconCenter = "res/icons/focus-centered.svg";
         static const wxString kIconAlignFace = "res/icons/align-face.svg";
         static const wxString kIconAlignMidplane = "res/icons/align-midplane.svg";
@@ -3108,6 +3248,17 @@ wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
         toolsRow2->Add(makeToolBtn(ID_ToolCenter, "Center", false, kIconCenter), 0, wxEXPAND);
         toolsRow2->Add(makeToolBtn(ID_ToolPattern, "Pattern", true, kIconPattern), 0, wxEXPAND);
         toolsSizer->Add(toolsRow2, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
+        toolsSizer->AddSpacer(4);
+
+        // Row 3 — Precision Place on its own full-width row. The label is too
+        // long to share a half/third with another tool, and it reads as a
+        // distinct "type an exact XZ target" action rather than a modal grab.
+        // Built toggle-style like the other transform dialogs so it gets the
+        // same press feedback; OnToolPrecisionPlace clears the toggle as soon
+        // as the dialog opens.
+        auto* toolsRow3 = new wxGridSizer(1, 1, 0, 4);
+        toolsRow3->Add(makeToolBtn(ID_ToolPrecisionPlace, "Precision Place", true), 0, wxEXPAND);
+        toolsSizer->Add(toolsRow3, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
 
         toolsSizer->AddSpacer(14);  // gap before the next subsection header
 

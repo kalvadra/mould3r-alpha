@@ -88,7 +88,7 @@ bool ProjectFile::Save(const std::string& path,
     // for sticky-placement (vents and gates track their parent objects through
     // transforms and patterning). v1 files round-trip cleanly: missing keys
     // load as parentIndex=-1 (unparented), preserving the old behaviour.
-    file << "version = 2\n";
+    file << "version = 3\n";
     if (!data.fixturePath.empty())
         file << "fixture = " << MakeRelative(data.fixturePath, baseDir) << "\n";
 
@@ -208,6 +208,29 @@ bool ProjectFile::Save(const std::string& path,
         file << "localNormalX = " << vn.localNormal.x << "\n";
         file << "localNormalY = " << vn.localNormal.y << "\n";
         file << "localNormalZ = " << vn.localNormal.z << "\n";
+
+        // Complex (authored) path (v3+). Simple vents write nothing extra and
+        // re-derive on load exactly as before. A complex path is dumped as its
+        // node list — one line per node, in order — plus the kind/smooth flags.
+        // Layout: "node = px py pz dx dy dz handleLen | hInxyz hOutxyz linked manual".
+        // The trailing handle tokens are v4+; v3 readers / files stop after
+        // handleLen and the defaults cover the rest.
+        if (vn.isComplex)
+        {
+            file << "pathKind = complex\n";
+            file << "smooth   = " << (vn.smooth ? "true" : "false") << "\n";
+            for (const auto& nd : vn.nodes)
+            {
+                file << "node = "
+                    << nd.pos.x << " " << nd.pos.y << " " << nd.pos.z << " "
+                    << nd.dir.x << " " << nd.dir.y << " " << nd.dir.z << " "
+                    << nd.handleLen << " "
+                    << nd.handleIn.x << " " << nd.handleIn.y << " " << nd.handleIn.z << " "
+                    << nd.handleOut.x << " " << nd.handleOut.y << " " << nd.handleOut.z << " "
+                    << (nd.handlesLinked ? 1 : 0) << " "
+                    << (nd.handlesManual ? 1 : 0) << "\n";
+            }
+        }
     }
 
     // -- [ejector.N] ---------------------------------------------------------
@@ -408,6 +431,27 @@ bool ProjectFile::Load(const std::string& path,
             else if (key == "localNormalX") pendingVent.localNormal.x = ParseFloat(val, 0.0f);
             else if (key == "localNormalY") pendingVent.localNormal.y = ParseFloat(val, 0.0f);
             else if (key == "localNormalZ") pendingVent.localNormal.z = ParseFloat(val, 1.0f);
+            // v3 complex-path keys. Absent in older files / simple vents, so
+            // isComplex defaults false and the path is re-derived as before.
+            else if (key == "pathKind") pendingVent.isComplex = (val == "complex");
+            else if (key == "smooth")   pendingVent.smooth = ParseBool(val);
+            else if (key == "node")
+            {
+                // "px py pz dx dy dz handleLen [hInxyz hOutxyz linked manual]".
+                // The bracketed tokens are v4+; on a v3 line those extractions
+                // fail and the DTO defaults (zero handles, linked, not manual)
+                // stand — the loader re-derives handles from dir/handleLen.
+                std::istringstream iss(val);
+                ProjectPathNode pn;
+                iss >> pn.pos.x >> pn.pos.y >> pn.pos.z
+                    >> pn.dir.x >> pn.dir.y >> pn.dir.z >> pn.handleLen;
+                iss >> pn.handleIn.x >> pn.handleIn.y >> pn.handleIn.z
+                    >> pn.handleOut.x >> pn.handleOut.y >> pn.handleOut.z;
+                int linked = 1, manual = 0;
+                if (iss >> linked) pn.handlesLinked = (linked != 0);
+                if (iss >> manual) pn.handlesManual = (manual != 0);
+                pendingVent.nodes.push_back(pn);
+            }
             break;
 
         case Section::Ejector:

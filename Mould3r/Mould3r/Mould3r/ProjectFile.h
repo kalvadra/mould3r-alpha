@@ -55,6 +55,23 @@ struct ProjectGateData
     glm::vec3 localNormal{ 0.0f, 0.0f, 1.0f };
 };
 
+// One control point of a vent's complex (authored) path (v3+). Mirrors the
+// engine's PathNode but kept independent so the serialization layer carries no
+// dependency on the geometry/GL headers.
+struct ProjectPathNode
+{
+    glm::vec3 pos{ 0.0f };
+    glm::vec3 dir{ 0.0f, 0.0f, 1.0f };
+    float     handleLen = 0.0f;
+    // v4+: explicit independent tangent handles (offsets from pos). Older files
+    // omit these tokens on the node line; defaults below preserve the v3
+    // symmetric behaviour (handles get re-derived from dir/handleLen on load).
+    glm::vec3 handleIn{ 0.0f };
+    glm::vec3 handleOut{ 0.0f };
+    bool      handlesLinked = true;
+    bool      handlesManual = false;
+};
+
 struct ProjectVentData
 {
     glm::vec3 pos{ 0.0f };
@@ -64,6 +81,15 @@ struct ProjectVentData
     int       parentIndex = -1;
     glm::vec3 localPos{ 0.0f };
     glm::vec3 localNormal{ 0.0f, 0.0f, 1.0f };
+
+    // Complex-path persistence (v3+). isComplex=false → the historical derived
+    // Simple path, re-routed on load via ComputeVentPath (so old files and
+    // simple vents need none of the fields below). When true, `nodes` (>= 2
+    // entries, authored on the parting plane) and `smooth` fully describe the
+    // path — it cannot be re-derived, so it must round-trip verbatim.
+    bool      isComplex = false;
+    bool      smooth = false;
+    std::vector<ProjectPathNode> nodes;
 };
 
 // Ejectors carry only a world-space point at present — no normal (none of the
