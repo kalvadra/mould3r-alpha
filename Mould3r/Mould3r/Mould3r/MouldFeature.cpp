@@ -224,26 +224,36 @@ std::vector<PathStation> SamplePath(const FeaturePath& path, float spacing)
 
     if (!path.smooth)
     {
-        // Straight A->B->C polyline through the node positions. Interior nodes
-        // are mitered (ring oriented to the averaged tangent) so the swept box
-        // bends through a corner without tearing.
+        // Straight A->B->C polyline, but emitted as one INDEPENDENT run per
+        // segment rather than a single mitered chain. Each leg gets two
+        // stations — both square to that leg's own direction — so the swept
+        // box keeps a constant cross-section the whole way down the leg and
+        // never shears or changes width through a corner. The first station of
+        // every leg is flagged `startsRun`, so the sweeper caps each leg
+        // separately instead of trying to bridge the orientation change at a
+        // node. (Adjacent legs therefore leave a small wedge of empty space on
+        // the outside of each bend; that gap is filled in a later step.)
         const int n = (int)nodes.size();
-        for (int i = 0; i < n; ++i)
+        for (int seg = 0; seg + 1 < n; ++seg)
         {
-            glm::vec3 inDir(0.0f), outDir(0.0f);
-            if (i > 0)     inDir = SafeNormalize(nodes[i].pos - nodes[i - 1].pos, glm::vec3(0.0f));
-            if (i < n - 1) outDir = SafeNormalize(nodes[i + 1].pos - nodes[i].pos, glm::vec3(0.0f));
+            const glm::vec3 d = nodes[seg + 1].pos - nodes[seg].pos;
+            if (glm::length(glm::vec3(d.x, 0.0f, d.z)) < 1e-6f) continue; // skip degenerate leg
+            const glm::vec3 fwd = inPlaneTangent(d);
+            const glm::vec3 side = SideAxisOf(fwd);
 
-            glm::vec3 t;
-            if (i == 0)          t = outDir;
-            else if (i == n - 1) t = inDir;
-            else                 t = SafeNormalize(inDir + outDir, outDir); // miter
+            PathStation a;
+            a.pos = nodes[seg].pos;
+            a.tangent = fwd;
+            a.sideAxis = side;
+            a.startsRun = true;            // open a fresh prism for this leg
 
-            PathStation s;
-            s.pos = nodes[i].pos;
-            s.tangent = inPlaneTangent(t);
-            s.sideAxis = SideAxisOf(s.tangent);
-            out.push_back(s);
+            PathStation b;
+            b.pos = nodes[seg + 1].pos;
+            b.tangent = fwd;
+            b.sideAxis = side;             // same orientation along the whole leg
+
+            out.push_back(a);
+            out.push_back(b);
         }
         return out;
     }
@@ -409,29 +419,120 @@ SolidMesh BuildBoxSweepMesh(const FeaturePath& path, float width, float depth,
             idx.push_back(base + 0); idx.push_back(base + 2); idx.push_back(base + 3);
         };
 
-    // Start cap — faces backward along the first station's tangent.
-    const auto firstRing = ringOf(stations.front());
-    addQuad(firstRing[0], firstRing[3], firstRing[2], firstRing[1],
-        -stations.front().tangent);
+    // A joint fills the corner where two legs meet: the rectangular section
+    // revolved 360 degrees about the vertical (Y) axis through the node. For a
+    // rectangle that revolution is a cylinder of radius hw (half-width) and
+    // height 2*hd (full depth), centred on the node. Being rotationally
+    // symmetric it meets both legs flush at any bend angle and fills the open
+    // wedge the per-leg prisms leave on the outside of the corner. Round-shaded
+    // sides, flat caps.
+    const int kJointSegments = 24;
+    auto addJoint = [&](const glm::vec3& centre)
+        {
+            const glm::vec3 e1(1.0f, 0.0f, 0.0f);
+            const glm::vec3 e2(0.0f, 0.0f, 1.0f);
+            const glm::vec3 top = centre + upAxis * hd;
+            const glm::vec3 bot = centre - upAxis * hd;
 
-    // Side walls — four quads per segment between consecutive stations. For a
-    // Simple path (one segment) these are exactly the old bottom/right/top/left.
-    for (size_t i = 0; i + 1 < stations.size(); ++i)
+            auto pv = [&](const glm::vec3& p, const glm::vec3& nrm)
+                {
+                    verts.push_back(p.x); verts.push_back(p.y); verts.push_back(p.z);
+                    verts.push_back(nrm.x); verts.push_back(nrm.y); verts.push_back(nrm.z);
+                };
+
+            // Side wall - bottom ring then top ring, radial (round) normals.
+            const uint32_t sideBase = (uint32_t)(verts.size() / 6);
+            for (int ring = 0; ring < 2; ++ring)
+            {
+                const glm::vec3 c = (ring == 0) ? bot : top;
+                for (int i = 0; i < kJointSegments; ++i)
+                {
+                    const float th =
+                        (float(i) / float(kJointSegments)) * glm::two_pi<float>();
+                    const glm::vec3 radial = std::cos(th) * e1 + std::sin(th) * e2;
+                    pv(c + radial * hw, radial);
+                }
+            }
+            for (int i = 0; i < kJointSegments; ++i)
+            {
+                const uint32_t b0 = sideBase + (uint32_t)i;
+                const uint32_t b1 = sideBase + (uint32_t)((i + 1) % kJointSegments);
+                const uint32_t t0 = sideBase + (uint32_t)(kJointSegments + i);
+                const uint32_t t1 =
+                    sideBase + (uint32_t)(kJointSegments + (i + 1) % kJointSegments);
+                idx.push_back(b0); idx.push_back(b1); idx.push_back(t1);
+                idx.push_back(b0); idx.push_back(t1); idx.push_back(t0);
+            }
+
+            // Caps - flat disks closing the top and bottom of the joint.
+            auto addCap = [&](const glm::vec3& c, const glm::vec3& nrm)
+                {
+                    const uint32_t centreIdx = (uint32_t)(verts.size() / 6);
+                    pv(c, nrm);
+                    const uint32_t rimBase = (uint32_t)(verts.size() / 6);
+                    for (int i = 0; i < kJointSegments; ++i)
+                    {
+                        const float th =
+                            (float(i) / float(kJointSegments)) * glm::two_pi<float>();
+                        const glm::vec3 radial =
+                            std::cos(th) * e1 + std::sin(th) * e2;
+                        pv(c + radial * hw, nrm);
+                    }
+                    for (int i = 0; i < kJointSegments; ++i)
+                    {
+                        const uint32_t r0 = rimBase + (uint32_t)i;
+                        const uint32_t r1 =
+                            rimBase + (uint32_t)((i + 1) % kJointSegments);
+                        idx.push_back(centreIdx); idx.push_back(r0); idx.push_back(r1);
+                    }
+                };
+            addCap(top, upAxis);
+            addCap(bot, -upAxis);
+        };
+
+    // Sweep each run as its own capped prism. A run break (`startsRun`, plus
+    // the implicit run start at index 0) is where one swept piece ends and the
+    // next begins: we cap the start of a run, connect side walls only between
+    // stations that belong to the SAME run, and cap the end of a run. For a
+    // Simple or smooth-complex path the whole station list is one run, so this
+    // reduces to exactly the old start-cap / side-walls / end-cap and the mesh
+    // is unchanged. A straight complex path is one run per leg, so each leg
+    // comes out as an independent constant-width box.
+    const size_t N = stations.size();
+    for (size_t i = 0; i < N; ++i)
     {
+        const bool runStart = (i == 0) || stations[i].startsRun;
+        const bool runEnd   = (i + 1 >= N) || stations[i + 1].startsRun;
+
         const auto A = ringOf(stations[i]);
-        const auto B = ringOf(stations[i + 1]);
-        const glm::vec3 side = stations[i].sideAxis;
 
-        addQuad(A[0], A[1], B[1], B[0], -upAxis);   // bottom
-        addQuad(A[1], A[2], B[2], B[1], side);      // right
-        addQuad(A[2], A[3], B[3], B[2], upAxis);    // top
-        addQuad(A[3], A[0], B[0], B[3], -side);     // left
+        // Start cap — faces backward along this run's leading tangent.
+        if (runStart)
+            addQuad(A[0], A[3], A[2], A[1], -stations[i].tangent);
+
+        // Side walls to the next station, but only within the same run.
+        if (!runEnd)
+        {
+            const auto B = ringOf(stations[i + 1]);
+            const glm::vec3 side = stations[i].sideAxis;
+
+            addQuad(A[0], A[1], B[1], B[0], -upAxis);   // bottom
+            addQuad(A[1], A[2], B[2], B[1], side);      // right
+            addQuad(A[2], A[3], B[3], B[2], upAxis);    // top
+            addQuad(A[3], A[0], B[0], B[3], -side);     // left
+        }
+
+        // End cap — faces forward along this run's trailing tangent.
+        if (runEnd)
+            addQuad(A[0], A[1], A[2], A[3], stations[i].tangent);
+
+        // Interior node (an internal run boundary): drop a revolved joint so
+        // the two legs meet through a filled, rounded corner. Endpoints - the
+        // start of the first run and the end of the last - are not run
+        // boundaries, so they keep their square caps.
+        if (runEnd && (i + 1 < N))
+            addJoint(stations[i].pos);
     }
-
-    // End cap — faces forward along the last station's tangent.
-    const auto lastRing = ringOf(stations.back());
-    addQuad(lastRing[0], lastRing[1], lastRing[2], lastRing[3],
-        stations.back().tangent);
 
     // ---- Upload to GPU ----
     glGenVertexArrays(1, &solid.vao);

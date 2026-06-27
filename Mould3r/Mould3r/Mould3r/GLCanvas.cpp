@@ -1408,28 +1408,34 @@ void GLCanvas::ClearSprue()
 }
 
 // ---------------------------------------------------------------------------
-// BuildVentCutTool — produce the solid to subtract for one vent.
+// BuildVentCutPieces - produce the independent solids to subtract for one vent.
 //
-//   Simple path  : a single straight prism — identical to the original cut
-//                  (cross-section face shifted back by overrunStart, then
-//                  extruded along the path by rawLen + overruns).
-//   Complex path : loft a solid through the per-station cross-section rings
-//                  from SamplePath, so the cut follows the same route the
-//                  preview sweep draws. ThruSections (ruled, solid) is the OCC
-//                  analog of the preview's ring-to-ring quad strip: it connects
-//                  corresponding corners of consecutive rings and caps the
-//                  ends. Chosen over BRepOffsetAPI_MakePipeShell — faceted like
-//                  the preview, robust on tight bends, and preview==cut by
-//                  construction. (A pipe-shell along a BSpline spine could give
-//                  smoother cut walls on smooth paths later if wanted.)
+//   Simple path        : one straight prism (cross-section face shifted back by
+//                        overrunStart, extruded by rawLen + overruns) - the
+//                        original cut, unchanged.
+//   Smooth complex path : one ThruSections loft over the sampled rings (a single
+//                        genuinely-curved run).
+//   Non-smooth complex  : one straight prism PER LEG, each built with the very
+//                        same MakePrism the Simple path uses (every leg is a
+//                        square-ended box), PLUS one revolved joint cylinder per
+//                        interior node. Every piece is subtracted from the blank
+//                        independently by the caller - NO ThruSections and NO
+//                        Fuse on the straight path, so a bent vent cuts exactly
+//                        as reliably as a simple one and follows the runner /
+//                        gate / ejector pattern. (Lofting + fusing square-ended
+//                        legs that meet only along a corner edge was the fragile
+//                        step that made bent vents fail to cut.)
 //
-// Returns a null shape on any failure; the caller skips the cut and warns.
+// Fills outPieces and returns true if at least one valid piece was produced;
+// false means there is nothing to cut (the caller warns and skips).
 // ---------------------------------------------------------------------------
-static TopoDS_Shape BuildVentCutTool(const VentInstance& vent)
+static bool BuildVentCutPieces(const VentInstance& vent,
+                               std::vector<TopoDS_Shape>& outPieces)
 {
+    outPieces.clear();
     const VentCrossSection& xs = vent.crossSection;
     const FeaturePath& vp = vent.path;
-    if (!xs.valid || !vp.valid) return TopoDS_Shape();
+    if (!xs.valid || !vp.valid) return false;
 
     auto toOCC = [](const glm::vec3& v) { return gp_Pnt(v.x, v.y, v.z); };
 
@@ -1446,19 +1452,19 @@ static TopoDS_Shape BuildVentCutTool(const VentInstance& vent)
         BRepBuilderAPI_MakeEdge e2(p2, p3);
         BRepBuilderAPI_MakeEdge e3(p3, p0);
         if (!e0.IsDone() || !e1.IsDone() || !e2.IsDone() || !e3.IsDone())
-            return TopoDS_Shape();
+            return false;
 
         BRepBuilderAPI_MakeWire wire;
         wire.Add(e0.Edge()); wire.Add(e1.Edge());
         wire.Add(e2.Edge()); wire.Add(e3.Edge());
-        if (!wire.IsDone()) return TopoDS_Shape();
+        if (!wire.IsDone()) return false;
 
         BRepBuilderAPI_MakeFace face(wire.Wire(), /*onlyPlane=*/true);
-        if (!face.IsDone()) return TopoDS_Shape();
+        if (!face.IsDone()) return false;
 
         const glm::vec3 rawSweep = vp.end - vp.start;
         const float     rawLen = glm::length(rawSweep);
-        if (rawLen < 1e-6f) return TopoDS_Shape();
+        if (rawLen < 1e-6f) return false;
         const glm::vec3 sweepDir = rawSweep / rawLen;
 
         const glm::vec3 originOffset = -sweepDir * vp.overrunStart;
@@ -1472,62 +1478,134 @@ static TopoDS_Shape BuildVentCutTool(const VentInstance& vent)
         const gp_Vec    sweepVec(totalSweep.x, totalSweep.y, totalSweep.z);
 
         BRepPrimAPI_MakePrism prism(offsetFace, sweepVec);
-        if (!prism.IsDone() || prism.Shape().IsNull()) return TopoDS_Shape();
-        return prism.Shape();
+        if (!prism.IsDone() || prism.Shape().IsNull()) return false;
+        outPieces.push_back(prism.Shape());
+        return true;
     }
 
-    // ---- Complex: loft through the sampled cross-section rings -------------
+    // ---- Complex: sample the route, recover the profile half-extents --------
     std::vector<PathStation> stations = SamplePath(vp);
-    if (stations.size() < 2) return TopoDS_Shape();
+    if (stations.size() < 2) return false;
 
-    // Extend the ends past the surface, same as the preview and Simple prism.
+    // Extend the very first / very last station past the surface, same as the
+    // preview sweep and the Simple prism.
     stations.front().pos -= stations.front().tangent * vp.overrunStart;
-    stations.back().pos += stations.back().tangent * vp.overrunEnd;
+    stations.back().pos  += stations.back().tangent  * vp.overrunEnd;
 
-    // Recover the rectangular profile half-extents from the baked cross-section
-    // (symmetric, so the sideAxis sign is irrelevant) so the swept tube matches
-    // whatever width/depth the vent was built with — and the preview.
-    const float hw = 0.5f * glm::length(xs.corners[1] - xs.corners[0]); // along sideAxis
-    const float hd = 0.5f * glm::length(xs.corners[3] - xs.corners[0]); // along +Y
+    // Half-extents from the baked cross-section (symmetric, so the sideAxis sign
+    // is irrelevant) so the cut matches whatever width/depth the vent was built
+    // with - and the preview.
+    const float hw = 0.5f * glm::length(xs.corners[1] - xs.corners[0]); // sideAxis
+    const float hd = 0.5f * glm::length(xs.corners[3] - xs.corners[0]); // +Y
     const glm::vec3 up(0.0f, 1.0f, 0.0f);
 
-    BRepOffsetAPI_ThruSections gen(true /*isSolid*/, true /*ruled*/);
-
-    int       added = 0;
-    bool      havePrev = false;
-    glm::vec3 prevPos(0.0f);
-    for (const PathStation& s : stations)
+    // One rectangular section wire for a station.
+    auto sectionWire = [&](const PathStation& st, TopoDS_Wire& outWire) -> bool
     {
-        // Coincident stations make duplicate section wires, which ThruSections
-        // rejects — skip them.
-        if (havePrev && glm::length(s.pos - prevPos) < 1e-5f) continue;
-
-        const glm::vec3 c0 = s.pos - s.sideAxis * hw - up * hd;
-        const glm::vec3 c1 = s.pos + s.sideAxis * hw - up * hd;
-        const glm::vec3 c2 = s.pos + s.sideAxis * hw + up * hd;
-        const glm::vec3 c3 = s.pos - s.sideAxis * hw + up * hd;
+        const glm::vec3 c0 = st.pos - st.sideAxis * hw - up * hd;
+        const glm::vec3 c1 = st.pos + st.sideAxis * hw - up * hd;
+        const glm::vec3 c2 = st.pos + st.sideAxis * hw + up * hd;
+        const glm::vec3 c3 = st.pos - st.sideAxis * hw + up * hd;
 
         BRepBuilderAPI_MakeEdge e0(toOCC(c0), toOCC(c1));
         BRepBuilderAPI_MakeEdge e1(toOCC(c1), toOCC(c2));
         BRepBuilderAPI_MakeEdge e2(toOCC(c2), toOCC(c3));
         BRepBuilderAPI_MakeEdge e3(toOCC(c3), toOCC(c0));
-        if (!e0.IsDone() || !e1.IsDone() || !e2.IsDone() || !e3.IsDone()) continue;
+        if (!e0.IsDone() || !e1.IsDone() || !e2.IsDone() || !e3.IsDone()) return false;
 
         BRepBuilderAPI_MakeWire w;
         w.Add(e0.Edge()); w.Add(e1.Edge());
         w.Add(e2.Edge()); w.Add(e3.Edge());
-        if (!w.IsDone()) continue;
+        if (!w.IsDone()) return false;
+        outWire = w.Wire();
+        return true;
+    };
 
-        gen.AddWire(w.Wire());
-        ++added;
-        havePrev = true;
-        prevPos = s.pos;
+    // ---- Smooth: one ruled ThruSections loft over all rings (single run) ----
+    if (vp.smooth)
+    {
+        std::vector<TopoDS_Wire> wires;
+        bool havePrev = false; glm::vec3 prevPos(0.0f);
+        for (const PathStation& st : stations)
+        {
+            if (havePrev && glm::length(st.pos - prevPos) < 1e-5f) continue;
+            TopoDS_Wire w;
+            if (!sectionWire(st, w)) continue;
+            wires.push_back(w);
+            havePrev = true; prevPos = st.pos;
+        }
+        if (wires.size() < 2) return false;
+
+        BRepOffsetAPI_ThruSections gen(true /*isSolid*/, true /*ruled*/);
+        for (const TopoDS_Wire& w : wires) gen.AddWire(w);
+        gen.Build();
+        if (!gen.IsDone() || gen.Shape().IsNull()) return false;
+        outPieces.push_back(gen.Shape());
+        return true;
     }
-    if (added < 2) return TopoDS_Shape();
 
-    gen.Build();
-    if (!gen.IsDone() || gen.Shape().IsNull()) return TopoDS_Shape();
-    return gen.Shape();
+    // ---- Non-smooth: one straight prism per leg + a joint per interior node --
+    // Every leg is a square-ended box, so extrude its start section straight to
+    // the leg's end with the same MakePrism the Simple path uses. Each leg (and
+    // each joint) is an independent piece - no loft, no fuse. A run is the block
+    // of stations from one startsRun to the next; for a straight path that is
+    // exactly the two endpoints of one leg.
+    std::vector<glm::vec3> jointCentres;   // interior nodes -> revolved joints
+    const size_t N = stations.size();
+    size_t i = 0;
+    while (i < N)
+    {
+        size_t j = i + 1;
+        while (j < N && !stations[j].startsRun) ++j;   // run = [i, j)
+
+        const PathStation& A = stations[i];        // leg start (square to leg)
+        const PathStation& B = stations[j - 1];    // leg end
+        const glm::vec3 sweep = B.pos - A.pos;
+        if (glm::length(sweep) > 1e-6f)
+        {
+            TopoDS_Wire w;
+            if (sectionWire(A, w))
+            {
+                BRepBuilderAPI_MakeFace face(w, /*onlyPlane=*/true);
+                if (face.IsDone())
+                {
+                    const gp_Vec sv(sweep.x, sweep.y, sweep.z);
+                    BRepPrimAPI_MakePrism prism(face.Face(), sv);
+                    if (prism.IsDone() && !prism.Shape().IsNull())
+                        outPieces.push_back(prism.Shape());
+                }
+            }
+        }
+
+        if (j < N) jointCentres.push_back(B.pos);  // shared interior node
+        i = j;
+    }
+
+    // Joint at each interior corner: the rectangular section revolved 360 deg
+    // about the vertical (Y) axis through the node - a cylinder of radius hw and
+    // height 2*hd, centred on the node (the same MakeCylinder the runners use).
+    // Grown a hair (radius +kJointRadEps, ~invisible next to the preview, and
+    // +kJointAxEps each end to protrude through) so the cut crosses cleanly and
+    // leaves no sliver at the corner. (If the cross-section ever stops being
+    // rectangular, swap this for a BRepPrimAPI_MakeRevol of the half-profile.)
+    if (hw > 1e-6f && hd > 1e-6f)
+    {
+        const float kJointRadEps = 0.01f;
+        const float kJointAxEps  = 0.10f;
+        const float jr = hw + kJointRadEps;
+        const float jh = 2.0f * hd + 2.0f * kJointAxEps;
+        for (const glm::vec3& c : jointCentres)
+        {
+            const gp_Ax2 jointAx(gp_Pnt(c.x, c.y - hd - kJointAxEps, c.z),
+                                 gp_Dir(0.0, 1.0, 0.0));
+            BRepPrimAPI_MakeCylinder jcyl(jointAx, jr, jh);
+            jcyl.Build();   // MakeCylinder is lazy - without this Shape() is null
+            if (jcyl.IsDone() && !jcyl.Shape().IsNull())
+                outPieces.push_back(jcyl.Shape());
+        }
+    }
+
+    return !outPieces.empty();
 }
 
 // ---------------------------------------------------------------------------
@@ -1682,26 +1760,33 @@ bool GLCanvas::GenerateMould()
 
             if (!vent.crossSection.valid || !vent.path.valid) continue;
 
-            // Build the cut solid for this vent. Simple paths give the original
-            // straight prism; complex paths loft along the sampled route so the
-            // cut matches the swept preview.
-            const TopoDS_Shape cutTool = BuildVentCutTool(vent);
-            if (cutTool.IsNull())
+            // Build the independent solids to subtract for this vent: a simple
+            // prism, a smooth loft, or per-leg prisms + corner joints. Each is
+            // cut from the blank on its own (no fused tool), so one bad leg or
+            // corner can never drop the rest of the vent.
+            std::vector<TopoDS_Shape> ventPieces;
+            if (!BuildVentCutPieces(vent, ventPieces) || ventPieces.empty())
             {
                 wxMessageBox("Vent cut tool build failed for vent " + std::to_string(vi + 1),
                     "Generate Mould", wxOK | wxICON_WARNING, this);
                 continue;
             }
 
-            BRepAlgoAPI_Cut ventCut(result, cutTool);
-            ventCut.Build();
-            if (!ventCut.IsDone() || ventCut.Shape().IsNull())
+            bool anyVentCut = false;
+            for (const TopoDS_Shape& piece : ventPieces)
             {
+                if (piece.IsNull()) continue;
+                BRepAlgoAPI_Cut ventCut(result, piece);
+                ventCut.Build();
+                if (ventCut.IsDone() && !ventCut.Shape().IsNull())
+                {
+                    result = ventCut.Shape();
+                    anyVentCut = true;
+                }
+            }
+            if (!anyVentCut)
                 wxMessageBox("Vent cut failed for vent " + std::to_string(vi + 1),
                     "Generate Mould", wxOK | wxICON_WARNING, this);
-                continue;
-            }
-            result = ventCut.Shape();
         }
 
         // Steps: subtract each runner (cylinder from sprue parting point to runner point)
@@ -6152,65 +6237,6 @@ void GLCanvas::OnPaint(wxPaintEvent&)
                 glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
             }
 
-            // Part 5: node handles for the vent being edited (Complex only).
-            // Origin = cyan, endpoint = orange, interior = white; the node
-            // currently grabbed for dragging pulses brighter. Markers are
-            // slightly smaller than the vent point so they read as sub-handles.
-            if (m_transformMode == TransformMode::EditVent &&
-                m_editFeatureIndex >= 0 && m_editFeatureIndex < (int)m_vents.size() &&
-                m_vents[m_editFeatureIndex].path.kind == PathKind::Complex)
-            {
-                const std::vector<PathNode>& nodes =
-                    m_vents[m_editFeatureIndex].path.nodes;
-                const int last = (int)nodes.size() - 1;
-                const float nodeR = kVentMarkerRadius * 0.7f;
-
-                for (int n = 0; n < (int)nodes.size(); ++n)
-                {
-                    glm::vec3 c(0.95f, 0.95f, 0.95f);        // interior = white
-                    if (n == 0)         c = glm::vec3(0.20f, 0.85f, 0.95f);  // origin = cyan
-                    else if (n == last) c = glm::vec3(1.00f, 0.55f, 0.00f);  // endpoint = orange
-
-                    float scale = nodeR;
-                    if (n == m_editVentNode) { scale = nodeR * 1.35f; }      // grabbed = larger
-
-                    glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &c[0]);
-                    glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 1.0f);
-
-                    glm::mat4 model = glm::translate(glm::mat4(1.0f), nodes[n].pos);
-                    model = glm::scale(model, glm::vec3(scale));
-                    glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &model[0][0]);
-                    glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
-                }
-
-                // Part 6: tangent-handle endpoints (smooth + Move tool only).
-                // Magenta beads at pos+handleIn / pos+handleOut; the grabbed arm
-                // reads larger. Origin shows only its outgoing arm, endpoint only
-                // its incoming arm.
-                if (m_pathEditTool == PathEditTool::Move &&
-                    m_vents[m_editFeatureIndex].path.smooth)
-                {
-                    const float hR = kVentMarkerRadius * 0.5f;
-                    auto drawHandle = [&](int ni, bool isOut, const glm::vec3& at)
-                        {
-                            glm::vec3 c(0.95f, 0.35f, 0.90f);   // magenta
-                            float scale = hR;
-                            if (ni == m_editHandleNode && isOut == m_editHandleIsOut)
-                                scale = hR * 1.4f;
-                            glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &c[0]);
-                            glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 1.0f);
-                            glm::mat4 m = glm::translate(glm::mat4(1.0f), at);
-                            m = glm::scale(m, glm::vec3(scale));
-                            glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &m[0][0]);
-                            glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
-                        };
-                    for (int ni = 0; ni <= last; ++ni)
-                    {
-                        if (ni != 0)    drawHandle(ni, false, nodes[ni].pos + nodes[ni].handleIn);
-                        if (ni != last) drawHandle(ni, true, nodes[ni].pos + nodes[ni].handleOut);
-                    }
-                }
-            }
         }
 
         glBindVertexArray(0);
@@ -6781,6 +6807,85 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         glUseProgram(0);
         glDepthMask(GL_TRUE);
         glDisable(GL_BLEND);
+    }
+
+    // ---- Edit-mode path control points (always-on-top overlay) -------------
+    // Drawn last and with depth testing OFF, so every node of the complex vent
+    // being edited reads clearly the moment edit mode is entered — never hidden
+    // inside the translucent channel (drawn just above) or behind other
+    // geometry. Origin = cyan, endpoint = orange, interior = white; the grabbed
+    // node reads larger. For a smooth path in the Move tool, the magenta
+    // tangent-handle beads ride on top too.
+    if (m_program && m_sphereVAO && m_sphereIndexCount > 0 &&
+        m_transformMode == TransformMode::EditVent &&
+        m_editFeatureIndex >= 0 && m_editFeatureIndex < (int)m_vents.size() &&
+        m_vents[m_editFeatureIndex].path.kind == PathKind::Complex)
+    {
+        const std::vector<PathNode>& nodes =
+            m_vents[m_editFeatureIndex].path.nodes;
+        const int   last = (int)nodes.size() - 1;
+        const float nodeR = kVentMarkerRadius * 0.7f;
+
+        glDisable(GL_DEPTH_TEST);          // overlay — control points never occluded
+        glUseProgram(m_program);
+        glUniform3fv(glGetUniformLocation(m_program, "uCameraPos"), 1, &camPos[0]);
+        glUniform3fv(glGetUniformLocation(m_program, "uLightDir"), 1, &lightDir[0]);
+        glUniform3fv(glGetUniformLocation(m_program, "uLightColor"), 1, &lightColor[0]);
+        glUniform1f(glGetUniformLocation(m_program, "uAmbient"), 0.45f);
+        glUniform1f(glGetUniformLocation(m_program, "uDiffuse"), 0.75f);
+        glUniform1f(glGetUniformLocation(m_program, "uSpecular"), 0.40f);
+        glUniform1f(glGetUniformLocation(m_program, "uShininess"), 32.0f);
+        glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 1.0f);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uView"), 1, GL_FALSE, &view[0][0]);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uProj"), 1, GL_FALSE, &proj[0][0]);
+        glBindVertexArray(m_sphereVAO);
+
+        for (int n = 0; n <= last; ++n)
+        {
+            glm::vec3 c(0.95f, 0.95f, 0.95f);                       // interior = white
+            if (n == 0)         c = glm::vec3(0.20f, 0.85f, 0.95f); // origin = cyan
+            else if (n == last) c = glm::vec3(1.00f, 0.55f, 0.00f); // endpoint = orange
+
+            float scale = nodeR;
+            if (n == m_editVentNode) scale = nodeR * 1.35f;         // grabbed = larger
+
+            glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &c[0]);
+            glm::mat4 model = glm::translate(glm::mat4(1.0f), nodes[n].pos);
+            model = glm::scale(model, glm::vec3(scale));
+            glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &model[0][0]);
+            glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
+        }
+
+        // Tangent-handle endpoints (smooth + Move tool only). Origin shows only
+        // its outgoing arm, endpoint only its incoming arm; the grabbed arm
+        // reads larger.
+        if (m_pathEditTool == PathEditTool::Move &&
+            m_vents[m_editFeatureIndex].path.smooth)
+        {
+            const float     hR = kVentMarkerRadius * 0.5f;
+            const glm::vec3 magenta(0.95f, 0.35f, 0.90f);
+            glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &magenta[0]);
+
+            auto drawHandle = [&](int ni, bool isOut, const glm::vec3& at)
+                {
+                    float scale = hR;
+                    if (ni == m_editHandleNode && isOut == m_editHandleIsOut)
+                        scale = hR * 1.4f;
+                    glm::mat4 m = glm::translate(glm::mat4(1.0f), at);
+                    m = glm::scale(m, glm::vec3(scale));
+                    glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &m[0][0]);
+                    glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
+                };
+            for (int ni = 0; ni <= last; ++ni)
+            {
+                if (ni != 0)    drawHandle(ni, false, nodes[ni].pos + nodes[ni].handleIn);
+                if (ni != last) drawHandle(ni, true, nodes[ni].pos + nodes[ni].handleOut);
+            }
+        }
+
+        glBindVertexArray(0);
+        glUseProgram(0);
+        glEnable(GL_DEPTH_TEST);           // restore for the passes that follow
     }
 
     // ---- Runner solids (lit, semi-transparent blue) -------------------------

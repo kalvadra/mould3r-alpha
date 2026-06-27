@@ -123,15 +123,30 @@ struct PathStation
     glm::vec3 pos{ 0.0f };               // point on the path (parting plane)
     glm::vec3 tangent{ 0.0f, 0.0f, 1.0f };  // unit forward (sweep) direction
     glm::vec3 sideAxis{ 1.0f, 0.0f, 0.0f }; // unit in-plane perpendicular
+
+    // Run boundary. A "run" is one contiguous swept piece: the consumer caps
+    // the start of every run and the end of every run, and only connects walls
+    // between stations WITHIN the same run. `startsRun` marks the first station
+    // of a new run (index 0 is always an implicit run start, whether or not it
+    // is flagged). Simple and smooth-complex paths are a single run (no station
+    // after the first is flagged) so they sweep as one continuous tube exactly
+    // as before. A straight (non-smooth) complex path emits one run PER SEGMENT
+    // — two stations, both square to that segment — so every leg is its own
+    // clean constant-width prism instead of a mitered chain. (The little gaps
+    // that leaves at the outside of each corner are filled in a later step.)
+    bool      startsRun = false;
 };
 
 // Sample a path into an ordered list of stations.
-//   Simple            -> exactly two stations (start, end).
-//   Complex, !smooth  -> one station per node, mitered at interior corners
-//                        (straight A->B->C segments between them).
+//   Simple            -> exactly two stations (start, end); one run.
+//   Complex, !smooth  -> one independent run PER SEGMENT: two stations per leg
+//                        (both square to that leg's direction), flagged with a
+//                        run break so the consumer sweeps each leg as its own
+//                        constant-width prism. No mitering, so thickness never
+//                        balloons or pinches at a corner.
 //   Complex, smooth    -> cubic Bezier per segment from the nodes' symmetric
 //                        tangent handles (dir + handleLen), resampled at
-//                        roughly `spacing` mm by arc length.
+//                        roughly `spacing` mm by arc length; one continuous run.
 // Stations carry no overrun — the start/end overruns are a sweeper concern,
 // applied by the consumer (BuildBoxSweepMesh / the OCC cut), not baked in here.
 // Returns fewer than two stations for a degenerate path (caller treats as
