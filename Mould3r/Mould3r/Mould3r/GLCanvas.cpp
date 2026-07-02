@@ -505,12 +505,12 @@ void GLCanvas::ApplyCircularPattern(int count, bool overrideRadius, float radius
     // Snapshot local placements of seed-parented features. Reading m_vents
     // / m_gates while we push to them would loop indefinitely, so we
     // snapshot first, then push.
-    struct LocalPlacement { glm::vec3 pos; glm::vec3 normal; };
+    struct LocalPlacement { glm::vec3 pos; glm::vec3 normal; FeaturePath path; };
     std::vector<LocalPlacement> seedVentPlacements;
     std::vector<LocalPlacement> seedGatePlacements;
     for (const auto& vi : m_vents)
         if (vi.parentIndex == seedIndex)
-            seedVentPlacements.push_back({ vi.localPos, vi.localNormal });
+            seedVentPlacements.push_back({ vi.localPos, vi.localNormal, vi.path });
     for (const auto& gf : m_gates)
         if (gf.parentIndex == seedIndex)
             seedGatePlacements.push_back({ gf.localPos, gf.localNormal });
@@ -530,6 +530,37 @@ void GLCanvas::ApplyCircularPattern(int count, bool overrideRadius, float radius
             vi.parentIndex = cloneIdx;
             vi.localPos = lp.pos;
             vi.localNormal = lp.normal;
+            vi.path = lp.path;   // carry the authored path so the clone gets a
+                                 // matching feature (simple paths are re-derived
+                                 // by ReanchorVent, so this is a no-op for them).
+
+            // Rotate a complex (authored) path about the world Y origin - the
+            // pattern centre - by this clone's angular offset, so a bent vent
+            // follows the radial arrangement instead of keeping the seed's
+            // orientation. Matches the clone object's own rotation about the
+            // origin. ReanchorVent then shifts the origin onto the clone's vent
+            // point (a near-zero correction) and re-snaps the endpoint.
+            if (vi.path.kind == PathKind::Complex && vi.path.nodes.size() >= 2)
+            {
+                const float a  = dtheta * static_cast<float>(k + 1);
+                const float ca = std::cos(a), sa = std::sin(a);
+                auto rotY = [&](glm::vec3& v)
+                    {
+                        const float x = v.x, z = v.z;
+                        v.x = x * ca - z * sa;
+                        v.z = x * sa + z * ca;
+                    };
+                for (PathNode& nd : vi.path.nodes)
+                {
+                    rotY(nd.pos);
+                    rotY(nd.dir);
+                    rotY(nd.handleIn);
+                    rotY(nd.handleOut);
+                }
+                vi.path.start = vi.path.nodes.front().pos;
+                vi.path.end   = vi.path.nodes.back().pos;
+            }
+
             // World point + GPU mesh built by ReanchorVent below.
             m_vents.push_back(std::move(vi));
         }
@@ -730,12 +761,12 @@ void GLCanvas::ApplyGridPattern(int numH, int numV, bool mirrorH, bool mirrorV,
     const int numClones = numH * numV - 1;
     const int firstCloneIdx = (int)m_objects.size() - numClones;
 
-    struct LocalPlacement { glm::vec3 pos; glm::vec3 normal; };
+    struct LocalPlacement { glm::vec3 pos; glm::vec3 normal; FeaturePath path; };
     std::vector<LocalPlacement> seedVentPlacements;
     std::vector<LocalPlacement> seedGatePlacements;
     for (const auto& vi : m_vents)
         if (vi.parentIndex == seedIndex)
-            seedVentPlacements.push_back({ vi.localPos, vi.localNormal });
+            seedVentPlacements.push_back({ vi.localPos, vi.localNormal, vi.path });
     for (const auto& gf : m_gates)
         if (gf.parentIndex == seedIndex)
             seedGatePlacements.push_back({ gf.localPos, gf.localNormal });
@@ -755,6 +786,11 @@ void GLCanvas::ApplyGridPattern(int numH, int numV, bool mirrorH, bool mirrorV,
             vi.parentIndex = cloneIdx;
             vi.localPos = lp.pos;
             vi.localNormal = lp.normal;
+            // Carry the authored path so the clone gets a matching feature; the
+            // grid is a pure translation, so ReanchorVent's rigid shift lands it
+            // on the clone. (Simple paths are re-derived; a MIRRORED clone with a
+            // complex path is translated but not yet mirrored - a known limit.)
+            vi.path = lp.path;
             m_vents.push_back(std::move(vi));
         }
         for (const auto& lp : seedGatePlacements)
@@ -1582,23 +1618,18 @@ static bool BuildVentCutPieces(const VentInstance& vent,
     }
 
     // Joint at each interior corner: the rectangular section revolved 360 deg
-    // about the vertical (Y) axis through the node - a cylinder of radius hw and
-    // height 2*hd, centred on the node (the same MakeCylinder the runners use).
-    // Grown a hair (radius +kJointRadEps, ~invisible next to the preview, and
-    // +kJointAxEps each end to protrude through) so the cut crosses cleanly and
-    // leaves no sliver at the corner. (If the cross-section ever stops being
+    // about the vertical (Y) axis through the node - exactly a cylinder of
+    // radius hw and height 2*hd, centred on the node (the same MakeCylinder the
+    // runners use). No epsilon grow: it matches the preview and the leg prisms
+    // (which also span +/- hd) exactly. (If the cross-section ever stops being
     // rectangular, swap this for a BRepPrimAPI_MakeRevol of the half-profile.)
     if (hw > 1e-6f && hd > 1e-6f)
     {
-        const float kJointRadEps = 0.01f;
-        const float kJointAxEps  = 0.10f;
-        const float jr = hw + kJointRadEps;
-        const float jh = 2.0f * hd + 2.0f * kJointAxEps;
         for (const glm::vec3& c : jointCentres)
         {
-            const gp_Ax2 jointAx(gp_Pnt(c.x, c.y - hd - kJointAxEps, c.z),
+            const gp_Ax2 jointAx(gp_Pnt(c.x, c.y - hd, c.z),
                                  gp_Dir(0.0, 1.0, 0.0));
-            BRepPrimAPI_MakeCylinder jcyl(jointAx, jr, jh);
+            BRepPrimAPI_MakeCylinder jcyl(jointAx, hw, 2.0f * hd);
             jcyl.Build();   // MakeCylinder is lazy - without this Shape() is null
             if (jcyl.IsDone() && !jcyl.Shape().IsNull())
                 outPieces.push_back(jcyl.Shape());
@@ -6817,16 +6848,11 @@ void GLCanvas::OnPaint(wxPaintEvent&)
     // node reads larger. For a smooth path in the Move tool, the magenta
     // tangent-handle beads ride on top too.
     if (m_program && m_sphereVAO && m_sphereIndexCount > 0 &&
-        m_transformMode == TransformMode::EditVent &&
-        m_editFeatureIndex >= 0 && m_editFeatureIndex < (int)m_vents.size() &&
-        m_vents[m_editFeatureIndex].path.kind == PathKind::Complex)
+        m_transformMode == TransformMode::EditVent)
     {
-        const std::vector<PathNode>& nodes =
-            m_vents[m_editFeatureIndex].path.nodes;
-        const int   last = (int)nodes.size() - 1;
         const float nodeR = kVentMarkerRadius * 0.7f;
 
-        glDisable(GL_DEPTH_TEST);          // overlay — control points never occluded
+        glDisable(GL_DEPTH_TEST);          // overlay - control points never occluded
         glUseProgram(m_program);
         glUniform3fv(glGetUniformLocation(m_program, "uCameraPos"), 1, &camPos[0]);
         glUniform3fv(glGetUniformLocation(m_program, "uLightDir"), 1, &lightDir[0]);
@@ -6840,28 +6866,68 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         glUniformMatrix4fv(glGetUniformLocation(m_program, "uProj"), 1, GL_FALSE, &proj[0][0]);
         glBindVertexArray(m_sphereVAO);
 
-        for (int n = 0; n <= last; ++n)
+        // Show the control points of EVERY vent the moment edit mode is entered,
+        // so the user can immediately spot which vents are complex (more than two
+        // points) and what's adjustable - without having to click one first. The
+        // selected vent uses the live editing colours (origin cyan / endpoint
+        // orange / interior white, grabbed node larger); the rest read dim and
+        // small - visible, but clearly not the active edit target.
+        for (int vIdx = 0; vIdx < (int)m_vents.size(); ++vIdx)
         {
-            glm::vec3 c(0.95f, 0.95f, 0.95f);                       // interior = white
-            if (n == 0)         c = glm::vec3(0.20f, 0.85f, 0.95f); // origin = cyan
-            else if (n == last) c = glm::vec3(1.00f, 0.55f, 0.00f); // endpoint = orange
+            const VentInstance& vv = m_vents[vIdx];
+            if (!vv.path.valid) continue;
 
-            float scale = nodeR;
-            if (n == m_editVentNode) scale = nodeR * 1.35f;         // grabbed = larger
+            // Points to show: complex -> all authored nodes; simple -> the two
+            // path endpoints, so every vent reveals its origin + endpoint and a
+            // complex one stands out by its extra interior nodes.
+            const bool isComplex =
+                (vv.path.kind == PathKind::Complex && vv.path.nodes.size() >= 2);
+            std::vector<glm::vec3> pts;
+            if (isComplex)
+                for (const PathNode& nd : vv.path.nodes) pts.push_back(nd.pos);
+            else
+            { pts.push_back(vv.path.start); pts.push_back(vv.path.end); }
 
-            glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &c[0]);
-            glm::mat4 model = glm::translate(glm::mat4(1.0f), nodes[n].pos);
-            model = glm::scale(model, glm::vec3(scale));
-            glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &model[0][0]);
-            glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
+            const bool selected = (vIdx == m_editFeatureIndex);
+            const int  last = (int)pts.size() - 1;
+
+            for (int n = 0; n <= last; ++n)
+            {
+                glm::vec3 c;
+                float     scale;
+                if (selected)
+                {
+                    c = glm::vec3(0.95f, 0.95f, 0.95f);                     // interior = white
+                    if (n == 0)         c = glm::vec3(0.20f, 0.85f, 0.95f); // origin = cyan
+                    else if (n == last) c = glm::vec3(1.00f, 0.55f, 0.00f); // endpoint = orange
+                    scale = (n == m_editVentNode) ? nodeR * 1.35f : nodeR;  // grabbed = larger
+                }
+                else
+                {
+                    c = glm::vec3(0.45f, 0.50f, 0.58f);                     // unselected = dim
+                    scale = nodeR * 0.8f;
+                }
+
+                glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &c[0]);
+                glm::mat4 model = glm::translate(glm::mat4(1.0f), pts[n]);
+                model = glm::scale(model, glm::vec3(scale));
+                glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &model[0][0]);
+                glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
+            }
         }
 
-        // Tangent-handle endpoints (smooth + Move tool only). Origin shows only
-        // its outgoing arm, endpoint only its incoming arm; the grabbed arm
-        // reads larger.
-        if (m_pathEditTool == PathEditTool::Move &&
-            m_vents[m_editFeatureIndex].path.smooth)
+        // Tangent-handle endpoints for the SELECTED smooth complex vent in the
+        // Move tool. Origin shows only its outgoing arm, endpoint only its
+        // incoming arm; the grabbed arm reads larger.
+        if (m_editFeatureIndex >= 0 && m_editFeatureIndex < (int)m_vents.size() &&
+            m_vents[m_editFeatureIndex].path.kind == PathKind::Complex &&
+            m_vents[m_editFeatureIndex].path.nodes.size() >= 2 &&
+            m_vents[m_editFeatureIndex].path.smooth &&
+            m_pathEditTool == PathEditTool::Move)
         {
+            const std::vector<PathNode>& nodes =
+                m_vents[m_editFeatureIndex].path.nodes;
+            const int       last = (int)nodes.size() - 1;
             const float     hR = kVentMarkerRadius * 0.5f;
             const glm::vec3 magenta(0.95f, 0.35f, 0.90f);
             glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &magenta[0]);
@@ -8650,6 +8716,13 @@ void GLCanvas::ReanchorVent(VentInstance& vi)
 
         for (PathNode& nd : vi.path.nodes)
             nd.pos += delta;
+
+        // Re-snap the endpoint to the nearest fixture-perimeter point. The rigid
+        // shift keeps the authored shape attached to the part as it moves, but
+        // the last node can drift off the mould edge; snapping it back keeps the
+        // vent reaching the perimeter on any transform.
+        vi.path.nodes.back().pos = SnapToFixturePerimeter(vi.path.nodes.back().pos);
+
         vi.path.start = vi.path.nodes.front().pos;
         vi.path.end = vi.path.nodes.back().pos;
         vi.path.overrunStart = ventOverrunStart;
