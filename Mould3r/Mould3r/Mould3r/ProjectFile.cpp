@@ -88,7 +88,12 @@ bool ProjectFile::Save(const std::string& path,
     // for sticky-placement (vents and gates track their parent objects through
     // transforms and patterning). v1 files round-trip cleanly: missing keys
     // load as parentIndex=-1 (unparented), preserving the old behaviour.
-    file << "version = 3\n";
+    // v3: complex (authored) vent paths (pathKind/smooth/node lines under
+    // [vent.N]). v4: the same complex-path lines under [runner.N]. The reader is
+    // tolerant (presence of pathKind/node lines drives it, not the version
+    // number), so older readers ignore the new lines and older files load as
+    // simple — the version is informational.
+    file << "version = 4\n";
     if (!data.fixturePath.empty())
         file << "fixture = " << MakeRelative(data.fixturePath, baseDir) << "\n";
 
@@ -166,6 +171,27 @@ bool ProjectFile::Save(const std::string& path,
         file << "pointX = " << rn.point.x << "\n";
         file << "pointY = " << rn.point.y << "\n";
         file << "pointZ = " << rn.point.z << "\n";
+
+        // Complex (authored) path (v4+). Simple runners write only the point
+        // above and re-route on load; a complex runner dumps its node list plus
+        // the kind/smooth flags, identical in layout to the [vent.N] node lines.
+        // Layout: "node = px py pz dx dy dz handleLen hInxyz hOutxyz linked manual".
+        if (rn.isComplex)
+        {
+            file << "pathKind = complex\n";
+            file << "smooth   = " << (rn.smooth ? "true" : "false") << "\n";
+            for (const auto& nd : rn.nodes)
+            {
+                file << "node = "
+                    << nd.pos.x << " " << nd.pos.y << " " << nd.pos.z << " "
+                    << nd.dir.x << " " << nd.dir.y << " " << nd.dir.z << " "
+                    << nd.handleLen << " "
+                    << nd.handleIn.x << " " << nd.handleIn.y << " " << nd.handleIn.z << " "
+                    << nd.handleOut.x << " " << nd.handleOut.y << " " << nd.handleOut.z << " "
+                    << (nd.handlesLinked ? 1 : 0) << " "
+                    << (nd.handlesManual ? 1 : 0) << "\n";
+            }
+        }
     }
 
     // -- [gate.N] ------------------------------------------------------------
@@ -395,6 +421,26 @@ bool ProjectFile::Load(const std::string& path,
             if (key == "pointX") pendingRun.point.x = ParseFloat(val, 0.0f);
             else if (key == "pointY") pendingRun.point.y = ParseFloat(val, 0.0f);
             else if (key == "pointZ") pendingRun.point.z = ParseFloat(val, 0.0f);
+            // v4 complex-path keys. Absent in older files / simple runners, so
+            // isComplex defaults false and the path is re-derived Simple on load.
+            else if (key == "pathKind") pendingRun.isComplex = (val == "complex");
+            else if (key == "smooth")   pendingRun.smooth = ParseBool(val);
+            else if (key == "node")
+            {
+                // Same layout as the [vent.N] node line; the bracketed handle
+                // tokens are optional (older lines stop after handleLen and the
+                // DTO defaults stand — handles re-derive from dir/handleLen).
+                std::istringstream iss(val);
+                ProjectPathNode pn;
+                iss >> pn.pos.x >> pn.pos.y >> pn.pos.z
+                    >> pn.dir.x >> pn.dir.y >> pn.dir.z >> pn.handleLen;
+                iss >> pn.handleIn.x >> pn.handleIn.y >> pn.handleIn.z
+                    >> pn.handleOut.x >> pn.handleOut.y >> pn.handleOut.z;
+                int linked = 1, manual = 0;
+                if (iss >> linked) pn.handlesLinked = (linked != 0);
+                if (iss >> manual) pn.handlesManual = (manual != 0);
+                pendingRun.nodes.push_back(pn);
+            }
             break;
 
         case Section::Gate:

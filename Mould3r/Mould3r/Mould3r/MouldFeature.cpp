@@ -561,3 +561,196 @@ SolidMesh BuildBoxSweepMesh(const FeaturePath& path, float width, float depth,
     solid.valid = true;
     return solid;
 }
+
+// ---------------------------------------------------------------------------
+// BuildTubeSweepMesh — sweeps a CIRCULAR cross-section along a feature path,
+// the round-profile analogue of BuildBoxSweepMesh (used for runners).  It is
+// driven by the same SamplePath stations, so a Simple path yields a plain
+// straight cylinder visually identical to BuildCylinderMesh; a non-smooth
+// complex path yields one independent constant-radius cylinder per leg with a
+// SPHERE joint dropped at each interior node to fill the corner; a smooth
+// complex path yields a single continuous swept tube.
+//
+// The joint is a sphere of the tube radius centred on the node: every point of
+// an adjoining leg's circular end rim is exactly `radius` from the node, so the
+// rim lies on the sphere and the sphere mates flush with both legs at any bend
+// angle in all three axes — the circular counterpart of the vent's
+// revolved-rectangle (cylinder) joint.  Interior nodes only; the two endpoints
+// keep their flat disk caps.
+//
+// Vertex layout: [px, py, pz, nx, ny, nz] — compatible with vsLit.  Normals are
+// the true outward directions (radial on the walls, spherical on the joints),
+// so lighting is correct regardless of triangle winding (culling is disabled).
+// ---------------------------------------------------------------------------
+SolidMesh BuildTubeSweepMesh(const FeaturePath& path, float radius, int segments,
+    float overrunStart, float overrunEnd)
+{
+    SolidMesh solid;
+    solid.valid = false;
+
+    if (!path.valid || radius < 1e-6f || segments < 3) return solid;
+
+    // One station list drives the whole sweep (Simple -> 2 stations, so this
+    // stays a plain cylinder).  Matches BuildBoxSweepMesh's use of SamplePath so
+    // the preview can never disagree with the OCC cut that consumes the same
+    // stations.
+    std::vector<PathStation> stations = SamplePath(path);
+    if (stations.size() < 2) return solid;
+
+    // Overruns extend the tube past its first/last station along the local
+    // tangent (unused for runners today; kept for parity with BuildBoxSweepMesh).
+    stations.front().pos -= stations.front().tangent * overrunStart;
+    stations.back().pos  += stations.back().tangent  * overrunEnd;
+
+    const glm::vec3 up(0.0f, 1.0f, 0.0f);
+
+    std::vector<float>    verts;
+    std::vector<uint32_t> idx;
+
+    auto pv = [&](const glm::vec3& p, const glm::vec3& n)
+        {
+            verts.push_back(p.x); verts.push_back(p.y); verts.push_back(p.z);
+            verts.push_back(n.x); verts.push_back(n.y); verts.push_back(n.z);
+        };
+
+    // Outward radial direction of a station's cross-section at angle th.  The
+    // section plane is spanned by the in-plane perpendicular (sideAxis) and the
+    // vertical (up); because the path is planar these vary continuously along a
+    // run, so consecutive rings stay aligned and the tube never twists.
+    auto radialAt = [&](const PathStation& s, float th)
+        {
+            return std::cos(th) * s.sideAxis + std::sin(th) * up;
+        };
+
+    // Push a ring of `segments` verts (radial normals) at a station; return the
+    // index of the ring's first vertex.
+    auto pushRing = [&](const PathStation& s) -> uint32_t
+        {
+            const uint32_t base = (uint32_t)(verts.size() / 6);
+            for (int i = 0; i < segments; ++i)
+            {
+                const float th = (float(i) / float(segments)) * glm::two_pi<float>();
+                const glm::vec3 rad = radialAt(s, th);
+                pv(s.pos + radius * rad, rad);
+            }
+            return base;
+        };
+
+    // Connect two rings (same segment count) with side quads.  Winding matches
+    // BuildCylinderMesh; culling is off so only the normals matter.
+    auto connectRings = [&](uint32_t a, uint32_t b)
+        {
+            for (int i = 0; i < segments; ++i)
+            {
+                const uint32_t s0 = a + (uint32_t)i;
+                const uint32_t s1 = a + (uint32_t)((i + 1) % segments);
+                const uint32_t e0 = b + (uint32_t)i;
+                const uint32_t e1 = b + (uint32_t)((i + 1) % segments);
+                idx.push_back(s0); idx.push_back(e0); idx.push_back(e1);
+                idx.push_back(s0); idx.push_back(e1); idx.push_back(s1);
+            }
+        };
+
+    // Flat disk cap at a station, facing capNorm (the run's leading/trailing
+    // tangent, negated at the start).
+    auto addCap = [&](const PathStation& s, const glm::vec3& capNorm)
+        {
+            const uint32_t centreIdx = (uint32_t)(verts.size() / 6);
+            pv(s.pos, capNorm);
+            const uint32_t rimBase = (uint32_t)(verts.size() / 6);
+            for (int i = 0; i < segments; ++i)
+            {
+                const float th = (float(i) / float(segments)) * glm::two_pi<float>();
+                pv(s.pos + radius * radialAt(s, th), capNorm);
+            }
+            for (int i = 0; i < segments; ++i)
+            {
+                const uint32_t r0 = rimBase + (uint32_t)i;
+                const uint32_t r1 = rimBase + (uint32_t)((i + 1) % segments);
+                idx.push_back(centreIdx); idx.push_back(r0); idx.push_back(r1);
+            }
+        };
+
+    // Sphere joint (radius == tube radius) centred on an interior node.  A UV
+    // sphere: `lon` longitude columns, `lat` latitude bands, spherical normals.
+    auto addSphere = [&](const glm::vec3& c)
+        {
+            const int lon = segments;
+            const int lat = std::max(6, segments / 2);
+            const uint32_t base = (uint32_t)(verts.size() / 6);
+            for (int i = 0; i <= lat; ++i)
+            {
+                const float phi = (float(i) / float(lat)) * glm::pi<float>();
+                const float cy = std::cos(phi);
+                const float sy = std::sin(phi);
+                for (int j = 0; j <= lon; ++j)
+                {
+                    const float th = (float(j) / float(lon)) * glm::two_pi<float>();
+                    const glm::vec3 n(sy * std::cos(th), cy, sy * std::sin(th));
+                    pv(c + radius * n, n);
+                }
+            }
+            const int stride = lon + 1;
+            for (int i = 0; i < lat; ++i)
+                for (int j = 0; j < lon; ++j)
+                {
+                    const uint32_t a = base + (uint32_t)(i * stride + j);
+                    const uint32_t b = base + (uint32_t)((i + 1) * stride + j);
+                    idx.push_back(a);     idx.push_back(b); idx.push_back(a + 1);
+                    idx.push_back(a + 1); idx.push_back(b); idx.push_back(b + 1);
+                }
+        };
+
+    // Walk the stations run by run (a run break is `startsRun`, plus the
+    // implicit run start at index 0).  Push a ring at every station, connect
+    // consecutive rings WITHIN a run, cap the two ends of each run, and drop a
+    // sphere joint at every interior node (an internal run boundary).  A Simple
+    // path is a single 2-station run -> one capped cylinder identical to
+    // BuildCylinderMesh; a non-smooth complex path is one run per leg.
+    const size_t N = stations.size();
+
+    std::vector<uint32_t> ringBase(N);
+    for (size_t i = 0; i < N; ++i)
+        ringBase[i] = pushRing(stations[i]);
+
+    for (size_t i = 0; i + 1 < N; ++i)
+        if (!stations[i + 1].startsRun)
+            connectRings(ringBase[i], ringBase[i + 1]);
+
+    for (size_t i = 0; i < N; ++i)
+    {
+        const bool runStart = (i == 0) || stations[i].startsRun;
+        const bool runEnd   = (i + 1 >= N) || stations[i + 1].startsRun;
+
+        if (runStart) addCap(stations[i], -stations[i].tangent);
+        if (runEnd)   addCap(stations[i], +stations[i].tangent);
+        if (runEnd && (i + 1 < N)) addSphere(stations[i].pos);
+    }
+
+    // ---- Upload to GPU ----
+    glGenVertexArrays(1, &solid.vao);
+    glGenBuffers(1, &solid.vbo);
+    glGenBuffers(1, &solid.ebo);
+
+    glBindVertexArray(solid.vao);
+    glBindBuffer(GL_ARRAY_BUFFER, solid.vbo);
+    glBufferData(GL_ARRAY_BUFFER,
+        (GLsizeiptr)(verts.size() * sizeof(float)),
+        verts.data(), GL_STATIC_DRAW);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, solid.ebo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+        (GLsizeiptr)(idx.size() * sizeof(uint32_t)),
+        idx.data(), GL_STATIC_DRAW);
+
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float),
+        (void*)(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+
+    glBindVertexArray(0);
+
+    solid.indexCount = (GLsizei)idx.size();
+    solid.valid = true;
+    return solid;
+}

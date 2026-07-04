@@ -271,12 +271,22 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
         if (m_canvas) m_canvas->SetPathEditTool(t);
         });
     m_ventEditToolbar->SetOnSmooth([this](bool on) {
-        if (m_canvas) m_canvas->SetEditVentSmooth(on);
+        if (!m_canvas) return;
+        if (m_canvas->IsEditingRunner()) m_canvas->SetEditRunnerSmooth(on);
+        else                             m_canvas->SetEditVentSmooth(on);
         });
     m_ventEditToolbar->SetOnToggleComplex([this](bool wantComplex) {
         if (!m_canvas) return;
-        if (wantComplex) m_canvas->ConvertEditVentToComplex();
-        else             m_canvas->ConvertEditVentToSimple();
+        if (m_canvas->IsEditingRunner())
+        {
+            if (wantComplex) m_canvas->ConvertEditRunnerToComplex();
+            else             m_canvas->ConvertEditRunnerToSimple();
+        }
+        else
+        {
+            if (wantComplex) m_canvas->ConvertEditVentToComplex();
+            else             m_canvas->ConvertEditVentToSimple();
+        }
         });
     m_canvas->SetPathToolbar(m_ventEditToolbar);
     m_canvas->SetOnPathEditChanged([this] { UpdateVentEditToolbar(); });
@@ -974,6 +984,7 @@ void MainFrame::UpdateVentEditToolbar()
         // Visible as soon as Edit Vent mode is entered — even with nothing
         // selected — so Add Node (which snaps onto any path) is reachable and
         // the tools are discoverable. Per-cell enabling reflects the selection.
+        m_ventEditToolbar->SetLabels("VENT PATH", "Select a vent path");
         m_ventEditToolbar->Configure(
             m_canvas->HasEditVentSelected(),
             m_canvas->IsEditVentComplex(),
@@ -983,6 +994,21 @@ void MainFrame::UpdateVentEditToolbar()
         if (!m_ventEditToolbar->IsShown())
             m_ventEditToolbar->Show();
         m_ventEditToolbar->Raise();   // keep above the GL surface
+    }
+    else if (m_canvas->IsEditingRunner())
+    {
+        // Same shared overlay, retitled for runners. node[0] is pinned to the
+        // sprue feed point and the endpoint is free (no perimeter snap).
+        m_ventEditToolbar->SetLabels("RUNNER PATH", "Select a runner");
+        m_ventEditToolbar->Configure(
+            m_canvas->HasEditRunnerSelected(),
+            m_canvas->IsEditRunnerComplex(),
+            m_canvas->IsEditRunnerSmooth(),
+            m_canvas->EditRunnerNodeCount(),
+            m_canvas->GetPathEditTool());
+        if (!m_ventEditToolbar->IsShown())
+            m_ventEditToolbar->Show();
+        m_ventEditToolbar->Raise();
     }
     else
     {
@@ -1570,7 +1596,32 @@ void MainFrame::OnSaveProject(wxCommandEvent&)
 
     // Runners
     for (const auto& rf : m_canvas->GetRunners())
-        data.runners.push_back(ProjectRunnerData{ rf.point });
+    {
+        ProjectRunnerData pr;
+        pr.point = rf.point;
+
+        // Persist an authored complex path verbatim; simple paths re-derive.
+        if (rf.path.kind == PathKind::Complex)
+        {
+            pr.isComplex = true;
+            pr.smooth = rf.path.smooth;
+            pr.nodes.reserve(rf.path.nodes.size());
+            for (const auto& n : rf.path.nodes)
+            {
+                ProjectPathNode pn;
+                pn.pos = n.pos;
+                pn.dir = n.dir;
+                pn.handleLen = n.handleLen;
+                pn.handleIn = n.handleIn;
+                pn.handleOut = n.handleOut;
+                pn.handlesLinked = n.handlesLinked;
+                pn.handlesManual = n.handlesManual;
+                pr.nodes.push_back(pn);
+            }
+        }
+
+        data.runners.push_back(pr);
+    }
 
     // Gates
     for (const auto& gf : m_canvas->GetGates())
@@ -1721,7 +1772,30 @@ void MainFrame::OnLoadProject(wxCommandEvent&)
 
     // ---- Restore runners ---------------------------------------------------
     for (const auto& rn : data.runners)
-        m_canvas->RestoreRunner(rn.point);
+    {
+        if (rn.isComplex && rn.nodes.size() >= 2)
+        {
+            std::vector<PathNode> nodes;
+            nodes.reserve(rn.nodes.size());
+            for (const auto& pn : rn.nodes)
+            {
+                PathNode nd;
+                nd.pos = pn.pos;
+                nd.dir = pn.dir;
+                nd.handleLen = pn.handleLen;
+                nd.handleIn = pn.handleIn;
+                nd.handleOut = pn.handleOut;
+                nd.handlesLinked = pn.handlesLinked;
+                nd.handlesManual = pn.handlesManual;
+                nodes.push_back(nd);
+            }
+            m_canvas->RestoreRunnerComplex(rn.point, nodes, rn.smooth);
+        }
+        else
+        {
+            m_canvas->RestoreRunner(rn.point);
+        }
+    }
 
     // ---- Restore gates -----------------------------------------------------
     for (const auto& gt : data.gates)

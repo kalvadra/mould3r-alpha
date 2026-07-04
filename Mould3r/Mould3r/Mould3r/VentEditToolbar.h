@@ -37,6 +37,12 @@ public:
     void Configure(bool hasSelection, bool complex, bool smooth, int nodeCount,
         PathEditTool tool);
 
+    // Retitle the bar for the feature being edited (this same overlay is reused
+    // for both vents and runners). `title` is the header (e.g. "RUNNER PATH");
+    // `emptyStatus` is the right-hand hint shown when nothing is selected.
+    // Set-only (no repaint) — the following Configure() call repaints.
+    void SetLabels(const wxString& title, const wxString& emptyStatus);
+
     // Intent callbacks (set by the owner).
     void SetOnTool(std::function<void(PathEditTool)> cb) { m_onTool = std::move(cb); }
     void SetOnSmooth(std::function<void(bool)> cb) { m_onSmooth = std::move(cb); }
@@ -60,6 +66,9 @@ private:
     wxRect m_rMove, m_rAdd, m_rRemove, m_rSmooth, m_rToggle;
 
     // Display state
+    wxString     m_title = wxT("VENT PATH");
+    wxString     m_emptyStatus = wxT("Select a vent path");
+
     bool         m_hasSelection = false;
     bool         m_complex = false;
     bool         m_smooth = false;

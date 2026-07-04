@@ -173,6 +173,18 @@ void AutoComputeComplexHandles(FeaturePath& path);
 SolidMesh BuildBoxSweepMesh(const FeaturePath& path, float width, float depth,
     float overrunStart = 0.0f, float overrunEnd = 0.0f);
 
+// Swept CIRCULAR cross-section along a path on the parting plane — the round
+// analogue of BuildBoxSweepMesh, used for runners.  Driven by the same
+// SamplePath stations, so a Simple path yields a plain straight cylinder
+// (visually identical to BuildCylinderMesh), a non-smooth complex path yields
+// one independent constant-radius cylinder per leg with a SPHERE joint at each
+// interior node (the tube-radius sphere passes through each adjoining leg's end
+// rim, so it mates flush at any bend angle — the circular counterpart of the
+// vent's revolved-rectangle cylinder joint), and a smooth complex path yields a
+// single continuous swept tube.  Un-drafted (constant radius).
+SolidMesh BuildTubeSweepMesh(const FeaturePath& path, float radius,
+    int segments = 32, float overrunStart = 0.0f, float overrunEnd = 0.0f);
+
 // ---------------------------------------------------------------------------
 // VentPoint  — a user-placed point on the parting surface of an object.
 // ---------------------------------------------------------------------------
@@ -240,6 +252,18 @@ struct RunnerFeature
     glm::vec3 point{ 0.0f };
     SolidMesh solid;
     SolidMesh coldPlugSolid;
+
+    // Part 7 (R1): the runner's route from the shared sprue feed point to
+    // `point`.  Populated as a Simple path (start = sprue parting point, end =
+    // point) by GLCanvas::ComputeRunnerPath, so it is byte-identical to the
+    // historical straight cylinder.  Later steps let the user author a Complex
+    // multi-node route in its place; until then nothing consumes this field —
+    // the preview and cut are still driven directly by point + sprue feed
+    // point — so populating it changes nothing that is drawn or cut.  Kept as
+    // the LAST data member so the RunnerFeature{ point, {}, {} } aggregate
+    // initializers keep meaning point / solid / coldPlugSolid, with path
+    // value-initialized from its in-class defaults (Simple, invalid).
+    FeaturePath path;
 
     void Destroy() { solid.Destroy(); coldPlugSolid.Destroy(); }
 };

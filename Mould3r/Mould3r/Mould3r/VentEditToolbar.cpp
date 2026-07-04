@@ -50,6 +50,13 @@ void VentEditToolbar::Configure(bool hasSelection, bool complex, bool smooth,
     Refresh(false);
 }
 
+void VentEditToolbar::SetLabels(const wxString& title, const wxString& emptyStatus)
+{
+    m_title = title;
+    m_emptyStatus = emptyStatus;
+    // No Refresh here — the owner calls Configure() right after, which repaints.
+}
+
 void VentEditToolbar::LayoutCells()
 {
     const int y = 38;
@@ -141,11 +148,11 @@ void VentEditToolbar::OnPaint(wxPaintEvent&)
     wxFont titleFont = GetFont().Bold();
     titleFont.SetPointSize(GetFont().GetPointSize());
     gc->SetFont(titleFont, Style::TextSubtle);
-    gc->DrawText("VENT PATH", kPad, 11);
+    gc->DrawText(m_title, kPad, 11);
 
     wxString status;
     if (!m_hasSelection)
-        status = wxT("Select a vent path");
+        status = m_emptyStatus;
     else if (m_complex)
     {
         status = wxString::Format(wxT("Complex \u00B7 %d node"), m_nodeCount);
