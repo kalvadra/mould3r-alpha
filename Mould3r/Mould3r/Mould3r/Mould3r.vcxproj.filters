@@ -60,6 +60,9 @@
     <ClCompile Include="TranslateDialog.cpp">
       <Filter>Source Files\TransformHandlers</Filter>
     </ClCompile>
+    <ClCompile Include="PrecisionPlaceDialog.cpp">
+      <Filter>Source Files\TransformHandlers</Filter>
+    </ClCompile>
     <ClCompile Include="ScaleDialog.cpp">
       <Filter>Source Files\TransformHandlers</Filter>
     </ClCompile>
@@ -114,6 +117,9 @@
     <ClCompile Include="PerspectiveButton.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="VentEditToolbar.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="WindowEffects.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -150,6 +156,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="TranslateDialog.h">
+      <Filter>Header Files\TransformHandlers</Filter>
+    </ClInclude>
+    <ClInclude Include="PrecisionPlaceDialog.h">
       <Filter>Header Files\TransformHandlers</Filter>
     </ClInclude>
     <ClInclude Include="ScaleDialog.h">
@@ -210,6 +219,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="PerspectiveButton.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="VentEditToolbar.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="WindowEffects.h">

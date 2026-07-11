@@ -37,9 +37,36 @@ struct ProjectSprueData
     InjectionPoint injectionPoint;
 };
 
+// One control point of a feature's complex (authored) path. Mirrors the engine's
+// PathNode but kept independent so the serialization layer carries no dependency
+// on the geometry/GL headers. Used by vents (v3+) and runners (v4+).
+struct ProjectPathNode
+{
+    glm::vec3 pos{ 0.0f };
+    glm::vec3 dir{ 0.0f, 0.0f, 1.0f };
+    float     handleLen = 0.0f;
+    // Explicit independent tangent handles (offsets from pos). Older files omit
+    // these tokens on the node line; defaults below preserve the earlier
+    // symmetric behaviour (handles get re-derived from dir/handleLen on load).
+    glm::vec3 handleIn{ 0.0f };
+    glm::vec3 handleOut{ 0.0f };
+    bool      handlesLinked = true;
+    bool      handlesManual = false;
+};
+
 struct ProjectRunnerData
 {
     glm::vec3 point{ 0.0f };
+
+    // Complex (authored) path persistence (v4+). Same scheme as ProjectVentData:
+    // isComplex=false → the historical point-only runner, re-routed Simple on
+    // load (feed point -> point), so old files and simple runners need none of
+    // the fields below. When true, `nodes` (>= 2, authored on the parting plane)
+    // and `smooth` describe the path verbatim — node[0] is the sprue feed point,
+    // nodes.back() is the endpoint (== point).
+    bool      isComplex = false;
+    bool      smooth = false;
+    std::vector<ProjectPathNode> nodes;
 };
 
 struct ProjectGateData
@@ -53,6 +80,17 @@ struct ProjectGateData
     int       parentIndex = -1;
     glm::vec3 localPos{ 0.0f };
     glm::vec3 localNormal{ 0.0f, 0.0f, 1.0f };
+
+    // Complex (authored) SUB-RUNNER path persistence (v5+). Same scheme as
+    // ProjectRunnerData: isComplex=false → the historical straight sub-runner,
+    // re-derived Simple on load (gate origin -> feed) so old files and simple
+    // gates need none of the fields below. When true, `nodes` (>= 2, authored on
+    // the parting plane) and `smooth` describe the sub-runner route verbatim —
+    // node[0] is the gate origin, nodes.back() is the feed attach point. The gate
+    // FRUSTUM is never serialized here: it is rebuilt from the gate-card fields.
+    bool      isComplex = false;
+    bool      smooth = false;
+    std::vector<ProjectPathNode> nodes;
 };
 
 struct ProjectVentData
@@ -64,6 +102,15 @@ struct ProjectVentData
     int       parentIndex = -1;
     glm::vec3 localPos{ 0.0f };
     glm::vec3 localNormal{ 0.0f, 0.0f, 1.0f };
+
+    // Complex-path persistence (v3+). isComplex=false → the historical derived
+    // Simple path, re-routed on load via ComputeVentPath (so old files and
+    // simple vents need none of the fields below). When true, `nodes` (>= 2
+    // entries, authored on the parting plane) and `smooth` fully describe the
+    // path — it cannot be re-derived, so it must round-trip verbatim.
+    bool      isComplex = false;
+    bool      smooth = false;
+    std::vector<ProjectPathNode> nodes;
 };
 
 // Ejectors carry only a world-space point at present — no normal (none of the

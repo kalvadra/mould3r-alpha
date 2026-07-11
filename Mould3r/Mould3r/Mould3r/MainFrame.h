@@ -22,8 +22,15 @@ class PreviewPanel;    // forward decl — m_previewPanel pointer; full def
 // is included from MainFrame.cpp where the panel is created.
 class wxSimplebook;    // forward decl — m_book pointer; the perspective pager.
 class PerspectiveButton; // forward decl — m_btnPrepare/m_btnPreview tabs.
+class VentEditToolbar;   // forward decl — m_ventEditToolbar overlay (Part 5).
 
 enum class TransformMode { Select, Translate, Rotate, Scale, Pattern, PlaceVent, PlaceRunner, PlaceGate, PlaceEjector, RemoveVent, RemoveRunner, RemoveGate, RemoveSprue, RemoveEjector, EditVent, EditRunner, EditGate, EditEjector, SelectInjectionPoint, AlignFace, AlignMidplane };
+
+// Sub-tool active while editing a Complex vent path (Part 5). Shared between
+// GLCanvas (which owns the authoring logic) and the floating VentEditToolbar
+// (which drives it). Lives here, next to TransformMode, so the lightweight
+// toolbar header doesn't have to pull in the heavy GLCanvas header.
+enum class PathEditTool { Move, AddNode, RemoveNode };
 
 class MainFrame : public wxFrame
 {
@@ -33,6 +40,11 @@ public:
 
     // Called by GLCanvas when Escape is pressed to sync button state
     void SetActiveTool(TransformMode mode);
+
+    // Open the Precision Place dialog for the current selection and apply the
+    // resulting absolute XZ move. Shared by the ribbon button handler and the
+    // canvas double-click shortcut, so both routes behave identically.
+    void PrecisionPlaceSelected();
 
     // Called by GLCanvas when the user picks an injection point via the
     // SelectInjectionPoint tool. Updates UI fields whose value depends on
@@ -107,6 +119,7 @@ private:
     void OnToolRotate(wxCommandEvent& evt);
     void OnToolScale(wxCommandEvent& evt);
     void OnToolPattern(wxCommandEvent& evt);
+    void OnToolPrecisionPlace(wxCommandEvent& evt);
     void OnToolCenter(wxCommandEvent& evt);
     void OnToolAlignFace(wxCommandEvent& evt);
     void OnToolAlignMidplane(wxCommandEvent& evt);
@@ -230,6 +243,11 @@ private:
 
     GLCanvas* m_canvas = nullptr;
 
+    // Part 5: floating overlay toolbar for authoring complex vent paths. Lives
+    // as a child of m_canvas, shown only while a vent is being edited.
+    VentEditToolbar* m_ventEditToolbar = nullptr;
+    void UpdateVentEditToolbar();   // canvas path-edit-changed hook target
+
     // The two stacked workflow perspectives and the pager that switches between
     // them. m_preparePage wraps the left panel + main canvas; m_previewPanel is
     // the embedded preview perspective (replaces the old breakout PreviewFrame).
@@ -330,6 +348,7 @@ private:
         ID_ToolRotate,
         ID_ToolScale,
         ID_ToolPattern,
+        ID_ToolPrecisionPlace,
         ID_ToolCenter,
         ID_ToolAlignFace,
         ID_ToolAlignMidplane,

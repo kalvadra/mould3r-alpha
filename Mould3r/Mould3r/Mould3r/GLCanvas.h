@@ -110,6 +110,10 @@ struct SceneObject
     }
 };
 
+// PathEditTool (the EditVent sub-tool enum) is declared in MainFrame.h next to
+// TransformMode so the lightweight VentEditToolbar header can use it without
+// pulling in this heavy canvas header.
+
 class GLCanvas : public wxGLCanvas
 {
 public:
@@ -138,6 +142,19 @@ public:
     void ApplyTranslation(float x, float y, float z);
     void ApplyScale(float factor);
     void CenterSelectedObject();
+
+    // Precision Place — move the current selection to an absolute world XZ
+    // position, preserving each member's Y (height) and the selection's
+    // internal arrangement. For a single object this is a direct
+    // "pos.x = x, pos.z = z"; for a multi-selection the whole group is
+    // shifted so its XZ centroid lands on the target (same convention as
+    // CenterSelectedObject).
+    void MoveSelectionToXZ(float x, float z);
+
+    // Report the XZ centroid of the current selection (the value the
+    // Precision Place dialog pre-fills). Returns false (leaving outputs
+    // untouched) when nothing is selected.
+    bool GetSelectionCenterXZ(float& outX, float& outZ) const;
 
     // Circular pattern around the world origin in the XZ plane.
     //   count          - total instances including the original (no-op if <= 1)
@@ -339,6 +356,77 @@ public:
         m_onSceneMutated = std::move(cb);
     }
 
+    // ---- Part 5: complex vent-path authoring hooks -------------------------
+    // Fired whenever the EditVent selection or path-edit state changes (a vent
+    // is picked / deselected, a Simple<->Complex conversion happens, the
+    // smooth flag flips, or a node is added / removed). The MainFrame uses it
+    // to reconfigure and reposition the floating VentEditToolbar.
+    void SetOnPathEditChanged(std::function<void()> cb)
+    {
+        m_onPathEditChanged = std::move(cb);
+    }
+
+    // Register the floating toolbar window (a child of this canvas). The canvas
+    // treats it as an opaque wxWindow* — it only needs to reposition it on
+    // resize so it stays pinned to the top-centre of the viewport.
+    void SetPathToolbar(wxWindow* w) { m_pathToolbar = w; RepositionPathToolbar(); }
+
+    // State queried by the floating toolbar.
+    bool         IsEditingVent()       const { return m_transformMode == TransformMode::EditVent; }
+    bool         HasEditVentSelected() const
+    {
+        return m_transformMode == TransformMode::EditVent &&
+            m_editFeatureIndex >= 0 && m_editFeatureIndex < (int)m_vents.size();
+    }
+    bool         IsEditVentComplex()   const;
+    bool         IsEditVentSmooth()    const;
+    int          EditVentNodeCount()   const;
+    PathEditTool GetPathEditTool()     const { return m_pathEditTool; }
+
+    // Commands invoked by the floating toolbar.
+    void SetPathEditTool(PathEditTool t);
+    void ConvertEditVentToComplex();   // seed nodes from the Simple path; no-op if already Complex
+    void ConvertEditVentToSimple();    // drop nodes, re-derive the Simple path
+    void SetEditVentSmooth(bool smooth);
+
+    // Runner-path authoring (Part 7 / R5) — parallels the vent API above and is
+    // driven by the SAME shared floating toolbar while in EditRunner mode. The
+    // deltas vs vents: node[0] is pinned to the sprue feed point (only the free
+    // endpoint moves) and the endpoint is NOT snapped to the perimeter.
+    bool         IsEditingRunner()       const { return m_transformMode == TransformMode::EditRunner; }
+    bool         HasEditRunnerSelected() const
+    {
+        return m_transformMode == TransformMode::EditRunner &&
+            m_editFeatureIndex >= 0 && m_editFeatureIndex < (int)m_runners.size();
+    }
+    bool         IsEditRunnerComplex()   const;
+    bool         IsEditRunnerSmooth()    const;
+    int          EditRunnerNodeCount()   const;
+
+    void ConvertEditRunnerToComplex();  // seed [feed point, endpoint]; no-op if already Complex
+    void ConvertEditRunnerToSimple();   // drop nodes, collapse to the straight runner
+    void SetEditRunnerSmooth(bool smooth);
+
+    // ---- Gate SUB-RUNNER complex-path editing (G5) -------------------------
+    // Driven by the SAME shared floating toolbar while in EditGate mode. The
+    // gate FRUSTUM stays a straight tapered cone from the card fields; only the
+    // sub-runner gets a complex route. node[0] is pinned to the gate origin
+    // (gf.point.worldPos); the endpoint (nodes.back()) is the feed attach point,
+    // freely authored when Complex (it does not chase a moving feed).
+    bool         IsEditingGate()       const { return m_transformMode == TransformMode::EditGate; }
+    bool         HasEditGateSelected() const
+    {
+        return m_transformMode == TransformMode::EditGate &&
+            m_editFeatureIndex >= 0 && m_editFeatureIndex < (int)m_gates.size();
+    }
+    bool         IsEditGateComplex()   const;
+    bool         IsEditGateSmooth()    const;
+    int          EditGateNodeCount()   const;
+
+    void ConvertEditGateToComplex();  // seed [gate origin, feed attach]; no-op if already Complex
+    void ConvertEditGateToSimple();   // drop nodes, collapse to the straight sub-runner
+    void SetEditGateSmooth(bool smooth);
+
     void ClearFixtures();
 
     // Vent point placement
@@ -400,12 +488,43 @@ public:
 
     void RestoreRunner(const glm::vec3& point);
 
+    // Restore a runner whose path was authored as a complex (multi-node) path.
+    // Like RestoreVentComplex, the path is rebuilt verbatim from `nodes` (>= 2,
+    // on the parting plane) and `smooth` rather than re-derived; `point` is the
+    // runner endpoint (== nodes.back()). Solids are built by the following
+    // RebuildRunnerSolids (ComputeRunnerPath preserves the authored path).
+    void RestoreRunnerComplex(const glm::vec3& point,
+        const std::vector<PathNode>& nodes, bool smooth);
+
     void RestoreGate(const glm::vec3& pos, const glm::vec3& normal,
         int parentIndex = -1,
         const glm::vec3& localPos = glm::vec3(0.0f),
         const glm::vec3& localNormal = glm::vec3(0.0f, 0.0f, 1.0f));
 
+    // Restore a gate whose SUB-RUNNER was authored as a complex (multi-node)
+    // path. Like RestoreGate for the placement + parent fields, but the
+    // sub-runner path is rebuilt verbatim from `nodes` (>= 2, on the parting
+    // plane; node[0] the gate origin, nodes.back() the feed attach) and `smooth`
+    // rather than re-derived. The gate frustum still comes from the card fields.
+    void RestoreGateComplex(const glm::vec3& pos, const glm::vec3& normal,
+        const std::vector<PathNode>& nodes, bool smooth,
+        int parentIndex = -1,
+        const glm::vec3& localPos = glm::vec3(0.0f),
+        const glm::vec3& localNormal = glm::vec3(0.0f, 0.0f, 1.0f));
+
     void RestoreVent(const glm::vec3& pos, const glm::vec3& normal,
+        float ventWidth, float ventLength,
+        float overrunStart, float overrunEnd,
+        int parentIndex = -1,
+        const glm::vec3& localPos = glm::vec3(0.0f),
+        const glm::vec3& localNormal = glm::vec3(0.0f, 0.0f, 1.0f));
+
+    // Restore a vent whose path was authored as a complex (multi-node) path.
+    // Unlike RestoreVent, the path is NOT re-derived — it is rebuilt verbatim
+    // from `nodes` (>= 2, on the parting plane) and `smooth`. pos/normal are
+    // the vent origin (matches nodes.front()).
+    void RestoreVentComplex(const glm::vec3& pos, const glm::vec3& normal,
+        const std::vector<PathNode>& nodes, bool smooth,
         float ventWidth, float ventLength,
         float overrunStart, float overrunEnd,
         int parentIndex = -1,
@@ -428,6 +547,7 @@ private:
     void OnPaint(wxPaintEvent& evt);
     void OnResize(wxSizeEvent& evt);
     void OnMouse(wxMouseEvent& evt);
+    void OnMouseDClick(wxMouseEvent& evt);
     void OnMouseWheel(wxMouseEvent& evt);
     void OnKeyDown(wxKeyEvent& evt);
 
@@ -510,6 +630,106 @@ private:
     VentPath         ComputeVentPath(const VentPoint& vp);
     void             RebuildPathVBO();
 
+    // ---- Part 5: complex vent-path authoring internals ---------------------
+    // Rebuild the currently edited vent's cross-section, preview solid and the
+    // start/end mirror from its (already mutated) path.nodes, reading width /
+    // length / overrun from the MainFrame UI. Recomputes auto handles first
+    // when the path is smooth. Refreshes path + cross-section VBOs.
+    void RebuildEditVentGeometry();
+
+    // Closest point (XZ, y=0) on the fixture perimeter polygon to p. Returns p
+    // unchanged when no perimeter is available.
+    glm::vec3 SnapToFixturePerimeter(const glm::vec3& p) const;
+
+    // Pick the nearest node marker of the currently edited Complex vent to the
+    // mouse ray; returns its node index or -1 if none is within the marker hit
+    // radius.
+    int  PickEditVentNode(int mouseX, int mouseY) const;
+
+    // ---- Part 6: tangent-handle editing (smooth complex vents, Move tool) ---
+    // Pick the nearest tangent-handle endpoint of the edited smooth vent to the
+    // mouse ray. Returns the owning node index (and sets outIsOut = true for the
+    // outgoing arm, false for the incoming arm) or -1 if none is in range.
+    int  PickEditVentHandle(int mouseX, int mouseY, bool& outIsOut) const;
+
+    // Drag a tangent handle to follow the cursor on the parting plane. Marks the
+    // node hand-edited. breakLink (Alt) moves only the dragged arm and unlinks
+    // the node; otherwise a linked node mirrors the opposite arm (symmetric).
+    void MoveEditVentHandle(int node, bool isOut, int mouseX, int mouseY, bool breakLink);
+
+    // Rebuild the GL line buffer that draws node->handle stems for the edited
+    // smooth vent (called per frame while the handles are visible).
+    void RebuildHandleLineVBO();
+
+    // Insert a new node into the path of vent `ventIndex` at world point
+    // `worldPt` (which the caller has snapped onto that vent's path). Selects
+    // the vent, auto-converts Simple -> Complex, and splices the node into the
+    // nearest segment so it lands between the two nodes that section spans.
+    void InsertNodeOnVentAt(int ventIndex, const glm::vec3& worldPt);
+
+    // Screen-space snap of the cursor onto an existing vent path (Add Node
+    // tool). Mirrors RayCastEjectorSnap's runner snapping: returns the closest
+    // point on any vent's RENDERED polyline within kEjectorSnapRadiusPx, plus
+    // which vent it belongs to. Lets the user only place nodes on existing
+    // paths, associating each new node with the path it snapped to.
+    bool RayCastPathNodeSnap(int mouseX, int mouseY,
+        glm::vec3& outPos, int& outVentIndex) const;
+
+    // Remove node `idx` from the edited Complex vent. Origin (0) and endpoint
+    // (last) are protected; interior nodes only. No-op if it would drop below
+    // two nodes or idx is out of range.
+    void RemoveEditVentNode(int idx);
+
+    // Move node `idx` of the edited Complex vent to follow the mouse on the
+    // parting plane. Origin re-snaps to a part edge (and recaptures parent),
+    // the endpoint snaps to the fixture perimeter, interior nodes move freely.
+    void MoveEditVentNode(int idx, int mouseX, int mouseY);
+
+    // ---- Part 7 / R5b: runner node authoring (parallels the vent methods) ----
+    // The runner deltas: node[0] is PINNED to the sprue feed point (not
+    // grabbable), the endpoint is FREE inside the perimeter (no snap), and all
+    // nodes must stay inside the fixture hull.
+    int  PickEditRunnerNode(int mouseX, int mouseY) const;   // nearest node marker, -1 if none
+    void MoveEditRunnerNode(int idx, int mouseX, int mouseY);// drag endpoint/interior (node[0] pinned)
+    void RemoveEditRunnerNode(int idx);                      // interior only; feed(0)+endpoint protected
+    void InsertNodeOnRunnerAt(int runnerIndex, const glm::vec3& worldPt); // splice on the snapped path
+    // Screen-space snap onto any runner's RENDERED polyline (Add Node tool).
+    bool RayCastRunnerNodeSnap(int mouseX, int mouseY,
+        glm::vec3& outPos, int& outRunnerIndex) const;
+
+    // ---- Gate SUB-RUNNER node authoring (G5b) ------------------------------
+    // Mirrors the runner node methods, with the gate twist that node[0] is the
+    // gate origin (pinned — clicking it re-places the GATE instead of grabbing a
+    // node) and the endpoint is FREE with snap-assist to the feed network.
+    int  PickEditGateNode(int mouseX, int mouseY) const;   // nearest sub-runner node, -1 if none
+    void MoveEditGateNode(int idx, int mouseX, int mouseY);// drag endpoint/interior (node[0] pinned)
+    void RemoveEditGateNode(int idx);                      // interior only; origin(0)+endpoint protected
+    void InsertNodeOnGateAt(int gateIndex, const glm::vec3& worldPt); // splice on the snapped sub-runner
+    bool RayCastGateNodeSnap(int mouseX, int mouseY,
+        glm::vec3& outPos, int& outGateIndex) const;
+    // Nearest feed attach point (sprue parting pt or any runner centreline) to a
+    // parting-plane XZ; false if there is no feed network. Endpoint snap-assist.
+    bool NearestFeedPoint(const glm::vec2& xz, glm::vec3& outFeed) const;
+
+    // ---- Part 7 / R6: runner tangent-handle editing (mirrors the vent Part-6
+    // handle machinery, reusing m_editHandle* state + the handle-line VAO). The
+    // feed node (0) exposes only its outgoing arm and the endpoint only its
+    // incoming arm, exactly as for vents; the feed POSITION stays pinned.
+    int  PickEditRunnerHandle(int mouseX, int mouseY, bool& outIsOut) const;
+    void MoveEditRunnerHandle(int node, bool isOut, int mouseX, int mouseY, bool breakLink);
+
+    // ---- G6: gate SUB-RUNNER tangent-handle editing (mirrors the runner R6
+    // machinery, reusing the same m_editHandle* state + handle-line VAO). node[0]
+    // (the gate origin) exposes only its outgoing arm, the endpoint only its
+    // incoming arm; node[0]'s POSITION stays pinned to the gate.
+    int  PickEditGateHandle(int mouseX, int mouseY, bool& outIsOut) const;
+    void MoveEditGateHandle(int node, bool isOut, int mouseX, int mouseY, bool breakLink);
+
+    // Reposition the floating toolbar to the top-centre of the viewport.
+    void RepositionPathToolbar();
+
+    void NotifyPathEditChanged() { if (m_onPathEditChanged) m_onPathEditChanged(); }
+
     // Vent cross-section geometry
     VentCrossSection BuildVentCrossSection(const VentPath& path,
         float width, float depth);
@@ -535,8 +755,31 @@ private:
     // Runner solid geometry — swept cylinders from sprue parting point to each runner point
     void RebuildRunnerSolids();
 
-    // Gate path lines GPU upload (gate point → nearest feed point)
+    // Part 7 (R1): derive a runner's Simple FeaturePath (start = sprue feed
+    // point, end = runner point) into rf.path.  Pure bookkeeping — it keeps the
+    // stored path in sync as the sprue or runner point move so later steps can
+    // author a Complex route in its place; it drives no geometry yet.
+    void ComputeRunnerPath(RunnerFeature& rf) const;
+
+    // Gate feed-attach bookkeeping — derives each gate's pathEnd / hasPath
+    // (Simple: nearest feed; Complex: the authored endpoint). Runs BEFORE
+    // ComputeGatePath (which needs a Simple gate's pathEnd). Does NOT upload the
+    // guide-line VBO — that is RebuildGateLineVBO, run AFTER the sub-runner is
+    // finalised so a bent complex line always matches the tube.
     void RebuildGatePathVBO();
+
+    // Uploads the yellow gate guide lines from each gate's finalised subPath
+    // (Simple: straight origin→feed; Complex: the real bent centreline). Called
+    // at the end of RebuildGateSolids.
+    void RebuildGateLineVBO();
+
+    // Gate step G1: derive a gate's SUB-RUNNER Simple FeaturePath (start = gate
+    // origin, end = feed attach point / pathEnd) into gf.subPath.  Runs at the
+    // top of RebuildGateSolids so pathEnd is already fresh.  Pure bookkeeping —
+    // it keeps the stored sub-runner path in sync as the gate or feed network
+    // move so later steps can author a Complex route in its place; it drives no
+    // geometry yet (the frustum + sub-runner are still built from pathEnd).
+    void ComputeGatePath(GateFeature& gf) const;
 
     // Gate and sub-runner solid geometry
     void RebuildGateSolids();
@@ -866,6 +1109,27 @@ private:
     int     m_editFeatureIndex = -1;
     wxPoint m_editMousePos;              // deferred mouse position for edit drag
     bool    m_editNeedsUpdate = false;   // true when edit drag needs processing in OnPaint
+
+    // ---- Part 5: complex vent-path authoring state -------------------------
+    PathEditTool m_pathEditTool = PathEditTool::Move;  // active EditVent sub-tool
+    int          m_editVentNode = -1;   // node being dragged (Move tool), -1 = none
+    int          m_editRunnerNode = -1; // runner node being dragged (Move tool), -1 = none
+    int          m_editGateNode = -1;   // gate sub-runner node being dragged (Move tool), -1 = none
+    wxWindow*    m_pathToolbar  = nullptr;  // floating toolbar overlay (opaque)
+    std::function<void()> m_onPathEditChanged;  // toolbar reconfigure hook
+
+    // Add Node ghost — snaps onto an existing vent path under the cursor.
+    glm::vec3 m_pathNodeGhostPos{ 0.0f };
+    bool      m_pathNodeGhostActive = false;
+    wxPoint   m_pathNodeGhostMousePos;
+
+    // ---- Part 6: tangent-handle drag state ---------------------------------
+    int    m_editHandleNode = -1;     // node whose handle is grabbed (-1 = none)
+    bool   m_editHandleIsOut = false; // true = outgoing arm, false = incoming
+    bool   m_editHandleBreak = false; // Alt held during the current handle drag
+    GLuint  m_handleLineVAO = 0;      // node->handle stems (flat program)
+    GLuint  m_handleLineVBO = 0;
+    GLsizei m_handleLineVertexCount = 0;
 
     // Picking FBO
     GLuint m_pickFBO = 0;
