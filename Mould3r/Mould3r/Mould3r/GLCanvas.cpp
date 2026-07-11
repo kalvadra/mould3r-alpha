@@ -182,6 +182,7 @@ void GLCanvas::SetTransformMode(TransformMode mode)
         m_editNeedsUpdate = false;
         m_editVentNode = -1;
         m_editRunnerNode = -1;
+        m_editGateNode = -1;
         m_pathEditTool = PathEditTool::Move;   // Part 5: reset sub-tool
         m_pathNodeGhostActive = false;         // Part 5: drop Add Node ghost
         m_editHandleNode = -1;                 // Part 6: drop handle grab
@@ -1100,6 +1101,90 @@ void GLCanvas::RebuildRunnerSolids()
 }
 
 // ---------------------------------------------------------------------------
+// ComputeGatePath — derive a gate's SUB-RUNNER Simple FeaturePath from the
+// current gate origin and feed attach point.  The mirror of ComputeRunnerPath,
+// with two role differences dictated by the locked gate design:
+//
+//   * node[0] is pinned to the GATE ORIGIN (gf.point.worldPos), not the sprue
+//     feed — the gate is the source, the feed network is the destination.  So
+//     the reanchor below re-pins node[0] to the gate origin when the gate moves
+//     (mirroring how the runner re-pins node[0] to the sprue), rather than to
+//     the feed.
+//   * The endpoint (nodes.back()) is the feed attach point.  While Simple it is
+//     auto-snapped by RebuildGatePathVBO (which runs just before this) into
+//     gf.pathEnd; while Complex it is a freely authored node and does NOT chase
+//     a moving feed — so the reanchor rigid-shifts it with the gate but leaves
+//     it where the user placed it relative to the gate.
+//
+// Pure bookkeeping: it only populates gf.subPath.  Nothing consumes that field
+// yet (the frustum and sub-runner are still built directly from pathEnd), so
+// this changes nothing that is drawn or cut.
+// ---------------------------------------------------------------------------
+void GLCanvas::ComputeGatePath(GateFeature& gf) const
+{
+    const glm::vec3 origin = gf.point.worldPos;   // node[0] anchor (gate source)
+
+    // An authored (Complex) sub-runner is preserved verbatim — never re-derived,
+    // or a loaded / authored bent sub-runner would be clobbered back to a
+    // straight one on the next rebuild (this runs on every gate mutation and on
+    // load).  Only the derived fields are refreshed, plus the reanchor re-pin.
+    if (gf.subPath.kind == PathKind::Complex && gf.subPath.nodes.size() >= 2)
+    {
+        // Reanchor: node[0] is pinned to the gate origin.  If the gate has moved
+        // since the sub-runner was authored (a gate edit-drag, or a parent
+        // object transform via ReanchorGate), rigidly shift every node by the
+        // XZ delta so the whole sub-runner travels with the gate — and re-pin
+        // node[0] exactly onto the origin.  The shift is XZ-only so the plane-
+        // locked interior / endpoint nodes stay on y = 0 (decision 5); node[0]
+        // itself then takes the origin's full Y, which is the intended slight
+        // first-leg tilt when the gate sits just off the parting plane.  During
+        // normal authoring node[0] already sits on the origin, so the delta is
+        // zero and this is a no-op.
+        const glm::vec3 front = gf.subPath.nodes.front().pos;
+        const glm::vec3 deltaXZ(origin.x - front.x, 0.0f, origin.z - front.z);
+        const bool gateMoved = glm::dot(deltaXZ, deltaXZ) > 1e-12f;
+        if (gateMoved)
+            for (PathNode& nd : gf.subPath.nodes)
+                nd.pos += deltaXZ;
+        gf.subPath.nodes.front().pos = origin;     // exact re-pin (kills drift)
+
+        // The rigid shift above also dragged the FAR end along, pulling the
+        // feed-attach node off the sprue/runner it was snapped to (which would
+        // break the path — the gate no longer connects upstream).  So whenever
+        // the gate origin moved (a gate-point re-place, or a parent transform),
+        // re-snap the endpoint back onto the nearest feed, mirroring node[0]'s
+        // re-pin at the other end.  Skipped when the gate didn't move so normal
+        // authoring / load never perturbs an already-placed endpoint.
+        if (gateMoved && gf.subPath.nodes.size() >= 2)
+        {
+            const glm::vec3 ep = gf.subPath.nodes.back().pos;
+            glm::vec3 feed;
+            if (NearestFeedPoint(glm::vec2(ep.x, ep.z), feed))
+                gf.subPath.nodes.back().pos = glm::vec3(feed.x, 0.0f, feed.z);
+        }
+
+        gf.subPath.start = gf.subPath.nodes.front().pos;
+        gf.subPath.end   = gf.subPath.nodes.back().pos;
+        gf.subPath.valid = true;
+        if (gf.subPath.smooth)
+            AutoComputeComplexHandles(gf.subPath);
+        return;
+    }
+
+    // Simple: a straight route gate origin -> feed attach point (pathEnd), valid
+    // only when RebuildGatePathVBO found a feed to snap to (gf.hasPath) and the
+    // two ends are distinct.  Byte-for-byte the same span the frustum + straight
+    // sub-runner are already built from.
+    gf.subPath.kind   = PathKind::Simple;
+    gf.subPath.smooth = false;
+    gf.subPath.nodes.clear();
+    gf.subPath.start  = origin;
+    gf.subPath.end    = gf.hasPath ? gf.pathEnd : origin;
+    gf.subPath.valid  = gf.hasPath &&
+        glm::length(gf.subPath.end - gf.subPath.start) > 1e-6f;
+}
+
+// ---------------------------------------------------------------------------
 // RebuildGateSolids — builds a tapered frustum (gate) and a straight cylinder
 // (sub-runner) for every placed gate that has a valid path.
 //
@@ -1112,8 +1197,21 @@ void GLCanvas::RebuildRunnerSolids()
 // If the taper length >= total path length, the gate fills the whole path
 // and no sub-runner section is produced.
 // ---------------------------------------------------------------------------
+// Forward decl: the sub-path trimmed to begin at the transition point (defined
+// further down, next to the OCC cut that also consumes it).  The preview builds
+// its tube from this same trimmed path so preview and cut can never disagree.
+static FeaturePath GateSubRunnerCutPath(const FeaturePath& subPath,
+                                        const glm::vec3& transitionPt);
+
 void GLCanvas::RebuildGateSolids()
 {
+    // Gate step G1: keep every gate's stored sub-runner path in sync before
+    // building geometry.  This is the universal chokepoint — RebuildGatePathVBO
+    // (which refreshes pathEnd) is always called immediately before this — so
+    // deriving the Simple path here means placement, edit-drag, feed moves,
+    // removal and load all flow through one place.  Drives no geometry yet.
+    for (auto& gf : m_gates) ComputeGatePath(gf);
+
     for (auto& gf : m_gates) { gf.solid.Destroy(); gf.subRunnerSolid.Destroy(); }
     if (m_gates.empty()) return;
 
@@ -1134,46 +1232,96 @@ void GLCanvas::RebuildGateSolids()
 
     for (GateFeature& gf : m_gates)
     {
-        if (!gf.hasPath) continue;
+        // The sub-runner path (G1) is the route's source of truth now.  For a
+        // Simple gate subPath is a straight origin -> pathEnd line, so every
+        // branch below reduces to the historical behaviour exactly; a Complex
+        // gate (G5+) supplies an authored multi-node route.  subPath.valid is
+        // the Simple `hasPath && length > 1e-6` guard folded into one flag.
+        if (!gf.subPath.valid) continue;
 
         const glm::vec3 origin = gf.point.worldPos;
-        const glm::vec3 pathVec = gf.pathEnd - origin;
-        const float     totalLen = glm::length(pathVec);
-        if (totalLen < 1e-6f) continue;
-        const glm::vec3 pathDir = pathVec / totalLen;
 
-        // Distance along path at which the draft expands gate to sub-runner radius
+        // First-leg direction of the sub-runner route.  The gate frustum is a
+        // straight tapered cone that always lives on this first leg (decision
+        // 3); the sub-runner tube follows the remainder.  For a Simple path the
+        // first leg IS the whole straight route, so pathDir matches the old
+        // `normalize(pathEnd - origin)` byte-for-byte (gate origins sit on the
+        // parting plane, y approx 0, so the tube's Y-flattened first tangent
+        // agrees with this to within the accepted slight first-leg tilt).
+        glm::vec3 firstVec;
+        if (gf.subPath.kind == PathKind::Complex && gf.subPath.nodes.size() >= 2)
+            firstVec = gf.subPath.nodes[1].pos - gf.subPath.nodes[0].pos;
+        else
+            firstVec = gf.subPath.end - gf.subPath.start;
+
+        const float firstLegLen = glm::length(firstVec);
+        if (firstLegLen < 1e-6f) continue;
+        const glm::vec3 pathDir = firstVec / firstLegLen;
+
+        // Straight origin -> endpoint length, used only to detect the Simple
+        // "gate fills the whole straight path" degenerate.
+        const float totalLen = glm::length(gf.subPath.end - origin);
+
+        // Distance along the first leg at which the draft expands the gate to
+        // sub-runner radius.
         float taperLen = std::numeric_limits<float>::max();
         if (tanDraft > 1e-6f && subRunnerRadius > gateRadius)
             taperLen = (subRunnerRadius - gateRadius) / tanDraft;
 
-        // Overrun shifts the cylinder's start backward along -pathDir into
-        // the model. The radius at the start is reduced so that the radius
-        // at the original origin (parting surface) still equals gateRadius —
-        // i.e. the user-typed Diameter remains the diameter of the inlet
-        // hole at the parting surface, regardless of overrun. For typical
-        // drafts the start-radius shrinkage is sub-millimetre and the
-        // visible effect is just "the cylinder pokes back into the model".
-        // Clamped to a small floor so aggressive overrun + draft combos
-        // don't degenerate into a zero-radius cap (BuildCylinderMesh
-        // rejects radii below 1e-6).
+        // Overrun shifts the cone's start backward along -pathDir into the
+        // model, with a compensated start radius so the radius at the parting
+        // surface (origin) still equals gateRadius — i.e. the user-typed
+        // Diameter stays the inlet-hole diameter regardless of overrun.
+        // Floored so aggressive overrun + draft combos can't drive it to a
+        // zero-radius cap (BuildCylinderMesh rejects radii below 1e-6).
         const glm::vec3 startPt = origin - pathDir * overrun;
         const float startRadius = std::max(0.01f, gateRadius - tanDraft * overrun);
 
-        if (taperLen >= totalLen)
+        // A Simple gate whose taper would swallow the entire straight path:
+        // emit one cone spanning the whole thing and no sub-runner — the
+        // historical degenerate, preserved exactly.  A Complex route never
+        // takes this branch; its cone is clamped to the first leg below.
+        const bool simpleFull =
+            gf.subPath.kind != PathKind::Complex && taperLen >= totalLen;
+
+        if (simpleFull)
         {
-            // Gate fills the entire path — no sub-runner section
-            gf.solid = BuildCylinderMesh(startPt, gf.pathEnd, startRadius, draftAngle);
+            gf.solid = BuildCylinderMesh(startPt, gf.subPath.end,
+                startRadius, draftAngle);
         }
         else
         {
-            const glm::vec3 transitionPt = origin + pathDir * taperLen;
+            // Cone lives on the first leg only; clamp so a shallow draft can't
+            // push the transition past the first node (decision 3).  When the
+            // clamp bites (very shallow draft on a short first leg) the cone
+            // ends below sub-runner radius and the tube starts at full radius,
+            // an accepted small step at the junction.
+            const float     taperOnLeg  = std::min(taperLen, firstLegLen);
+            const glm::vec3 transitionPt = origin + pathDir * taperOnLeg;
+
             gf.solid = BuildCylinderMesh(startPt, transitionPt,
                 startRadius, draftAngle);
-            gf.subRunnerSolid = BuildCylinderMesh(transitionPt, gf.pathEnd,
-                subRunnerRadius, 0.0f);
+
+            // Sub-runner tube: sweep along the sub-path TRIMMED to begin at the
+            // transition point (the exact path the OCC cut consumes), so preview
+            // and cut can never disagree.  A smooth sub-runner therefore starts
+            // AT the transition — running the full origin->endpoint curve at
+            // constant radius (which ignored the gate cone) was the bug — and
+            // gets a junction sphere so the straight cone blends into the curve
+            // that leaves the transition at an angle.  Non-smooth first legs are
+            // colinear with the cone, so no sphere (would be a redundant bulge).
+            const FeaturePath subTubePath =
+                GateSubRunnerCutPath(gf.subPath, transitionPt);
+            gf.subRunnerSolid = BuildTubeSweepMesh(subTubePath, subRunnerRadius,
+                /*segments=*/32, /*overrunStart=*/0.0f, /*overrunEnd=*/0.0f,
+                /*sphereAtStart=*/subTubePath.kind == PathKind::Complex,
+                /*sphereAtEnd=*/subTubePath.kind == PathKind::Complex);
         }
     }
+
+    // The sub-runner is now finalised for every gate — upload the guide lines so
+    // a bent complex line follows the real centreline instead of a straight chord.
+    RebuildGateLineVBO();
 }
 
 // ---------------------------------------------------------------------------
@@ -1222,13 +1370,21 @@ void GLCanvas::RebuildEjectorSolids()
 // ---------------------------------------------------------------------------
 void GLCanvas::RebuildGatePathVBO()
 {
-    if (!m_gatePathVAO) return;
-
-    std::vector<float> verts;
-    verts.reserve(m_gates.size() * 6);
-
+    // Feed-attach bookkeeping only (pathEnd / hasPath). The guide-line VBO is
+    // uploaded separately by RebuildGateLineVBO, AFTER ComputeGatePath finalises
+    // the sub-runner, so a bent complex line always matches the tube.
     for (GateFeature& gf : m_gates)
     {
+        // Complex sub-runner: the endpoint is authored and already snapped to a
+        // feed (MoveEditGateNode / ComputeGatePath), so pathEnd is just the last
+        // node — no nearest-feed re-derivation.
+        if (gf.subPath.kind == PathKind::Complex && gf.subPath.nodes.size() >= 2)
+        {
+            gf.pathEnd = gf.subPath.nodes.back().pos;
+            gf.hasPath = gf.subPath.valid;
+            continue;
+        }
+
         gf.hasPath = false;
 
         const glm::vec2 gateXZ(gf.point.worldPos.x, gf.point.worldPos.z);
@@ -1282,13 +1438,44 @@ void GLCanvas::RebuildGatePathVBO()
         {
             gf.pathEnd = bestPt;
             gf.hasPath = true;
+        }
+    }
+}
 
-            verts.push_back(gf.point.worldPos.x);
-            verts.push_back(gf.point.worldPos.y);
-            verts.push_back(gf.point.worldPos.z);
-            verts.push_back(bestPt.x);
-            verts.push_back(bestPt.y);
-            verts.push_back(bestPt.z);
+// ---------------------------------------------------------------------------
+// RebuildGateLineVBO — upload the yellow gate guide lines from each gate's
+// FINALISED subPath.  Simple: a straight origin -> feed chord.  Complex: the
+// real bent sub-runner centreline (every leg / the smooth curve) so the line
+// matches the tube.  Runs at the END of RebuildGateSolids (after ComputeGatePath
+// has reanchored / re-snapped), so it never lags the path on a gate-point drag.
+// ---------------------------------------------------------------------------
+void GLCanvas::RebuildGateLineVBO()
+{
+    if (!m_gatePathVAO) return;
+
+    std::vector<float> verts;
+    verts.reserve(m_gates.size() * 6);
+
+    std::vector<glm::vec3> poly;
+    for (const GateFeature& gf : m_gates)
+    {
+        if (!gf.subPath.valid) continue;
+
+        if (gf.subPath.kind == PathKind::Complex && gf.subPath.nodes.size() >= 2)
+        {
+            // Follow the real centreline so the line tracks the bent tube.
+            RunnerCenterline(gf.subPath, gf.point.worldPos, gf.pathEnd, poly);
+            for (size_t s = 0; s + 1 < poly.size(); ++s)
+            {
+                verts.push_back(poly[s].x);     verts.push_back(poly[s].y);     verts.push_back(poly[s].z);
+                verts.push_back(poly[s + 1].x); verts.push_back(poly[s + 1].y); verts.push_back(poly[s + 1].z);
+            }
+        }
+        else
+        {
+            // Simple: straight origin -> feed attach (subPath.start -> .end).
+            verts.push_back(gf.subPath.start.x); verts.push_back(gf.subPath.start.y); verts.push_back(gf.subPath.start.z);
+            verts.push_back(gf.subPath.end.x);   verts.push_back(gf.subPath.end.y);   verts.push_back(gf.subPath.end.z);
         }
     }
 
@@ -1789,7 +1976,9 @@ static bool BuildVentCutPieces(const VentInstance& vent,
 // least one valid piece was produced.
 // ---------------------------------------------------------------------------
 static bool BuildRunnerCutPieces(const FeaturePath& path, float radius,
-                                 std::vector<TopoDS_Shape>& outPieces)
+                                 std::vector<TopoDS_Shape>& outPieces,
+                                 bool sphereAtStart = false,
+                                 bool sphereAtEnd = false)
 {
     outPieces.clear();
     if (!path.valid || radius < 1e-6f) return false;
@@ -1832,6 +2021,14 @@ static bool BuildRunnerCutPieces(const FeaturePath& path, float radius,
         addCylinder(path.start, path.end);
         return !outPieces.empty();
     }
+
+    // Optional junction sphere at the path start (gates: rounds the frustum ->
+    // smooth-sub-runner transition so the cut matches the preview).
+    if (sphereAtStart) addSphere(path.start);
+
+    // Optional junction sphere at the path end (gates: the feed end blends into
+    // the sprue/runner — a sphere at every sub-runner node bar the gate origin).
+    if (sphereAtEnd)   addSphere(path.end);
 
     std::vector<PathStation> stations = SamplePath(path);
     if (stations.size() < 2) return false;
@@ -1892,6 +2089,56 @@ static bool BuildRunnerCutPieces(const FeaturePath& path, float radius,
     for (const glm::vec3& c : jointCentres) addSphere(c);
 
     return !outPieces.empty();
+}
+
+// ---------------------------------------------------------------------------
+// GateSubRunnerCutPath — the sub-runner FeaturePath trimmed so it BEGINS at the
+// gate's transition point (where the frustum cone ends).  The frustum covers
+// [gate origin, transition]; this covers [transition, feed attach].  Handing the
+// trimmed path to BuildRunnerCutPieces gives the sub-runner cut (a Simple
+// cylinder, or a bent tube + sphere joints when Complex) WITHOUT a constant-
+// radius cylinder spanning the inlet region and overriding the frustum's taper.
+// node[0]'s tangent handle is left as authored; the transition sits only a short
+// taper-length into the first leg, so any smooth-curve start distortion is minute
+// and hidden inside the cone.
+// ---------------------------------------------------------------------------
+static FeaturePath GateSubRunnerCutPath(const FeaturePath& subPath,
+                                        const glm::vec3& transitionPt)
+{
+    FeaturePath p = subPath;
+    if (p.kind == PathKind::Complex && p.nodes.size() >= 2)
+    {
+        p.nodes.front().pos = transitionPt;   // slide the first node to the transition
+
+        // If the frustum reached (or passed) the first authored node — common
+        // with a long taper on a short first leg — the trim collapses the first
+        // leg to zero length.  Drop the now-coincident second node(s) so the
+        // sub-runner starts cleanly at the transition instead of emitting a
+        // degenerate leg (which yields a NaN tangent and malformed stations —
+        // the likely cause of a missing joint in the cut).
+        while (p.nodes.size() > 2 &&
+               glm::length(p.nodes[1].pos - p.nodes[0].pos) < 1e-4f)
+            p.nodes.erase(p.nodes.begin() + 1);
+
+        p.start = p.nodes.front().pos;
+        p.end   = p.nodes.back().pos;
+        p.valid = p.nodes.size() >= 2 &&
+                  glm::length(p.end - p.start) > 1e-6f;
+
+        // Recompute tangent handles for the trimmed node positions so a smooth
+        // sub-runner's first Bezier segment leaves the transition correctly
+        // (auto nodes only; manual handles are preserved by AutoComputeComplexHandles).
+        if (p.smooth) AutoComputeComplexHandles(p);
+    }
+    else
+    {
+        p.kind   = PathKind::Simple;
+        p.smooth = false;
+        p.nodes.clear();
+        p.start  = transitionPt;              // p.end stays the feed attach point
+        p.valid  = glm::length(p.end - p.start) > 1e-6f;
+    }
+    return p;
 }
 
 // ---------------------------------------------------------------------------
@@ -2182,15 +2429,25 @@ bool GLCanvas::GenerateMould()
                     std::to_string((int)m_gates.size()) + "...");
 
                 const GateFeature& gf = m_gates[gi];
-                if (!gf.hasPath) continue;
+                if (!gf.subPath.valid || gateRadius < 1e-6f) continue;
 
                 const glm::vec3 origin = gf.point.worldPos;
-                const glm::vec3 pathVec = gf.pathEnd - origin;
-                const float     totalLen = glm::length(pathVec);
-                if (totalLen < 1e-6f || gateRadius < 1e-6f) continue;
-                const glm::vec3 pathDir = pathVec / totalLen;
 
-                const gp_Pnt occOrigin(origin.x, origin.y, origin.z);
+                // First-leg direction of the sub-runner route: the frustum cone
+                // lives on this leg (decision 3), matching the RebuildGateSolids
+                // preview.  For a Simple gate the first leg IS the whole straight
+                // route, so pathDir / totalLen equal the historical values.
+                glm::vec3 firstVec;
+                if (gf.subPath.kind == PathKind::Complex && gf.subPath.nodes.size() >= 2)
+                    firstVec = gf.subPath.nodes[1].pos - gf.subPath.nodes[0].pos;
+                else
+                    firstVec = gf.subPath.end - gf.subPath.start;
+
+                const float firstLegLen = glm::length(firstVec);
+                if (firstLegLen < 1e-6f) continue;
+                const glm::vec3 pathDir = firstVec / firstLegLen;
+                const float     totalLen = glm::length(gf.subPath.end - origin);
+
                 const gp_Dir occDir(pathDir.x, pathDir.y, pathDir.z);
 
                 // Back-extension along -pathDir into the model, combining two
@@ -2205,9 +2462,7 @@ bool GLCanvas::GenerateMould()
                 static constexpr float kCutEps = 0.1f;
                 const float backExt = kCutEps + overrun;
                 const glm::vec3 originExt = origin - pathDir * backExt;
-                const float     totalLenExt = totalLen + backExt;
-                const gp_Pnt    occOriginExt(originExt.x, originExt.y, originExt.z);
-                const gp_Ax2    gateAxExt(occOriginExt, occDir);
+                const gp_Ax2    gateAxExt(gp_Pnt(originExt.x, originExt.y, originExt.z), occDir);
 
                 // Radius at originExt, derived so the radius at the original
                 // parting-surface point (origin) is exactly gateRadius — i.e.
@@ -2219,21 +2474,28 @@ bool GLCanvas::GenerateMould()
                 const float startRadius = std::max(0.01f,
                     gateRadius - tanDraft * backExt);
 
-                // Distance along path where draft expands to sub-runner radius
+                // Distance along the first leg where draft reaches sub-runner
+                // radius, clamped to the first leg so a shallow draft can't push
+                // the transition past the first node (decision 3).
                 float taperLen = std::numeric_limits<float>::max();
                 if (tanDraft > 1e-6f && subRunnerRadius > gateRadius)
                     taperLen = (subRunnerRadius - gateRadius) / tanDraft;
+                const float taperOnLeg    = std::min(taperLen, firstLegLen);
+                const float taperOnLegExt = taperOnLeg + backExt;
 
-                // Adjust taperLen relative to the extended origin
-                const float taperLenExt = taperLen + backExt;
+                // A Simple gate whose taper swallows the whole straight path:
+                // one cone/cylinder, no sub-runner (historical degenerate).  A
+                // Complex route never takes this branch (cone clamped above).
+                const bool simpleFull =
+                    gf.subPath.kind != PathKind::Complex && taperLen >= totalLen;
 
-                if (taperLen >= totalLen)
+                if (simpleFull)
                 {
-                    // Gate fills the whole path — single cone/cylinder cut.
                     // End radius at pathEnd is the geometric extension from
                     // startRadius over totalLenExt, which simplifies to
                     // gateRadius + totalLen*tanDraft (the back-extension
                     // contributions cancel by construction of startRadius).
+                    const float totalLenExt = totalLen + backExt;
                     const float endR = startRadius + totalLenExt * tanDraft;
                     TopoDS_Shape gateShape;
                     if (std::abs(endR - startRadius) > 1e-6f)
@@ -2265,12 +2527,12 @@ bool GLCanvas::GenerateMould()
                 else
                 {
                     // --- Gate frustum (extended origin → transition point) ---
-                    // End radius at the transition is exactly subRunnerRadius
-                    // by definition of taperLen — the back-extension shifts
-                    // the start without changing where the taper hits
-                    // subRunnerRadius in world space.
+                    // Unchanged: a straight tapered cone driven purely by the
+                    // gate-card fields.  End radius at the transition is exactly
+                    // subRunnerRadius by definition of taperOnLeg (== taperLen for
+                    // a Simple gate, so byte-for-byte the historical cone).
                     {
-                        BRepPrimAPI_MakeCone cone(gateAxExt, startRadius, subRunnerRadius, taperLenExt);
+                        BRepPrimAPI_MakeCone cone(gateAxExt, startRadius, subRunnerRadius, taperOnLegExt);
                         cone.Build();
                         if (cone.IsDone() && !cone.Shape().IsNull())
                         {
@@ -2284,25 +2546,33 @@ bool GLCanvas::GenerateMould()
                         }
                     }
 
-                    // --- Sub-runner cylinder (transition point → pathEnd) ---
+                    // --- Sub-runner (transition point → feed attach) ---------
+                    // Routed through BuildRunnerCutPieces on the sub-path trimmed
+                    // to begin at the transition point: a Simple gate yields one
+                    // straight cylinder (the old sub-runner cut, now with the
+                    // standard kCutEps junction overlap); a Complex gate yields a
+                    // bent tube (one cylinder per leg + a sphere joint per
+                    // interior node).  No cold plug — gates don't have one.  Each
+                    // piece is cut independently so a failed piece never drops the
+                    // rest.
                     {
-                        const glm::vec3 transitionPt = originExt + pathDir * taperLenExt;
-                        const float     subLen = totalLenExt - taperLenExt;
-                        const gp_Ax2    subAx(
-                            gp_Pnt(transitionPt.x, transitionPt.y, transitionPt.z),
-                            occDir);
+                        const glm::vec3 transitionPt = originExt + pathDir * taperOnLegExt;
+                        const FeaturePath subCutPath =
+                            GateSubRunnerCutPath(gf.subPath, transitionPt);
 
-                        BRepPrimAPI_MakeCylinder subCyl(subAx, subRunnerRadius, subLen);
-                        subCyl.Build();
-                        if (subCyl.IsDone() && !subCyl.Shape().IsNull())
+                        std::vector<TopoDS_Shape> subPieces;
+                        if (BuildRunnerCutPieces(subCutPath, subRunnerRadius, subPieces, /*sphereAtStart=*/subCutPath.kind == PathKind::Complex, /*sphereAtEnd=*/subCutPath.kind == PathKind::Complex))
                         {
-                            BRepAlgoAPI_Cut subCut(result, subCyl.Shape());
-                            subCut.Build();
-                            if (subCut.IsDone() && !subCut.Shape().IsNull())
-                                result = subCut.Shape();
-                            else
-                                wxMessageBox("Sub-runner cut failed for gate " + std::to_string(gi + 1),
-                                    "Generate Mould", wxOK | wxICON_WARNING, this);
+                            for (const TopoDS_Shape& piece : subPieces)
+                            {
+                                BRepAlgoAPI_Cut subCut(result, piece);
+                                subCut.Build();
+                                if (subCut.IsDone() && !subCut.Shape().IsNull())
+                                    result = subCut.Shape();
+                                else
+                                    wxMessageBox("Sub-runner cut failed for gate " + std::to_string(gi + 1),
+                                        "Generate Mould", wxOK | wxICON_WARNING, this);
+                            }
                         }
                     }
                 }
@@ -3053,18 +3323,27 @@ bool GLCanvas::BuildShotModel(TopoDS_Shape& out)
 
         for (const GateFeature& gf : m_gates)
         {
-            if (!gf.hasPath) continue;
+            if (!gf.subPath.valid || gateRadius < 1e-6f) continue;
 
             const glm::vec3 origin = gf.point.worldPos;
-            const glm::vec3 pathVec = gf.pathEnd - origin;
-            const float     totalLen = glm::length(pathVec);
-            if (totalLen < 1e-6f || gateRadius < 1e-6f) continue;
-            const glm::vec3 pathDir = pathVec / totalLen;
+
+            // First-leg direction of the sub-runner route (see GenerateMould /
+            // RebuildGateSolids): frustum cone on the first leg; Simple reduces
+            // to the historical straight values.
+            glm::vec3 firstVec;
+            if (gf.subPath.kind == PathKind::Complex && gf.subPath.nodes.size() >= 2)
+                firstVec = gf.subPath.nodes[1].pos - gf.subPath.nodes[0].pos;
+            else
+                firstVec = gf.subPath.end - gf.subPath.start;
+
+            const float firstLegLen = glm::length(firstVec);
+            if (firstLegLen < 1e-6f) continue;
+            const glm::vec3 pathDir = firstVec / firstLegLen;
+            const float     totalLen = glm::length(gf.subPath.end - origin);
             const gp_Dir occDir(pathDir.x, pathDir.y, pathDir.z);
 
             const float backExt = kCutEps + overrun;
             const glm::vec3 originExt = origin - pathDir * backExt;
-            const float     totalLenExt = totalLen + backExt;
             const gp_Ax2    gateAxExt(gp_Pnt(originExt.x, originExt.y, originExt.z), occDir);
 
             const float startRadius = std::max(0.01f, gateRadius - tanDraft * backExt);
@@ -3072,10 +3351,15 @@ bool GLCanvas::BuildShotModel(TopoDS_Shape& out)
             float taperLen = std::numeric_limits<float>::max();
             if (tanDraft > 1e-6f && subRunnerRadius > gateRadius)
                 taperLen = (subRunnerRadius - gateRadius) / tanDraft;
-            const float taperLenExt = taperLen + backExt;
+            const float taperOnLeg    = std::min(taperLen, firstLegLen);
+            const float taperOnLegExt = taperOnLeg + backExt;
 
-            if (taperLen >= totalLen)
+            const bool simpleFull =
+                gf.subPath.kind != PathKind::Complex && taperLen >= totalLen;
+
+            if (simpleFull)
             {
+                const float totalLenExt = totalLen + backExt;
                 const float endR = startRadius + totalLenExt * tanDraft;
                 if (std::abs(endR - startRadius) > 1e-6f)
                 {
@@ -3094,21 +3378,24 @@ bool GLCanvas::BuildShotModel(TopoDS_Shape& out)
             }
             else
             {
-                BRepPrimAPI_MakeCone cone(gateAxExt, startRadius, subRunnerRadius, taperLenExt);
+                // Frustum cone on the first leg (gate-card fields only).
+                BRepPrimAPI_MakeCone cone(gateAxExt, startRadius, subRunnerRadius, taperOnLegExt);
                 cone.Build();
                 if (cone.IsDone() && !cone.Shape().IsNull())
                     shapes.push_back(cone.Shape());
 
-                const glm::vec3 transitionPt = originExt + pathDir * taperLenExt;
-                const float     subLen = totalLenExt - taperLenExt;
-                if (subLen > 1e-6f)
-                {
-                    gp_Ax2 subAx(gp_Pnt(transitionPt.x, transitionPt.y, transitionPt.z), occDir);
-                    BRepPrimAPI_MakeCylinder subCyl(subAx, subRunnerRadius, subLen);
-                    subCyl.Build();
-                    if (subCyl.IsDone() && !subCyl.Shape().IsNull())
-                        shapes.push_back(subCyl.Shape());
-                }
+                // Sub-runner tube for the shot: BuildRunnerCutPieces on the
+                // sub-path trimmed to begin at the transition point.  No cold
+                // plug — same pieces the GenerateMould cut removes, fused into
+                // the positive shot here.
+                const glm::vec3 transitionPt = originExt + pathDir * taperOnLegExt;
+                const FeaturePath subCutPath =
+                    GateSubRunnerCutPath(gf.subPath, transitionPt);
+
+                std::vector<TopoDS_Shape> subPieces;
+                if (BuildRunnerCutPieces(subCutPath, subRunnerRadius, subPieces, /*sphereAtStart=*/subCutPath.kind == PathKind::Complex, /*sphereAtEnd=*/subCutPath.kind == PathKind::Complex))
+                    for (const TopoDS_Shape& piece : subPieces)
+                        shapes.push_back(piece);
             }
         }
     }
@@ -4336,12 +4623,25 @@ bool GLCanvas::RayCastEjectorSnap(int mouseX, int mouseY, glm::vec3& outPos)
         }
     }
 
-    // 3. Gate segments (gate worldPos -> gate.pathEnd). pathEnd is only
-    //    valid when hasPath is true (computed by RebuildGatePathVBO).
-    for (const GateFeature& gf : m_gates)
+    // 3. Gate sub-runner centrelines. Simple: the straight origin -> feed chord;
+    //    Complex: every leg / the smooth curve, so an ejector snaps onto a bent
+    //    sub-runner just like it does onto a bent runner.
     {
-        if (!gf.hasPath) continue;
-        consider(closestOnSegment(gf.point.worldPos, gf.pathEnd));
+        std::vector<glm::vec3> poly;
+        for (const GateFeature& gf : m_gates)
+        {
+            if (gf.subPath.kind == PathKind::Complex && gf.subPath.valid &&
+                gf.subPath.nodes.size() >= 2)
+            {
+                RunnerCenterline(gf.subPath, gf.point.worldPos, gf.pathEnd, poly);
+                for (size_t s = 0; s + 1 < poly.size(); ++s)
+                    consider(closestOnSegment(poly[s], poly[s + 1]));
+            }
+            else if (gf.hasPath)
+            {
+                consider(closestOnSegment(gf.point.worldPos, gf.pathEnd));
+            }
+        }
     }
 
     if (hit)
@@ -4865,6 +5165,7 @@ void GLCanvas::SetPathEditTool(PathEditTool t)
     m_pathEditTool = t;
     m_editVentNode = -1;
     m_editRunnerNode = -1;
+    m_editGateNode = -1;
     NotifyPathEditChanged();
     Refresh(false);
 }
@@ -5132,6 +5433,92 @@ void GLCanvas::SetEditRunnerSmooth(bool smooth)
     Refresh(false);
 }
 
+// ---- Gate SUB-RUNNER complex-path editing (G5) ----------------------------
+bool GLCanvas::IsEditGateComplex() const
+{
+    return HasEditGateSelected() &&
+        m_gates[m_editFeatureIndex].subPath.kind == PathKind::Complex;
+}
+bool GLCanvas::IsEditGateSmooth() const
+{
+    return HasEditGateSelected() && m_gates[m_editFeatureIndex].subPath.smooth;
+}
+int GLCanvas::EditGateNodeCount() const
+{
+    if (!IsEditGateComplex()) return 0;
+    return (int)m_gates[m_editFeatureIndex].subPath.nodes.size();
+}
+void GLCanvas::ConvertEditGateToComplex()
+{
+    if (!HasEditGateSelected()) return;
+    GateFeature& gf = m_gates[m_editFeatureIndex];
+    if (gf.subPath.kind == PathKind::Complex) return;
+
+    // Seed a straight two-node sub-runner [gate origin, feed attach] so the
+    // Complex path is byte-visually identical to the Simple one until the user
+    // bends it. node[0] keeps the gate origin's Y (so the first leg can tilt if
+    // the gate sits just off the parting plane — decision 5); the endpoint is
+    // the current auto-snapped feed point (pathEnd), flattened to y=0. With no
+    // feed yet the endpoint collapses onto the origin's XZ so the path stays
+    // well-formed.
+    const glm::vec3 origin = gf.point.worldPos;
+    const glm::vec3 endpt = gf.hasPath
+        ? glm::vec3(gf.pathEnd.x, 0.0f, gf.pathEnd.z)
+        : glm::vec3(origin.x, 0.0f, origin.z);
+
+    gf.subPath.kind = PathKind::Complex;
+    gf.subPath.smooth = false;
+    gf.subPath.nodes.clear();
+    PathNode a; a.pos = origin;
+    PathNode b; b.pos = endpt;
+    gf.subPath.nodes.push_back(a);
+    gf.subPath.nodes.push_back(b);
+    gf.subPath.start = origin;
+    gf.subPath.end = endpt;
+    gf.subPath.valid = true;
+
+    RebuildGatePathVBO();
+    RebuildGateSolids();
+    NotifySceneMutated();
+    NotifyPathEditChanged();
+    Refresh(false);
+}
+void GLCanvas::ConvertEditGateToSimple()
+{
+    if (!HasEditGateSelected()) return;
+    GateFeature& gf = m_gates[m_editFeatureIndex];
+    if (gf.subPath.kind != PathKind::Complex) return;
+
+    // The gate point is the sub-runner's START, not its endpoint, so there is
+    // nothing to preserve back onto gf.point — a Simple sub-runner re-derives
+    // its endpoint by auto-snapping to the nearest feed (RebuildGatePathVBO ->
+    // ComputeGatePath).
+    gf.subPath.kind = PathKind::Simple;
+    gf.subPath.smooth = false;
+    gf.subPath.nodes.clear();
+
+    RebuildGatePathVBO();
+    RebuildGateSolids();
+    NotifySceneMutated();
+    NotifyPathEditChanged();
+    Refresh(false);
+}
+void GLCanvas::SetEditGateSmooth(bool smooth)
+{
+    if (!IsEditGateComplex()) return;
+    GateFeature& gf = m_gates[m_editFeatureIndex];
+    if (gf.subPath.smooth == smooth) return;
+    gf.subPath.smooth = smooth;
+    if (gf.subPath.smooth)
+        AutoComputeComplexHandles(gf.subPath);
+
+    RebuildGatePathVBO();
+    RebuildGateSolids();
+    NotifySceneMutated();
+    NotifyPathEditChanged();
+    Refresh(false);
+}
+
 // PickEditRunnerNode — nearest node marker of the edited Complex runner to the
 // mouse ray; returns its node index or -1 if none is within the hit radius.
 int GLCanvas::PickEditRunnerNode(int mouseX, int mouseY) const
@@ -5333,6 +5720,245 @@ bool GLCanvas::RayCastRunnerNodeSnap(int mouseX, int mouseY,
     return hit;
 }
 
+// ===========================================================================
+// Gate SUB-RUNNER node authoring (G5b) — the runner node methods adapted to the
+// gate: node[0] is the gate origin (pinned — clicking it re-places the GATE, not
+// a node) and the endpoint is free with snap-assist onto the feed network.
+// ===========================================================================
+int GLCanvas::PickEditGateNode(int mouseX, int mouseY) const
+{
+    if (!IsEditGateComplex()) return -1;
+    glm::vec3 rayOrig, rayDir;
+    const_cast<GLCanvas*>(this)->BuildMouseRay(mouseX, mouseY, rayOrig, rayDir);
+
+    const std::vector<PathNode>& nodes = m_gates[m_editFeatureIndex].subPath.nodes;
+    const float hitRadius = kVentMarkerRadius * 1.6f;
+    float bestDist = hitRadius;
+    int   bestIdx = -1;
+    for (int i = 0; i < (int)nodes.size(); ++i)
+    {
+        const float d = PointRayDistance(nodes[i].pos, rayOrig, rayDir);
+        if (d < bestDist) { bestDist = d; bestIdx = i; }
+    }
+    return bestIdx;
+}
+
+// MoveEditGateNode — drag a sub-runner node on the parting plane.
+//   node[0]  : PINNED to the gate origin — not movable (owned by the gate point).
+//   endpoint : free on the plane, kept inside the hull, with SNAP-ASSIST to the
+//              nearest feed (sprue parting pt / runner centreline) when near.
+//   interior : free on the plane, kept inside the hull.
+void GLCanvas::MoveEditGateNode(int idx, int mouseX, int mouseY)
+{
+    if (!IsEditGateComplex()) return;
+    GateFeature& gf = m_gates[m_editFeatureIndex];
+    std::vector<PathNode>& nodes = gf.subPath.nodes;
+    if (idx <= 0 || idx >= (int)nodes.size()) return;   // node[0] pinned; ignore -1
+    const int last = (int)nodes.size() - 1;
+
+    glm::vec3 plane;
+    if (!RayCastToPartingPlane(mouseX, mouseY, plane)) return;
+    const glm::vec2 xz(plane.x, plane.z);
+    if (!IsInsideConvexHull(m_fixturePerimeter, xz)) return;   // keep inside the mould
+
+    glm::vec3 target(plane.x, 0.0f, plane.z);
+
+    // The gate endpoint must connect to an upstream feature, so it ALWAYS snaps
+    // to the nearest point on the sprue or a runner path — a floating gate makes
+    // no sense.  Falls back to the free plane point only when there is no feed
+    // network yet.  Interior nodes never snap.
+    if (idx == last)
+    {
+        glm::vec3 feed;
+        if (NearestFeedPoint(xz, feed))
+            target = glm::vec3(feed.x, 0.0f, feed.z);
+    }
+
+    nodes[idx].pos = target;
+
+    gf.Destroy();
+    RebuildGatePathVBO();
+    RebuildGateSolids();
+    NotifySceneMutated();
+    Refresh(false);
+}
+
+// RemoveEditGateNode — delete an interior sub-runner node. Origin(0) and
+// endpoint(last) are protected; a Complex path keeps at least two nodes.
+void GLCanvas::RemoveEditGateNode(int idx)
+{
+    if (!IsEditGateComplex()) return;
+    std::vector<PathNode>& nodes = m_gates[m_editFeatureIndex].subPath.nodes;
+    const int last = (int)nodes.size() - 1;
+    if (idx <= 0 || idx >= last) return;   // protect origin + endpoint, ignore -1
+
+    nodes.erase(nodes.begin() + idx);
+
+    RebuildGatePathVBO();
+    RebuildGateSolids();
+    NotifySceneMutated();
+    NotifyPathEditChanged();
+    Refresh(false);
+}
+
+// InsertNodeOnGateAt — splice a node into the gate's sub-runner at a point the
+// caller has snapped onto that sub-runner. Selects the gate, auto-converts
+// Simple -> Complex, and inserts into the nearest segment.
+void GLCanvas::InsertNodeOnGateAt(int gateIndex, const glm::vec3& worldPt)
+{
+    if (gateIndex < 0 || gateIndex >= (int)m_gates.size()) return;
+
+    if (m_editFeatureIndex != gateIndex)
+    {
+        m_editFeatureIndex = gateIndex;
+        NotifyPathEditChanged();
+    }
+
+    if (m_gates[gateIndex].subPath.kind != PathKind::Complex)
+        ConvertEditGateToComplex();
+    if (!IsEditGateComplex()) return;
+
+    const glm::vec3 hit(worldPt.x, 0.0f, worldPt.z);   // lock to parting plane
+
+    std::vector<PathNode>& nodes = m_gates[gateIndex].subPath.nodes;
+    if (nodes.size() < 2) return;
+
+    int   bestSeg = 0;
+    float bestDist = std::numeric_limits<float>::max();
+    for (int s = 0; s + 1 < (int)nodes.size(); ++s)
+    {
+        const glm::vec3 c = ClosestPointOnSegment(nodes[s].pos, nodes[s + 1].pos, hit);
+        const float d = glm::length(glm::vec2(c.x - hit.x, c.z - hit.z));
+        if (d < bestDist) { bestDist = d; bestSeg = s; }
+    }
+
+    PathNode nn; nn.pos = hit;
+    nodes.insert(nodes.begin() + bestSeg + 1, nn);
+
+    RebuildGatePathVBO();
+    RebuildGateSolids();
+    NotifySceneMutated();
+    NotifyPathEditChanged();
+    Refresh(false);
+}
+
+// RayCastGateNodeSnap — screen-space nearest point across every gate's RENDERED
+// sub-runner polyline (Simple: origin->feed; Complex: the sampled curve), within
+// kEjectorSnapRadiusPx. Round counterpart of RayCastRunnerNodeSnap.
+bool GLCanvas::RayCastGateNodeSnap(int mouseX, int mouseY,
+    glm::vec3& outPos, int& outGateIndex) const
+{
+    const wxSize sz = const_cast<GLCanvas*>(this)->GetClientSize();
+    const int    w = std::max(1, sz.x);
+    const int    h = std::max(1, sz.y);
+
+    OrbitCamera cam = m_camera;
+    cam.SetAspect(float(w) / float(h));
+    const glm::mat4 view = cam.View();
+    const glm::mat4 proj = cam.Projection();
+    const glm::mat4 viewProj = proj * view;
+
+    const glm::vec2 cursorPx{ float(mouseX), float(mouseY) };
+
+    auto worldToScreen = [&](const glm::vec3& world, glm::vec2& outPx)
+    {
+        const glm::vec4 clip = viewProj * glm::vec4(world, 1.0f);
+        if (clip.w <= 1e-6f) return false;
+        outPx.x = ((clip.x / clip.w) * 0.5f + 0.5f) * float(w);
+        outPx.y = (1.0f - ((clip.y / clip.w) * 0.5f + 0.5f)) * float(h);
+        return true;
+    };
+
+    float bestPx = kEjectorSnapRadiusPx;
+    bool  hit = false;
+    outGateIndex = -1;
+
+    for (int gi = 0; gi < (int)m_gates.size(); ++gi)
+    {
+        const FeaturePath& path = m_gates[gi].subPath;
+        if (!path.valid) continue;
+
+        std::vector<glm::vec3> poly;
+        if (path.kind == PathKind::Complex)
+        {
+            const std::vector<PathStation> st = SamplePath(path);
+            poly.reserve(st.size());
+            for (const PathStation& s : st) poly.push_back(s.pos);
+        }
+        else
+        {
+            poly.push_back(path.start);
+            poly.push_back(path.end);
+        }
+
+        // Nearest point on each rendered segment, measured in screen space
+        // (sample the segment finely so the pixel distance is accurate).
+        for (size_t s = 0; s + 1 < poly.size(); ++s)
+        {
+            const glm::vec3 A = poly[s];
+            const glm::vec3 B = poly[s + 1];
+            constexpr int kSub = 8;
+            for (int k = 0; k <= kSub; ++k)
+            {
+                const glm::vec3 cand = A + (B - A) * (float(k) / float(kSub));
+                glm::vec2 px;
+                if (!worldToScreen(cand, px)) continue;
+                const float distPx = glm::length(px - cursorPx);
+                if (distPx < bestPx)
+                {
+                    bestPx = distPx;
+                    outPos = cand;
+                    outGateIndex = gi;
+                    hit = true;
+                }
+            }
+        }
+    }
+    return hit;
+}
+
+// NearestFeedPoint — nearest feed attach point (sprue parting pt or any runner
+// centreline) to a parting-plane XZ. Factored from RebuildGatePathVBO's snap so
+// the endpoint snap-assist and the auto-snap agree. false = no feed network.
+bool GLCanvas::NearestFeedPoint(const glm::vec2& xz, glm::vec3& outFeed) const
+{
+    float     bestDist = std::numeric_limits<float>::max();
+    glm::vec3 bestPt(0.0f);
+
+    if (m_sprue.hasPartingPoint)
+    {
+        const glm::vec2 d(m_sprue.partingPos.x - xz.x, m_sprue.partingPos.z - xz.y);
+        const float dist = glm::length(d);
+        if (dist < bestDist) { bestDist = dist; bestPt = m_sprue.partingPos; }
+
+        std::vector<glm::vec3> poly;
+        for (const RunnerFeature& rf : m_runners)
+        {
+            RunnerCenterline(rf.path, m_sprue.partingPos, rf.point, poly);
+            for (size_t s = 0; s + 1 < poly.size(); ++s)
+            {
+                const glm::vec2 A(poly[s].x, poly[s].z);
+                const glm::vec2 B(poly[s + 1].x, poly[s + 1].z);
+                const glm::vec2 AB = B - A;
+                const float     len2 = glm::dot(AB, AB);
+                const glm::vec2 closest = (len2 < 1e-10f)
+                    ? A
+                    : A + glm::clamp(glm::dot(xz - A, AB) / len2, 0.0f, 1.0f) * AB;
+                const float dist2 = glm::length(closest - xz);
+                if (dist2 < bestDist)
+                {
+                    bestDist = dist2;
+                    bestPt = glm::vec3(closest.x, 0.0f, closest.y);
+                }
+            }
+        }
+    }
+
+    if (bestDist == std::numeric_limits<float>::max()) return false;
+    outFeed = bestPt;
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // PickEditVentNode — nearest node marker of the edited Complex vent to the
 // mouse ray, within the marker hit radius. Returns node index or -1.
@@ -5495,6 +6121,71 @@ void GLCanvas::MoveEditRunnerHandle(int node, bool isOut, int mouseX, int mouseY
 }
 
 // ---------------------------------------------------------------------------
+// Gate SUB-RUNNER tangent-handle editing (G6) — the runner handle methods over
+// the selected gate's subPath. node[0] (gate origin) has only an outgoing arm,
+// the endpoint only an incoming arm; node[0]'s position stays pinned.
+// ---------------------------------------------------------------------------
+int GLCanvas::PickEditGateHandle(int mouseX, int mouseY, bool& outIsOut) const
+{
+    outIsOut = false;
+    if (!IsEditGateComplex() || !IsEditGateSmooth()) return -1;
+
+    glm::vec3 rayOrig, rayDir;
+    const_cast<GLCanvas*>(this)->BuildMouseRay(mouseX, mouseY, rayOrig, rayDir);
+
+    const std::vector<PathNode>& nodes = m_gates[m_editFeatureIndex].subPath.nodes;
+    const int   last = (int)nodes.size() - 1;
+    const float hitRadius = kVentMarkerRadius * 1.3f;   // handle dots are small
+    float bestDist = hitRadius;
+    int   bestIdx = -1;
+
+    for (int i = 0; i <= last; ++i)
+    {
+        if (i != 0)      // incoming arm exists for everything except the gate origin
+        {
+            const float d = PointRayDistance(nodes[i].pos + nodes[i].handleIn, rayOrig, rayDir);
+            if (d < bestDist) { bestDist = d; bestIdx = i; outIsOut = false; }
+        }
+        if (i != last)   // outgoing arm exists for everything except the endpoint
+        {
+            const float d = PointRayDistance(nodes[i].pos + nodes[i].handleOut, rayOrig, rayDir);
+            if (d < bestDist) { bestDist = d; bestIdx = i; outIsOut = true; }
+        }
+    }
+    return bestIdx;
+}
+
+void GLCanvas::MoveEditGateHandle(int node, bool isOut, int mouseX, int mouseY, bool breakLink)
+{
+    if (!IsEditGateComplex() || !IsEditGateSmooth()) return;
+    std::vector<PathNode>& nodes = m_gates[m_editFeatureIndex].subPath.nodes;
+    if (node < 0 || node >= (int)nodes.size()) return;
+
+    glm::vec3 plane;
+    if (!RayCastToPartingPlane(mouseX, mouseY, plane)) return;
+
+    PathNode& nd = nodes[node];
+    glm::vec3 arm(plane.x - nd.pos.x, 0.0f, plane.z - nd.pos.z);
+
+    if (breakLink) nd.handlesLinked = false;   // Alt splits the node
+
+    if (isOut) nd.handleOut = arm;
+    else       nd.handleIn = arm;
+
+    if (nd.handlesLinked)   // still-linked node keeps the opposite arm mirrored
+    {
+        if (isOut) nd.handleIn = -arm;
+        else       nd.handleOut = -arm;
+    }
+
+    nd.handlesManual = true;   // freeze against AutoCompute
+    RebuildGatePathVBO();
+    RebuildGateSolids();
+    NotifySceneMutated();
+    Refresh(false);
+}
+
+// ---------------------------------------------------------------------------
 // RebuildHandleLineVBO — fill the stem buffer with node->handle segments for
 // the edited smooth vent (one GL_LINES pair per visible arm).
 // ---------------------------------------------------------------------------
@@ -5510,6 +6201,8 @@ void GLCanvas::RebuildHandleLineVBO()
         nodesPtr = &m_vents[m_editFeatureIndex].path.nodes;
     else if (IsEditRunnerComplex() && IsEditRunnerSmooth())
         nodesPtr = &m_runners[m_editFeatureIndex].path.nodes;
+    else if (IsEditGateComplex() && IsEditGateSmooth())
+        nodesPtr = &m_gates[m_editFeatureIndex].subPath.nodes;
 
     if (nodesPtr)
     {
@@ -6757,33 +7450,51 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         else if (m_transformMode == TransformMode::EditGate &&
             m_editFeatureIndex >= 0 && m_editFeatureIndex < (int)m_gates.size())
         {
-            glm::vec3 hitPos, hitNormal;
-            int       hitObj = -1;
-            if (RayCastParting(m_editMousePos.x, m_editMousePos.y, hitPos, hitNormal, &hitObj))
+            // A grabbed tangent handle (smooth) takes priority; then a grabbed
+            // sub-runner node (interior / endpoint) drags that node only; node[0]
+            // (the gate origin) is pinned and never grabbed, so with no handle or
+            // node grab the drag re-places the GATE POINT on the parting surface
+            // (the historical behaviour), which carries a complex sub-runner
+            // along via ComputeGatePath's reanchor.
+            if (m_editHandleNode >= 0)
             {
-                GateFeature& gf = m_gates[m_editFeatureIndex];
-                gf.Destroy();
-                gf.point = VentPoint{ hitPos, hitNormal };
-
-                // Edit-drag re-captures parent association — see the EditVent
-                // branch above for the rationale.
-                if (hitObj >= 0 && hitObj < (int)m_objects.size())
+                MoveEditGateHandle(m_editHandleNode, m_editHandleIsOut,
+                    m_editMousePos.x, m_editMousePos.y, m_editHandleBreak);
+            }
+            else if (m_editGateNode >= 0)
+            {
+                MoveEditGateNode(m_editGateNode, m_editMousePos.x, m_editMousePos.y);
+            }
+            else
+            {
+                glm::vec3 hitPos, hitNormal;
+                int       hitObj = -1;
+                if (RayCastParting(m_editMousePos.x, m_editMousePos.y, hitPos, hitNormal, &hitObj))
                 {
-                    const glm::mat4 m = m_objects[hitObj].BuildModelMatrix();
-                    const glm::mat4 invM = glm::inverse(m);
-                    gf.parentIndex = hitObj;
-                    gf.localPos = glm::vec3(invM * glm::vec4(hitPos, 1.0f));
-                    glm::vec3 ln = glm::transpose(glm::mat3(m)) * hitNormal;
-                    const float lnLen = glm::length(ln);
-                    gf.localNormal = (lnLen > 1e-6f) ? ln / lnLen : glm::vec3(0, 0, 1);
-                }
-                else
-                {
-                    gf.parentIndex = -1;
-                }
+                    GateFeature& gf = m_gates[m_editFeatureIndex];
+                    gf.Destroy();
+                    gf.point = VentPoint{ hitPos, hitNormal };
 
-                RebuildGatePathVBO();
-                RebuildGateSolids();
+                    // Edit-drag re-captures parent association — see the EditVent
+                    // branch above for the rationale.
+                    if (hitObj >= 0 && hitObj < (int)m_objects.size())
+                    {
+                        const glm::mat4 m = m_objects[hitObj].BuildModelMatrix();
+                        const glm::mat4 invM = glm::inverse(m);
+                        gf.parentIndex = hitObj;
+                        gf.localPos = glm::vec3(invM * glm::vec4(hitPos, 1.0f));
+                        glm::vec3 ln = glm::transpose(glm::mat3(m)) * hitNormal;
+                        const float lnLen = glm::length(ln);
+                        gf.localNormal = (lnLen > 1e-6f) ? ln / lnLen : glm::vec3(0, 0, 1);
+                    }
+                    else
+                    {
+                        gf.parentIndex = -1;
+                    }
+
+                    RebuildGatePathVBO();
+                    RebuildGateSolids();
+                }
             }
         }
         else if (m_transformMode == TransformMode::EditEjector &&
@@ -6831,6 +7542,15 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         int       snapRunner = -1;
         m_pathNodeGhostActive = RayCastRunnerNodeSnap(
             m_pathNodeGhostMousePos.x, m_pathNodeGhostMousePos.y, snapPos, snapRunner);
+        m_pathNodeGhostPos = snapPos;
+    }
+    else if (m_transformMode == TransformMode::EditGate &&
+        m_pathEditTool == PathEditTool::AddNode)
+    {
+        glm::vec3 snapPos;
+        int       snapGate = -1;
+        m_pathNodeGhostActive = RayCastGateNodeSnap(
+            m_pathNodeGhostMousePos.x, m_pathNodeGhostMousePos.y, snapPos, snapGate);
         m_pathNodeGhostPos = snapPos;
     }
     else
@@ -7085,6 +7805,26 @@ void GLCanvas::OnPaint(wxPaintEvent&)
 
             glm::mat4 model = glm::translate(glm::mat4(1.0f), m_gateGhost.worldPos);
             model = glm::scale(model, glm::vec3(kVentMarkerRadius * 1.15f));
+            glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &model[0][0]);
+            glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
+
+            glDepthMask(GL_TRUE);
+            glDisable(GL_BLEND);
+        }
+
+        // Add Node ghost — amber bead riding the snapped sub-runner (Add Node
+        // tool in EditGate), signalling where the node will be spliced.
+        if (m_pathNodeGhostActive && m_transformMode == TransformMode::EditGate)
+        {
+            const glm::vec3 ghostColor(1.0f, 0.82f, 0.10f);   // amber
+            glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &ghostColor[0]);
+            glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 0.55f);
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glDepthMask(GL_FALSE);
+
+            glm::mat4 model = glm::translate(glm::mat4(1.0f), m_pathNodeGhostPos);
+            model = glm::scale(model, glm::vec3(kVentMarkerRadius * 0.8f));
             glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &model[0][0]);
             glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
 
@@ -7442,9 +8182,11 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         IsEditVentComplex() && IsEditVentSmooth();
     const bool runnerStems = m_transformMode == TransformMode::EditRunner &&
         IsEditRunnerComplex() && IsEditRunnerSmooth();
+    const bool gateStems = m_transformMode == TransformMode::EditGate &&
+        IsEditGateComplex() && IsEditGateSmooth();
     if (m_flatProgram && m_handleLineVAO &&
         m_pathEditTool == PathEditTool::Move &&
-        (ventStems || runnerStems))
+        (ventStems || runnerStems || gateStems))
     {
         RebuildHandleLineVBO();
         if (m_handleLineVertexCount > 0)
@@ -7815,6 +8557,85 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         glUseProgram(0);
         glDepthMask(GL_TRUE);
         glDisable(GL_BLEND);
+    }
+
+    // ---- Edit-mode gate sub-runner control points (always-on-top overlay) ---
+    // Depth test OFF so the authored sub-runner nodes of the gate being edited
+    // read clearly over the translucent tube. node[0] is PINNED to the gate
+    // origin (dim blue-gray, slightly smaller — signals it is not draggable and
+    // that clicking it re-places the gate); interior = white; endpoint = orange;
+    // the grabbed node reads larger. Only the selected complex gate shows nodes.
+    if (m_program && m_sphereVAO && m_sphereIndexCount > 0 &&
+        m_transformMode == TransformMode::EditGate &&
+        m_editFeatureIndex >= 0 && m_editFeatureIndex < (int)m_gates.size() &&
+        m_gates[m_editFeatureIndex].subPath.kind == PathKind::Complex &&
+        m_gates[m_editFeatureIndex].subPath.nodes.size() >= 2)
+    {
+        const std::vector<PathNode>& nodes = m_gates[m_editFeatureIndex].subPath.nodes;
+        const int   last = (int)nodes.size() - 1;
+        const float nodeR = kVentMarkerRadius * 0.7f;
+
+        glDisable(GL_DEPTH_TEST);
+        glUseProgram(m_program);
+        glUniform3fv(glGetUniformLocation(m_program, "uCameraPos"), 1, &camPos[0]);
+        glUniform3fv(glGetUniformLocation(m_program, "uLightDir"), 1, &lightDir[0]);
+        glUniform3fv(glGetUniformLocation(m_program, "uLightColor"), 1, &lightColor[0]);
+        glUniform1f(glGetUniformLocation(m_program, "uAmbient"), 0.45f);
+        glUniform1f(glGetUniformLocation(m_program, "uDiffuse"), 0.75f);
+        glUniform1f(glGetUniformLocation(m_program, "uSpecular"), 0.40f);
+        glUniform1f(glGetUniformLocation(m_program, "uShininess"), 32.0f);
+        glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 1.0f);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uView"), 1, GL_FALSE, &view[0][0]);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uProj"), 1, GL_FALSE, &proj[0][0]);
+        glBindVertexArray(m_sphereVAO);
+
+        for (int n = 0; n <= last; ++n)
+        {
+            glm::vec3 c;
+            float     scale = nodeR;
+            if (n == 0)         { c = glm::vec3(0.40f, 0.55f, 0.70f); scale = nodeR * 0.9f; } // origin = pinned
+            else if (n == last)   c = glm::vec3(1.00f, 0.55f, 0.00f);                          // endpoint = orange
+            else                  c = glm::vec3(0.95f, 0.95f, 0.95f);                          // interior = white
+            if (n == m_editGateNode) scale = nodeR * 1.35f;                                    // grabbed = larger
+
+            glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &c[0]);
+            glm::mat4 model = glm::translate(glm::mat4(1.0f), nodes[n].pos);
+            model = glm::scale(model, glm::vec3(scale));
+            glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &model[0][0]);
+            glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
+        }
+
+        // Tangent-handle endpoints for a SELECTED smooth sub-runner in the Move
+        // tool (magenta). node[0] shows only its outgoing arm, the endpoint only
+        // its incoming arm; the grabbed arm reads larger. Mirrors the runner
+        // overlay (G6).
+        if (m_gates[m_editFeatureIndex].subPath.smooth &&
+            m_pathEditTool == PathEditTool::Move)
+        {
+            const float     hR = kVentMarkerRadius * 0.5f;
+            const glm::vec3 magenta(0.95f, 0.35f, 0.90f);
+            glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &magenta[0]);
+
+            auto drawHandle = [&](int ni, bool isOut, const glm::vec3& at)
+                {
+                    float s = hR;
+                    if (ni == m_editHandleNode && isOut == m_editHandleIsOut)
+                        s = hR * 1.4f;
+                    glm::mat4 m = glm::translate(glm::mat4(1.0f), at);
+                    m = glm::scale(m, glm::vec3(s));
+                    glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &m[0][0]);
+                    glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
+                };
+            for (int ni = 0; ni <= last; ++ni)
+            {
+                if (ni != 0)    drawHandle(ni, false, nodes[ni].pos + nodes[ni].handleIn);
+                if (ni != last) drawHandle(ni, true, nodes[ni].pos + nodes[ni].handleOut);
+            }
+        }
+
+        glBindVertexArray(0);
+        glUseProgram(0);
+        glEnable(GL_DEPTH_TEST);
     }
 
     // ---- Ejector solids (lit, semi-transparent cyan) -----------------------
@@ -8516,19 +9337,76 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
         else if (m_transformMode == TransformMode::EditGate)
         {
             const wxPoint p = evt.GetPosition();
-            glm::vec3 rayOrig, rayDir;
-            BuildMouseRay(p.x, p.y, rayOrig, rayDir);
 
-            const float hitRadius = kVentMarkerRadius * 2.0f;
-            float bestDist = hitRadius;
-            int   bestIdx = -1;
-            for (int i = 0; i < (int)m_gates.size(); ++i)
+            const bool haveSel =
+                m_editFeatureIndex >= 0 && m_editFeatureIndex < (int)m_gates.size();
+            const bool selComplex =
+                haveSel && m_gates[m_editFeatureIndex].subPath.kind == PathKind::Complex;
+
+            if (m_pathEditTool == PathEditTool::AddNode)
             {
-                const float d = PointRayDistance(m_gates[i].point.worldPos, rayOrig, rayDir);
-                if (d < bestDist) { bestDist = d; bestIdx = i; }
+                // Add Node only places ON an existing sub-runner: snap the cursor
+                // to the nearest gate sub-runner and splice a node into it.
+                glm::vec3 snapPos;
+                int       snapGate = -1;
+                if (RayCastGateNodeSnap(p.x, p.y, snapPos, snapGate))
+                    InsertNodeOnGateAt(snapGate, snapPos);
+                m_editGateNode = -1;
+                Refresh(false);
             }
-            m_editFeatureIndex = bestIdx;
-            Refresh(false);
+            else if (selComplex && m_pathEditTool == PathEditTool::RemoveNode)
+            {
+                // Delete the clicked interior node (origin + endpoint protected).
+                RemoveEditGateNode(PickEditGateNode(p.x, p.y));
+                m_editGateNode = -1;
+                Refresh(false);
+            }
+            else
+            {
+                // Move tool. Pick priority: a tangent handle (smooth only, drawn
+                // on top) -> a sub-runner node (node[0] = gate origin is pinned
+                // and re-selects for a gate-point re-place) -> reselect the
+                // nearest gate marker (the drag then re-places the GATE POINT).
+                bool handleIsOut = false;
+                int  handleNode = selComplex
+                    ? PickEditGateHandle(p.x, p.y, handleIsOut) : -1;
+                int  grab = (handleNode < 0 && selComplex)
+                    ? PickEditGateNode(p.x, p.y) : -1;
+                if (grab == 0) grab = -1;   // node[0] = gate origin, pinned
+
+                if (handleNode >= 0)
+                {
+                    m_editHandleNode = handleNode;   // begin handle drag
+                    m_editHandleIsOut = handleIsOut;
+                    m_editHandleBreak = evt.AltDown();
+                    m_editGateNode = -1;
+                }
+                else if (grab >= 0)
+                {
+                    m_editGateNode = grab;   // begin node drag (interior / endpoint)
+                    m_editHandleNode = -1;
+                }
+                else
+                {
+                    glm::vec3 rayOrig, rayDir;
+                    BuildMouseRay(p.x, p.y, rayOrig, rayDir);
+
+                    const float hitRadius = kVentMarkerRadius * 2.0f;
+                    float bestDist = hitRadius;
+                    int   bestIdx = -1;
+                    for (int i = 0; i < (int)m_gates.size(); ++i)
+                    {
+                        const float d = PointRayDistance(m_gates[i].point.worldPos, rayOrig, rayDir);
+                        if (d < bestDist) { bestDist = d; bestIdx = i; }
+                    }
+                    const bool selectionChanged = (bestIdx != m_editFeatureIndex);
+                    m_editFeatureIndex = bestIdx;
+                    m_editGateNode = -1;
+                    m_editHandleNode = -1;
+                    if (selectionChanged) NotifyPathEditChanged();   // refresh the shared toolbar
+                }
+                Refresh(false);
+            }
         }
         else if (m_transformMode == TransformMode::EditEjector)
         {
@@ -8551,7 +9429,7 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
         }
     }
 
-    if (evt.LeftUp()) { m_lmb = false; m_editVentNode = -1; m_editRunnerNode = -1; m_editHandleNode = -1; if (HasCapture()) ReleaseMouse(); }
+    if (evt.LeftUp()) { m_lmb = false; m_editVentNode = -1; m_editRunnerNode = -1; m_editGateNode = -1; m_editHandleNode = -1; if (HasCapture()) ReleaseMouse(); }
     if (evt.MiddleDown()) { m_mmb = true;  m_hasLast = false; CaptureMouse(); }
     if (evt.MiddleUp()) { m_mmb = false; if (HasCapture()) ReleaseMouse(); }
     if (evt.RightDown()) { m_rmb = true;  m_hasLast = false; CaptureMouse(); }
@@ -8742,6 +9620,17 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
         {
             // Complex runner: only a grabbed node or handle drags; else orbit.
             deferDrag = (m_editRunnerNode >= 0 || m_editHandleNode >= 0);
+            if (m_editHandleNode >= 0)
+                m_editHandleBreak = evt.AltDown();   // live Alt = independent
+        }
+        else if (m_transformMode == TransformMode::EditGate &&
+            m_editFeatureIndex >= 0 && m_editFeatureIndex < (int)m_gates.size())
+        {
+            // Gate: any drag on the selected gate defers — a grabbed handle or
+            // sub-runner node drives it, otherwise it re-places the gate point
+            // (the legacy body drag). Track live Alt so a tangent handle can be
+            // split mid-drag, matching vents / runners.
+            deferDrag = true;
             if (m_editHandleNode >= 0)
                 m_editHandleBreak = evt.AltDown();   // live Alt = independent
         }
@@ -9316,6 +10205,7 @@ void GLCanvas::ClearAll()
     RebuildSprueXsecVBO();
     RebuildRunnerPathVBO();
     RebuildGatePathVBO();
+    RebuildGateLineVBO();
 
     Refresh(false);
 }
@@ -9429,6 +10319,45 @@ void GLCanvas::RestoreGate(const glm::vec3& pos, const glm::vec3& normal,
     gf.localPos = localPos;
     gf.localNormal = localNormal;
     m_gates.push_back(std::move(gf));
+}
+
+void GLCanvas::RestoreGateComplex(const glm::vec3& pos, const glm::vec3& normal,
+    const std::vector<PathNode>& nodes, bool smooth,
+    int parentIndex,
+    const glm::vec3& localPos,
+    const glm::vec3& localNormal)
+{
+    GateFeature gf;
+    gf.point = VentPoint{ pos, normal };
+    gf.parentIndex = parentIndex;
+    gf.localPos = localPos;
+    gf.localNormal = localNormal;
+
+    // Rebuild the authored sub-runner path verbatim — ComputeGatePath (run by the
+    // next RebuildGateSolids after the load) preserves a Complex path instead of
+    // re-deriving it, so this survives the rebuild. node[0] is the gate origin,
+    // nodes.back() the feed attach point.
+    FeaturePath path;
+    path.kind = PathKind::Complex;
+    path.nodes = nodes;
+    path.smooth = smooth;
+    path.valid = (nodes.size() >= 2);
+    if (!nodes.empty())
+    {
+        path.start = nodes.front().pos;   // gate origin
+        path.end = nodes.back().pos;      // feed attach point
+    }
+    gf.subPath = path;
+
+    // Fill tangent handles for smooth paths before anything samples them
+    // (reproduces earlier behaviour for files that carry no explicit handles,
+    // while leaving hand-edited nodes' saved handles intact).
+    if (gf.subPath.smooth)
+        AutoComputeComplexHandles(gf.subPath);
+
+    m_gates.push_back(std::move(gf));
+    // Solids are built by RebuildAllFeatures() -> RebuildGateSolids() at the end
+    // of the load.
 }
 
 void GLCanvas::RestoreVent(const glm::vec3& pos, const glm::vec3& normal,

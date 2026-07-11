@@ -407,6 +407,26 @@ public:
     void ConvertEditRunnerToSimple();   // drop nodes, collapse to the straight runner
     void SetEditRunnerSmooth(bool smooth);
 
+    // ---- Gate SUB-RUNNER complex-path editing (G5) -------------------------
+    // Driven by the SAME shared floating toolbar while in EditGate mode. The
+    // gate FRUSTUM stays a straight tapered cone from the card fields; only the
+    // sub-runner gets a complex route. node[0] is pinned to the gate origin
+    // (gf.point.worldPos); the endpoint (nodes.back()) is the feed attach point,
+    // freely authored when Complex (it does not chase a moving feed).
+    bool         IsEditingGate()       const { return m_transformMode == TransformMode::EditGate; }
+    bool         HasEditGateSelected() const
+    {
+        return m_transformMode == TransformMode::EditGate &&
+            m_editFeatureIndex >= 0 && m_editFeatureIndex < (int)m_gates.size();
+    }
+    bool         IsEditGateComplex()   const;
+    bool         IsEditGateSmooth()    const;
+    int          EditGateNodeCount()   const;
+
+    void ConvertEditGateToComplex();  // seed [gate origin, feed attach]; no-op if already Complex
+    void ConvertEditGateToSimple();   // drop nodes, collapse to the straight sub-runner
+    void SetEditGateSmooth(bool smooth);
+
     void ClearFixtures();
 
     // Vent point placement
@@ -477,6 +497,17 @@ public:
         const std::vector<PathNode>& nodes, bool smooth);
 
     void RestoreGate(const glm::vec3& pos, const glm::vec3& normal,
+        int parentIndex = -1,
+        const glm::vec3& localPos = glm::vec3(0.0f),
+        const glm::vec3& localNormal = glm::vec3(0.0f, 0.0f, 1.0f));
+
+    // Restore a gate whose SUB-RUNNER was authored as a complex (multi-node)
+    // path. Like RestoreGate for the placement + parent fields, but the
+    // sub-runner path is rebuilt verbatim from `nodes` (>= 2, on the parting
+    // plane; node[0] the gate origin, nodes.back() the feed attach) and `smooth`
+    // rather than re-derived. The gate frustum still comes from the card fields.
+    void RestoreGateComplex(const glm::vec3& pos, const glm::vec3& normal,
+        const std::vector<PathNode>& nodes, bool smooth,
         int parentIndex = -1,
         const glm::vec3& localPos = glm::vec3(0.0f),
         const glm::vec3& localNormal = glm::vec3(0.0f, 0.0f, 1.0f));
@@ -666,12 +697,33 @@ private:
     bool RayCastRunnerNodeSnap(int mouseX, int mouseY,
         glm::vec3& outPos, int& outRunnerIndex) const;
 
+    // ---- Gate SUB-RUNNER node authoring (G5b) ------------------------------
+    // Mirrors the runner node methods, with the gate twist that node[0] is the
+    // gate origin (pinned — clicking it re-places the GATE instead of grabbing a
+    // node) and the endpoint is FREE with snap-assist to the feed network.
+    int  PickEditGateNode(int mouseX, int mouseY) const;   // nearest sub-runner node, -1 if none
+    void MoveEditGateNode(int idx, int mouseX, int mouseY);// drag endpoint/interior (node[0] pinned)
+    void RemoveEditGateNode(int idx);                      // interior only; origin(0)+endpoint protected
+    void InsertNodeOnGateAt(int gateIndex, const glm::vec3& worldPt); // splice on the snapped sub-runner
+    bool RayCastGateNodeSnap(int mouseX, int mouseY,
+        glm::vec3& outPos, int& outGateIndex) const;
+    // Nearest feed attach point (sprue parting pt or any runner centreline) to a
+    // parting-plane XZ; false if there is no feed network. Endpoint snap-assist.
+    bool NearestFeedPoint(const glm::vec2& xz, glm::vec3& outFeed) const;
+
     // ---- Part 7 / R6: runner tangent-handle editing (mirrors the vent Part-6
     // handle machinery, reusing m_editHandle* state + the handle-line VAO). The
     // feed node (0) exposes only its outgoing arm and the endpoint only its
     // incoming arm, exactly as for vents; the feed POSITION stays pinned.
     int  PickEditRunnerHandle(int mouseX, int mouseY, bool& outIsOut) const;
     void MoveEditRunnerHandle(int node, bool isOut, int mouseX, int mouseY, bool breakLink);
+
+    // ---- G6: gate SUB-RUNNER tangent-handle editing (mirrors the runner R6
+    // machinery, reusing the same m_editHandle* state + handle-line VAO). node[0]
+    // (the gate origin) exposes only its outgoing arm, the endpoint only its
+    // incoming arm; node[0]'s POSITION stays pinned to the gate.
+    int  PickEditGateHandle(int mouseX, int mouseY, bool& outIsOut) const;
+    void MoveEditGateHandle(int node, bool isOut, int mouseX, int mouseY, bool breakLink);
 
     // Reposition the floating toolbar to the top-centre of the viewport.
     void RepositionPathToolbar();
@@ -709,8 +761,25 @@ private:
     // author a Complex route in its place; it drives no geometry yet.
     void ComputeRunnerPath(RunnerFeature& rf) const;
 
-    // Gate path lines GPU upload (gate point → nearest feed point)
+    // Gate feed-attach bookkeeping — derives each gate's pathEnd / hasPath
+    // (Simple: nearest feed; Complex: the authored endpoint). Runs BEFORE
+    // ComputeGatePath (which needs a Simple gate's pathEnd). Does NOT upload the
+    // guide-line VBO — that is RebuildGateLineVBO, run AFTER the sub-runner is
+    // finalised so a bent complex line always matches the tube.
     void RebuildGatePathVBO();
+
+    // Uploads the yellow gate guide lines from each gate's finalised subPath
+    // (Simple: straight origin→feed; Complex: the real bent centreline). Called
+    // at the end of RebuildGateSolids.
+    void RebuildGateLineVBO();
+
+    // Gate step G1: derive a gate's SUB-RUNNER Simple FeaturePath (start = gate
+    // origin, end = feed attach point / pathEnd) into gf.subPath.  Runs at the
+    // top of RebuildGateSolids so pathEnd is already fresh.  Pure bookkeeping —
+    // it keeps the stored sub-runner path in sync as the gate or feed network
+    // move so later steps can author a Complex route in its place; it drives no
+    // geometry yet (the frustum + sub-runner are still built from pathEnd).
+    void ComputeGatePath(GateFeature& gf) const;
 
     // Gate and sub-runner solid geometry
     void RebuildGateSolids();
@@ -1045,6 +1114,7 @@ private:
     PathEditTool m_pathEditTool = PathEditTool::Move;  // active EditVent sub-tool
     int          m_editVentNode = -1;   // node being dragged (Move tool), -1 = none
     int          m_editRunnerNode = -1; // runner node being dragged (Move tool), -1 = none
+    int          m_editGateNode = -1;   // gate sub-runner node being dragged (Move tool), -1 = none
     wxWindow*    m_pathToolbar  = nullptr;  // floating toolbar overlay (opaque)
     std::function<void()> m_onPathEditChanged;  // toolbar reconfigure hook
 

@@ -583,7 +583,7 @@ SolidMesh BuildBoxSweepMesh(const FeaturePath& path, float width, float depth,
 // so lighting is correct regardless of triangle winding (culling is disabled).
 // ---------------------------------------------------------------------------
 SolidMesh BuildTubeSweepMesh(const FeaturePath& path, float radius, int segments,
-    float overrunStart, float overrunEnd)
+    float overrunStart, float overrunEnd, bool sphereAtStart, bool sphereAtEnd)
 {
     SolidMesh solid;
     solid.valid = false;
@@ -726,6 +726,18 @@ SolidMesh BuildTubeSweepMesh(const FeaturePath& path, float radius, int segments
         if (runEnd)   addCap(stations[i], +stations[i].tangent);
         if (runEnd && (i + 1 < N)) addSphere(stations[i].pos);
     }
+
+    // Optional joint sphere at the very first station.  Used by gates: it rounds
+    // the junction where the straight frustum cone meets a sub-runner that
+    // leaves at an angle (i.e. a smooth sub-runner), filling the gap the flat
+    // start cap would otherwise leave.  The disk cap underneath stays harmlessly
+    // inside the sphere.
+    if (sphereAtStart) addSphere(stations.front().pos);
+
+    // Optional joint sphere at the very last station.  Used by gates so the
+    // feed end blends into the sprue/runner it meets — a sphere at every
+    // sub-runner node except the gate origin.
+    if (sphereAtEnd)   addSphere(stations.back().pos);
 
     // ---- Upload to GPU ----
     glGenVertexArrays(1, &solid.vao);

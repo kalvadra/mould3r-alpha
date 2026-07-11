@@ -272,8 +272,9 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
         });
     m_ventEditToolbar->SetOnSmooth([this](bool on) {
         if (!m_canvas) return;
-        if (m_canvas->IsEditingRunner()) m_canvas->SetEditRunnerSmooth(on);
-        else                             m_canvas->SetEditVentSmooth(on);
+        if      (m_canvas->IsEditingRunner()) m_canvas->SetEditRunnerSmooth(on);
+        else if (m_canvas->IsEditingGate())   m_canvas->SetEditGateSmooth(on);
+        else                                  m_canvas->SetEditVentSmooth(on);
         });
     m_ventEditToolbar->SetOnToggleComplex([this](bool wantComplex) {
         if (!m_canvas) return;
@@ -281,6 +282,11 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
         {
             if (wantComplex) m_canvas->ConvertEditRunnerToComplex();
             else             m_canvas->ConvertEditRunnerToSimple();
+        }
+        else if (m_canvas->IsEditingGate())
+        {
+            if (wantComplex) m_canvas->ConvertEditGateToComplex();
+            else             m_canvas->ConvertEditGateToSimple();
         }
         else
         {
@@ -1010,6 +1016,22 @@ void MainFrame::UpdateVentEditToolbar()
             m_ventEditToolbar->Show();
         m_ventEditToolbar->Raise();
     }
+    else if (m_canvas->IsEditingGate())
+    {
+        // Same shared overlay, retitled for the gate's SUB-RUNNER. node[0] is
+        // pinned to the gate origin; only the sub-runner gets a complex route
+        // (the gate frustum stays driven by the gate-card fields).
+        m_ventEditToolbar->SetLabels("SUB-RUNNER PATH", "Select a gate");
+        m_ventEditToolbar->Configure(
+            m_canvas->HasEditGateSelected(),
+            m_canvas->IsEditGateComplex(),
+            m_canvas->IsEditGateSmooth(),
+            m_canvas->EditGateNodeCount(),
+            m_canvas->GetPathEditTool());
+        if (!m_ventEditToolbar->IsShown())
+            m_ventEditToolbar->Show();
+        m_ventEditToolbar->Raise();
+    }
     else
     {
         if (m_ventEditToolbar->IsShown())
@@ -1632,6 +1654,28 @@ void MainFrame::OnSaveProject(wxCommandEvent&)
         pg.parentIndex = gf.parentIndex;
         pg.localPos = gf.localPos;
         pg.localNormal = gf.localNormal;
+
+        // Persist an authored complex sub-runner verbatim; simple sub-runners
+        // re-derive on load. The gate frustum is never persisted.
+        if (gf.subPath.kind == PathKind::Complex)
+        {
+            pg.isComplex = true;
+            pg.smooth = gf.subPath.smooth;
+            pg.nodes.reserve(gf.subPath.nodes.size());
+            for (const auto& n : gf.subPath.nodes)
+            {
+                ProjectPathNode pn;
+                pn.pos = n.pos;
+                pn.dir = n.dir;
+                pn.handleLen = n.handleLen;
+                pn.handleIn = n.handleIn;
+                pn.handleOut = n.handleOut;
+                pn.handlesLinked = n.handlesLinked;
+                pn.handlesManual = n.handlesManual;
+                pg.nodes.push_back(pn);
+            }
+        }
+
         data.gates.push_back(pg);
     }
 
@@ -1799,8 +1843,32 @@ void MainFrame::OnLoadProject(wxCommandEvent&)
 
     // ---- Restore gates -----------------------------------------------------
     for (const auto& gt : data.gates)
-        m_canvas->RestoreGate(gt.pos, gt.normal,
-            gt.parentIndex, gt.localPos, gt.localNormal);
+    {
+        if (gt.isComplex && gt.nodes.size() >= 2)
+        {
+            std::vector<PathNode> nodes;
+            nodes.reserve(gt.nodes.size());
+            for (const auto& pn : gt.nodes)
+            {
+                PathNode nd;
+                nd.pos = pn.pos;
+                nd.dir = pn.dir;
+                nd.handleLen = pn.handleLen;
+                nd.handleIn = pn.handleIn;
+                nd.handleOut = pn.handleOut;
+                nd.handlesLinked = pn.handlesLinked;
+                nd.handlesManual = pn.handlesManual;
+                nodes.push_back(nd);
+            }
+            m_canvas->RestoreGateComplex(gt.pos, gt.normal, nodes, gt.smooth,
+                gt.parentIndex, gt.localPos, gt.localNormal);
+        }
+        else
+        {
+            m_canvas->RestoreGate(gt.pos, gt.normal,
+                gt.parentIndex, gt.localPos, gt.localNormal);
+        }
+    }
 
     // ---- Restore vents -----------------------------------------------------
     for (const auto& vn : data.vents)

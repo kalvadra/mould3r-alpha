@@ -80,6 +80,17 @@ struct ProjectGateData
     int       parentIndex = -1;
     glm::vec3 localPos{ 0.0f };
     glm::vec3 localNormal{ 0.0f, 0.0f, 1.0f };
+
+    // Complex (authored) SUB-RUNNER path persistence (v5+). Same scheme as
+    // ProjectRunnerData: isComplex=false → the historical straight sub-runner,
+    // re-derived Simple on load (gate origin -> feed) so old files and simple
+    // gates need none of the fields below. When true, `nodes` (>= 2, authored on
+    // the parting plane) and `smooth` describe the sub-runner route verbatim —
+    // node[0] is the gate origin, nodes.back() is the feed attach point. The gate
+    // FRUSTUM is never serialized here: it is rebuilt from the gate-card fields.
+    bool      isComplex = false;
+    bool      smooth = false;
+    std::vector<ProjectPathNode> nodes;
 };
 
 struct ProjectVentData

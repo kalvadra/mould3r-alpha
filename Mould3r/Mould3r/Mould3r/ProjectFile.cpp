@@ -89,11 +89,13 @@ bool ProjectFile::Save(const std::string& path,
     // transforms and patterning). v1 files round-trip cleanly: missing keys
     // load as parentIndex=-1 (unparented), preserving the old behaviour.
     // v3: complex (authored) vent paths (pathKind/smooth/node lines under
-    // [vent.N]). v4: the same complex-path lines under [runner.N]. The reader is
+    // [vent.N]). v4: the same complex-path lines under [runner.N]. v5: the same
+    // under [gate.N] for authored SUB-RUNNER routes (the gate frustum itself is
+    // still rebuilt from the card fields, never serialized). The reader is
     // tolerant (presence of pathKind/node lines drives it, not the version
     // number), so older readers ignore the new lines and older files load as
     // simple — the version is informational.
-    file << "version = 4\n";
+    file << "version = 5\n";
     if (!data.fixturePath.empty())
         file << "fixture = " << MakeRelative(data.fixturePath, baseDir) << "\n";
 
@@ -214,6 +216,29 @@ bool ProjectFile::Save(const std::string& path,
         file << "localNormalX = " << gt.localNormal.x << "\n";
         file << "localNormalY = " << gt.localNormal.y << "\n";
         file << "localNormalZ = " << gt.localNormal.z << "\n";
+
+        // Complex (authored) SUB-RUNNER path (v5+). Simple gates write only the
+        // point/normal/parent fields above and re-derive the straight sub-runner
+        // on load; a complex gate dumps its sub-runner node list plus the
+        // kind/smooth flags, identical in layout to the [runner.N] / [vent.N]
+        // node lines. node[0] is the gate origin, nodes.back() the feed attach.
+        // The gate frustum is NOT serialized — it rebuilds from the card fields.
+        if (gt.isComplex)
+        {
+            file << "pathKind = complex\n";
+            file << "smooth   = " << (gt.smooth ? "true" : "false") << "\n";
+            for (const auto& nd : gt.nodes)
+            {
+                file << "node = "
+                    << nd.pos.x << " " << nd.pos.y << " " << nd.pos.z << " "
+                    << nd.dir.x << " " << nd.dir.y << " " << nd.dir.z << " "
+                    << nd.handleLen << " "
+                    << nd.handleIn.x << " " << nd.handleIn.y << " " << nd.handleIn.z << " "
+                    << nd.handleOut.x << " " << nd.handleOut.y << " " << nd.handleOut.z << " "
+                    << (nd.handlesLinked ? 1 : 0) << " "
+                    << (nd.handlesManual ? 1 : 0) << "\n";
+            }
+        }
     }
 
     // -- [vent.N] ------------------------------------------------------------
@@ -460,6 +485,24 @@ bool ProjectFile::Load(const std::string& path,
             else if (key == "localNormalX") pendingGate.localNormal.x = ParseFloat(val, 0.0f);
             else if (key == "localNormalY") pendingGate.localNormal.y = ParseFloat(val, 0.0f);
             else if (key == "localNormalZ") pendingGate.localNormal.z = ParseFloat(val, 1.0f);
+            // v5 complex sub-runner keys. Absent in older files / simple gates,
+            // so isComplex defaults false and the sub-runner re-derives Simple on
+            // load. Same node-line layout as [runner.N] / [vent.N].
+            else if (key == "pathKind") pendingGate.isComplex = (val == "complex");
+            else if (key == "smooth")   pendingGate.smooth = ParseBool(val);
+            else if (key == "node")
+            {
+                std::istringstream iss(val);
+                ProjectPathNode pn;
+                iss >> pn.pos.x >> pn.pos.y >> pn.pos.z
+                    >> pn.dir.x >> pn.dir.y >> pn.dir.z >> pn.handleLen;
+                iss >> pn.handleIn.x >> pn.handleIn.y >> pn.handleIn.z
+                    >> pn.handleOut.x >> pn.handleOut.y >> pn.handleOut.z;
+                int linked = 1, manual = 0;
+                if (iss >> linked) pn.handlesLinked = (linked != 0);
+                if (iss >> manual) pn.handlesManual = (manual != 0);
+                pendingGate.nodes.push_back(pn);
+            }
             break;
 
         case Section::Vent:

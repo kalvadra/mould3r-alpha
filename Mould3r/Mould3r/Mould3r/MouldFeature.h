@@ -183,7 +183,8 @@ SolidMesh BuildBoxSweepMesh(const FeaturePath& path, float width, float depth,
 // vent's revolved-rectangle cylinder joint), and a smooth complex path yields a
 // single continuous swept tube.  Un-drafted (constant radius).
 SolidMesh BuildTubeSweepMesh(const FeaturePath& path, float radius,
-    int segments = 32, float overrunStart = 0.0f, float overrunEnd = 0.0f);
+    int segments = 32, float overrunStart = 0.0f, float overrunEnd = 0.0f,
+    bool sphereAtStart = false, bool sphereAtEnd = false);
 
 // ---------------------------------------------------------------------------
 // VentPoint  — a user-placed point on the parting surface of an object.
@@ -287,6 +288,20 @@ struct GateFeature
     int       parentIndex = -1;
     glm::vec3 localPos{ 0.0f, 0.0f, 0.0f };
     glm::vec3 localNormal{ 0.0f, 0.0f, 1.0f };
+
+    // Gate step G1: the SUB-RUNNER's route from the gate origin (point.worldPos)
+    // to the feed attach point.  Populated as a Simple path (start = gate origin,
+    // end = pathEnd) by GLCanvas::ComputeGatePath, which runs at the top of
+    // RebuildGateSolids.  The GATE FRUSTUM itself is never described by this path
+    // — it stays a straight tapered cone driven purely by the gate-card fields
+    // (diameter / draft / sub-runner diameter / overrun); only the sub-runner
+    // section becomes a Complex multi-node route.  Until later steps consume it,
+    // nothing reads this field — the frustum and sub-runner preview / cut are
+    // still driven directly by point.worldPos + pathEnd — so populating it
+    // changes nothing that is drawn or cut.  node[0] is pinned to the gate
+    // origin; nodes.back() is the feed attach point (auto-snapped while Simple,
+    // freely authored while Complex).
+    FeaturePath subPath;
 
     void Destroy() { solid.Destroy(); subRunnerSolid.Destroy(); }
 };
