@@ -148,6 +148,12 @@ public:
     // walks it per-frame; no GPU buffer rebuild is needed.
     void SetInjectionPoints(const std::vector<InjectionPoint>& pts);
 
+    // Apply grid configuration (shape / size / spacing / spokes / major
+    // divisions) to the editor's ground-plane grid. Stored and pushed to the
+    // GridRenderer on the next paint, then refreshes — so the editor's grid
+    // previews the Grid Defaults being authored, rather than updating blind.
+    void SetGridSettings(const GridSettings& s);
+
 private:
     void OnPaint(wxPaintEvent&);
     void OnResize(wxSizeEvent&);
@@ -318,6 +324,12 @@ private:
 
     OrbitCamera  m_camera;
     GridRenderer m_grid;
+
+    // Current grid configuration + deferred-apply flag (same pattern as
+    // GLCanvas): SetGridSettings stores here and OnPaint pushes to m_grid once
+    // the grid program is ready.
+    GridSettings m_gridSettings;
+    bool         m_gridNeedsApply = true;
 
     // Lit program — compiled lazily by EnsureLitProgram on first load /
     // first paint. Cached uniform locations let the per-frame uniform

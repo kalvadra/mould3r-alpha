@@ -19,6 +19,12 @@
     <Filter Include="Source Files\TransformHandlers">
       <UniqueIdentifier>{b94244fb-aed7-4a1f-9214-ea840e957206}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Header Files\GridHandlers">
+      <UniqueIdentifier>{bc9babe4-11bd-410e-9b13-53e2684a6572}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\GridHandlers">
+      <UniqueIdentifier>{5eb1dba7-61b5-429c-9bee-cba00aec6443}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="Mould3r.cpp">
@@ -62,6 +68,9 @@
     </ClCompile>
     <ClCompile Include="PrecisionPlaceDialog.cpp">
       <Filter>Source Files\TransformHandlers</Filter>
+    </ClCompile>
+    <ClCompile Include="GridSettingsDialog.cpp">
+      <Filter>Source Files\GridHandlers</Filter>
     </ClCompile>
     <ClCompile Include="ScaleDialog.cpp">
       <Filter>Source Files\TransformHandlers</Filter>
@@ -160,6 +169,12 @@
     </ClInclude>
     <ClInclude Include="PrecisionPlaceDialog.h">
       <Filter>Header Files\TransformHandlers</Filter>
+    </ClInclude>
+    <ClInclude Include="GridSettings.h">
+      <Filter>Header Files\GridHandlers</Filter>
+    </ClInclude>
+    <ClInclude Include="GridSettingsDialog.h">
+      <Filter>Header Files\GridHandlers</Filter>
     </ClInclude>
     <ClInclude Include="ScaleDialog.h">
       <Filter>Header Files\TransformHandlers</Filter>

@@ -71,7 +71,7 @@ bool FixtureFile::Load(const std::string& path,
 
     // Section-aware parsing.
     // Sections: [fixture], [injection_point.N], [<feature>_defaults],
-    //           [half_a_transform], [half_b_transform]
+    //           [grid_defaults], [half_a_transform], [half_b_transform]
     // An injection_point block is committed to the list when the next section
     // header (or EOF) is encountered. Defaults sections write directly into
     // their corresponding struct on FixtureDefinition (no commit step needed
@@ -89,6 +89,7 @@ bool FixtureFile::Load(const std::string& path,
         GateDefaults,
         SubRunnerDefaults,
         EjectorDefaults,
+        GridDefaults,
         HalfATransform,
         HalfBTransform,
     };
@@ -120,6 +121,15 @@ bool FixtureFile::Load(const std::string& path,
     auto parseOptFloat = [](const std::string& s, std::optional<float>& dst)
         {
             try { dst = std::stof(s); }
+            catch (...) { /* leave dst unchanged */ }
+        };
+
+    // Helper: parse a numeric value into an optional<int>. Same forgiving
+    // stance as parseOptFloat — used by the grid defaults section (spokes,
+    // major_every).
+    auto parseOptInt = [](const std::string& s, std::optional<int>& dst)
+        {
+            try { dst = std::stoi(s); }
             catch (...) { /* leave dst unchanged */ }
         };
 
@@ -178,6 +188,10 @@ bool FixtureFile::Load(const std::string& path,
             else if (sectionName == "ejector_defaults")
             {
                 currentSection = Section::EjectorDefaults;
+            }
+            else if (sectionName == "grid_defaults")
+            {
+                currentSection = Section::GridDefaults;
             }
             else if (sectionName == "half_a_transform")
             {
@@ -279,6 +293,16 @@ bool FixtureFile::Load(const std::string& path,
             else if (key == "diameter") parseOptFloat(value, out.ejectorDefaults.diameter);
             else if (key == "length")   parseOptFloat(value, out.ejectorDefaults.length);
         }
+        else if (currentSection == Section::GridDefaults)
+        {
+            if (key == "shape")            out.gridDefaults.shape = value;
+            else if (key == "size_x")      parseOptFloat(value, out.gridDefaults.sizeX);
+            else if (key == "size_y")      parseOptFloat(value, out.gridDefaults.sizeY);
+            else if (key == "radius")      parseOptFloat(value, out.gridDefaults.radius);
+            else if (key == "spokes")      parseOptInt(value, out.gridDefaults.spokes);
+            else if (key == "spacing")     parseOptFloat(value, out.gridDefaults.spacing);
+            else if (key == "major_every") parseOptInt(value, out.gridDefaults.majorEvery);
+        }
         // ---- Per-half pose sections ----------------------------------------
         // Same forgiving parsing as the defaults sections above — unknown
         // keys silently dropped, malformed numbers leave the destination at
@@ -361,6 +385,10 @@ bool FixtureFile::Save(const std::string& path,
         {
             if (v) file << key << " = " << *v << "\n";
         };
+    auto writeKeyI = [&](const char* key, const std::optional<int>& v)
+        {
+            if (v) file << key << " = " << *v << "\n";
+        };
 
     {
         const VentDefaults& d = def.ventDefaults;
@@ -423,6 +451,21 @@ bool FixtureFile::Save(const std::string& path,
             writeKey("type", d.type);
             writeKeyF("diameter", d.diameter);
             writeKeyF("length", d.length);
+        }
+    }
+    {
+        const GridDefaults& d = def.gridDefaults;
+        if (d.shape || d.sizeX || d.sizeY || d.radius
+            || d.spokes || d.spacing || d.majorEvery)
+        {
+            file << "\n[grid_defaults]\n";
+            writeKey("shape", d.shape);
+            writeKeyF("size_x", d.sizeX);
+            writeKeyF("size_y", d.sizeY);
+            writeKeyF("radius", d.radius);
+            writeKeyI("spokes", d.spokes);
+            writeKeyF("spacing", d.spacing);
+            writeKeyI("major_every", d.majorEvery);
         }
     }
 

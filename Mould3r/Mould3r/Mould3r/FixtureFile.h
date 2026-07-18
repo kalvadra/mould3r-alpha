@@ -101,6 +101,25 @@ struct EjectorDefaults
 };
 
 // ---------------------------------------------------------------------------
+// GridDefaults — optional ground-plane grid configuration baked into the
+// fixture and applied to the live grid when the fixture is loaded. Same
+// presence-driven convention as the feature defaults above: only the fields
+// the fixture specifies are set; anything unset falls back to the current
+// application grid settings at apply time. Lengths are millimetres; `shape`
+// is "rectangular" or "circular"; `spokes`/`majorEvery` are unitless counts.
+// ---------------------------------------------------------------------------
+struct GridDefaults
+{
+    std::optional<std::string> shape;       // "rectangular" | "circular"
+    std::optional<float>       sizeX;       // mm (rectangular extent X)
+    std::optional<float>       sizeY;       // mm (rectangular extent Y = world Z)
+    std::optional<float>       radius;      // mm (circular)
+    std::optional<int>         spokes;      // circular radial divisions
+    std::optional<float>       spacing;     // mm (minor line spacing)
+    std::optional<int>         majorEvery;  // major line every N divisions
+};
+
+// ---------------------------------------------------------------------------
 // HalfTransform — per-half pose stored alongside the modelA / modelB paths.
 //
 // Captures any positioning the user does in the FixtureEditor (Move,
@@ -167,6 +186,10 @@ struct FixtureDefinition
     GateDefaults      gateDefaults;
     SubRunnerDefaults subRunnerDefaults;
     EjectorDefaults   ejectorDefaults;
+
+    // Optional grid configuration (see GridDefaults). Empty optionals mean
+    // "no override" — the live grid keeps its current settings on load.
+    GridDefaults      gridDefaults;
 
     bool IsValid() const
     {

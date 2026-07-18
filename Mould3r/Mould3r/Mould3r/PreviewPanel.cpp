@@ -266,6 +266,14 @@ void PreviewPanel::FlushIfDirty()
         });
 }
 
+void PreviewPanel::SetGridSettings(const GridSettings& s)
+{
+    // GLCanvas::SetGridSettings defers the actual push to its next paint, so
+    // this is safe even before the preview canvas has realized its GL context.
+    if (m_canvas)
+        m_canvas->SetGridSettings(s);
+}
+
 // ---------------------------------------------------------------------------
 // Left panel — runnable simulations. Styled to match the Prepare-side left
 // panel: a fixed-width column (AppBg) with a section title and a scrollable

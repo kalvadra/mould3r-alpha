@@ -19,6 +19,7 @@
 #include "TranslateDialog.h"
 #include "ScaleDialog.h"
 #include "PrecisionPlaceDialog.h"
+#include "GridSettingsDialog.h"
 #include "AppConfig.h"
 #include "MeshImportSettings.h"
 #include "RoundedButton.h"     // rounded button for sidebar / toolbar action buttons
@@ -202,6 +203,9 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
     Bind(wxEVT_MENU, &MainFrame::OnSetMetric, this, ID_UnitMetric);
     Bind(wxEVT_MENU, &MainFrame::OnSetImperial, this, ID_UnitImperial);
 
+    // Grid menu: the consolidated settings dialog.
+    Bind(wxEVT_MENU, &MainFrame::OnGridSettings, this, ID_GridSettings);
+
     // Mesh quality radio items just persist the chosen preset; the next
     // import picks it up via MeshImportSettings::GetQuality().
     Bind(wxEVT_MENU,
@@ -269,6 +273,13 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
     m_ventEditToolbar = new VentEditToolbar(m_preparePage);
     m_ventEditToolbar->SetOnTool([this](PathEditTool t) {
         if (m_canvas) m_canvas->SetPathEditTool(t);
+        });
+    // Place... — Precision Place the selected node. The canvas vets eligibility,
+    // and the cell is only enabled when GetSelectedPlaceableNode() is valid.
+    m_ventEditToolbar->SetOnPlaceNode([this]() {
+        if (!m_canvas) return;
+        const int node = m_canvas->GetSelectedPlaceableNode();
+        if (node >= 0) PrecisionPlaceEditNode(node);
         });
     m_ventEditToolbar->SetOnSmooth([this](bool on) {
         if (!m_canvas) return;
@@ -399,6 +410,9 @@ wxMenuBar* MainFrame::BuildPrepareMenuBar()
     fixtureMenu->Append(ID_ChangeFixture, "Change Fixture...");
     menuBar->Append(fixtureMenu, "&Fixture");
 
+    // Grid menu — edit the ground-plane grid's shape, size and spacing.
+    menuBar->Append(BuildGridMenu(), "&Grid");
+
     auto* unitsMenu = new wxMenu();
     unitsMenu->AppendRadioItem(ID_UnitMetric, "Metric (mm)");
     unitsMenu->AppendRadioItem(ID_UnitImperial, "Imperial (in)");
@@ -430,6 +444,21 @@ wxMenuBar* MainFrame::BuildPrepareMenuBar()
     }
 
     return menuBar;
+}
+
+// ---------------------------------------------------------------------------
+// BuildGridMenu — Shape submenu (Rectangular / Circular radio) plus the two
+// "Change..." actions. The shape governs which fields the size dialog shows,
+// so it's a persistent choice reflected here from m_gridSettings.
+// ---------------------------------------------------------------------------
+wxMenu* MainFrame::BuildGridMenu()
+{
+    // All grid settings live in one consolidated dialog (shape / size /
+    // spacing / major divisions), since the fields are related and some
+    // predicate others.
+    auto* gridMenu = new wxMenu();
+    gridMenu->Append(ID_GridSettings, "Grid Settings...");
+    return gridMenu;
 }
 
 // ---------------------------------------------------------------------------
@@ -473,7 +502,13 @@ void MainFrame::SetPerspective(Perspective which)
     UpdatePerspectiveButtons();
 
     if (which == Perspective::Preview && m_previewPanel)
+    {
+        // Keep the preview's ground-plane grid in step with the Prepare
+        // perspective. The Grid menu lives only in Prepare, so settings can't
+        // change while Preview is showing — syncing on entry is sufficient.
+        m_previewPanel->SetGridSettings(m_gridSettings);
         m_previewPanel->FlushIfDirty();
+    }
 }
 
 void MainFrame::OnPerspectivePrepare(wxCommandEvent&)
@@ -838,6 +873,29 @@ void MainFrame::PrecisionPlaceSelected()
     m_canvas->MoveSelectionToXZ(v.x, v.z);
 }
 
+// ---------------------------------------------------------------------------
+// PrecisionPlaceEditNode — same flow as PrecisionPlaceSelected, but for a
+// single path node: pre-fill from the node's current XZ, then write the typed
+// values back. The canvas owns eligibility and the invariants (staying inside
+// the mould, keeping rf.point on the endpoint), so a rejected value simply
+// leaves the node where it was.
+// ---------------------------------------------------------------------------
+void MainFrame::PrecisionPlaceEditNode(int nodeIdx)
+{
+    if (!m_canvas) return;
+
+    float curX = 0.0f, curZ = 0.0f;
+    if (!m_canvas->GetEditNodeXZ(nodeIdx, curX, curZ))
+        return;   // not an eligible node — nothing to place
+
+    PrecisionPlaceDialog dlg(this, curX, curZ);
+    if (dlg.ShowModal() != wxID_OK)
+        return;
+
+    const PrecisionPlaceValues v = dlg.GetValues();
+    m_canvas->MoveEditNodeToXZ(nodeIdx, v.x, v.z);
+}
+
 void MainFrame::OnToolCenter(wxCommandEvent&)
 {
     if (!m_canvas) return;
@@ -996,7 +1054,8 @@ void MainFrame::UpdateVentEditToolbar()
             m_canvas->IsEditVentComplex(),
             m_canvas->IsEditVentSmooth(),
             m_canvas->EditVentNodeCount(),
-            m_canvas->GetPathEditTool());
+            m_canvas->GetPathEditTool(),
+            m_canvas->GetSelectedPlaceableNode() >= 0);
         if (!m_ventEditToolbar->IsShown())
             m_ventEditToolbar->Show();
         m_ventEditToolbar->Raise();   // keep above the GL surface
@@ -1011,7 +1070,8 @@ void MainFrame::UpdateVentEditToolbar()
             m_canvas->IsEditRunnerComplex(),
             m_canvas->IsEditRunnerSmooth(),
             m_canvas->EditRunnerNodeCount(),
-            m_canvas->GetPathEditTool());
+            m_canvas->GetPathEditTool(),
+            m_canvas->GetSelectedPlaceableNode() >= 0);
         if (!m_ventEditToolbar->IsShown())
             m_ventEditToolbar->Show();
         m_ventEditToolbar->Raise();
@@ -1027,7 +1087,8 @@ void MainFrame::UpdateVentEditToolbar()
             m_canvas->IsEditGateComplex(),
             m_canvas->IsEditGateSmooth(),
             m_canvas->EditGateNodeCount(),
-            m_canvas->GetPathEditTool());
+            m_canvas->GetPathEditTool(),
+            false);   // gate sub-runner nodes are path-snapped — not eligible
         if (!m_ventEditToolbar->IsShown())
             m_ventEditToolbar->Show();
         m_ventEditToolbar->Raise();
@@ -1188,6 +1249,23 @@ void MainFrame::OnSetImperial(wxCommandEvent&)
         lbl->SetLabel("in");
 
     m_imperial = true;
+}
+
+// ---------------------------------------------------------------------------
+// Grid menu handler — the consolidated Grid Settings dialog. Authors the full
+// GridSettings (shape / size / spacing / major divisions) and pushes it to the
+// live grid so the rendered grid updates immediately.
+// ---------------------------------------------------------------------------
+void MainFrame::OnGridSettings(wxCommandEvent&)
+{
+    GridSettingsDialog dlg(this, m_gridSettings, m_imperial);
+    if (dlg.ShowModal() != wxID_OK)
+        return;
+
+    m_gridSettings = dlg.GetSettings();
+
+    if (m_canvas)
+        m_canvas->SetGridSettings(m_gridSettings);
 }
 
 void MainFrame::GetVentDimensions(float& outLength, float& outWidth,
@@ -2049,6 +2127,27 @@ void MainFrame::ApplyFixtureDefaults(const FixtureDefinition& def)
     setChoice(m_ejectorTypeChoice, def.ejectorDefaults.type);
     setLen(m_ejectorDiameter, def.ejectorDefaults.diameter);
     setLen(m_ejectorLength, def.ejectorDefaults.length);
+
+    // ---- Grid ---------------------------------------------------------------
+    // Start from the current grid settings and override only the fields the
+    // fixture specifies (presence-driven, like the feature defaults above), so
+    // a fixture silent on the grid — or one predating [grid_defaults] — leaves
+    // the live grid untouched. Then push to the canvas so it re-renders.
+    {
+        const GridDefaults& g = def.gridDefaults;
+        if (g.shape)
+            m_gridSettings.shape = (*g.shape == "circular")
+                ? GridShape::Circular : GridShape::Rectangular;
+        if (g.sizeX)      m_gridSettings.sizeX = *g.sizeX;
+        if (g.sizeY)      m_gridSettings.sizeY = *g.sizeY;
+        if (g.radius)     m_gridSettings.radius = *g.radius;
+        if (g.spokes)     m_gridSettings.spokes = *g.spokes;
+        if (g.spacing)    m_gridSettings.spacing = *g.spacing;
+        if (g.majorEvery) m_gridSettings.majorEvery = *g.majorEvery;
+
+        if (m_canvas)
+            m_canvas->SetGridSettings(m_gridSettings);
+    }
 }
 
 void MainFrame::OnBrowseExport(wxCommandEvent&)

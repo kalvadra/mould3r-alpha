@@ -151,6 +151,39 @@ public:
     // CenterSelectedObject).
     void MoveSelectionToXZ(float x, float z);
 
+    // Apply grid configuration (shape / size / spacing / major divisions) to
+    // the ground-plane grid. Stored and pushed to the GridRenderer on the next
+    // paint (once the GL context and grid program are ready), then refreshes.
+    void SetGridSettings(const GridSettings& s);
+
+    // Snap a world XZ point to the nearest point of the current grid: the
+    // rectangular lattice (multiples of the minor spacing, clamped to the
+    // extents), or for a circular grid the ring/spoke lattice plus the centre.
+    // Uses the active grid settings. Y is the caller's concern.
+    glm::vec2 SnapToGrid(const glm::vec2& xz) const;
+
+    // ---- Precision Place for feature path nodes -----------------------------
+    // Only nodes that live on the y=0 parting plane AND do their own free
+    // positioning are eligible: vent INTERIOR nodes (the origin snaps to the
+    // part silhouette, the endpoint to the fixture perimeter) and runner
+    // interior/endpoint nodes (node[0] is pinned to the sprue feed). Gates are
+    // excluded — their sub-runner path snaps. Mirrors the object-level
+    // GetSelectionCenterXZ / MoveSelectionToXZ pair.
+    bool IsEditNodePrecisePlaceable(int idx) const;
+    bool GetEditNodeXZ(int idx, float& outX, float& outZ) const;
+    void MoveEditNodeToXZ(int idx, float x, float z);
+
+    // Nearest eligible path node to the cursor in the active edit mode, or -1.
+    // Used by the double-click shortcut into Precision Place.
+    int  PickPrecisePlaceableNode(int mouseX, int mouseY) const;
+
+    // The currently selected path node in the active edit mode, or -1. This is
+    // the node last grabbed with the Move tool; it persists after the mouse is
+    // released (and is what the enlarged node marker indicates), so the edit
+    // toolbar can act on it. Returns -1 when the selection isn't Precision
+    // Place-eligible, so callers can use it directly to gate the button.
+    int  GetSelectedPlaceableNode() const;
+
     // Report the XZ centroid of the current selection (the value the
     // Precision Place dialog pre-fills). Returns false (leaving outputs
     // untouched) when nothing is selected.
@@ -551,6 +584,10 @@ private:
     void OnMouseWheel(wxMouseEvent& evt);
     void OnKeyDown(wxKeyEvent& evt);
 
+    // Ctrl release ends grid snapping; the ghosts/node drags read the key
+    // state in the paint pass, so repaint to drop back to the free position.
+    void OnKeyUp(wxKeyEvent& evt);
+
     // Preview-mode render path: grid + loaded mould halves only, all opaque,
     // honouring each half's visibility flag. Called from OnPaint after the
     // clear + camera setup when m_previewMode is true; the normal scene/
@@ -614,6 +651,13 @@ private:
     // Returns false if nothing is in range. See implementation for the
     // ranking rationale.
     bool RayCastEjectorSnap(int mouseX, int mouseY, glm::vec3& outPos);
+
+    // Ctrl-held ejector placement: XZ snapped to the nearest grid point, Y
+    // taken from the shell (topmost object surface) directly above that point
+    // rather than snapped — the grid is an XZ lattice, so it has no say in Y.
+    // Returns false when no shell lies over the snapped point (nothing to
+    // eject from), matching RayCastEjectorSnap's silent-miss behaviour.
+    bool RayCastEjectorGridSnap(int mouseX, int mouseY, glm::vec3& outPos);
 
     // Sticky placement helpers — re-derive a parented vent's / gate's
     // world-space data from its parent object's current transform plus the
@@ -863,6 +907,21 @@ private:
     OrbitCamera  m_camera;
     GridRenderer m_grid;
     shaders      m_shaders;
+
+    // Current grid configuration and a deferred-apply flag. The flag lets
+    // SetGridSettings work before the GL context exists: the settings are
+    // pushed to m_grid in OnPaint once the grid program is ready.
+    GridSettings m_gridSettings;
+    bool         m_gridNeedsApply = true;
+
+    // Grid-snap drag state (Select-mode object move). The drag applies screen
+    // deltas, so snapping the object positions directly would feed the snapped
+    // value back into the next frame's accumulation and the object would never
+    // leave the first grid point. Instead the true (unsnapped) group anchor is
+    // tracked here and the snap is derived from it each frame, which also lets
+    // releasing Ctrl fall straight back to the unsnapped position.
+    bool         m_snapDragActive = false;
+    glm::vec3    m_snapDragTrueAnchor{ 0.0f };
 
     // Scene
     std::vector<SceneObject> m_fixtures;
