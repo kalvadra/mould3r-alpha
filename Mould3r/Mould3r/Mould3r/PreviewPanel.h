@@ -10,6 +10,7 @@
 
 #include "FileImporter.h"   // FileImporter::MeshData
 #include "DesignChecks.h"   // DesignChecks::DemoldabilityResult
+#include "GridSettings.h"   // GridSettings — forwarded to the preview canvas
 
 class GLCanvas;
 class wxSpinCtrlDouble;
@@ -65,6 +66,12 @@ public:
     // switches the active perspective to Preview (and harmlessly a no-op when
     // nothing is dirty or the panel is still hidden). Idempotent.
     void FlushIfDirty();
+
+    // Push the ground-plane grid configuration to the preview's own canvas so
+    // it matches the Prepare perspective. MainFrame calls this on entry to the
+    // Preview perspective (the Grid menu lives only in Prepare, so settings
+    // can't change while Preview is showing — syncing on entry is enough).
+    void SetGridSettings(const GridSettings& s);
 
 private:
     // Build one visibility checkbox per part: a checkbox for each mould half,

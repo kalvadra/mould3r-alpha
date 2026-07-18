@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "FixtureFile.h"   // InjectionPoint — held by value in m_injectionPoints
+#include "GridSettings.h"  // GridSettings — the fixture's grid defaults
 
 class FixtureCanvas;
 
@@ -139,6 +140,12 @@ private:
     wxPanel* CreateGatesContent(wxWindow* parent);
     wxPanel* CreateVentsContent(wxWindow* parent);
     wxPanel* CreateEjectorsContent(wxWindow* parent);
+
+    // Grid Defaults card: a summary line + an "Edit…" button that opens the
+    // shared GridSettingsDialog. Values live in m_gridDefaults; they are only
+    // baked into the fixture when the override checkbox is ticked.
+    wxPanel* CreateGridDefaultsContent(wxWindow* parent);
+    void     UpdateGridSummary();   // refresh m_gridSummary from m_gridDefaults
 
     // Rebuild the list of injection-point entries inside m_injectionListPanel
     // from m_injectionPoints. Called after Add / Edit / Remove. Each entry
@@ -301,6 +308,14 @@ private:
     wxPanel* m_ejectorDimsPanel = nullptr;  // shown/hidden by type choice
     wxTextCtrl* m_ejectorDiameter = nullptr;
     wxTextCtrl* m_ejectorLength = nullptr;
+
+    // ---- Grid defaults ---------------------------------------------------
+    // Authored via the shared GridSettingsDialog (opened by the card's
+    // "Edit…" button). Stored in mm; written to the fixture only when
+    // m_gridOverride is ticked. m_gridSummary shows a human-readable digest.
+    GridSettings  m_gridDefaults;                 // defaults to app grid settings
+    wxCheckBox*   m_gridOverride = nullptr;
+    wxStaticText* m_gridSummary = nullptr;
 
     // ---- Injection points ------------------------------------------------
     // Live list of points the user has added through the side-panel card.

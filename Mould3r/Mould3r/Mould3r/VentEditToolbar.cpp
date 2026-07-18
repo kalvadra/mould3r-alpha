@@ -5,7 +5,7 @@
 #include <wx/graphics.h>
 
 // Fixed overlay size. The canvas pins it top-centre; cells are laid out within.
-static constexpr int kBarW = 524;
+static constexpr int kBarW = 602;   // +78 for the Place... cell
 static constexpr int kBarH = 90;
 static constexpr int kPad = 12;
 
@@ -40,13 +40,14 @@ VentEditToolbar::VentEditToolbar(wxWindow* parent)
 }
 
 void VentEditToolbar::Configure(bool hasSelection, bool complex, bool smooth,
-    int nodeCount, PathEditTool tool)
+    int nodeCount, PathEditTool tool, bool canPlaceNode)
 {
     m_hasSelection = hasSelection;
     m_complex = complex;
     m_smooth = smooth;
     m_nodeCount = nodeCount;
     m_tool = tool;
+    m_canPlaceNode = canPlaceNode;
     Refresh(false);
 }
 
@@ -65,7 +66,9 @@ void VentEditToolbar::LayoutCells()
 
     m_rMove = wxRect(x, y, 70, bh);   x += 72;
     m_rAdd = wxRect(x, y, 82, bh);   x += 84;
-    m_rRemove = wxRect(x, y, 100, bh);  x += 100;
+    m_rRemove = wxRect(x, y, 100, bh);  x += 102;
+    // Place... groups with the node tools — it acts on the selected node.
+    m_rPlace = wxRect(x, y, 76, bh);   x += 76;
 
     // Smooth checkbox cell after a small gap.
     x += 14;
@@ -81,6 +84,7 @@ VentEditToolbar::Cell VentEditToolbar::HitTest(const wxPoint& p) const
     if (m_rMove.Contains(p))   return CELL_MOVE;
     if (m_rAdd.Contains(p))    return CELL_ADD;
     if (m_rRemove.Contains(p)) return CELL_REMOVE;
+    if (m_rPlace.Contains(p))  return CELL_PLACE;
     if (m_rSmooth.Contains(p)) return CELL_SMOOTH;
     if (m_rToggle.Contains(p)) return CELL_TOGGLE;
     return CELL_NONE;
@@ -93,6 +97,7 @@ bool VentEditToolbar::CellEnabled(Cell c) const
     case CELL_MOVE:   return true;   // select / drag tool — usable with no selection
     case CELL_ADD:    return true;   // snaps onto any existing path
     case CELL_REMOVE: return m_hasSelection && m_complex;
+    case CELL_PLACE:  return m_hasSelection && m_complex && m_canPlaceNode;
     case CELL_SMOOTH: return m_hasSelection && m_complex;
     case CELL_TOGGLE: return m_hasSelection;
     default:          return false;
@@ -109,6 +114,7 @@ void VentEditToolbar::OnLeftDown(wxMouseEvent& evt)
     case CELL_MOVE:   if (m_onTool) m_onTool(PathEditTool::Move);       break;
     case CELL_ADD:    if (m_onTool) m_onTool(PathEditTool::AddNode);    break;
     case CELL_REMOVE: if (m_onTool) m_onTool(PathEditTool::RemoveNode); break;
+    case CELL_PLACE:  if (m_onPlaceNode) m_onPlaceNode();               break;
     case CELL_SMOOTH: if (m_onSmooth) m_onSmooth(!m_smooth);            break;
     case CELL_TOGGLE: if (m_onToggleComplex) m_onToggleComplex(!m_complex); break;
     default: break;
@@ -201,6 +207,10 @@ void VentEditToolbar::OnPaint(wxPaintEvent&)
         m_hover == CELL_ADD, Style::BtnActive);
     drawButton(m_rRemove, "Remove Node", CellEnabled(CELL_REMOVE), remOn,
         m_hover == CELL_REMOVE, Style::BtnActive);
+    // Place... is a momentary action (opens a dialog), so it never reads
+    // "active" the way the tool cells do.
+    drawButton(m_rPlace, "Place...", CellEnabled(CELL_PLACE), false,
+        m_hover == CELL_PLACE, Style::BtnActive);
 
     // ---- Smooth checkbox cell ---------------------------------------------
     {

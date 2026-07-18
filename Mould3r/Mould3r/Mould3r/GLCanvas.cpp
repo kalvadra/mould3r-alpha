@@ -14,6 +14,7 @@
 #include <wx/log.h>
 #include <wx/msgdlg.h>
 #include <wx/progdlg.h>
+#include <wx/utils.h>   // wxGetKeyState — live Ctrl state in the paint pass
 
 #include <opencascade/STEPControl_Reader.hxx>
 #include <opencascade/STEPControl_Writer.hxx>
@@ -157,6 +158,7 @@ GLCanvas::GLCanvas(wxWindow* parent)
     Bind(wxEVT_MOTION, &GLCanvas::OnMouse, this);
     Bind(wxEVT_MOUSEWHEEL, &GLCanvas::OnMouseWheel, this);
     Bind(wxEVT_KEY_DOWN, &GLCanvas::OnKeyDown, this);
+    Bind(wxEVT_KEY_UP, &GLCanvas::OnKeyUp, this);
 
     SetFocus();
 }
@@ -375,6 +377,55 @@ void GLCanvas::MoveSelectionToXZ(float x, float z)
     ReanchorFeaturesForObjects(m_selectedIndices);
     Refresh(false);
     NotifySceneMutated();
+}
+
+// ---------------------------------------------------------------------------
+// SetGridSettings — store the grid configuration and flag it for apply. The
+// actual push to the GridRenderer happens in OnPaint (once the GL context and
+// grid program are ready), so this is safe to call before the canvas has ever
+// painted. A Refresh schedules that paint.
+// ---------------------------------------------------------------------------
+void GLCanvas::SetGridSettings(const GridSettings& s)
+{
+    m_gridSettings = s;
+    m_gridNeedsApply = true;
+    Refresh(false);
+}
+
+// ---------------------------------------------------------------------------
+// SnapToGrid — nearest grid point to a world XZ position, per the active grid.
+// Rectangular: round to the minor-spacing lattice, clamped to the extents.
+// Circular: snap radius to the nearest ring and angle to the nearest spoke
+// (the centre is a valid point when inside the first ring).
+// ---------------------------------------------------------------------------
+glm::vec2 GLCanvas::SnapToGrid(const glm::vec2& p) const
+{
+    const GridSettings& g = m_gridSettings;
+    const float step = std::max(0.0001f, g.spacing);
+
+    if (g.shape == GridShape::Circular)
+    {
+        float r = glm::length(p);
+        float rs = std::round(r / step) * step;
+        rs = std::min(rs, g.radius);
+        if (rs <= 0.0f)
+            return glm::vec2(0.0f);                 // snap to the centre
+
+        const int   spokes  = std::max(1, g.spokes);
+        const float angStep = 6.28318530717958648f / static_cast<float>(spokes);
+        const float theta   = std::atan2(p.y, p.x); // p = (worldX, worldZ)
+        const float ts      = std::round(theta / angStep) * angStep;
+        return glm::vec2(rs * std::cos(ts), rs * std::sin(ts));
+    }
+
+    // Rectangular: minor lattice, clamped to the grid extents.
+    float x = std::round(p.x / step) * step;
+    float z = std::round(p.y / step) * step;
+    const float hx = g.sizeX * 0.5f;
+    const float hz = g.sizeY * 0.5f;
+    x = std::clamp(x, -hx, hx);
+    z = std::clamp(z, -hz, hz);
+    return glm::vec2(x, z);
 }
 
 // ---------------------------------------------------------------------------
@@ -4664,6 +4715,113 @@ bool GLCanvas::RayCastEjectorSnap(int mouseX, int mouseY, glm::vec3& outPos)
 }
 
 // ---------------------------------------------------------------------------
+// RayCastEjectorGridSnap — Ctrl-held ejector placement.
+//
+// The grid is an XZ lattice at y=0, so under Ctrl it is the authority on XZ:
+// take the cursor's point on the parting plane and snap it to the nearest grid
+// point. Y then comes from whatever that grid point lands on:
+//
+//   1. A runner / sub-runner path, when the grid point falls on one (within
+//      that path's own radius — i.e. the point is genuinely on the channel).
+//      Y is taken from the path so the ejector sits on it.
+//   2. Otherwise the shell: probe vertically for the part surface. The probe
+//      runs UPWARD from far below, so it lands on the BOTTOM-most surface —
+//      the underside the pin pushes against.
+//
+// Returns false when the grid point has neither a path nor a shell on it.
+// ---------------------------------------------------------------------------
+bool GLCanvas::RayCastEjectorGridSnap(int mouseX, int mouseY, glm::vec3& outPos)
+{
+    glm::vec3 plane;
+    if (!RayCastToPartingPlane(mouseX, mouseY, plane)) return false;
+
+    const glm::vec2 s = SnapToGrid(glm::vec2(plane.x, plane.z));
+    const glm::vec3 gridPt(s.x, 0.0f, s.y);
+
+    // Tolerance for "falls on the path" is the channel's own radius, so the
+    // grid point counts as on the runner exactly when it lies within it.
+    float runnerR = 2.5f;
+    float subR = 2.5f;
+    if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+    {
+        runnerR = frame->GetRunnerDiameter() * 0.5f;
+        subR = frame->GetSubRunnerDiameter() * 0.5f;
+    }
+
+    // Closest point on segment AB to an arbitrary point P (not to the ray).
+    auto closestToPoint = [](const glm::vec3& A, const glm::vec3& B,
+                             const glm::vec3& P)
+    {
+        const glm::vec3 AB = B - A;
+        const float len2 = glm::dot(AB, AB);
+        if (len2 < 1e-10f) return A;
+        float t = glm::dot(P - A, AB) / len2;
+        t = std::clamp(t, 0.0f, 1.0f);
+        return A + AB * t;
+    };
+
+    bool      found = false;
+    float     bestD = 0.0f;
+    glm::vec3 bestPt(0.0f);
+    auto considerSeg = [&](const glm::vec3& A, const glm::vec3& B, float tol)
+    {
+        const glm::vec3 c = closestToPoint(A, B, gridPt);
+        const float d = glm::length(glm::vec2(c.x - gridPt.x, c.z - gridPt.z));
+        if (d <= tol && (!found || d < bestD)) { found = true; bestD = d; bestPt = c; }
+    };
+
+    // Runner centrelines (every leg / the smooth curve), mirroring the
+    // candidate set RayCastEjectorSnap walks for the free-placement case.
+    if (m_sprue.hasPartingPoint)
+    {
+        std::vector<glm::vec3> poly;
+        for (const RunnerFeature& rf : m_runners)
+        {
+            RunnerCenterline(rf.path, m_sprue.partingPos, rf.point, poly);
+            for (size_t i = 0; i + 1 < poly.size(); ++i)
+                considerSeg(poly[i], poly[i + 1], runnerR);
+        }
+    }
+
+    // Gate sub-runner centrelines.
+    {
+        std::vector<glm::vec3> poly;
+        for (const GateFeature& gf : m_gates)
+        {
+            if (gf.subPath.kind == PathKind::Complex && gf.subPath.valid &&
+                gf.subPath.nodes.size() >= 2)
+            {
+                RunnerCenterline(gf.subPath, gf.point.worldPos, gf.pathEnd, poly);
+                for (size_t i = 0; i + 1 < poly.size(); ++i)
+                    considerSeg(poly[i], poly[i + 1], subR);
+            }
+            else if (gf.hasPath)
+            {
+                considerSeg(gf.point.worldPos, gf.pathEnd, subR);
+            }
+        }
+    }
+
+    if (found)
+    {
+        // On a path: keep the grid point's XZ, take Y from the path.
+        outPos = glm::vec3(s.x, bestPt.y, s.y);
+        return true;
+    }
+
+    // Shell: probe distance far beyond any plausible mould (world units are
+    // mm), so the ray starts clear of the geometry regardless of part size.
+    constexpr float kProbeY = 1.0e4f;
+    glm::vec3 hit;
+    if (!RayCastWorldRay(glm::vec3(s.x, -kProbeY, s.y),
+                         glm::vec3(0.0f, 1.0f, 0.0f), 2.0f * kProbeY, hit))
+        return false;   // no path and no shell at this grid point
+
+    outPos = glm::vec3(s.x, hit.y, s.y);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // ClearRunnerPoints
 // ---------------------------------------------------------------------------
 void GLCanvas::ClearRunnerPoints()
@@ -5553,6 +5711,16 @@ void GLCanvas::MoveEditRunnerNode(int idx, int mouseX, int mouseY)
 
     glm::vec3 plane;
     if (!RayCastToPartingPlane(mouseX, mouseY, plane)) return;
+    // Ctrl = grid snap. Runner nodes never perimeter-snap (they feed inward),
+    // so both interior nodes and the endpoint are eligible; node[0] is pinned
+    // to the sprue feed and already returned above. Called from the paint
+    // pass, so read the live key state.
+    if (wxGetKeyState(WXK_CONTROL))
+    {
+        const glm::vec2 s = SnapToGrid(glm::vec2(plane.x, plane.z));
+        plane.x = s.x;
+        plane.z = s.y;
+    }
     const glm::vec2 xz(plane.x, plane.z);
     if (!IsInsideConvexHull(m_fixturePerimeter, xz)) return;   // keep inside the mould
 
@@ -5568,8 +5736,109 @@ void GLCanvas::MoveEditRunnerNode(int idx, int mouseX, int mouseY)
     Refresh(false);
 }
 
-// RemoveEditRunnerNode — delete an interior node. Feed(0) and endpoint(last) are
-// protected; a Complex path keeps at least two nodes.
+// ---------------------------------------------------------------------------
+// Precision Place for path nodes.
+//
+// Eligibility mirrors the grid-snap rule: a node qualifies only if it lives on
+// the y=0 plane and positions itself freely. Vent origin (snaps to the part
+// silhouette, recapturing the parent) and vent endpoint (snaps to the fixture
+// perimeter) are therefore excluded, as are gates (their sub-runner snaps).
+// Runner node[0] is pinned to the sprue feed and excluded; its interior nodes
+// and endpoint are free and qualify.
+// ---------------------------------------------------------------------------
+bool GLCanvas::IsEditNodePrecisePlaceable(int idx) const
+{
+    if (idx < 0) return false;
+
+    if (m_transformMode == TransformMode::EditVent)
+    {
+        if (!IsEditVentComplex()) return false;
+        const std::vector<PathNode>& nodes =
+            m_vents[m_editFeatureIndex].path.nodes;
+        const int last = (int)nodes.size() - 1;
+        return idx > 0 && idx < last;              // interior only
+    }
+    if (m_transformMode == TransformMode::EditRunner)
+    {
+        if (!IsEditRunnerComplex()) return false;
+        const std::vector<PathNode>& nodes =
+            m_runners[m_editFeatureIndex].path.nodes;
+        return idx > 0 && idx < (int)nodes.size(); // node[0] pinned to the feed
+    }
+    return false;
+}
+
+bool GLCanvas::GetEditNodeXZ(int idx, float& outX, float& outZ) const
+{
+    if (!IsEditNodePrecisePlaceable(idx)) return false;
+
+    const std::vector<PathNode>& nodes =
+        (m_transformMode == TransformMode::EditVent)
+        ? m_vents[m_editFeatureIndex].path.nodes
+        : m_runners[m_editFeatureIndex].path.nodes;
+
+    outX = nodes[idx].pos.x;
+    outZ = nodes[idx].pos.z;
+    return true;
+}
+
+void GLCanvas::MoveEditNodeToXZ(int idx, float x, float z)
+{
+    if (!IsEditNodePrecisePlaceable(idx)) return;
+
+    if (m_transformMode == TransformMode::EditVent)
+    {
+        m_vents[m_editFeatureIndex].path.nodes[idx].pos = glm::vec3(x, 0.0f, z);
+        RebuildEditVentGeometry();
+        NotifySceneMutated();
+        Refresh(false);
+        return;
+    }
+
+    // Runner: hold the same invariants MoveEditRunnerNode maintains — stay
+    // inside the mould, and keep rf.point tracking the endpoint.
+    RunnerFeature& rf = m_runners[m_editFeatureIndex];
+    std::vector<PathNode>& nodes = rf.path.nodes;
+    const int last = (int)nodes.size() - 1;
+
+    if (!IsInsideConvexHull(m_fixturePerimeter, glm::vec2(x, z)))
+        return;   // outside the mould — reject, same as a drag would
+
+    nodes[idx].pos = glm::vec3(x, 0.0f, z);
+    if (idx == last) rf.point = nodes[last].pos;
+
+    rf.Destroy();
+    RebuildRunnerPathVBO();
+    RebuildRunnerSolids();
+    RebuildGatePathVBO();
+    RebuildGateSolids();
+    NotifySceneMutated();
+    Refresh(false);
+}
+
+// Nearest eligible node to the cursor, or -1. Delegates the actual picking to
+// the existing per-feature node pickers so the hit radius matches dragging.
+int GLCanvas::PickPrecisePlaceableNode(int mouseX, int mouseY) const
+{
+    int idx = -1;
+    if (m_transformMode == TransformMode::EditVent)
+        idx = PickEditVentNode(mouseX, mouseY);
+    else if (m_transformMode == TransformMode::EditRunner)
+        idx = PickEditRunnerNode(mouseX, mouseY);
+
+    return IsEditNodePrecisePlaceable(idx) ? idx : -1;
+}
+
+// The node the Move tool last grabbed (it survives the mouse release so it acts
+// as a selection), filtered through the same eligibility rule.
+int GLCanvas::GetSelectedPlaceableNode() const
+{
+    int idx = -1;
+    if (m_transformMode == TransformMode::EditVent)        idx = m_editVentNode;
+    else if (m_transformMode == TransformMode::EditRunner) idx = m_editRunnerNode;
+
+    return IsEditNodePrecisePlaceable(idx) ? idx : -1;
+}
 void GLCanvas::RemoveEditRunnerNode(int idx)
 {
     if (!IsEditRunnerComplex()) return;
@@ -6451,6 +6720,16 @@ void GLCanvas::MoveEditVentNode(int idx, int mouseX, int mouseY)
     {
         glm::vec3 plane;
         if (!RayCastToPartingPlane(mouseX, mouseY, plane)) return;
+        // Interior nodes are free on the plane, so Ctrl = grid snap. The
+        // origin (part-silhouette snap) and endpoint (perimeter snap) above
+        // already have their own snapping and are deliberately excluded.
+        // Called from the paint pass, so read the live key state.
+        if (wxGetKeyState(WXK_CONTROL))
+        {
+            const glm::vec2 s = SnapToGrid(glm::vec2(plane.x, plane.z));
+            plane.x = s.x;
+            plane.z = s.y;
+        }
         nodes[idx].pos = glm::vec3(plane.x, 0.0f, plane.z);
     }
 
@@ -7081,6 +7360,14 @@ void GLCanvas::OnPaint(wxPaintEvent&)
     InitGLOnce();
     m_grid.Init();
 
+    // Push any pending grid configuration now that the grid program exists.
+    // Guarded by a flag so we don't rebuild geometry every frame.
+    if (m_gridNeedsApply && m_grid.IsReady())
+    {
+        m_grid.ApplySettings(m_gridSettings);
+        m_gridNeedsApply = false;
+    }
+
     const wxSize sz = GetClientSize();
     const int w = std::max(1, sz.x);
     const int h = std::max(1, sz.y);
@@ -7663,6 +7950,14 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         glm::vec3 hitPos;
         const bool hit = RayCastToPartingPlane(
             m_runnerGhostMousePos.x, m_runnerGhostMousePos.y, hitPos);
+        // Ctrl = grid snap (runners feed inward, so no perimeter snap here).
+        // Runs in the paint pass, so read the live key state.
+        if (hit && wxGetKeyState(WXK_CONTROL))
+        {
+            const glm::vec2 s = SnapToGrid(glm::vec2(hitPos.x, hitPos.z));
+            hitPos.x = s.x;
+            hitPos.z = s.y;
+        }
         const glm::vec2 hitXZ(hitPos.x, hitPos.z);
         m_runnerGhostActive = hit && IsInsideConvexHull(m_fixturePerimeter, hitXZ);
         m_runnerGhostPos = hitPos;
@@ -7882,8 +8177,12 @@ void GLCanvas::OnPaint(wxPaintEvent&)
     if (m_transformMode == TransformMode::PlaceEjector)
     {
         glm::vec3 hitPos;
-        m_ejectorGhostActive = RayCastEjectorSnap(m_ejectorGhostMousePos.x,
-            m_ejectorGhostMousePos.y, hitPos);
+        // Ctrl = grid snap (live key state — this runs in the paint pass).
+        m_ejectorGhostActive = wxGetKeyState(WXK_CONTROL)
+            ? RayCastEjectorGridSnap(m_ejectorGhostMousePos.x,
+                m_ejectorGhostMousePos.y, hitPos)
+            : RayCastEjectorSnap(m_ejectorGhostMousePos.x,
+                m_ejectorGhostMousePos.y, hitPos);
         m_ejectorGhostPos = hitPos;
     }
     if (m_program && m_sphereVAO && m_sphereIndexCount > 0 &&
@@ -8844,6 +9143,8 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
     {
         m_lmb = true;
         m_hasLast = false;
+        // New gesture — recapture the unsnapped anchor on the first drag frame.
+        m_snapDragActive = false;
 
         if (m_transformMode == TransformMode::Select)
         {
@@ -8952,6 +9253,13 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
             glm::vec3 hitPos;
             if (RayCastToPartingPlane(p.x, p.y, hitPos))
             {
+                // Ctrl = snap the placement to the nearest grid point.
+                if (evt.ControlDown())
+                {
+                    const glm::vec2 s = SnapToGrid(glm::vec2(hitPos.x, hitPos.z));
+                    hitPos.x = s.x;
+                    hitPos.z = s.y;
+                }
                 const glm::vec2 hitXZ(hitPos.x, hitPos.z);
                 if (IsInsideConvexHull(m_fixturePerimeter, hitXZ))
                 {
@@ -9004,7 +9312,11 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
             // modes' behaviour for an out-of-bounds click.
             const wxPoint p = evt.GetPosition();
             glm::vec3 hitPos;
-            if (RayCastEjectorSnap(p.x, p.y, hitPos))
+            // Ctrl = grid snap: XZ to the nearest grid point, Y from the shell.
+            const bool hit = evt.ControlDown()
+                ? RayCastEjectorGridSnap(p.x, p.y, hitPos)
+                : RayCastEjectorSnap(p.x, p.y, hitPos);
+            if (hit)
             {
                 EjectorFeature ef;
                 ef.point = hitPos;
@@ -9429,7 +9741,26 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
         }
     }
 
-    if (evt.LeftUp()) { m_lmb = false; m_editVentNode = -1; m_editRunnerNode = -1; m_editGateNode = -1; m_editHandleNode = -1; if (HasCapture()) ReleaseMouse(); }
+    // Node state persists past the release so it reads as a SELECTION, not just
+    // a grab: the marker stays enlarged and the toolbar's Place... button has
+    // something to act on. Safe because every LeftDown reassigns it (to the
+    // grabbed node, or -1 when the click missed), and the deferred drag path is
+    // gated on m_lmb — so a stale index can never make a node follow the cursor.
+    // Handle/gate drags are transient and still clear here.
+    if (evt.LeftUp())
+    {
+        m_lmb = false;
+        m_snapDragActive = false;
+        m_editGateNode = -1;
+        m_editHandleNode = -1;
+        if (HasCapture()) ReleaseMouse();
+
+        // The released node is now the selection, which decides whether the
+        // toolbar's Place... button is live — refresh it.
+        if (m_transformMode == TransformMode::EditVent ||
+            m_transformMode == TransformMode::EditRunner)
+            NotifyPathEditChanged();
+    }
     if (evt.MiddleDown()) { m_mmb = true;  m_hasLast = false; CaptureMouse(); }
     if (evt.MiddleUp()) { m_mmb = false; if (HasCapture()) ReleaseMouse(); }
     if (evt.RightDown()) { m_rmb = true;  m_hasLast = false; CaptureMouse(); }
@@ -9527,10 +9858,50 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
             // rigid group, preserving relative positions.
             const glm::vec3 delta = right * (dx * unitsPerPx)
                 + forward * (-dyAdjusted * unitsPerPx);
+
+            // Group anchor = centroid of the selected origins (the origin
+            // itself for a single selection). Snapping this and shifting the
+            // whole group by the same amount keeps the group rigid.
+            auto anchorOf = [this]() {
+                glm::vec3 sum(0.0f);
+                int n = 0;
+                for (int idx : m_selectedIndices)
+                {
+                    if (idx < 0 || idx >= (int)m_objects.size()) continue;
+                    sum += m_objects[idx].pos;
+                    ++n;
+                }
+                return (n > 0) ? sum / float(n) : glm::vec3(0.0f);
+            };
+
+            const glm::vec3 anchor = anchorOf();
+
+            // Capture the unsnapped truth once per drag, then accumulate raw
+            // deltas into it. The applied position is derived from it, so a
+            // snapped frame never corrupts the next frame's accumulation.
+            if (!m_snapDragActive)
+            {
+                m_snapDragTrueAnchor = anchor;
+                m_snapDragActive = true;
+            }
+            m_snapDragTrueAnchor += delta;
+
+            // Ctrl = snap the group anchor to the nearest grid point. The grid
+            // is an XZ lattice, so Y rides along with the raw drag untouched.
+            // Releasing Ctrl falls back to the unsnapped anchor.
+            glm::vec3 desired = m_snapDragTrueAnchor;
+            if (ctrl)
+            {
+                const glm::vec2 s = SnapToGrid(glm::vec2(desired.x, desired.z));
+                desired.x = s.x;
+                desired.z = s.y;
+            }
+
+            const glm::vec3 applyDelta = desired - anchor;
             for (int idx : m_selectedIndices)
             {
                 if (idx < 0 || idx >= (int)m_objects.size()) continue;
-                m_objects[idx].pos += delta;
+                m_objects[idx].pos += applyDelta;
             }
             // Parented vents/gates ride along with their parents; unparented
             // features are independent and left alone.
@@ -9743,6 +10114,24 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
 void GLCanvas::OnMouseDClick(wxMouseEvent& evt)
 {
     if (m_previewMode) { evt.Skip(); return; }
+
+    // Path-edit modes: double-clicking a node opens Precision Place for it.
+    // Restricted to the Move tool — under Add/Remove Node a click already
+    // means "insert here" / "delete this", and a double-click would fire that
+    // action twice before we ever saw it.
+    if ((m_transformMode == TransformMode::EditVent ||
+         m_transformMode == TransformMode::EditRunner) &&
+        m_pathEditTool == PathEditTool::Move)
+    {
+        const wxPoint p = evt.GetPosition();
+        const int node = PickPrecisePlaceableNode(p.x, p.y);
+        if (node < 0) { evt.Skip(); return; }
+
+        if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+            frame->PrecisionPlaceEditNode(node);
+        return;
+    }
+
     if (m_transformMode != TransformMode::Select) { evt.Skip(); return; }
 
     const wxPoint p = evt.GetPosition();
@@ -9774,6 +10163,12 @@ void GLCanvas::OnKeyDown(wxKeyEvent& evt)
     // (Escape mode-exit, Ctrl+A/C/V, Delete) apply. Let the event propagate
     // so the host frame can still react (e.g. Escape to close).
     if (m_previewMode) { evt.Skip(); return; }
+
+    // Ctrl toggles grid snapping for the placement ghosts / node drags, which
+    // are evaluated in the paint pass. Repaint on the key itself so the
+    // preview jumps to the grid point without needing a mouse nudge first.
+    if (evt.GetKeyCode() == WXK_CONTROL)
+        Refresh(false);
 
     if (evt.GetKeyCode() == WXK_ESCAPE)
     {
@@ -9862,6 +10257,19 @@ void GLCanvas::OnKeyDown(wxKeyEvent& evt)
     {
         evt.Skip();
     }
+}
+
+// ---------------------------------------------------------------------------
+// OnKeyUp — only interested in Ctrl, which ends grid snapping. The placement
+// ghosts and node drags sample the live key state during the paint pass, so a
+// repaint here drops them back to their free (unsnapped) position immediately
+// rather than waiting for the next mouse move.
+// ---------------------------------------------------------------------------
+void GLCanvas::OnKeyUp(wxKeyEvent& evt)
+{
+    if (!m_previewMode && evt.GetKeyCode() == WXK_CONTROL)
+        Refresh(false);
+    evt.Skip();
 }
 
 // ---------------------------------------------------------------------------

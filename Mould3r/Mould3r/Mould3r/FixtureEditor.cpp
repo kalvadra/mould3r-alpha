@@ -18,6 +18,7 @@
 
 #include "FixtureCanvas.h"
 #include "FixtureFile.h"       // OnGenerateFixture
+#include "GridSettingsDialog.h" // Grid Defaults card "Edit…" button
 #include "RoundedButton.h"     // owner-drawn rounded button — replaces wxButton in custom-themed UI
 #include "WindowEffects.h"     // DWM corner rounding for the editor frame
 #include "InjectionPointDialog.h"  // Add/Edit injection-point flow
@@ -679,6 +680,7 @@ wxWindow* FixtureEditor::BuildToolbar(wxWindow* parent)
     cardSizer->Add(CreateGatesContent(scrollWin), 0, wxEXPAND | wxTOP, 8);
     cardSizer->Add(CreateVentsContent(scrollWin), 0, wxEXPAND | wxTOP, 8);
     cardSizer->Add(CreateEjectorsContent(scrollWin), 0, wxEXPAND | wxTOP, 8);
+    cardSizer->Add(CreateGridDefaultsContent(scrollWin), 0, wxEXPAND | wxTOP, 8);
     cardSizer->AddSpacer(12);
     scrollWin->SetSizer(cardSizer);
     scrollWin->FitInside();
@@ -867,6 +869,10 @@ wxPanel* FixtureEditor::CreateUnitToggle(wxWindow* parent)
                 if (field->GetValue().ToDouble(&v))
                     field->SetValue(wxString::Format(fmt, v * factor));
             }
+
+            // The Grid Defaults summary is derived text (stored in mm), so
+            // just re-render it in the new unit.
+            UpdateGridSummary();
         };
 
     // Hover: highlight the inactive segment on mouse-over.
@@ -1476,7 +1482,88 @@ wxPanel* FixtureEditor::CreateEjectorsContent(wxWindow* parent)
 }
 
 // ---------------------------------------------------------------------------
-// Active-tool routing
+// Grid Defaults card — a summary line + an "Edit..." button that opens the
+// shared GridSettingsDialog. Unlike the feature cards (which expose their
+// fields inline), the grid's shape-dependent field set is handled entirely by
+// the dialog; the card just shows the current choice and gates whether it is
+// written into the fixture via the override checkbox.
+// ---------------------------------------------------------------------------
+wxPanel* FixtureEditor::CreateGridDefaultsContent(wxWindow* parent)
+{
+    wxSizer* sizer = nullptr;
+    auto* card = MakeCardWithTitle(parent, "Grid Defaults", sizer);
+
+    // Off by default — mirrors the "No Override" stance of the feature cards.
+    // Only when ticked does OnGenerateFixture emit a [grid_defaults] section.
+    m_gridOverride = new wxCheckBox(card, wxID_ANY,
+        "Save grid defaults with this fixture");
+    m_gridOverride->SetForegroundColour(Style::TextPrimary);
+    m_gridOverride->SetValue(false);
+    sizer->Add(m_gridOverride, 0, wxLEFT | wxRIGHT | wxTOP, 12);
+
+    // Human-readable digest of m_gridDefaults (unit follows the editor toggle).
+    m_gridSummary = new wxStaticText(card, wxID_ANY, wxEmptyString);
+    m_gridSummary->SetForegroundColour(Style::TextSubtle);
+    sizer->Add(m_gridSummary, 0, wxLEFT | wxRIGHT | wxTOP, 8);
+
+    auto* btnEdit = new RoundedButton(card, wxID_ANY, "Edit...",
+        wxDefaultPosition, wxSize(90, 28), wxBORDER_NONE);
+    btnEdit->SetBackgroundColour(Style::BtnSecondary);
+    btnEdit->SetForegroundColour(Style::TextPrimary);
+    sizer->Add(btnEdit, 0, wxLEFT | wxTOP, 12);
+
+    // Edit... seeds the dialog with the current defaults and the editor's unit.
+    btnEdit->Bind(wxEVT_BUTTON, [this](wxCommandEvent&)
+        {
+            GridSettingsDialog dlg(this, m_gridDefaults, !m_isMetric);
+            if (dlg.ShowModal() != wxID_OK)
+                return;
+            m_gridDefaults = dlg.GetSettings();
+            // Editing the grid implies the user wants it saved.
+            if (m_gridOverride) m_gridOverride->SetValue(true);
+            UpdateGridSummary();
+            // Preview the change on the editor's own grid so it's not a blind
+            // edit.
+            if (m_canvas) m_canvas->SetGridSettings(m_gridDefaults);
+        });
+
+    UpdateGridSummary();
+    sizer->AddSpacer(10);
+    return card;
+}
+
+// ---------------------------------------------------------------------------
+// UpdateGridSummary — render m_gridDefaults into the card's summary label.
+// Values are stored in mm; the display unit follows the editor's toggle.
+// ---------------------------------------------------------------------------
+void FixtureEditor::UpdateGridSummary()
+{
+    if (!m_gridSummary) return;
+
+    const double toDisp = m_isMetric ? 1.0 : (1.0 / 25.4);
+    const wxString u = m_isMetric ? "mm" : "in";
+    auto len = [&](float mm) { return wxString::Format("%.4g", mm * toDisp); };
+
+    wxString s;
+    if (m_gridDefaults.shape == GridShape::Circular)
+    {
+        s = wxString::Format(
+            "Circular - r %s %s - %d spokes - spacing %s %s - major /%d",
+            len(m_gridDefaults.radius), u,
+            m_gridDefaults.spokes,
+            len(m_gridDefaults.spacing), u,
+            m_gridDefaults.majorEvery);
+    }
+    else
+    {
+        s = wxString::Format(
+            "Rectangular - %s x %s %s - spacing %s %s - major /%d",
+            len(m_gridDefaults.sizeX), len(m_gridDefaults.sizeY), u,
+            len(m_gridDefaults.spacing), u,
+            m_gridDefaults.majorEvery);
+    }
+    m_gridSummary->SetLabel(s);
+}
 //
 // Drives toolbar visuals AND the canvas's transform mode in lock-step. The
 // only persistent canvas mode the fixture editor uses is AlignFace; every
@@ -1959,6 +2046,22 @@ void FixtureEditor::OnGenerateFixture(wxCommandEvent&)
         readChoice(m_ejectorTypeChoice, def.ejectorDefaults.type);
         readFieldMM(m_ejectorDiameter, def.ejectorDefaults.diameter);
         readFieldMM(m_ejectorLength, def.ejectorDefaults.length);
+    }
+
+    // Grid defaults — only baked in when the override checkbox is ticked.
+    // m_gridDefaults is already stored in mm (the dialog handles unit display),
+    // so there's no unit conversion to do here.
+    if (m_gridOverride && m_gridOverride->GetValue())
+    {
+        const GridSettings& g = m_gridDefaults;
+        def.gridDefaults.shape = (g.shape == GridShape::Circular)
+            ? std::string("circular") : std::string("rectangular");
+        def.gridDefaults.sizeX = g.sizeX;
+        def.gridDefaults.sizeY = g.sizeY;
+        def.gridDefaults.radius = g.radius;
+        def.gridDefaults.spokes = g.spokes;
+        def.gridDefaults.spacing = g.spacing;
+        def.gridDefaults.majorEvery = g.majorEvery;
     }
 
     // Injection points — straight copy of the editor's live list. Order

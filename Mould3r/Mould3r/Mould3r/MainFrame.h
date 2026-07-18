@@ -11,6 +11,7 @@
 #include "AppConfig.h"
 #include "StartupDialog.h"
 #include "ProjectFile.h"
+#include "GridSettings.h"    // GridShape / GridSettings — authored via the Grid menu
 
 #include <functional>
 #include <unordered_map>
@@ -45,6 +46,12 @@ public:
     // resulting absolute XZ move. Shared by the ribbon button handler and the
     // canvas double-click shortcut, so both routes behave identically.
     void PrecisionPlaceSelected();
+
+    // Precision Place for a feature path node (vent/runner nodes that sit on
+    // the y=0 plane and aren't perimeter/path-snapped). Called by the canvas
+    // when such a node is double-clicked; the canvas has already vetted the
+    // index via IsEditNodePrecisePlaceable.
+    void PrecisionPlaceEditNode(int nodeIdx);
 
     // Called by GLCanvas when the user picks an injection point via the
     // SelectInjectionPoint tool. Updates UI fields whose value depends on
@@ -157,6 +164,12 @@ private:
     void OnSetMetric(wxCommandEvent&);
     void OnSetImperial(wxCommandEvent&);
 
+    // ---- Grid menu ---------------------------------------------------------
+    // Opens the consolidated Grid Settings dialog (shape / size / spacing /
+    // major divisions), stores the result in m_gridSettings, and pushes it to
+    // the canvas so the rendered grid updates.
+    void OnGridSettings(wxCommandEvent&);
+
     // ---- Workflow perspectives ---------------------------------------------
     // The window hosts two stacked perspectives in a wxSimplebook: "Prepare"
     // (the editing view — left panel + main canvas) and "Preview" (the post-cut
@@ -173,6 +186,10 @@ private:
     // for now and grows as preview-specific actions are added.
     wxMenuBar* BuildPrepareMenuBar();
     wxMenuBar* BuildPreviewMenuBar();
+
+    // Builds the Grid menu (Shape submenu + Change Size / Change Spacing),
+    // reflecting the current m_gridSettings in the shape radio state.
+    wxMenu* BuildGridMenu();
 
     // Drive the two ribbon perspective tabs so the active one reads as
     // selected. Safe to call before either tab exists (no-ops).
@@ -276,6 +293,10 @@ private:
     // Unit system (false = metric/mm, true = imperial/in)
     bool m_imperial = false;
     std::vector<wxStaticText*> m_mmUnitLabels;  // labels that switch "mm"↔"in"
+
+    // Grid configuration (shape / size / spacing), authored via the Grid menu.
+    // Stored in mm; not yet applied to the live GridRenderer.
+    GridSettings m_gridSettings;
 
     // Toggle-button setter registry. Each entry is (command-id → set-active(bool)).
     // makeToolBtn registers a setter for each toggle-style ribbon button so that
@@ -382,6 +403,7 @@ private:
         ID_NewProject,
         ID_UnitMetric,
         ID_UnitImperial,
+        ID_GridSettings,
         ID_MeshQualityOff,
         ID_MeshQualityDraft,
         ID_MeshQualityNormal,

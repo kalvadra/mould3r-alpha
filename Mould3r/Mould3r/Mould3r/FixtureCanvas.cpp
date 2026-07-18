@@ -430,6 +430,13 @@ void FixtureCanvas::SetInjectionPoints(const std::vector<InjectionPoint>& pts)
     Refresh(false);
 }
 
+void FixtureCanvas::SetGridSettings(const GridSettings& s)
+{
+    m_gridSettings = s;
+    m_gridNeedsApply = true;   // applied in OnPaint once the grid is ready
+    Refresh(false);
+}
+
 // ---------------------------------------------------------------------------
 // UploadMesh — interleaved position+normal VBO, indexed EBO. Same layout
 // the main canvas uses (location 0 = pos, location 1 = normal), so the
@@ -603,6 +610,14 @@ void FixtureCanvas::OnPaint(wxPaintEvent&)
     InitGLOnce();
     EnsureLitProgram();
     m_grid.Init();   // safe to call repeatedly; internal m_ready guards setup
+
+    // Push any pending grid configuration now that the grid program exists.
+    // Guarded so we don't rebuild geometry every frame.
+    if (m_gridNeedsApply && m_grid.IsReady())
+    {
+        m_grid.ApplySettings(m_gridSettings);
+        m_gridNeedsApply = false;
+    }
 
     const wxSize sz = GetClientSize();
     const int w = std::max(1, sz.x);
