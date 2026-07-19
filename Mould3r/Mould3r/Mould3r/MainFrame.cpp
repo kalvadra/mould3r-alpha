@@ -627,15 +627,19 @@ wxPanel* MainFrame::CreateRibbon(wxWindow* parent)
     Bind(wxEVT_BUTTON, &MainFrame::OnClearGates, this, ID_ClearGates);
     Bind(wxEVT_BUTTON, &MainFrame::OnPlaceEjector, this, ID_PlaceEjector);
     Bind(wxEVT_BUTTON, &MainFrame::OnClearEjectors, this, ID_ClearEjectors);
+    Bind(wxEVT_BUTTON, &MainFrame::OnPlaceInsert, this, ID_PlaceInsert);
+    Bind(wxEVT_BUTTON, &MainFrame::OnClearInserts, this, ID_ClearInserts);
     Bind(wxEVT_BUTTON, &MainFrame::OnRemoveVent, this, ID_RemoveVent);
     Bind(wxEVT_BUTTON, &MainFrame::OnRemoveSprue, this, ID_RemoveSprue);
     Bind(wxEVT_BUTTON, &MainFrame::OnRemoveRunner, this, ID_RemoveRunner);
     Bind(wxEVT_BUTTON, &MainFrame::OnRemoveGate, this, ID_RemoveGate);
     Bind(wxEVT_BUTTON, &MainFrame::OnRemoveEjector, this, ID_RemoveEjector);
+    Bind(wxEVT_BUTTON, &MainFrame::OnRemoveInsert, this, ID_RemoveInsert);
     Bind(wxEVT_BUTTON, &MainFrame::OnEditVent, this, ID_EditVent);
     Bind(wxEVT_BUTTON, &MainFrame::OnEditRunner, this, ID_EditRunner);
     Bind(wxEVT_BUTTON, &MainFrame::OnEditGate, this, ID_EditGate);
     Bind(wxEVT_BUTTON, &MainFrame::OnEditEjector, this, ID_EditEjector);
+    Bind(wxEVT_BUTTON, &MainFrame::OnEditInsert, this, ID_EditInsert);
     Bind(wxEVT_BUTTON, &MainFrame::OnGenerateMould, this, ID_GenerateMould);
     Bind(wxEVT_BUTTON, &MainFrame::OnExport, this, ID_Export);
 
@@ -725,6 +729,7 @@ void MainFrame::SetActiveTool(TransformMode mode)
     case TransformMode::PlaceRunner:   activeId = ID_PlaceRunner;       break;
     case TransformMode::PlaceGate:     activeId = ID_PlaceGate;         break;
     case TransformMode::PlaceEjector:  activeId = ID_PlaceEjector;      break;
+    case TransformMode::PlaceInsert:   activeId = ID_PlaceInsert;       break;
     case TransformMode::AlignFace:     activeId = ID_ToolAlignFace;     break;
     case TransformMode::AlignMidplane: activeId = ID_ToolAlignMidplane; break;
     default:                                                            break;
@@ -1158,6 +1163,108 @@ void MainFrame::OnEditEjector(wxCommandEvent&)
         SetActiveTool(TransformMode::EditEjector);
 }
 
+// ---------------------------------------------------------------------------
+// Insert handlers.
+//
+// An insert is an imported body whose pose is driven entirely by a parent
+// object, so placement is a two-part act: pick the parent, then pick the file.
+// OnPlaceInsert resolves the parent:
+//
+//   exactly one object selected -> that's the parent; go straight to the file
+//                                  dialog, no mode change, no extra click.
+//   zero or 2+ selected         -> toggle into PlaceInsert and let the canvas
+//                                  collect the parent pick. The canvas calls
+//                                  PlaceInsertOnParent below once it has one,
+//                                  which runs the same file dialog.
+//
+// Both routes converge on PlaceInsertOnParent, so the flow is identical
+// regardless of how the parent was chosen. A 2+ selection deliberately falls
+// through to the pick mode rather than guessing which member to parent to.
+// ---------------------------------------------------------------------------
+void MainFrame::OnPlaceInsert(wxCommandEvent&)
+{
+    if (!m_canvas) return;
+
+    // Toggle back out if we're already collecting a parent pick.
+    if (m_canvas->GetTransformMode() == TransformMode::PlaceInsert)
+    {
+        SetActiveTool(TransformMode::Select);
+        return;
+    }
+
+    const int sel = m_canvas->GetSingleSelectedObject();
+    if (sel >= 0)
+    {
+        PlaceInsertOnParent(sel);
+        return;
+    }
+
+    SetActiveTool(TransformMode::PlaceInsert);
+}
+
+void MainFrame::PlaceInsertOnParent(int parentIdx)
+{
+    if (!m_canvas) return;
+
+    wxFileDialog dlg(
+        this, "Import Insert", "", "",
+        "All supported (*.step;*.stp;*.stl;*.obj)|*.step;*.stp;*.stl;*.obj|"
+        "STEP files (*.step;*.stp)|*.step;*.stp|"
+        "STL files (*.stl)|*.stl|"
+        "OBJ files (*.obj)|*.obj|"
+        "All files (*.*)|*.*",
+        wxFD_OPEN | wxFD_FILE_MUST_EXIST
+    );
+
+    // Cancelling the file dialog leaves the parent pick spent but places
+    // nothing — drop back to Select rather than silently staying armed, so
+    // the toggle button state always matches what the next click will do.
+    if (dlg.ShowModal() != wxID_OK)
+    {
+        SetActiveTool(TransformMode::Select);
+        return;
+    }
+
+    const bool placed =
+        m_canvas->PlaceInsertOnObject(parentIdx, dlg.GetPath().ToStdString());
+
+    SetActiveTool(TransformMode::Select);
+
+    // Same Clean->Dirty reasoning as OnImport: an insert adds geometry to the
+    // scene without invalidating an existing mould outright. (Inserts don't
+    // participate in the cut yet, so this is conservative rather than
+    // strictly necessary — it costs one warning on Export and stops being
+    // conservative the moment cut integration lands.)
+    if (placed && m_mouldState == MouldState::Clean)
+        m_mouldState = MouldState::Dirty;
+}
+
+void MainFrame::OnClearInserts(wxCommandEvent&)
+{
+    if (m_canvas)
+        m_canvas->ClearInserts();
+}
+
+void MainFrame::OnRemoveInsert(wxCommandEvent&)
+{
+    if (m_canvas && m_canvas->GetTransformMode() == TransformMode::RemoveInsert)
+        SetActiveTool(TransformMode::Select);
+    else
+        SetActiveTool(TransformMode::RemoveInsert);
+}
+
+// Edit Insert — deliberately inert for now. The button ships so the Inserts
+// card matches every other feature card; the mode toggles (and the canvas
+// gives it a hand cursor) but nothing is authored yet. Offset / rotation
+// authoring against the parent lands behind this.
+void MainFrame::OnEditInsert(wxCommandEvent&)
+{
+    if (m_canvas && m_canvas->GetTransformMode() == TransformMode::EditInsert)
+        SetActiveTool(TransformMode::Select);
+    else
+        SetActiveTool(TransformMode::EditInsert);
+}
+
 void MainFrame::OnEditSprue(wxCommandEvent&)
 {
     if (m_fixtureDef.injectionPoints.size() <= 1) return;  // nothing to choose
@@ -1404,6 +1511,20 @@ float MainFrame::GetEjectorLength() const
     if (!m_ejectorLength->GetValue().ToDouble(&v)) return 25.0f;
     if (v <= 0.0) v = 25.0;
     return static_cast<float>(v) * (m_imperial ? 25.4f : 1.0f);
+}
+
+// Insert "Cut scale": the card takes a percentage, callers want a multiplier,
+// so 100 -> 1.0. No unit conversion — a percentage is unitless, which is why
+// its "%" label is not registered in m_mmUnitLabels and doesn't flip with the
+// metric/imperial switch. Non-positive or unparseable input falls back to
+// 100% (nominal fit) rather than collapsing the body to nothing.
+float MainFrame::GetInsertCutScale() const
+{
+    if (!m_insertCutScale) return 1.0f;
+    double v = 100.0;
+    if (!m_insertCutScale->GetValue().ToDouble(&v)) return 1.0f;
+    if (v <= 0.0) v = 100.0;
+    return static_cast<float>(v * 0.01);
 }
 
 // ---------------------------------------------------------------------------
@@ -2306,7 +2427,11 @@ void MainFrame::OnGenerateMould(wxCommandEvent&)
                 shot.halves    = &m_canvas->GetLastHalfShapes();
             }
 
-            m_previewPanel->SetData(halves, shot);
+            // Inserts form their own preview category (one checkbox, yellow).
+            // Passed even when empty — SetData treats an empty list as "no
+            // insert checkbox", so a run without inserts is unaffected.
+            m_previewPanel->SetData(halves, shot,
+                m_canvas->GetLastInsertMeshes());
         }
 
         // Jump to the Preview perspective so the freshly generated mould is
@@ -3213,6 +3338,138 @@ wxPanel* MainFrame::CreateEjectorsContent(wxWindow* parent)
     return panel;
 }
 
+// ---------------------------------------------------------------------------
+// CreateInsertsContent — left-panel "Inserts" feature card.
+//
+// Same layout as CreateEjectorsContent (title, Place button, three small
+// action buttons, collapsible Settings) so the card reads identically to its
+// neighbours.
+//
+// The one structural difference is the Settings body. Every other feature
+// authors its geometry from card fields, so those cards carry a type dropdown
+// plus dimension rows. An insert's geometry is whatever was imported, so
+// there is nothing to dimension and no second geometry to switch between —
+// a type dropdown with one dead entry would be noise. Instead Settings holds
+// the single value that IS authored here: "Cut scale", the percentage the
+// body is scaled up by when it cuts its own pocket during Generate Mould
+// (>100% opens clearance around the insert; 100% is a nominal fit). Read at
+// placement time and captured onto the InsertFeature — same convention as the
+// dimension fields everywhere else, so changing it affects the NEXT insert
+// placed, not the ones already down.
+// ---------------------------------------------------------------------------
+wxPanel* MainFrame::CreateInsertsContent(wxWindow* parent)
+{
+    auto* panel = new wxPanel(parent, wxID_ANY);
+    panel->SetBackgroundColour(Style::CardBg);
+    auto* sizer = new wxBoxSizer(wxVERTICAL);
+
+    auto* titleLabel = new wxStaticText(panel, wxID_ANY, "Inserts");
+    titleLabel->SetForegroundColour(*wxWHITE);
+    titleLabel->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_BOLD, false, "Segoe UI"));
+    sizer->Add(titleLabel, 0, wxLEFT | wxTOP, 12);
+    sizer->AddSpacer(6);
+
+    auto* btnPlace = MakePlaceButton(panel, ID_PlaceInsert, "Place Insert");
+    sizer->Add(btnPlace, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
+    sizer->AddSpacer(6);
+
+    auto* actionGrid = new wxGridSizer(1, 3, 0, 4);
+    auto makeSmallBtn = [&](const wxString& label) -> RoundedButton* {
+        auto* btn = new RoundedButton(panel, wxID_ANY, label,
+            wxDefaultPosition, wxSize(-1, 26), wxBORDER_NONE);
+        btn->SetBackgroundColour(Style::BtnSmall);
+        btn->SetForegroundColour(Style::TextPrimary);
+        btn->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+        return btn;
+        };
+    auto* btnEdit = makeSmallBtn("Edit");
+    btnEdit->SetId(ID_EditInsert);
+    auto* btnRemove = makeSmallBtn("Remove");
+    btnRemove->SetId(ID_RemoveInsert);
+    auto* btnClearAll = makeSmallBtn("Clear all");
+    btnClearAll->SetId(ID_ClearInserts);
+    actionGrid->Add(btnEdit, 0, wxEXPAND);
+    actionGrid->Add(btnRemove, 0, wxEXPAND);
+    actionGrid->Add(btnClearAll, 0, wxEXPAND);
+    sizer->Add(actionGrid, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
+    sizer->AddSpacer(8);
+
+    // Collapsible Settings — same chevron / debounce pattern as the other cards.
+    auto* settingsBtn = new wxToggleButton(panel, wxID_ANY,
+        "Settings",
+        wxDefaultPosition, wxSize(-1, 22), wxBU_LEFT | wxBORDER_NONE);
+    settingsBtn->SetValue(false);
+    settingsBtn->SetBackgroundColour(Style::CardBg);
+    settingsBtn->SetForegroundColour(Style::TextSubtle);
+    settingsBtn->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+    settingsBtn->SetBitmap(LoadSvgBundle(kChevronRightSvg, wxSize(12, 12), true));
+    settingsBtn->SetBitmapPosition(wxRIGHT);
+    sizer->Add(settingsBtn, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
+
+    auto* settingsPanel = new wxPanel(panel, wxID_ANY);
+    settingsPanel->SetBackgroundColour(Style::CardBg);
+    auto* settingsSizer = new wxBoxSizer(wxVERTICAL);
+
+    // Dimension-row helper — identical to the one used in CreateEjectorsContent.
+    // Note the unitStr == "mm" guard: "%" never lands in m_mmUnitLabels, so the
+    // Cut scale label survives the metric/imperial switch unchanged.
+    auto addRow = [&](wxWindow* parent_, wxSizer* parentSz,
+        const wxString& label, wxTextCtrl*& ctrl,
+        const wxString& defVal, const wxString& unitStr, int /*lblW*/ = 60)
+        {
+            auto* row = new wxBoxSizer(wxHORIZONTAL);
+            auto* lbl = new wxStaticText(parent_, wxID_ANY, label);
+            lbl->SetForegroundColour(Style::TextMuted);
+            lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+            ctrl = new wxTextCtrl(parent_, wxID_ANY, defVal, wxDefaultPosition, wxSize(kFieldWidth, 22));
+            ctrl->SetBackgroundColour(Style::BtnSmall); ctrl->SetForegroundColour(kTextDefault);
+            auto* u = new wxStaticText(parent_, wxID_ANY, unitStr);
+            if (unitStr == "mm") m_mmUnitLabels.push_back(u);
+            u->SetForegroundColour(Style::TextSubtle);
+            u->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+            u->SetMinSize(wxSize(kUnitWidth, -1));
+            row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL);
+            row->AddStretchSpacer(1);
+            row->Add(ctrl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, kFieldGap);
+            row->Add(u, 0, wxALIGN_CENTER_VERTICAL);
+            parentSz->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
+        };
+
+    auto* dimsPanel = new wxPanel(settingsPanel, wxID_ANY);
+    dimsPanel->SetBackgroundColour(Style::CardBg);
+    auto* dimsSizer = new wxBoxSizer(wxVERTICAL);
+    addRow(dimsPanel, dimsSizer, "Cut scale:", m_insertCutScale, "100.0", "%");
+    dimsPanel->SetSizer(dimsSizer);
+    settingsSizer->Add(dimsPanel, 0, wxEXPAND | wxBOTTOM, 10);
+
+    settingsPanel->SetSizer(settingsSizer);
+    settingsPanel->Show(false);
+    sizer->Add(settingsPanel, 0, wxEXPAND);
+
+    settingsBtn->Bind(wxEVT_TOGGLEBUTTON, [settingsBtn, settingsPanel, panel](wxCommandEvent&) {
+        // Same 200ms debounce as the other settings togglers — mid-frame
+        // double-clicks (often from a touchpad tap) otherwise re-collapse
+        // the panel before the layout finishes.
+        static wxLongLong lastToggleMs = 0;
+        wxLongLong now = wxGetLocalTimeMillis();
+        if ((now - lastToggleMs).GetValue() < 200) { settingsBtn->SetValue(!settingsBtn->GetValue()); return; }
+        lastToggleMs = now;
+        const bool expanded = settingsBtn->GetValue();
+        settingsBtn->SetBitmap(LoadSvgBundle(
+            expanded ? kChevronDownSvg : kChevronRightSvg,
+            wxSize(12, 12), true));
+        settingsBtn->SetBitmapPosition(wxRIGHT);
+        settingsPanel->Show(expanded);
+        panel->Layout(); panel->GetParent()->Layout(); panel->GetParent()->GetParent()->Layout();
+        });
+
+    panel->SetSizer(sizer);
+    return panel;
+}
+
 wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
 {
     // Outer container: content column + right border
@@ -3583,6 +3840,9 @@ wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
 
     wxPanel* ejectorsContent = CreateEjectorsContent(scrollWin);
     sizer->Add(ejectorsContent, 0, wxEXPAND | wxTOP, 8);
+
+    wxPanel* insertsContent = CreateInsertsContent(scrollWin);
+    sizer->Add(insertsContent, 0, wxEXPAND | wxTOP, 8);
 
     sizer->AddSpacer(12);
 

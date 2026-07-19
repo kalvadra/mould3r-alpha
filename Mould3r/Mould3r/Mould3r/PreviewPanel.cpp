@@ -153,10 +153,12 @@ PreviewPanel::PreviewPanel(wxWindow* parent)
 // (Re)seed the preview with a fresh set of post-cut halves and an optional shot.
 // ---------------------------------------------------------------------------
 void PreviewPanel::SetData(const std::vector<FileImporter::MeshData>& halves,
-    const ShotPreviewInput& shot)
+    const ShotPreviewInput& shot,
+    const std::vector<FileImporter::MeshData>& inserts)
 {
     // Stash the new data, replacing whatever the previous generation left.
     m_pendingHalves = halves;
+    m_pendingInserts = inserts;
 
     m_shotMesh = FileImporter::MeshData();
     m_shotShape = TopoDS_Shape();
@@ -177,6 +179,14 @@ void PreviewPanel::SetData(const std::vector<FileImporter::MeshData>& halves,
     // The shot is appended after the mould halves in LoadHalves, so its
     // preview-part index is the half count.
     m_shotHalfIndex = m_hasShot ? (int)halves.size() : -1;
+
+    // Inserts load after the halves and the shot, as a contiguous block. Record
+    // where that block starts so the single insert checkbox can drive the whole
+    // range in one go.
+    m_insertCount = (int)inserts.size();
+    m_insertFirstIndex = (m_insertCount > 0)
+        ? (int)halves.size() + (m_hasShot ? 1 : 0)
+        : -1;
 
     // Reset any debug overlay state carried over from the previous generation.
     m_hasResult = false;
@@ -200,7 +210,7 @@ void PreviewPanel::SetData(const std::vector<FileImporter::MeshData>& halves,
 
     // Rebuild the dynamic UI for the new part set.
     ClearVisibilityChecks();
-    BuildVisibilityChecks((int)halves.size(), m_hasShot);
+    BuildVisibilityChecks((int)halves.size(), m_hasShot, m_insertCount);
     UpdateInfoPanel();
 
     // The mesh upload waits until we're actually visible — a canvas on a hidden
@@ -215,6 +225,10 @@ void PreviewPanel::SetData(const std::vector<FileImporter::MeshData>& halves,
 void PreviewPanel::ClearData()
 {
     m_pendingHalves.clear();
+    m_pendingInserts.clear();
+    m_insertCheck = nullptr;
+    m_insertFirstIndex = -1;
+    m_insertCount = 0;
     m_shotMesh = FileImporter::MeshData();
     m_shotShape = TopoDS_Shape();
     m_shotFaceIds.clear();
@@ -1050,12 +1064,12 @@ void PreviewPanel::ToggleDebugContacts()
 // (Re)build the show/hide visibility checkboxes for the current part set, into
 // m_visPanel (left column). One per mould half, then "Shot" if present.
 // ---------------------------------------------------------------------------
-void PreviewPanel::BuildVisibilityChecks(int halfCount, bool hasShot)
+void PreviewPanel::BuildVisibilityChecks(int halfCount, bool hasShot, int insertCount)
 {
     if (!m_visPanel) return;
     auto* vSizer = m_visPanel->GetSizer();
 
-    const bool anyParts = (halfCount > 0) || hasShot;
+    const bool anyParts = (halfCount > 0) || hasShot || (insertCount > 0);
     if (m_visEmptyLabel) m_visEmptyLabel->Show(!anyParts);
 
     auto addCheck = [&](int partIndex, const wxString& label, const wxString& tip,
@@ -1089,6 +1103,31 @@ void PreviewPanel::BuildVisibilityChecks(int halfCount, bool hasShot)
         addCheck(halfCount, "Shot",
             "Show / hide the shot model (part + feed system)", /*initialVisible*/ true);
 
+    // Inserts: ONE checkbox for the whole category, not one per body. It drives
+    // the contiguous block of preview parts [firstIdx, firstIdx + insertCount).
+    // Its command ID is based on firstIdx so it can't collide with the per-part
+    // half/shot IDs above. Visible by default.
+    m_insertCheck = nullptr;
+    if (insertCount > 0)
+    {
+        const int firstIdx = halfCount + (hasShot ? 1 : 0);
+        auto* cb = new wxCheckBox(m_visPanel, kHalfToggleIdBase + firstIdx, "Inserts");
+        cb->SetForegroundColour(Style::TextPrimary);
+        cb->SetBackgroundColour(Style::CardBg);
+        cb->SetValue(true);
+        cb->SetToolTip("Show / hide all inserts");
+        cb->Bind(wxEVT_CHECKBOX,
+            [this, firstIdx, insertCount](wxCommandEvent& evt)
+            {
+                if (!m_canvas) return;
+                const bool on = evt.IsChecked();
+                for (int k = 0; k < insertCount; ++k)
+                    m_canvas->SetPreviewHalfVisible(firstIdx + k, on);
+            });
+        vSizer->Add(cb, 0, wxEXPAND | wxALL, 6);
+        m_insertCheck = cb;
+    }
+
     m_visPanel->Layout();
     if (m_visPanel->GetParent()) m_visPanel->GetParent()->Layout();
 }
@@ -1106,6 +1145,12 @@ void PreviewPanel::ClearVisibilityChecks()
         cb->Destroy();
     }
     m_halfChecks.clear();
+    if (m_insertCheck)
+    {
+        if (vSizer) vSizer->Detach(m_insertCheck);
+        m_insertCheck->Destroy();
+        m_insertCheck = nullptr;
+    }
     if (m_visEmptyLabel) m_visEmptyLabel->Show(true);
     if (m_visPanel) m_visPanel->Layout();
 }
@@ -1132,15 +1177,38 @@ void PreviewPanel::LoadHalves()
         m_canvas->AddPreviewHalf(m_shotMesh, "Shot", shotColor);
     }
 
-    // Half meshes are now on the GPU; drop the CPU copies (the shot is kept).
+    // Inserts last, as a contiguous block after the shot. Each is its own
+    // preview part (so the canvas can show/hide them), but they share the one
+    // "Inserts" checkbox. Yellow — the same colour they carry in the Prepare
+    // perspective — so a body reads as the same insert across both views. The
+    // label is per-body (they're distinct parts) but never surfaced as its own
+    // toggle, so it only matters for any part-label debug readout.
+    for (size_t i = 0; i < m_pendingInserts.size(); ++i)
+    {
+        const glm::vec3 insertColor(0.82f, 0.62f, 0.28f);
+        m_canvas->AddPreviewHalf(m_pendingInserts[i],
+            "Insert " + std::to_string(i + 1), insertColor);
+    }
+
+    // Half + insert meshes are now on the GPU; drop the CPU copies (the shot is
+    // kept for the design checks).
     m_pendingHalves.clear();
     m_pendingHalves.shrink_to_fit();
+    m_pendingInserts.clear();
+    m_pendingInserts.shrink_to_fit();
 
     // Apply the initial checkbox states to the freshly loaded parts (parts are
     // added visible, so hide any whose checkbox starts unchecked — e.g. Half A).
     for (size_t i = 0; i < m_halfChecks.size(); ++i)
         if (m_halfChecks[i] && !m_halfChecks[i]->GetValue())
             m_canvas->SetPreviewHalfVisible((int)i, false);
+
+    // The one insert checkbox governs the whole [m_insertFirstIndex, +count)
+    // block. It starts checked (visible), so no initial hide is needed; honour
+    // it anyway in case a future default flips.
+    if (m_insertCheck && !m_insertCheck->GetValue() && m_insertFirstIndex >= 0)
+        for (int k = 0; k < m_insertCount; ++k)
+            m_canvas->SetPreviewHalfVisible(m_insertFirstIndex + k, false);
 
     m_canvas->Refresh(false);
 }
