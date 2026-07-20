@@ -19,13 +19,16 @@
 class GLCanvas;
 class RoundedButton;   // forward decl — m_btnExport pointer below; full def
 // is included from MainFrame.cpp where it's used.
+class InsertEditDialog;  // forward decl — modeless insert-transform editor,
+                         // defined entirely in MainFrame.cpp (no header /
+                         // .vcxproj entry needed since only the frame uses it)
 class PreviewPanel;    // forward decl — m_previewPanel pointer; full def
 // is included from MainFrame.cpp where the panel is created.
 class wxSimplebook;    // forward decl — m_book pointer; the perspective pager.
 class PerspectiveButton; // forward decl — m_btnPrepare/m_btnPreview tabs.
 class VentEditToolbar;   // forward decl — m_ventEditToolbar overlay (Part 5).
 
-enum class TransformMode { Select, Translate, Rotate, Scale, Pattern, PlaceVent, PlaceRunner, PlaceGate, PlaceEjector, RemoveVent, RemoveRunner, RemoveGate, RemoveSprue, RemoveEjector, EditVent, EditRunner, EditGate, EditEjector, SelectInjectionPoint, AlignFace, AlignMidplane };
+enum class TransformMode { Select, Translate, Rotate, Scale, Pattern, PlaceVent, PlaceRunner, PlaceGate, PlaceEjector, PlaceInsert, RemoveVent, RemoveRunner, RemoveGate, RemoveSprue, RemoveEjector, RemoveInsert, EditVent, EditRunner, EditGate, EditEjector, EditInsert, SelectInjectionPoint, AlignFace, AlignMidplane };
 
 // Sub-tool active while editing a Complex vent path (Part 5). Shared between
 // GLCanvas (which owns the authoring logic) and the floating VentEditToolbar
@@ -84,6 +87,35 @@ public:
 
     float GetEjectorDiameter() const;
     float GetEjectorLength() const;
+
+    // Insert "Cut scale", as a fraction (the card takes percent; this returns
+    // 1.0 for 100%). Unitless, so unlike every other feature getter it does
+    // NOT convert for the imperial unit system.
+    float GetInsertCutScale() const;
+
+    // Called by GLCanvas when the user picks a parent object in PlaceInsert
+    // mode. Runs the import file dialog and hands the result to the canvas,
+    // then drops back to Select. Public because the canvas drives it — the
+    // parent pick happens on the GL surface, but the file dialog and the
+    // side-panel field reads belong to the frame.
+    void PlaceInsertOnParent(int parentIdx);
+
+    // Insert Edit dialog lifecycle. OpenInsertEditor is called by the canvas
+    // when an insert is picked in EditInsert mode — it creates the modeless
+    // dialog or retargets the existing one at `insertId`. ValidateInsertEditor
+    // is called by the canvas after a structural insert change: it closes the
+    // dialog if its target insert is gone, else refreshes its fields.
+    // OnInsertEditorClosed is called by the dialog as it closes so the frame
+    // drops its pointer.
+    void OpenInsertEditor(int insertId);
+    void ValidateInsertEditor();
+    void OnInsertEditorClosed();
+
+    // Destroys the modeless editor if open (used by ~MainFrame). Defined after
+    // the InsertEditDialog class body in the .cpp — ~MainFrame precedes that
+    // class, where the type is still incomplete, so the destroy can't be inlined
+    // into the destructor.
+    void DestroyInsertEditor();
 
     // Project save/load support
     const FixtureDefinition& GetFixtureDefinition() const { return m_fixtureDef; }
@@ -149,17 +181,28 @@ private:
     void OnPlaceEjector(wxCommandEvent& evt);
     void OnClearEjectors(wxCommandEvent&);
 
+    // Inserts. Place uses the current single selection as the parent if there
+    // is one, otherwise it toggles into PlaceInsert so the next canvas click
+    // picks the parent. Remove toggles into RemoveInsert (click a body to
+    // delete it); Clear wipes every insert. Edit is a deliberate no-op stub —
+    // the button exists so the card matches its neighbours, and the offset /
+    // rotation authoring lands behind it later.
+    void OnPlaceInsert(wxCommandEvent& evt);
+    void OnClearInserts(wxCommandEvent&);
+
     void OnRemoveVent(wxCommandEvent&);
     void OnRemoveSprue(wxCommandEvent&);
     void OnRemoveRunner(wxCommandEvent&);
     void OnRemoveGate(wxCommandEvent&);
     void OnRemoveEjector(wxCommandEvent&);
+    void OnRemoveInsert(wxCommandEvent&);
 
     void OnEditVent(wxCommandEvent&);
     void OnEditRunner(wxCommandEvent&);
     void OnEditGate(wxCommandEvent&);
     void OnEditSprue(wxCommandEvent&);
     void OnEditEjector(wxCommandEvent&);
+    void OnEditInsert(wxCommandEvent&);
 
     void OnSetMetric(wxCommandEvent&);
     void OnSetImperial(wxCommandEvent&);
@@ -209,6 +252,7 @@ private:
     wxPanel* CreateRunnersContent(wxWindow* parent);
     wxPanel* CreateGatesContent(wxWindow* parent);
     wxPanel* CreateEjectorsContent(wxWindow* parent);
+    wxPanel* CreateInsertsContent(wxWindow* parent);
 
     // Builds a "Place …" button with the standard side-panel styling (rounded
     // corners, BtnPlace fill — matching the Sprue feature button) and registers
@@ -254,6 +298,19 @@ private:
     wxChoice* m_ejectorTypeChoice = nullptr;
     wxTextCtrl* m_ejectorDiameter = nullptr;
     wxTextCtrl* m_ejectorLength = nullptr;
+
+    // Insert field members. An insert has no authored dimensions — its
+    // geometry is whatever was imported — so the Settings panel carries the
+    // single "Cut scale" percentage rather than a type dropdown + dimension
+    // rows. Read at placement time and captured onto the InsertFeature, the
+    // same convention the dimension fields use for every other feature.
+    wxTextCtrl* m_insertCutScale = nullptr;
+
+    // The modeless insert-transform editor, or null when closed. Owned by
+    // wxWidgets (parented to this frame); ~MainFrame destroys it explicitly so
+    // it can't outlive the frame or fire a close-notify into a half-destroyed
+    // frame.
+    InsertEditDialog* m_insertEditDialog = nullptr;
 
     // Creates the top ribbon panel
     wxPanel* CreateRibbon(wxWindow* parent);
@@ -388,16 +445,20 @@ private:
         ID_ClearGates,
         ID_PlaceEjector,
         ID_ClearEjectors,
+        ID_PlaceInsert,
+        ID_ClearInserts,
         ID_RemoveVent,
         ID_RemoveSprue,
         ID_RemoveRunner,
         ID_RemoveGate,
         ID_RemoveEjector,
+        ID_RemoveInsert,
         ID_EditVent,
         ID_EditRunner,
         ID_EditGate,
         ID_EditSprue,
         ID_EditEjector,
+        ID_EditInsert,
         ID_SaveProject,
         ID_LoadProject,
         ID_NewProject,

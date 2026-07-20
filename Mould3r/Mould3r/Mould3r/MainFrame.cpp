@@ -8,6 +8,8 @@
 #include <wx/graphics.h>   // wxGraphicsContext — rounded-rect paint for icon tool buttons
 #include <wx/dcbuffer.h>   // wxAutoBufferedPaintDC — flicker-free repaint on hover/toggle
 #include <wx/simplebook.h> // wxSimplebook — the Prepare/Preview perspective pager
+#include <wx/spinctrl.h>   // wxSpinCtrlDouble — fine-tune fields in the insert editor
+#include <wx/statline.h>   // wxStaticLine — section separators in the insert editor
 #include <memory>
 
 #include "MainFrame.h"
@@ -372,6 +374,12 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
 // ---------------------------------------------------------------------------
 MainFrame::~MainFrame()
 {
+    // Destroy the modeless insert editor first: it's parented to this frame, so
+    // leaving it for the base wxFrame teardown would fire its close-notify into
+    // an already-destructed MainFrame. (Helper, not inlined: InsertEditDialog is
+    // an incomplete type here — its definition is further down the .cpp.)
+    DestroyInsertEditor();
+
     wxMenuBar* attached = GetMenuBar();
     if (m_prepareMenuBar && m_prepareMenuBar != attached)
     {
@@ -627,15 +635,19 @@ wxPanel* MainFrame::CreateRibbon(wxWindow* parent)
     Bind(wxEVT_BUTTON, &MainFrame::OnClearGates, this, ID_ClearGates);
     Bind(wxEVT_BUTTON, &MainFrame::OnPlaceEjector, this, ID_PlaceEjector);
     Bind(wxEVT_BUTTON, &MainFrame::OnClearEjectors, this, ID_ClearEjectors);
+    Bind(wxEVT_BUTTON, &MainFrame::OnPlaceInsert, this, ID_PlaceInsert);
+    Bind(wxEVT_BUTTON, &MainFrame::OnClearInserts, this, ID_ClearInserts);
     Bind(wxEVT_BUTTON, &MainFrame::OnRemoveVent, this, ID_RemoveVent);
     Bind(wxEVT_BUTTON, &MainFrame::OnRemoveSprue, this, ID_RemoveSprue);
     Bind(wxEVT_BUTTON, &MainFrame::OnRemoveRunner, this, ID_RemoveRunner);
     Bind(wxEVT_BUTTON, &MainFrame::OnRemoveGate, this, ID_RemoveGate);
     Bind(wxEVT_BUTTON, &MainFrame::OnRemoveEjector, this, ID_RemoveEjector);
+    Bind(wxEVT_BUTTON, &MainFrame::OnRemoveInsert, this, ID_RemoveInsert);
     Bind(wxEVT_BUTTON, &MainFrame::OnEditVent, this, ID_EditVent);
     Bind(wxEVT_BUTTON, &MainFrame::OnEditRunner, this, ID_EditRunner);
     Bind(wxEVT_BUTTON, &MainFrame::OnEditGate, this, ID_EditGate);
     Bind(wxEVT_BUTTON, &MainFrame::OnEditEjector, this, ID_EditEjector);
+    Bind(wxEVT_BUTTON, &MainFrame::OnEditInsert, this, ID_EditInsert);
     Bind(wxEVT_BUTTON, &MainFrame::OnGenerateMould, this, ID_GenerateMould);
     Bind(wxEVT_BUTTON, &MainFrame::OnExport, this, ID_Export);
 
@@ -725,6 +737,7 @@ void MainFrame::SetActiveTool(TransformMode mode)
     case TransformMode::PlaceRunner:   activeId = ID_PlaceRunner;       break;
     case TransformMode::PlaceGate:     activeId = ID_PlaceGate;         break;
     case TransformMode::PlaceEjector:  activeId = ID_PlaceEjector;      break;
+    case TransformMode::PlaceInsert:   activeId = ID_PlaceInsert;       break;
     case TransformMode::AlignFace:     activeId = ID_ToolAlignFace;     break;
     case TransformMode::AlignMidplane: activeId = ID_ToolAlignMidplane; break;
     default:                                                            break;
@@ -1158,6 +1171,378 @@ void MainFrame::OnEditEjector(wxCommandEvent&)
         SetActiveTool(TransformMode::EditEjector);
 }
 
+// ===========================================================================
+// InsertEditDialog — modeless transform editor for a single insert.
+//
+// Design notes:
+//  * MODELESS + live-apply. Shown with Show(), not ShowModal(), so it stays up
+//    while the user makes repeated small nudges — it never "collapses" after an
+//    edit. Every field change is pushed straight to the canvas, which reanchors
+//    and redraws, so the viewport tracks the spinners in real time.
+//  * REPOSITIONABLE. wxDEFAULT_DIALOG_STYLE gives a native caption the user can
+//    drag anywhere; wxSTAY_ON_TOP keeps it floating over the model (and matches
+//    the app's other tool dialogs, e.g. PrecisionPlaceDialog) so it can't get
+//    lost behind the main window mid-tune.
+//  * Targets an insert by STABLE ID, not index, so a remove elsewhere can't
+//    silently retarget it. On any apply, a failed lookup means the insert is
+//    gone and the dialog closes itself. The frame also validates it after
+//    structural changes (ValidateInsertEditor).
+//  * wxSpinCtrlDouble everywhere: the increment arrows are exactly the "smaller
+//    repositions to fine tune" affordance asked for. Position is in mm, uniform
+//    scale is unitless (matches SceneObject's single-float scale, and keeps the
+//    resolved world matrix representable as a gp_Trsf for the OCC cut).
+// ===========================================================================
+class InsertEditDialog : public wxDialog
+{
+public:
+    InsertEditDialog(MainFrame* frame, GLCanvas* canvas, int insertId)
+        : wxDialog(frame, wxID_ANY, "Edit Insert",
+            wxDefaultPosition, wxDefaultSize,
+            wxDEFAULT_DIALOG_STYLE | wxSTAY_ON_TOP)
+        , m_frame(frame), m_canvas(canvas), m_insertId(insertId)
+    {
+        auto* main = new wxBoxSizer(wxVERTICAL);
+
+        auto addHeader = [&](const wxString& text)
+        {
+            auto* lbl = new wxStaticText(this, wxID_ANY, text);
+            wxFont fnt = lbl->GetFont();
+            fnt.SetWeight(wxFONTWEIGHT_BOLD);
+            lbl->SetFont(fnt);
+            main->Add(lbl, 0, wxLEFT | wxRIGHT | wxTOP, 12);
+        };
+
+        // One spinner row. `digits`/`inc`/min/max tune the field to its role:
+        // position gets a fine 0.5 mm step, rotation 1 deg, scale 0.05x.
+        auto addSpin = [&](const wxString& label, wxSpinCtrlDouble*& ctrl,
+            double lo, double hi, double inc, unsigned digits,
+            const wxString& unit)
+        {
+            auto* row = new wxBoxSizer(wxHORIZONTAL);
+            auto* lbl = new wxStaticText(this, wxID_ANY, label,
+                wxDefaultPosition, wxSize(72, -1));
+            ctrl = new wxSpinCtrlDouble(this, wxID_ANY, wxEmptyString,
+                wxDefaultPosition, wxSize(110, -1),
+                wxSP_ARROW_KEYS, lo, hi, 0.0, inc);
+            ctrl->SetDigits(digits);
+            auto* u = new wxStaticText(this, wxID_ANY, unit,
+                wxDefaultPosition, wxSize(24, -1));
+            row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 6);
+            row->Add(ctrl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
+            row->Add(u, 0, wxALIGN_CENTER_VERTICAL);
+            main->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 8);
+            // Arrow clicks and focus-out commits apply here. Enter is handled
+            // at the dialog level (see the wxEVT_CHAR_HOOK below) because
+            // wxSpinCtrlDouble's own Enter path commits its value AFTER emitting
+            // its events, so an event-driven apply would read the stale value.
+            ctrl->Bind(wxEVT_SPINCTRLDOUBLE, &InsertEditDialog::OnField, this);
+        };
+
+        addHeader("Position");
+        addSpin("X:", m_px, -100000.0, 100000.0, 0.5, 3, "mm");
+        addSpin("Y:", m_py, -100000.0, 100000.0, 0.5, 3, "mm");
+        addSpin("Z:", m_pz, -100000.0, 100000.0, 0.5, 3, "mm");
+
+        main->Add(new wxStaticLine(this), 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
+        addHeader("Rotation");
+        addSpin("X:", m_rx, -36000.0, 36000.0, 1.0, 2, "\u00B0");
+        addSpin("Y:", m_ry, -36000.0, 36000.0, 1.0, 2, "\u00B0");
+        addSpin("Z:", m_rz, -36000.0, 36000.0, 1.0, 2, "\u00B0");
+
+        main->Add(new wxStaticLine(this), 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
+        addHeader("Scale");
+        addSpin("Uniform:", m_scale, 0.001, 1000.0, 0.05, 3, "\u00D7");
+
+        // Actions: Reset returns to the placement default (origin-aligned, true
+        // size); Close dismisses. The native caption "X" also closes.
+        auto* btnRow = new wxBoxSizer(wxHORIZONTAL);
+        auto* reset = new wxButton(this, wxID_ANY, "Reset");
+        auto* close = new wxButton(this, wxID_CLOSE, "Close");
+        reset->Bind(wxEVT_BUTTON, &InsertEditDialog::OnReset, this);
+        close->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { Close(); });
+        btnRow->AddStretchSpacer(1);
+        btnRow->Add(reset, 0, wxRIGHT, 6);
+        btnRow->Add(close, 0);
+        main->Add(btnRow, 0, wxEXPAND | wxALL, 12);
+
+        SetSizerAndFit(main);
+        CentreOnParent();
+        WindowEffects::ApplyRoundedCorners(this);
+
+        // Closing (caption X or Close button) tells the frame to drop its
+        // pointer, then destroys the window. Destroy(), not delete — wxWidgets
+        // owns the lifetime.
+        Bind(wxEVT_CLOSE_WINDOW, [this](wxCloseEvent&)
+        {
+            if (m_frame) m_frame->OnInsertEditorClosed();
+            Destroy();
+        });
+
+        // Route ESC through Close() too. wxDialog's default ESC handling on a
+        // MODELESS dialog can merely hide it, which would leave the frame's
+        // pointer dangling-but-non-null; Close() fires the handler above so the
+        // frame drops its pointer and the window is destroyed.
+        Bind(wxEVT_CHAR_HOOK, [this](wxKeyEvent& e)
+        {
+            const int k = e.GetKeyCode();
+            if (k == WXK_ESCAPE) { Close(); return; }
+            if (k == WXK_RETURN || k == WXK_NUMPAD_ENTER)
+            {
+                // Commit the in-progress edit, then apply. Consume the key so it
+                // doesn't go hunting for a default dialog button.
+                CommitFocusedField();
+                Apply();
+                return;
+            }
+            e.Skip();
+        });
+
+        Populate();
+    }
+
+    int TargetId() const { return m_insertId; }
+
+    // Retarget an already-open dialog at a different insert (user clicked
+    // another insert while editing). Repopulate from that insert's transform.
+    void SetTarget(int insertId)
+    {
+        m_insertId = insertId;
+        Populate();
+    }
+
+    // True while the target insert still exists; the frame uses this to decide
+    // between refreshing and closing after a structural change.
+    bool TargetAlive() const
+    {
+        return m_canvas && m_canvas->InsertIndexFromId(m_insertId) >= 0;
+    }
+
+    // Re-read the target's transform into the fields (e.g. after an external
+    // change). Public so the frame can refresh without a full retarget.
+    void RefreshFromCanvas() { Populate(); }
+
+private:
+    // Load the target insert's transform into the spinners. Guarded by
+    // m_populating so the SetValue calls don't re-enter OnField and echo the
+    // values straight back to the canvas.
+    void Populate()
+    {
+        if (!m_canvas) return;
+        glm::vec3 off(0.0f), rot(0.0f);
+        float scale = 1.0f;
+        if (!m_canvas->GetInsertTransformById(m_insertId, off, rot, scale))
+            return;   // target gone — leave fields; the frame will close us
+
+        m_populating = true;
+        m_px->SetValue(off.x); m_py->SetValue(off.y); m_pz->SetValue(off.z);
+        m_rx->SetValue(rot.x); m_ry->SetValue(rot.y); m_rz->SetValue(rot.z);
+        m_scale->SetValue(scale);
+        m_populating = false;
+    }
+
+    // Push the current field values to the canvas. If the target is gone the
+    // set fails and we close.
+    void Apply()
+    {
+        if (m_populating || !m_canvas) return;
+        const glm::vec3 off((float)m_px->GetValue(),
+                            (float)m_py->GetValue(),
+                            (float)m_pz->GetValue());
+        const glm::vec3 rot((float)m_rx->GetValue(),
+                            (float)m_ry->GetValue(),
+                            (float)m_rz->GetValue());
+        const float scale = (float)m_scale->GetValue();
+        if (!m_canvas->SetInsertTransformById(m_insertId, off, rot, scale))
+            Close();
+    }
+
+    void OnField(wxSpinDoubleEvent&) { Apply(); }
+
+    // Force the focused field to adopt its typed-but-uncommitted text before an
+    // Enter-driven Apply reads it. wxSpinCtrlDouble is the generic composite on
+    // every platform: the focused widget is its inner wxTextCtrl, whose parent
+    // is the spin control. Parsing the shown text and SetValue()-ing it makes
+    // GetValue() fresh (and clamps to range). Unfocused fields already committed
+    // on focus-loss, so only the focused one needs this.
+    void CommitFocusedField()
+    {
+        wxWindow* foc = FindFocus();
+        auto* txt = dynamic_cast<wxTextCtrl*>(foc);
+        if (!txt) return;
+        auto* spin = dynamic_cast<wxSpinCtrlDouble*>(txt->GetParent());
+        if (!spin) return;
+        double v = 0.0;
+        if (txt->GetValue().ToDouble(&v))
+            spin->SetValue(v);
+    }
+
+    void OnReset(wxCommandEvent&)
+    {
+        m_populating = true;
+        m_px->SetValue(0.0); m_py->SetValue(0.0); m_pz->SetValue(0.0);
+        m_rx->SetValue(0.0); m_ry->SetValue(0.0); m_rz->SetValue(0.0);
+        m_scale->SetValue(1.0);
+        m_populating = false;
+        Apply();
+    }
+
+    MainFrame* m_frame = nullptr;
+    GLCanvas*  m_canvas = nullptr;
+    int        m_insertId = -1;
+    bool       m_populating = false;
+
+    wxSpinCtrlDouble* m_px = nullptr; wxSpinCtrlDouble* m_py = nullptr; wxSpinCtrlDouble* m_pz = nullptr;
+    wxSpinCtrlDouble* m_rx = nullptr; wxSpinCtrlDouble* m_ry = nullptr; wxSpinCtrlDouble* m_rz = nullptr;
+    wxSpinCtrlDouble* m_scale = nullptr;
+};
+
+// OpenInsertEditor — create the modeless editor, or retarget/raise the existing
+// one, on `insertId`. Called by the canvas when an insert is picked in
+// EditInsert mode.
+void MainFrame::OpenInsertEditor(int insertId)
+{
+    if (!m_canvas) return;
+    if (m_insertEditDialog)
+    {
+        m_insertEditDialog->SetTarget(insertId);
+        m_insertEditDialog->Raise();
+        return;
+    }
+    m_insertEditDialog = new InsertEditDialog(this, m_canvas, insertId);
+    m_insertEditDialog->Show();
+}
+
+// ValidateInsertEditor — after a structural insert change, close the editor if
+// its target is gone, otherwise refresh its fields (the transform itself is
+// unchanged by a reanchor, but a refresh is cheap and keeps it honest).
+void MainFrame::ValidateInsertEditor()
+{
+    if (!m_insertEditDialog) return;
+    if (!m_insertEditDialog->TargetAlive())
+        m_insertEditDialog->Close();
+    else
+        m_insertEditDialog->RefreshFromCanvas();
+}
+
+// OnInsertEditorClosed — the dialog is closing; drop our pointer so we don't
+// touch a destroyed window. The dialog Destroy()s itself right after this.
+void MainFrame::OnInsertEditorClosed()
+{
+    m_insertEditDialog = nullptr;
+}
+
+// DestroyInsertEditor — tear the editor down from ~MainFrame. Null first so the
+// window's close-notify (OnInsertEditorClosed) is a no-op if it races.
+void MainFrame::DestroyInsertEditor()
+{
+    if (!m_insertEditDialog) return;
+    InsertEditDialog* dlg = m_insertEditDialog;
+    m_insertEditDialog = nullptr;
+    dlg->Destroy();
+}
+
+// ---------------------------------------------------------------------------
+// Insert handlers.
+//
+// An insert is an imported body whose pose is driven entirely by a parent
+// object, so placement is a two-part act: pick the parent, then pick the file.
+// OnPlaceInsert resolves the parent:
+//
+//   exactly one object selected -> that's the parent; go straight to the file
+//                                  dialog, no mode change, no extra click.
+//   zero or 2+ selected         -> toggle into PlaceInsert and let the canvas
+//                                  collect the parent pick. The canvas calls
+//                                  PlaceInsertOnParent below once it has one,
+//                                  which runs the same file dialog.
+//
+// Both routes converge on PlaceInsertOnParent, so the flow is identical
+// regardless of how the parent was chosen. A 2+ selection deliberately falls
+// through to the pick mode rather than guessing which member to parent to.
+// ---------------------------------------------------------------------------
+void MainFrame::OnPlaceInsert(wxCommandEvent&)
+{
+    if (!m_canvas) return;
+
+    // Toggle back out if we're already collecting a parent pick.
+    if (m_canvas->GetTransformMode() == TransformMode::PlaceInsert)
+    {
+        SetActiveTool(TransformMode::Select);
+        return;
+    }
+
+    const int sel = m_canvas->GetSingleSelectedObject();
+    if (sel >= 0)
+    {
+        PlaceInsertOnParent(sel);
+        return;
+    }
+
+    SetActiveTool(TransformMode::PlaceInsert);
+}
+
+void MainFrame::PlaceInsertOnParent(int parentIdx)
+{
+    if (!m_canvas) return;
+
+    wxFileDialog dlg(
+        this, "Import Insert", "", "",
+        "All supported (*.step;*.stp;*.stl;*.obj)|*.step;*.stp;*.stl;*.obj|"
+        "STEP files (*.step;*.stp)|*.step;*.stp|"
+        "STL files (*.stl)|*.stl|"
+        "OBJ files (*.obj)|*.obj|"
+        "All files (*.*)|*.*",
+        wxFD_OPEN | wxFD_FILE_MUST_EXIST
+    );
+
+    // Cancelling the file dialog leaves the parent pick spent but places
+    // nothing — drop back to Select rather than silently staying armed, so
+    // the toggle button state always matches what the next click will do.
+    if (dlg.ShowModal() != wxID_OK)
+    {
+        SetActiveTool(TransformMode::Select);
+        return;
+    }
+
+    const bool placed =
+        m_canvas->PlaceInsertOnObject(parentIdx, dlg.GetPath().ToStdString());
+
+    SetActiveTool(TransformMode::Select);
+
+    // Same Clean->Dirty reasoning as OnImport: an insert adds geometry to the
+    // scene without invalidating an existing mould outright. (Inserts don't
+    // participate in the cut yet, so this is conservative rather than
+    // strictly necessary — it costs one warning on Export and stops being
+    // conservative the moment cut integration lands.)
+    if (placed && m_mouldState == MouldState::Clean)
+        m_mouldState = MouldState::Dirty;
+}
+
+void MainFrame::OnClearInserts(wxCommandEvent&)
+{
+    if (m_canvas)
+        m_canvas->ClearInserts();
+}
+
+void MainFrame::OnRemoveInsert(wxCommandEvent&)
+{
+    if (m_canvas && m_canvas->GetTransformMode() == TransformMode::RemoveInsert)
+        SetActiveTool(TransformMode::Select);
+    else
+        SetActiveTool(TransformMode::RemoveInsert);
+}
+
+// Edit Insert — deliberately inert for now. The button ships so the Inserts
+// card matches every other feature card; the mode toggles (and the canvas
+// gives it a hand cursor) but nothing is authored yet. Offset / rotation
+// authoring against the parent lands behind this.
+void MainFrame::OnEditInsert(wxCommandEvent&)
+{
+    if (m_canvas && m_canvas->GetTransformMode() == TransformMode::EditInsert)
+        SetActiveTool(TransformMode::Select);
+    else
+        SetActiveTool(TransformMode::EditInsert);
+}
+
 void MainFrame::OnEditSprue(wxCommandEvent&)
 {
     if (m_fixtureDef.injectionPoints.size() <= 1) return;  // nothing to choose
@@ -1404,6 +1789,20 @@ float MainFrame::GetEjectorLength() const
     if (!m_ejectorLength->GetValue().ToDouble(&v)) return 25.0f;
     if (v <= 0.0) v = 25.0;
     return static_cast<float>(v) * (m_imperial ? 25.4f : 1.0f);
+}
+
+// Insert "Cut scale": the card takes a percentage, callers want a multiplier,
+// so 100 -> 1.0. No unit conversion — a percentage is unitless, which is why
+// its "%" label is not registered in m_mmUnitLabels and doesn't flip with the
+// metric/imperial switch. Non-positive or unparseable input falls back to
+// 100% (nominal fit) rather than collapsing the body to nothing.
+float MainFrame::GetInsertCutScale() const
+{
+    if (!m_insertCutScale) return 1.0f;
+    double v = 100.0;
+    if (!m_insertCutScale->GetValue().ToDouble(&v)) return 1.0f;
+    if (v <= 0.0) v = 100.0;
+    return static_cast<float>(v * 0.01);
 }
 
 // ---------------------------------------------------------------------------
@@ -1800,6 +2199,19 @@ void MainFrame::OnSaveProject(wxCommandEvent&)
         data.ejectors.push_back(pe);
     }
 
+    // Inserts — source body path + parent index + local transform. Cut scale is
+    // a global card value, not per-insert, so it isn't stored here.
+    for (const auto& in : m_canvas->GetInserts())
+    {
+        ProjectInsertData pi;
+        pi.sourcePath  = in.body.sourcePath;
+        pi.parentIndex = in.parentIndex;
+        pi.localOffset = in.localOffset;
+        pi.localRotDeg = in.localRotDeg;
+        pi.localScale  = in.localScale;
+        data.inserts.push_back(pi);
+    }
+
     std::string error;
     if (!ProjectFile::Save(savePath, data, error))
     {
@@ -1886,6 +2298,16 @@ void MainFrame::OnLoadProject(wxCommandEvent&)
             obj.yawDeg, obj.pitchDeg,
             obj.rollDeg, obj.scale,
             obj.mirrorX, obj.mirrorZ);
+    }
+
+    // ---- Restore inserts ----------------------------------------------------
+    // After objects: each insert re-parents by index into the objects just
+    // restored (same order they were saved). An insert whose parent didn't
+    // restore is dropped inside RestoreInsert.
+    for (const auto& in : data.inserts)
+    {
+        m_canvas->RestoreInsert(in.sourcePath, in.parentIndex,
+            in.localOffset, in.localRotDeg, in.localScale);
     }
 
     // ---- Restore sprue -----------------------------------------------------
@@ -2306,7 +2728,11 @@ void MainFrame::OnGenerateMould(wxCommandEvent&)
                 shot.halves    = &m_canvas->GetLastHalfShapes();
             }
 
-            m_previewPanel->SetData(halves, shot);
+            // Inserts form their own preview category (one checkbox, yellow).
+            // Passed even when empty — SetData treats an empty list as "no
+            // insert checkbox", so a run without inserts is unaffected.
+            m_previewPanel->SetData(halves, shot,
+                m_canvas->GetLastInsertMeshes());
         }
 
         // Jump to the Preview perspective so the freshly generated mould is
@@ -3213,6 +3639,138 @@ wxPanel* MainFrame::CreateEjectorsContent(wxWindow* parent)
     return panel;
 }
 
+// ---------------------------------------------------------------------------
+// CreateInsertsContent — left-panel "Inserts" feature card.
+//
+// Same layout as CreateEjectorsContent (title, Place button, three small
+// action buttons, collapsible Settings) so the card reads identically to its
+// neighbours.
+//
+// The one structural difference is the Settings body. Every other feature
+// authors its geometry from card fields, so those cards carry a type dropdown
+// plus dimension rows. An insert's geometry is whatever was imported, so
+// there is nothing to dimension and no second geometry to switch between —
+// a type dropdown with one dead entry would be noise. Instead Settings holds
+// the single value that IS authored here: "Cut scale", the percentage the
+// body is scaled up by when it cuts its own pocket during Generate Mould
+// (>100% opens clearance around the insert; 100% is a nominal fit). Read at
+// placement time and captured onto the InsertFeature — same convention as the
+// dimension fields everywhere else, so changing it affects the NEXT insert
+// placed, not the ones already down.
+// ---------------------------------------------------------------------------
+wxPanel* MainFrame::CreateInsertsContent(wxWindow* parent)
+{
+    auto* panel = new wxPanel(parent, wxID_ANY);
+    panel->SetBackgroundColour(Style::CardBg);
+    auto* sizer = new wxBoxSizer(wxVERTICAL);
+
+    auto* titleLabel = new wxStaticText(panel, wxID_ANY, "Inserts");
+    titleLabel->SetForegroundColour(*wxWHITE);
+    titleLabel->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_BOLD, false, "Segoe UI"));
+    sizer->Add(titleLabel, 0, wxLEFT | wxTOP, 12);
+    sizer->AddSpacer(6);
+
+    auto* btnPlace = MakePlaceButton(panel, ID_PlaceInsert, "Place Insert");
+    sizer->Add(btnPlace, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
+    sizer->AddSpacer(6);
+
+    auto* actionGrid = new wxGridSizer(1, 3, 0, 4);
+    auto makeSmallBtn = [&](const wxString& label) -> RoundedButton* {
+        auto* btn = new RoundedButton(panel, wxID_ANY, label,
+            wxDefaultPosition, wxSize(-1, 26), wxBORDER_NONE);
+        btn->SetBackgroundColour(Style::BtnSmall);
+        btn->SetForegroundColour(Style::TextPrimary);
+        btn->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+        return btn;
+        };
+    auto* btnEdit = makeSmallBtn("Edit");
+    btnEdit->SetId(ID_EditInsert);
+    auto* btnRemove = makeSmallBtn("Remove");
+    btnRemove->SetId(ID_RemoveInsert);
+    auto* btnClearAll = makeSmallBtn("Clear all");
+    btnClearAll->SetId(ID_ClearInserts);
+    actionGrid->Add(btnEdit, 0, wxEXPAND);
+    actionGrid->Add(btnRemove, 0, wxEXPAND);
+    actionGrid->Add(btnClearAll, 0, wxEXPAND);
+    sizer->Add(actionGrid, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
+    sizer->AddSpacer(8);
+
+    // Collapsible Settings — same chevron / debounce pattern as the other cards.
+    auto* settingsBtn = new wxToggleButton(panel, wxID_ANY,
+        "Settings",
+        wxDefaultPosition, wxSize(-1, 22), wxBU_LEFT | wxBORDER_NONE);
+    settingsBtn->SetValue(false);
+    settingsBtn->SetBackgroundColour(Style::CardBg);
+    settingsBtn->SetForegroundColour(Style::TextSubtle);
+    settingsBtn->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+    settingsBtn->SetBitmap(LoadSvgBundle(kChevronRightSvg, wxSize(12, 12), true));
+    settingsBtn->SetBitmapPosition(wxRIGHT);
+    sizer->Add(settingsBtn, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
+
+    auto* settingsPanel = new wxPanel(panel, wxID_ANY);
+    settingsPanel->SetBackgroundColour(Style::CardBg);
+    auto* settingsSizer = new wxBoxSizer(wxVERTICAL);
+
+    // Dimension-row helper — identical to the one used in CreateEjectorsContent.
+    // Note the unitStr == "mm" guard: "%" never lands in m_mmUnitLabels, so the
+    // Cut scale label survives the metric/imperial switch unchanged.
+    auto addRow = [&](wxWindow* parent_, wxSizer* parentSz,
+        const wxString& label, wxTextCtrl*& ctrl,
+        const wxString& defVal, const wxString& unitStr, int /*lblW*/ = 60)
+        {
+            auto* row = new wxBoxSizer(wxHORIZONTAL);
+            auto* lbl = new wxStaticText(parent_, wxID_ANY, label);
+            lbl->SetForegroundColour(Style::TextMuted);
+            lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+            ctrl = new wxTextCtrl(parent_, wxID_ANY, defVal, wxDefaultPosition, wxSize(kFieldWidth, 22));
+            ctrl->SetBackgroundColour(Style::BtnSmall); ctrl->SetForegroundColour(kTextDefault);
+            auto* u = new wxStaticText(parent_, wxID_ANY, unitStr);
+            if (unitStr == "mm") m_mmUnitLabels.push_back(u);
+            u->SetForegroundColour(Style::TextSubtle);
+            u->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+            u->SetMinSize(wxSize(kUnitWidth, -1));
+            row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL);
+            row->AddStretchSpacer(1);
+            row->Add(ctrl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, kFieldGap);
+            row->Add(u, 0, wxALIGN_CENTER_VERTICAL);
+            parentSz->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
+        };
+
+    auto* dimsPanel = new wxPanel(settingsPanel, wxID_ANY);
+    dimsPanel->SetBackgroundColour(Style::CardBg);
+    auto* dimsSizer = new wxBoxSizer(wxVERTICAL);
+    addRow(dimsPanel, dimsSizer, "Cut scale:", m_insertCutScale, "100.0", "%");
+    dimsPanel->SetSizer(dimsSizer);
+    settingsSizer->Add(dimsPanel, 0, wxEXPAND | wxBOTTOM, 10);
+
+    settingsPanel->SetSizer(settingsSizer);
+    settingsPanel->Show(false);
+    sizer->Add(settingsPanel, 0, wxEXPAND);
+
+    settingsBtn->Bind(wxEVT_TOGGLEBUTTON, [settingsBtn, settingsPanel, panel](wxCommandEvent&) {
+        // Same 200ms debounce as the other settings togglers — mid-frame
+        // double-clicks (often from a touchpad tap) otherwise re-collapse
+        // the panel before the layout finishes.
+        static wxLongLong lastToggleMs = 0;
+        wxLongLong now = wxGetLocalTimeMillis();
+        if ((now - lastToggleMs).GetValue() < 200) { settingsBtn->SetValue(!settingsBtn->GetValue()); return; }
+        lastToggleMs = now;
+        const bool expanded = settingsBtn->GetValue();
+        settingsBtn->SetBitmap(LoadSvgBundle(
+            expanded ? kChevronDownSvg : kChevronRightSvg,
+            wxSize(12, 12), true));
+        settingsBtn->SetBitmapPosition(wxRIGHT);
+        settingsPanel->Show(expanded);
+        panel->Layout(); panel->GetParent()->Layout(); panel->GetParent()->GetParent()->Layout();
+        });
+
+    panel->SetSizer(sizer);
+    return panel;
+}
+
 wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
 {
     // Outer container: content column + right border
@@ -3583,6 +4141,9 @@ wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
 
     wxPanel* ejectorsContent = CreateEjectorsContent(scrollWin);
     sizer->Add(ejectorsContent, 0, wxEXPAND | wxTOP, 8);
+
+    wxPanel* insertsContent = CreateInsertsContent(scrollWin);
+    sizer->Add(insertsContent, 0, wxEXPAND | wxTOP, 8);
 
     sizer->AddSpacer(12);
 

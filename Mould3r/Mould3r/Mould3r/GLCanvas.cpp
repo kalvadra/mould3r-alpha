@@ -235,16 +235,24 @@ void GLCanvas::SetTransformMode(TransformMode mode)
         SetCursor(wxCursor(wxCURSOR_CROSS));    break;
     case TransformMode::PlaceEjector:
         SetCursor(wxCursor(wxCURSOR_CROSS));    break;
+    case TransformMode::PlaceInsert:
+        // Collecting a PARENT pick, not a position — the hand reads as
+        // "click a thing" the way the Remove / Edit modes do, where the
+        // cross would imply the click location matters. It doesn't: the
+        // insert lands on the parent's origin wherever you click it.
+        SetCursor(wxCursor(wxCURSOR_HAND));     break;
     case TransformMode::RemoveVent:
     case TransformMode::RemoveRunner:
     case TransformMode::RemoveGate:
     case TransformMode::RemoveSprue:
     case TransformMode::RemoveEjector:
+    case TransformMode::RemoveInsert:
         SetCursor(wxCursor(wxCURSOR_HAND));     break;
     case TransformMode::EditVent:
     case TransformMode::EditRunner:
     case TransformMode::EditGate:
     case TransformMode::EditEjector:
+    case TransformMode::EditInsert:
         SetCursor(wxCursor(wxCURSOR_HAND));     break;
     case TransformMode::SelectInjectionPoint:
         SetCursor(wxCursor(wxCURSOR_HAND));     break;
@@ -570,6 +578,28 @@ void GLCanvas::ApplyCircularPattern(int count, bool overrideRadius, float radius
         if (gf.parentIndex == seedIndex)
             seedGatePlacements.push_back({ gf.localPos, gf.localNormal });
 
+    // Snapshot the seed's inserts the same way. An insert's placement is its
+    // localOffset / localRotDeg (parent-space) plus the imported body itself,
+    // so we capture the CPU geometry + BREP needed to rebuild a clone's GPU
+    // mesh without re-reading the source file — mirroring how the object
+    // clones above rebuild from cpuVerts. Inserts don't ride the parent's full
+    // model matrix (rotation + translation only — see InsertFeature), so unlike
+    // a complex vent path there is nothing to rotate about the pattern centre
+    // here: ReanchorInsert re-derives the world transform from each clone's own
+    // pose. (Cut scale isn't carried — it's a single global card value read at
+    // Generate Mould time, not a per-insert property.)
+    struct InsertPlacement {
+        glm::vec3 localOffset; glm::vec3 localRotDeg; float localScale;
+        std::vector<float> cpuVerts; std::vector<uint32_t> cpuIndices;
+        TopoDS_Shape sourceShape; bool hasSourceShape; std::string sourcePath;
+    };
+    std::vector<InsertPlacement> seedInsertPlacements;
+    for (const auto& in : m_inserts)
+        if (in.parentIndex == seedIndex)
+            seedInsertPlacements.push_back({ in.localOffset, in.localRotDeg,
+                in.localScale, in.body.cpuVerts, in.body.cpuIndices,
+                in.body.sourceShape, in.body.hasSourceShape, in.body.sourcePath });
+
     std::vector<int> reanchorTargets;
     reanchorTargets.reserve(count);
     reanchorTargets.push_back(seedIndex);   // seed's pos may have shifted
@@ -629,6 +659,10 @@ void GLCanvas::ApplyCircularPattern(int count, bool overrideRadius, float radius
             // RebuildGatePathVBO/Solids below.
             m_gates.push_back(std::move(gf));
         }
+        for (const auto& ip : seedInsertPlacements)
+            CloneInsertOnto(cloneIdx, ip.localOffset, ip.localRotDeg,
+                ip.localScale, ip.cpuVerts, ip.cpuIndices,
+                ip.sourceShape, ip.hasSourceShape, ip.sourcePath);
     }
 
     // Single batch reanchor for the seed (in case override-radius moved it)
@@ -826,6 +860,24 @@ void GLCanvas::ApplyGridPattern(int numH, int numV, bool mirrorH, bool mirrorV,
         if (gf.parentIndex == seedIndex)
             seedGatePlacements.push_back({ gf.localPos, gf.localNormal });
 
+    // Seed inserts — see ApplyCircularPattern for the rationale. The grid is a
+    // pure translation (plus mirror flags on the clone objects), but an insert
+    // ignores parent scale/mirror by design, so a mirrored grid cell carries an
+    // UN-mirrored insert. That's the correct-for-hardware behaviour (a brass
+    // boss isn't a mirror image of itself), and it matches the known
+    // mirrored-complex-vent limitation noted above rather than adding a new one.
+    struct InsertPlacement {
+        glm::vec3 localOffset; glm::vec3 localRotDeg; float localScale;
+        std::vector<float> cpuVerts; std::vector<uint32_t> cpuIndices;
+        TopoDS_Shape sourceShape; bool hasSourceShape; std::string sourcePath;
+    };
+    std::vector<InsertPlacement> seedInsertPlacements;
+    for (const auto& in : m_inserts)
+        if (in.parentIndex == seedIndex)
+            seedInsertPlacements.push_back({ in.localOffset, in.localRotDeg,
+                in.localScale, in.body.cpuVerts, in.body.cpuIndices,
+                in.body.sourceShape, in.body.hasSourceShape, in.body.sourcePath });
+
     std::vector<int> reanchorTargets;
     reanchorTargets.reserve(numClones + 1);
     reanchorTargets.push_back(seedIndex);   // seed's pos may have shifted
@@ -856,11 +908,56 @@ void GLCanvas::ApplyGridPattern(int numH, int numV, bool mirrorH, bool mirrorV,
             gf.localNormal = lp.normal;
             m_gates.push_back(std::move(gf));
         }
+        for (const auto& ip : seedInsertPlacements)
+            CloneInsertOnto(cloneIdx, ip.localOffset, ip.localRotDeg,
+                ip.localScale, ip.cpuVerts, ip.cpuIndices,
+                ip.sourceShape, ip.hasSourceShape, ip.sourcePath);
     }
 
     ReanchorFeaturesForObjects(reanchorTargets);
     Refresh(false);
     NotifySceneMutated();
+}
+
+// ---------------------------------------------------------------------------
+// CloneInsertOnto — push a fresh insert parented to `cloneIdx`, rebuilding its
+// GPU mesh from cached CPU geometry (no source-file re-read), then resolve its
+// world transform. Shared by both pattern tools so an insert clones the same
+// way whether the arrangement is circular or grid. Mirrors the object-clone
+// GPU rebuild (ComputeVertexNormals_Pos3 -> SplitByCreaseAngle_Pos3 ->
+// UploadMeshToGPU) exactly, so a cloned insert is byte-identical to one placed
+// by hand. Caller batches ReanchorFeaturesForObjects afterwards; the explicit
+// ReanchorInsert here means the clone is valid even before that batch runs.
+// ---------------------------------------------------------------------------
+void GLCanvas::CloneInsertOnto(int cloneIdx,
+    const glm::vec3& localOffset, const glm::vec3& localRotDeg, float localScale,
+    const std::vector<float>& cpuVerts, const std::vector<uint32_t>& cpuIndices,
+    const TopoDS_Shape& sourceShape, bool hasSourceShape,
+    const std::string& sourcePath)
+{
+    InsertFeature in;
+    in.parentIndex = cloneIdx;
+    in.localOffset = localOffset;
+    in.localRotDeg = localRotDeg;
+    in.localScale = localScale;   // seed's edit scale propagates to clones
+    in.id = m_nextInsertId++;
+    in.body.sourcePath = sourcePath;
+    in.body.cpuVerts = cpuVerts;
+    in.body.cpuIndices = cpuIndices;
+    in.body.sourceShape = sourceShape;
+    in.body.hasSourceShape = hasSourceShape;
+
+    FileImporter::MeshData md;
+    md.vertices = cpuVerts;
+    md.indices = cpuIndices;
+    ComputeVertexNormals_Pos3(md.vertices, md.indices, md.posNorm);
+    auto split = SplitByCreaseAngle_Pos3(md.vertices, md.indices, 35.0f);
+    md.posNorm = std::move(split.posNorm);
+    md.indices = std::move(split.indices);
+    UploadMeshToGPU(md, in.body);
+
+    m_inserts.push_back(std::move(in));
+    ReanchorInsert(m_inserts.back());
 }
 
 void GLCanvas::ClearVentPoints()
@@ -2210,8 +2307,8 @@ bool GLCanvas::GenerateMould()
         return false;
     }
 
-    // Steps per fixture: 1 read + 1 transform + (1 per object subtract) + (1 per vent subtract) + (1 per runner subtract) + (1 per gate subtract) + (1 per ejector subtract) + 1 sprue + 1 tessellate + 1 upload
-    const int stepsPerFixture = 4 + (int)m_objects.size() + (int)m_vents.size() + (int)m_runners.size() + (int)m_gates.size() + (int)m_ejectors.size();
+    // Steps per fixture: 1 read + 1 transform + (1 per object subtract) + (1 per insert subtract) + (1 per vent subtract) + (1 per runner subtract) + (1 per gate subtract) + (1 per ejector subtract) + 1 sprue + 1 tessellate + 1 upload
+    const int stepsPerFixture = 4 + (int)m_objects.size() + (int)m_inserts.size() + (int)m_vents.size() + (int)m_runners.size() + (int)m_gates.size() + (int)m_ejectors.size();
     const int totalSteps = stepsPerFixture * (int)m_fixtures.size();
 
     wxProgressDialog progress(
@@ -2234,6 +2331,7 @@ bool GLCanvas::GenerateMould()
     m_lastShotShape = TopoDS_Shape();
     m_lastShotFaceIds.clear();
     m_lastHalfShapes.clear();
+    m_lastInsertMeshes.clear();
 
     SetCurrent(*m_context);
     InitGLOnce();
@@ -2326,6 +2424,47 @@ bool GLCanvas::GenerateMould()
             {
                 wxMessageBox("Boolean subtract failed for object " +
                     std::to_string(oi + 1),
+                    "Generate Mould", wxOK | wxICON_WARNING, this);
+                continue;
+            }
+            result = cut.Shape();
+        }
+
+        // Steps: subtract each insert (its body scaled up by the card's Cut
+        // scale, so the pocket carries clearance around the seated insert).
+        // Cut scale is read LIVE from the card here — like every other feature
+        // dimension (gate diameter, ejector length, ...) — NOT captured at
+        // placement, so setting the field and re-generating takes effect on the
+        // inserts already in the scene. One global field, so every insert cuts
+        // at the same scale.
+        // Each insert is cut independently, like the objects above; a cut that
+        // leaves a half untouched (an insert seated entirely within the other
+        // half) returns that half unchanged, so no per-half branching is
+        // needed. A genuinely failed boolean is warned and skipped rather than
+        // dropping the rest.
+        float insertCutScale = 1.0f;
+        if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+            insertCutScale = frame->GetInsertCutScale();
+
+        for (int ii = 0; ii < (int)m_inserts.size(); ++ii)
+        {
+            progress.Update(step++,
+                fixLabel + ": subtracting insert " +
+                std::to_string(ii + 1) + " of " +
+                std::to_string((int)m_inserts.size()) + "...");
+
+            const InsertFeature& in = m_inserts[ii];
+
+            TopoDS_Shape insertCut;
+            if (!BuildInsertCutSolid(in, insertCutScale, insertCut) || insertCut.IsNull())
+                continue;   // no usable BREP / degenerate scale — nothing to cut
+
+            BRepAlgoAPI_Cut cut(result, insertCut);
+            cut.Build();
+            if (!cut.IsDone() || cut.Shape().IsNull())
+            {
+                wxMessageBox("Boolean subtract failed for insert " +
+                    std::to_string(ii + 1),
                     "Generate Mould", wxOK | wxICON_WARNING, this);
                 continue;
             }
@@ -2869,6 +3008,25 @@ bool GLCanvas::GenerateMould()
         }
     }
 
+    // ---- Insert display bodies --------------------------------------------
+    // Tessellate each insert's UNSCALED world solid for the preview. This is
+    // the same geometry subtracted from the shot (BuildInsertCutSolid at 1.0),
+    // so the yellow bodies the user sees in Preview sit exactly in the voids
+    // they carve. Independent of fixtures — an insert is one world-space body —
+    // so built once here. A skipped insert (no BREP) simply contributes no
+    // preview body, matching its absence from the shot cut.
+    for (const InsertFeature& in : m_inserts)
+    {
+        TopoDS_Shape insertSolid;
+        if (!BuildInsertCutSolid(in, 1.0f, insertSolid) || insertSolid.IsNull())
+            continue;
+
+        FileImporter::MeshData mesh;
+        TessellateShapeToMesh(insertSolid, mesh, nullptr);
+        if (!mesh.posNorm.empty() && !mesh.indices.empty())
+            m_lastInsertMeshes.push_back(std::move(mesh));
+    }
+
     progress.Update(totalSteps, "Done.");
     Refresh(false);
     wxMessageBox("Mould generated successfully.",
@@ -3236,6 +3394,60 @@ void GLCanvas::RenderPreview(const glm::mat4& view, const glm::mat4& proj,
 // for now so this addition can't regress mould generation; a future pass could
 // factor the shared primitive builders out and have both call them.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// BuildInsertCutSolid — the world-space solid an insert removes.
+//
+//   local body (sourceShape)
+//     -> scaled about its LOCAL ORIGIN by `scalePct` (1.0 == exact body)
+//     -> placed by the insert's worldMatrix.
+//
+// Scaling about the local origin (not the body centroid) is deliberate: the
+// insert's local origin is what was aligned to the parent, so growing the cut
+// there keeps the enlarged pocket concentric with the seated insert instead of
+// drifting toward the mesh centroid. The mould cut passes the card's Cut scale
+// (>1 opens clearance); the shot cut passes exactly 1.0 so the void left in the
+// positive shot matches the true insert size.
+//
+// Returns false (leaving `out` untouched) when the insert has no usable BREP
+// or the scale/transform degenerates — the caller skips that insert.
+// ---------------------------------------------------------------------------
+bool GLCanvas::BuildInsertCutSolid(const InsertFeature& in, float scalePct,
+    TopoDS_Shape& out) const
+{
+    if (!in.body.hasSourceShape || in.body.sourceShape.IsNull())
+        return false;
+
+    TopoDS_Shape shape = in.body.sourceShape;
+
+    // Uniform scale about the local origin. Applied before the world placement
+    // so the scale centre is the insert's own origin, in local space.
+    if (std::abs(scalePct - 1.0f) > 1e-6f)
+    {
+        if (scalePct < 1e-4f) return false;   // degenerate — nothing to cut
+        gp_Trsf scaleT;
+        scaleT.SetScale(gp_Pnt(0.0, 0.0, 0.0), scalePct);
+        BRepBuilderAPI_Transform scaleX(shape, scaleT, true);
+        if (scaleX.Shape().IsNull()) return false;
+        shape = scaleX.Shape();
+    }
+
+    // Place into world space via the insert's resolved (rigid) matrix — the
+    // same transform it renders with, so the cut lands exactly where the body
+    // is drawn.
+    gp_Trsf worldT;
+    const glm::mat4& m = in.worldMatrix;
+    worldT.SetValues(
+        m[0][0], m[1][0], m[2][0], m[3][0],
+        m[0][1], m[1][1], m[2][1], m[3][1],
+        m[0][2], m[1][2], m[2][2], m[3][2]
+    );
+    BRepBuilderAPI_Transform worldX(shape, worldT, true);
+    if (worldX.Shape().IsNull()) return false;
+
+    out = worldX.Shape();
+    return true;
+}
+
 bool GLCanvas::BuildShotModel(TopoDS_Shape& out)
 {
     std::vector<TopoDS_Shape> shapes;
@@ -3466,6 +3678,29 @@ bool GLCanvas::BuildShotModel(TopoDS_Shape& out)
         if (fuse.IsDone() && !fuse.Shape().IsNull())
             acc = fuse.Shape();
         // else: keep acc, skip this piece.
+    }
+
+    if (acc.IsNull()) return false;
+
+    // ---- Subtract inserts (UNSCALED) --------------------------------------
+    // The shot is the positive body of injected plastic. An insert occupies
+    // space the plastic does NOT fill, so its true (100%) body is removed from
+    // the fused shot — this is what keeps the volume readout and any downstream
+    // simulation honest. Unscaled on purpose: the cut clearance (Cut scale) is
+    // a mould-cavity concern, not a plastic-volume one, so the void here is the
+    // real insert size, not the enlarged pocket. A failed cut drops that one
+    // insert rather than aborting the shot.
+    for (const InsertFeature& in : m_inserts)
+    {
+        TopoDS_Shape insertSolid;
+        if (!BuildInsertCutSolid(in, 1.0f, insertSolid) || insertSolid.IsNull())
+            continue;
+
+        BRepAlgoAPI_Cut cut(acc, insertSolid);
+        cut.Build();
+        if (cut.IsDone() && !cut.Shape().IsNull())
+            acc = cut.Shape();
+        // else: keep acc, skip this insert.
     }
 
     if (acc.IsNull()) return false;
@@ -4861,6 +5096,22 @@ void GLCanvas::ClearEjectors()
 }
 
 // ---------------------------------------------------------------------------
+// ClearInserts — drop every insert. The reason inserts got their own list:
+// with the bodies pooled into m_objects this would have to tell insert bodies
+// apart from cavity bodies, and getting that wrong deletes the user's part.
+// No ghost flag to reset and no VBO to rebuild — an insert draws straight from
+// its own mesh + worldMatrix.
+// ---------------------------------------------------------------------------
+void GLCanvas::ClearInserts()
+{
+    for (auto& in : m_inserts) in.Destroy();
+    m_inserts.clear();
+    Refresh(false);
+    NotifySceneMutated();
+    NotifyInsertsChanged();   // any open Edit dialog now has no target
+}
+
+// ---------------------------------------------------------------------------
 // BuildMouseRay — unprojects mouse coordinates into a world-space ray.
 // ---------------------------------------------------------------------------
 void GLCanvas::BuildMouseRay(int mouseX, int mouseY,
@@ -5042,6 +5293,132 @@ void GLCanvas::RemoveEjectorAtMouse(int mouseX, int mouseY)
     RebuildEjectorSolids();
     Refresh(false);
     NotifySceneMutated();
+}
+
+// ---------------------------------------------------------------------------
+// RemoveInsertAtMouse — removes the insert whose BODY the ray hits first.
+//
+// Every other Remove*AtMouse tests a small marker sphere, because every other
+// feature is represented by a point. An insert is a whole imported body, so
+// the natural target is the body itself: click anywhere on it and it goes.
+// Nearest hit wins, so a click through overlapping inserts takes the front
+// one, and an insert buried inside its parent can't be grabbed through the
+// parent's surface any more than the front one can be missed.
+//
+// The ray is transformed into each insert's LOCAL space instead of pushing
+// every vertex out to world space — one matrix inverse per insert versus one
+// transform per vertex per click. worldMatrix is rigid (no scale term — see
+// InsertFeature), so the transformed direction keeps its length and the `t`
+// values remain directly comparable across inserts.
+// ---------------------------------------------------------------------------
+// PickInsertAtMouse — index of the insert whose body the ray hits first, else
+// -1. Shared by Remove (delete it) and EditInsert (target the dialog at it).
+// The ray is cast into each insert's LOCAL space via inverse(worldMatrix); the
+// uniform scale in worldMatrix leaves the returned t directly comparable across
+// inserts (see InsertFeature), so nearest-hit-wins is correct.
+int GLCanvas::PickInsertAtMouse(int mouseX, int mouseY)
+{
+    if (m_inserts.empty()) return -1;
+
+    glm::vec3 rayOrig, rayDir;
+    BuildMouseRay(mouseX, mouseY, rayOrig, rayDir);
+
+    float bestT = std::numeric_limits<float>::max();
+    int   bestIdx = -1;
+
+    for (int i = 0; i < (int)m_inserts.size(); ++i)
+    {
+        const InsertFeature& in = m_inserts[i];
+        const std::vector<float>&    V = in.body.cpuVerts;
+        const std::vector<uint32_t>& I = in.body.cpuIndices;
+        if (V.empty() || I.size() < 3) continue;
+
+        const glm::mat4 invM = glm::inverse(in.worldMatrix);
+        const glm::vec3 localOrig = glm::vec3(invM * glm::vec4(rayOrig, 1.0f));
+        const glm::vec3 localDir = glm::vec3(invM * glm::vec4(rayDir, 0.0f));
+
+        for (size_t t = 0; t + 2 < I.size(); t += 3)
+        {
+            const uint32_t i0 = I[t], i1 = I[t + 1], i2 = I[t + 2];
+            if ((size_t)i0 * 3 + 2 >= V.size() ||
+                (size_t)i1 * 3 + 2 >= V.size() ||
+                (size_t)i2 * 3 + 2 >= V.size()) continue;
+
+            const glm::vec3 v0(V[i0 * 3 + 0], V[i0 * 3 + 1], V[i0 * 3 + 2]);
+            const glm::vec3 v1(V[i1 * 3 + 0], V[i1 * 3 + 1], V[i1 * 3 + 2]);
+            const glm::vec3 v2(V[i2 * 3 + 0], V[i2 * 3 + 1], V[i2 * 3 + 2]);
+
+            float localT = 0.0f;
+            if (!RayTriangle(localOrig, localDir, v0, v1, v2, localT)) continue;
+            if (localT < bestT) { bestT = localT; bestIdx = i; }
+        }
+    }
+
+    return bestIdx;
+}
+
+void GLCanvas::RemoveInsertAtMouse(int mouseX, int mouseY)
+{
+    const int bestIdx = PickInsertAtMouse(mouseX, mouseY);
+    if (bestIdx < 0) return;
+
+    m_inserts[bestIdx].Destroy();
+    m_inserts.erase(m_inserts.begin() + bestIdx);
+
+    Refresh(false);
+    NotifySceneMutated();
+    NotifyInsertsChanged();   // a dialog editing the removed insert must close
+}
+
+// ---- Insert id <-> index + transform-by-id --------------------------------
+int GLCanvas::InsertIndexFromId(int id) const
+{
+    for (int i = 0; i < (int)m_inserts.size(); ++i)
+        if (m_inserts[i].id == id) return i;
+    return -1;
+}
+
+int GLCanvas::InsertIdAtIndex(int index) const
+{
+    if (index < 0 || index >= (int)m_inserts.size()) return -1;
+    return m_inserts[index].id;
+}
+
+bool GLCanvas::GetInsertTransformById(int id, glm::vec3& offset,
+    glm::vec3& rotDeg, float& scale) const
+{
+    const int i = InsertIndexFromId(id);
+    if (i < 0) return false;
+    offset = m_inserts[i].localOffset;
+    rotDeg = m_inserts[i].localRotDeg;
+    scale  = m_inserts[i].localScale;
+    return true;
+}
+
+bool GLCanvas::SetInsertTransformById(int id, const glm::vec3& offset,
+    const glm::vec3& rotDeg, float scale)
+{
+    const int i = InsertIndexFromId(id);
+    if (i < 0) return false;
+    m_inserts[i].localOffset = offset;
+    m_inserts[i].localRotDeg = rotDeg;
+    // Clamp to a small positive scale: 0 or negative would collapse/mirror the
+    // body and break the gp_Trsf-based cut. The dialog's spin range guards the
+    // UI; this guards the model.
+    m_inserts[i].localScale  = (scale > 1e-4f) ? scale : 1e-4f;
+    ReanchorInsert(m_inserts[i]);
+    Refresh(false);
+    NotifySceneMutated();
+    return true;
+}
+
+// NotifyInsertsChanged — after a structural change, ask the frame to close the
+// Edit dialog if its target insert is gone. dynamic_cast mirrors the pattern
+// PlaceInsert already uses to reach the frame from the canvas.
+void GLCanvas::NotifyInsertsChanged()
+{
+    if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+        frame->ValidateInsertEditor();
 }
 
 // ---------------------------------------------------------------------------
@@ -7001,6 +7378,8 @@ void GLCanvas::DestroyGL()
     m_runners.clear();
     for (auto& gf : m_gates) gf.Destroy();
     m_gates.clear();
+    for (auto& in : m_inserts) in.Destroy();
+    m_inserts.clear();
     m_sprue.DestroyGL();
 
     if (m_outlineProgram) { glDeleteProgram(m_outlineProgram);        m_outlineProgram = 0; }
@@ -7164,9 +7543,19 @@ void GLCanvas::ExportFixtures(const std::string& pathA, const std::string& pathB
 }
 
 // ---------------------------------------------------------------------------
-// Import — appends a new SceneObject (STEP / STL / OBJ)
+// ImportBodyInto — the shared import pipeline, factored out of ImportFile so
+// inserts can reuse it verbatim rather than growing a third near-copy of it.
+// Parses via FileImporter, computes vertex normals, splits by crease angle,
+// caches the BREP shape, and uploads to the GPU — all into `out`, which is the
+// only thing that differs between an imported object and an imported insert.
+//
+// `out` is left untouched on failure, so callers can import into a local
+// SceneObject and only commit it to a list once this returns true. (That also
+// keeps a half-built body out of m_objects while the modal progress dialog is
+// pumping paints.)
 // ---------------------------------------------------------------------------
-void GLCanvas::ImportFile(const std::string& path)
+bool GLCanvas::ImportBodyInto(const std::string& path, SceneObject& out,
+    const wxString& title)
 {
     SetCurrent(*m_context);
     InitGLOnce();
@@ -7187,7 +7576,7 @@ void GLCanvas::ImportFile(const std::string& path)
         : "Reading STEP file...";
 
     wxProgressDialog progress(
-        "Importing File",
+        title,
         firstMsg,
         5,
         nullptr,
@@ -7202,7 +7591,7 @@ void GLCanvas::ImportFile(const std::string& path)
 
     if (!res.ok()) {
         wxMessageBox(res.error, "Import failed", wxOK | wxICON_ERROR, this);
-        return;
+        return false;
     }
 
     progress.Update(step++, "Computing vertex normals...");
@@ -7223,15 +7612,14 @@ void GLCanvas::ImportFile(const std::string& path)
     res.meshes[0].indices = std::move(split.indices);
 
     progress.Update(step++, "Uploading to GPU...");
-    m_objects.emplace_back();
-    m_objects.back().sourcePath = path;
-    m_objects.back().cpuVerts = std::move(cpuVerts);
-    m_objects.back().cpuIndices = std::move(cpuIndices);
+    out.sourcePath = path;
+    out.cpuVerts = std::move(cpuVerts);
+    out.cpuIndices = std::move(cpuIndices);
     if (res.hasShape) {
-        m_objects.back().sourceShape = res.shape;
-        m_objects.back().hasSourceShape = true;
+        out.sourceShape = res.shape;
+        out.hasSourceShape = true;
     }
-    UploadMeshToGPU(res.meshes[0], m_objects.back());
+    UploadMeshToGPU(res.meshes[0], out);
 
     progress.Update(step++, "Done.");
 
@@ -7246,7 +7634,106 @@ void GLCanvas::ImportFile(const std::string& path)
             "Non-manifold mesh", wxOK | wxICON_WARNING, this);
     }
 
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Import — appends a new SceneObject (STEP / STL / OBJ)
+// ---------------------------------------------------------------------------
+void GLCanvas::ImportFile(const std::string& path)
+{
+    // Build into a local first so a failed import doesn't leave an empty
+    // SceneObject in the list. SceneObject has no destructor and GPUMesh
+    // frees only via an explicit Destroy(), so moving it into the vector
+    // hands the GL handles over intact.
+    SceneObject obj;
+    if (!ImportBodyInto(path, obj, "Importing File"))
+        return;
+
+    m_objects.push_back(std::move(obj));
     Refresh(false);
+}
+
+// ---------------------------------------------------------------------------
+// PlaceInsertOnObject — import `path` and attach it to m_objects[parentIdx].
+//
+// The new insert's local origin lands ON the parent's origin: localOffset and
+// localRotDeg are both zero, so ReanchorInsert resolves worldMatrix to the
+// parent's own rotation + translation. Whatever the imported body's origin
+// meant in its source file is where it sits relative to the parent — which is
+// the intended authoring workflow (model the insert in place, in the part's
+// coordinate frame, and it arrives already positioned).
+// ---------------------------------------------------------------------------
+bool GLCanvas::PlaceInsertOnObject(int parentIdx, const std::string& path)
+{
+    if (parentIdx < 0 || parentIdx >= (int)m_objects.size())
+        return false;
+
+    InsertFeature in;
+    if (!ImportBodyInto(path, in.body, "Importing Insert"))
+        return false;
+
+    in.parentIndex = parentIdx;
+    in.localOffset = glm::vec3(0.0f);
+    in.localRotDeg = glm::vec3(0.0f);
+    in.localScale = 1.0f;   // aligned to parent origin, true size — the Edit dialog changes this
+    in.id = m_nextInsertId++;
+    // Cut scale is NOT captured here — it's a single global card value read
+    // live at Generate Mould time (like every other feature dimension), so a
+    // later change to the field applies to inserts already placed.
+
+    m_inserts.push_back(std::move(in));
+    ReanchorInsert(m_inserts.back());
+
+    Refresh(false);
+    NotifySceneMutated();
+    NotifyInsertsChanged();
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// ReanchorInsert — resolve worldMatrix from the parent's current pose.
+//
+//   T(parent.pos) * R(parent yaw/pitch/roll) * T(localOffset) * R(localRotDeg)
+//
+// Composed by hand rather than reusing parent.BuildModelMatrix() precisely so
+// the parent's scale and mirrorX / mirrorZ terms never enter the product: an
+// insert keeps its true size and handedness no matter what its parent was
+// scaled or mirrored to. Rotation order matches BuildModelMatrix (T * RY * RX
+// * RZ) at both levels so a parent's rotation and an insert's local rotation
+// read the same way.
+// ---------------------------------------------------------------------------
+void GLCanvas::ReanchorInsert(InsertFeature& in)
+{
+    if (in.parentIndex < 0 || in.parentIndex >= (int)m_objects.size())
+        return;
+
+    const SceneObject& parent = m_objects[in.parentIndex];
+
+    glm::mat4 m = glm::translate(glm::mat4(1.0f), parent.pos);
+    m = glm::rotate(m, glm::radians(parent.yawDeg), glm::vec3(0, 1, 0));
+    m = glm::rotate(m, glm::radians(parent.pitchDeg), glm::vec3(1, 0, 0));
+    m = glm::rotate(m, glm::radians(parent.rollDeg), glm::vec3(0, 0, 1));
+
+    m = glm::translate(m, in.localOffset);
+    m = glm::rotate(m, glm::radians(in.localRotDeg.y), glm::vec3(0, 1, 0));
+    m = glm::rotate(m, glm::radians(in.localRotDeg.x), glm::vec3(1, 0, 0));
+    m = glm::rotate(m, glm::radians(in.localRotDeg.z), glm::vec3(0, 0, 1));
+
+    // Uniform scale last (innermost), about the local origin. Kept uniform so
+    // worldMatrix stays gp_Trsf-representable for the OCC cut, and so the cut
+    // scale (BuildInsertCutSolid) and this edit scale simply multiply.
+    m = glm::scale(m, glm::vec3(in.localScale));
+
+    in.worldMatrix = m;
+}
+
+int GLCanvas::GetSingleSelectedObject() const
+{
+    if (m_selectedIndices.size() != 1) return -1;
+    const int idx = m_selectedIndices[0];
+    if (idx < 0 || idx >= (int)m_objects.size()) return -1;
+    return idx;
 }
 
 void GLCanvas::ImportFileAsFixture(const std::string& path,
@@ -7433,6 +7920,36 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         glBindVertexArray(obj.mesh.vao);
         glDrawElements(GL_TRIANGLES, obj.mesh.indexCount, GL_UNSIGNED_INT, 0);
         glBindVertexArray(0);
+    }
+
+    // ---- Draw inserts ------------------------------------------------------
+    // Same lit program as the objects above, but in a warmer base colour so an
+    // insert reads as hardware sitting in the part rather than as another body
+    // that will be subtracted. Pose comes from the pre-resolved worldMatrix,
+    // never body.BuildModelMatrix() — see InsertFeature. uBaseColor is restored
+    // afterwards because later passes in this frame share m_program.
+    //
+    // Note what's absent: inserts are NOT drawn into the picking FBO
+    // (PickObjectAt / RenderPickPass_NoRead), which is what keeps the model
+    // tools from grabbing one.
+    if (!m_inserts.empty())
+    {
+        const glm::vec3 insertColor(0.82f, 0.62f, 0.28f);
+        glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &insertColor[0]);
+
+        for (const InsertFeature& in : m_inserts)
+        {
+            if (in.body.mesh.vao == 0 || in.body.mesh.indexCount == 0) continue;
+
+            glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE,
+                &in.worldMatrix[0][0]);
+
+            glBindVertexArray(in.body.mesh.vao);
+            glDrawElements(GL_TRIANGLES, in.body.mesh.indexCount, GL_UNSIGNED_INT, 0);
+            glBindVertexArray(0);
+        }
+
+        glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &baseColor[0]);
     }
 
     // ---- AlignFace hover highlight -----------------------------------------
@@ -9355,6 +9872,44 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
             const wxPoint p = evt.GetPosition();
             RemoveEjectorAtMouse(p.x, p.y);
         }
+        else if (m_transformMode == TransformMode::PlaceInsert)
+        {
+            // Parent pick. PickObjectAt uses the ID framebuffer, which only
+            // ever draws m_objects — so an existing insert can't be picked as
+            // a parent, and a click on empty space or a fixture is a clean
+            // miss that leaves the mode armed for another try.
+            const wxPoint p = evt.GetPosition();
+            const int parentIdx = PickObjectAt(p.x, p.y);
+            if (parentIdx >= 0)
+            {
+                // The frame owns the file dialog and the card fields; it
+                // calls back into PlaceInsertOnObject and returns us to
+                // Select. Nothing after this line may touch member state —
+                // the callback runs a modal dialog and re-enters the canvas.
+                if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+                    frame->PlaceInsertOnParent(parentIdx);
+            }
+        }
+        else if (m_transformMode == TransformMode::RemoveInsert)
+        {
+            const wxPoint p = evt.GetPosition();
+            RemoveInsertAtMouse(p.x, p.y);
+        }
+        else if (m_transformMode == TransformMode::EditInsert)
+        {
+            // Pick an insert body; hand its stable id to the frame, which owns
+            // the modeless Edit dialog (create-or-retarget). A miss does
+            // nothing, so the mode stays armed for another click. Clicking a
+            // different insert while the dialog is open just retargets it.
+            const wxPoint p = evt.GetPosition();
+            const int idx = PickInsertAtMouse(p.x, p.y);
+            if (idx >= 0)
+            {
+                const int id = InsertIdAtIndex(idx);
+                if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+                    frame->OpenInsertEditor(id);
+            }
+        }
         else if (m_transformMode == TransformMode::AlignFace)
         {
             // Click commits whatever face is currently highlighted under the
@@ -9967,6 +10522,22 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
             m_camera.Orbit(dx, dy);
         Refresh(false);
     }
+    else if (m_lmb && (m_transformMode == TransformMode::PlaceInsert ||
+        m_transformMode == TransformMode::RemoveInsert ||
+        m_transformMode == TransformMode::EditInsert))
+    {
+        // Orbit while holding LMB in the insert modes. A click picks (a parent,
+        // or the insert to edit/remove); a drag navigates. This is what lets
+        // the user orbit the scene while the modeless Edit Insert dialog is up —
+        // the dialog stays open, only the camera moves.
+        if (shift)
+            m_camera.Pan(dx, -dy);
+        else if (ctrl)
+            m_camera.Dolly(dy * 0.05f);
+        else
+            m_camera.Orbit(dx, dy);
+        Refresh(false);
+    }
     else if (m_lmb && (m_transformMode == TransformMode::EditVent ||
         m_transformMode == TransformMode::EditRunner ||
         m_transformMode == TransformMode::EditGate ||
@@ -10238,8 +10809,18 @@ void GLCanvas::OnKeyDown(wxKeyEvent& evt)
                 if (gf.parentIndex == idx) { gf.Destroy(); return true; }
                 return false;
             }), m_gates.end());
+            // Inserts follow the same rule: an insert exists only relative to
+            // its parent, so deleting the parent deletes the insert. There is
+            // no unparented fallback to demote it to.
+            m_inserts.erase(std::remove_if(m_inserts.begin(), m_inserts.end(),
+                [idx](InsertFeature& in) {
+                if (in.parentIndex == idx) { in.Destroy(); return true; }
+                return false;
+            }), m_inserts.end());
             for (auto& vi : m_vents) if (vi.parentIndex > idx) --vi.parentIndex;
             for (auto& gf : m_gates) if (gf.parentIndex > idx) --gf.parentIndex;
+            for (auto& in : m_inserts) if (in.parentIndex > idx) --in.parentIndex;
+            NotifyInsertsChanged();   // close the Edit dialog if its insert was parent-deleted
 
             m_objects[idx].mesh.Destroy();
             m_objects.erase(m_objects.begin() + idx);
@@ -10593,6 +11174,11 @@ void GLCanvas::ClearAll()
     for (auto& ef : m_ejectors) ef.Destroy();
     m_ejectors.clear();
 
+    // Inserts
+    for (auto& in : m_inserts) in.Destroy();
+    m_inserts.clear();
+    NotifyInsertsChanged();
+
     // Sprue
     m_sprue.Clear();
     m_sprue.DestroyGL();
@@ -10637,6 +11223,33 @@ void GLCanvas::RestoreObject(const std::string& path, const glm::vec3& pos,
         obj.mirrorX = mirrorX;
         obj.mirrorZ = mirrorZ;
     }
+}
+
+// ---------------------------------------------------------------------------
+// RestoreInsert — re-create one insert from saved project data. Mirrors
+// PlaceInsertOnObject (re-import + parent + reanchor) but takes the local
+// transform verbatim instead of defaulting to origin-aligned, and skips the
+// interactive side effects (no Refresh / NotifySceneMutated / editor-validate);
+// the load flow refreshes once when it finishes.
+// ---------------------------------------------------------------------------
+void GLCanvas::RestoreInsert(const std::string& path, int parentIndex,
+    const glm::vec3& localOffset, const glm::vec3& localRotDeg, float localScale)
+{
+    if (parentIndex < 0 || parentIndex >= (int)m_objects.size())
+        return;   // parent object didn't restore — drop the orphaned insert
+
+    InsertFeature in;
+    if (!ImportBodyInto(path, in.body, "Loading Insert"))
+        return;   // body file missing / failed to import — skip this insert
+
+    in.parentIndex = parentIndex;
+    in.localOffset = localOffset;
+    in.localRotDeg = localRotDeg;
+    in.localScale  = (localScale > 1e-4f) ? localScale : 1e-4f;   // guard, matches SetInsertTransformById
+    in.id = m_nextInsertId++;
+
+    m_inserts.push_back(std::move(in));
+    ReanchorInsert(m_inserts.back());
 }
 
 void GLCanvas::RestoreSprue(const ProjectSprueData& data)
@@ -11000,6 +11613,15 @@ void GLCanvas::ReanchorFeaturesForObjects(const std::vector<int>& objIndices)
         ReanchorGate(gf);
         touchedGate = true;
     }
+    // Inserts need no touched* flag / VBO rebuild: ReanchorInsert writes the
+    // world transform an insert draws with directly, so re-resolving it is the
+    // whole update.
+    for (auto& in : m_inserts)
+    {
+        if (in.parentIndex < 0) continue;
+        if (affected.find(in.parentIndex) == affected.end()) continue;
+        ReanchorInsert(in);
+    }
 
     if (touchedVent)
     {
@@ -11026,5 +11648,6 @@ void GLCanvas::RebuildAllFeatures()
     RebuildGatePathVBO();
     RebuildGateSolids();
     RebuildEjectorSolids();
+    for (auto& in : m_inserts) ReanchorInsert(in);
     Refresh(false);
 }

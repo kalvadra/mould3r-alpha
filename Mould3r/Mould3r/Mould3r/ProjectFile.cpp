@@ -95,7 +95,7 @@ bool ProjectFile::Save(const std::string& path,
     // tolerant (presence of pathKind/node lines drives it, not the version
     // number), so older readers ignore the new lines and older files load as
     // simple — the version is informational.
-    file << "version = 5\n";
+    file << "version = 6\n";
     if (!data.fixturePath.empty())
         file << "fixture = " << MakeRelative(data.fixturePath, baseDir) << "\n";
 
@@ -298,6 +298,26 @@ bool ProjectFile::Save(const std::string& path,
         file << "posZ = " << ej.point.z << "\n";
     }
 
+    // -- [insert.N] ----------------------------------------------------------
+    // An imported body parented to object[parentIndex], with a local offset,
+    // rotation and uniform scale. The body is re-imported from `path` on load,
+    // exactly like [object.N]. Unknown to older parsers, which skip it via the
+    // Section::None fallback.
+    for (int i = 0; i < (int)data.inserts.size(); ++i)
+    {
+        const auto& in = data.inserts[i];
+        file << "\n[insert." << i << "]\n";
+        file << "path   = " << MakeRelative(in.sourcePath, baseDir) << "\n";
+        file << "parent = " << in.parentIndex << "\n";
+        file << "offX   = " << in.localOffset.x << "\n";
+        file << "offY   = " << in.localOffset.y << "\n";
+        file << "offZ   = " << in.localOffset.z << "\n";
+        file << "rotX   = " << in.localRotDeg.x << "\n";
+        file << "rotY   = " << in.localRotDeg.y << "\n";
+        file << "rotZ   = " << in.localRotDeg.z << "\n";
+        file << "scale  = " << in.localScale << "\n";
+    }
+
     return true;
 }
 
@@ -320,7 +340,8 @@ bool ProjectFile::Load(const std::string& path,
 
     // Section tracking
     enum class Section {
-        None, Project, Parameters, Object, Sprue, Runner, Gate, Vent, Ejector
+        None, Project, Parameters, Object, Sprue, Runner, Gate, Vent, Ejector,
+        Insert
     };
     Section currentSection = Section::None;
 
@@ -330,6 +351,7 @@ bool ProjectFile::Load(const std::string& path,
     ProjectGateData    pendingGate;    bool hasGate = false;
     ProjectVentData    pendingVent;    bool hasVent = false;
     ProjectEjectorData pendingEjector; bool hasEjector = false;
+    ProjectInsertData  pendingInsert;  bool hasInsert = false;
 
     auto commitPending = [&]()
         {
@@ -338,6 +360,7 @@ bool ProjectFile::Load(const std::string& path,
             if (hasGate) { out.gates.push_back(pendingGate);       pendingGate = {};    hasGate = false; }
             if (hasVent) { out.vents.push_back(pendingVent);       pendingVent = {};    hasVent = false; }
             if (hasEjector) { out.ejectors.push_back(pendingEjector); pendingEjector = {}; hasEjector = false; }
+            if (hasInsert) { out.inserts.push_back(pendingInsert);   pendingInsert = {};  hasInsert = false; }
         };
 
     std::string line;
@@ -361,6 +384,7 @@ bool ProjectFile::Load(const std::string& path,
             else if (sec.rfind("gate.", 0) == 0) { currentSection = Section::Gate;   hasGate = true; }
             else if (sec.rfind("vent.", 0) == 0) { currentSection = Section::Vent;   hasVent = true; }
             else if (sec.rfind("ejector.", 0) == 0) { currentSection = Section::Ejector; hasEjector = true; }
+            else if (sec.rfind("insert.", 0) == 0) { currentSection = Section::Insert; hasInsert = true; }
             else                                       currentSection = Section::None;
 
             continue;
@@ -550,6 +574,18 @@ bool ProjectFile::Load(const std::string& path,
             if (key == "posX")    pendingEjector.point.x = ParseFloat(val, 0.0f);
             else if (key == "posY") pendingEjector.point.y = ParseFloat(val, 0.0f);
             else if (key == "posZ") pendingEjector.point.z = ParseFloat(val, 0.0f);
+            break;
+
+        case Section::Insert:
+            if (key == "path")       pendingInsert.sourcePath = ResolveRelative(val, baseDir);
+            else if (key == "parent") pendingInsert.parentIndex = ParseInt(val, -1);
+            else if (key == "offX")   pendingInsert.localOffset.x = ParseFloat(val, 0.0f);
+            else if (key == "offY")   pendingInsert.localOffset.y = ParseFloat(val, 0.0f);
+            else if (key == "offZ")   pendingInsert.localOffset.z = ParseFloat(val, 0.0f);
+            else if (key == "rotX")   pendingInsert.localRotDeg.x = ParseFloat(val, 0.0f);
+            else if (key == "rotY")   pendingInsert.localRotDeg.y = ParseFloat(val, 0.0f);
+            else if (key == "rotZ")   pendingInsert.localRotDeg.z = ParseFloat(val, 0.0f);
+            else if (key == "scale")  pendingInsert.localScale = ParseFloat(val, 1.0f);
             break;
 
         default:

@@ -56,7 +56,8 @@ public:
     // and, when its mesh is present, gets its own show/hide toggle, renders in a
     // distinct colour, and is analysable by the design checks.
     void SetData(const std::vector<FileImporter::MeshData>& halves,
-        const ShotPreviewInput& shot = {});
+        const ShotPreviewInput& shot = {},
+        const std::vector<FileImporter::MeshData>& inserts = {});
 
     // Drop all loaded parts and reset the panel to its empty (grid-only) state.
     void ClearData();
@@ -78,7 +79,7 @@ private:
     // then a "Shot" checkbox when a shot model is present, into m_visPanel (in
     // the left column, above the Simulations section). Re-runnable: call
     // ClearVisibilityChecks first to drop the previous set.
-    void BuildVisibilityChecks(int halfCount, bool hasShot);
+    void BuildVisibilityChecks(int halfCount, bool hasShot, int insertCount);
     void ClearVisibilityChecks();
 
     // Left panel: a list of runnable simulations, each with its own Start
@@ -167,6 +168,18 @@ private:
     wxPanel* m_visPanel = nullptr;
     wxStaticText* m_visEmptyLabel = nullptr;
     std::vector<wxCheckBox*> m_halfChecks;
+
+    // Insert preview bodies. Unlike halves and the shot, ALL inserts share a
+    // SINGLE show/hide checkbox (m_insertCheck) rather than one each — the user
+    // treats "the inserts" as one category. m_pendingInserts stages the meshes
+    // until the panel is visible (same deferral as m_pendingHalves);
+    // [m_insertFirstIndex, m_insertFirstIndex + m_insertCount) is the contiguous
+    // block of preview-part indices they occupy once loaded, so the one checkbox
+    // can drive the whole range.
+    std::vector<FileImporter::MeshData> m_pendingInserts;
+    wxCheckBox* m_insertCheck = nullptr;
+    int m_insertFirstIndex = -1;
+    int m_insertCount = 0;
 
     // Design-check parameter fields (left panel) and the verdict read-outs
     // (right panel). Plain text fields styled like the mould-feature inputs:
