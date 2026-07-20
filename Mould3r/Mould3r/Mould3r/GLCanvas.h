@@ -150,20 +150,22 @@ struct InsertFeature
     int       parentIndex = -1;
     glm::vec3 localOffset{ 0.0f };   // parent-space offset (mm)
     glm::vec3 localRotDeg{ 0.0f };   // parent-space rotation (deg), YXZ order
+    float     localScale = 1.0f;     // UNIFORM scale, authored in the Edit dialog
 
-    // "Cut scale" from the Inserts card, as a multiplier (1.0 == 100%),
-    // captured at placement time — the same convention every other feature
-    // uses for its dimension fields, so editing the field affects the next
-    // insert placed rather than retroactively resizing existing ones.
-    // How much the body is scaled up when it cuts its own pocket during
-    // Generate Mould: >1 opens clearance around the insert, 1.0 is a nominal
-    // fit. NOT YET CONSUMED — GenerateMould does not subtract inserts.
-    float     cutScalePct = 1.0f;
+    // Stable identity, assigned once at placement / clone from m_nextInsertId and
+    // never reused. The Edit dialog references an insert by id, not index, so it
+    // survives the index shifts a remove causes; a lookup miss means the insert
+    // is gone and the dialog closes. -1 only on a half-built instance.
+    int       id = -1;
 
     // Resolved world transform, rebuilt by GLCanvas::ReanchorInsert:
-    //   T(parent.pos) * R(parent yaw/pitch/roll) * T(localOffset) * R(localRotDeg)
-    // Rigid (no scale term), which is what lets RemoveInsertAtMouse compare
-    // ray parameters straight across inserts without renormalising.
+    //   T(parent.pos)*R(parent yaw/pitch/roll)*T(localOffset)*R(localRotDeg)*S(localScale)
+    // Rotation + UNIFORM scale + translation only — no parent scale/mirror, and
+    // localScale is uniform, so this stays representable as a gp_Trsf for the OCC
+    // cut (gp_Trsf can't hold a non-uniform scale). The uniform scale is also why
+    // RemoveInsertAtMouse can still compare ray parameters across inserts: for a
+    // world ray dir D, M*(inv(M)*D)==D, so the hit t is world-space t regardless
+    // of the scale baked into M.
     glm::mat4 worldMatrix{ 1.0f };
 
     void Destroy() { body.mesh.Destroy(); }
@@ -580,6 +582,28 @@ public:
     // guessing which member to parent to.
     int  GetSingleSelectedObject() const;
 
+    // ---- Insert editing (used by the modeless Edit-Insert dialog) ----------
+    // Pick the insert whose body the mouse ray hits first, or -1 on a miss.
+    // Same hit-test as RemoveInsertAtMouse (which now shares it); EditInsert
+    // mode uses it to choose which insert the dialog targets. Non-const because
+    // BuildMouseRay (shared with every other picker) is non-const.
+    int  PickInsertAtMouse(int mouseX, int mouseY);
+
+    // id <-> index resolution. Index is only valid until the next structural
+    // change to m_inserts; id is stable, so the dialog holds the id.
+    int  InsertIndexFromId(int id) const;
+    int  InsertIdAtIndex(int index) const;
+
+    // Read / write one insert's local transform by id. Get returns false (and
+    // leaves the outs untouched) when the id is gone — the dialog treats that
+    // as "target removed" and closes. Set reanchors, redraws and marks the
+    // scene mutated; scale is clamped to a small positive minimum so a zero or
+    // negative value can't produce a degenerate matrix.
+    bool GetInsertTransformById(int id, glm::vec3& offset, glm::vec3& rotDeg,
+        float& scale) const;
+    bool SetInsertTransformById(int id, const glm::vec3& offset,
+        const glm::vec3& rotDeg, float scale);
+
     // Remove individual features by clicking their marker
     void RemoveVentAtMouse(int mouseX, int mouseY);
     void RemoveRunnerAtMouse(int mouseX, int mouseY);
@@ -605,6 +629,15 @@ public:
     void RestoreObject(const std::string& path, const glm::vec3& pos,
         float yaw, float pitch, float roll, float scale,
         bool mirrorX, bool mirrorZ);
+
+    // Restore an insert during project load: re-import the body from `path`
+    // (like RestoreObject) and parent it to object[parentIndex] with the saved
+    // local transform. Skips silently if the parent index is out of range (its
+    // object failed to restore) or the body import fails. Does not mark the
+    // scene mutated — this is load, not an edit.
+    void RestoreInsert(const std::string& path, int parentIndex,
+        const glm::vec3& localOffset, const glm::vec3& localRotDeg,
+        float localScale);
 
     void RestoreSprue(const ProjectSprueData& data);
 
@@ -739,11 +772,16 @@ private:
     // patterns identically to a placed one.
     void CloneInsertOnto(int cloneIdx,
         const glm::vec3& localOffset, const glm::vec3& localRotDeg,
-        float cutScalePct,
+        float localScale,
         const std::vector<float>& cpuVerts,
         const std::vector<uint32_t>& cpuIndices,
         const TopoDS_Shape& sourceShape, bool hasSourceShape,
         const std::string& sourcePath);
+
+    // Fire the frame's insert-editor validator after a STRUCTURAL change to
+    // m_inserts (add/remove/clear) so a dialog whose target vanished closes.
+    // No-op when no frame / no dialog. Transform-only edits don't call this.
+    void NotifyInsertsChanged();
 
     void EnsurePickFBO(int w, int h);
     void DestroyPickFBO();
@@ -1229,6 +1267,11 @@ private:
     // InsertFeature. No ghost-preview flag: placement is parent-pick +
     // file dialog, not a cursor-tracked drop, so there is nothing to ghost.
     std::vector<InsertFeature>  m_inserts;
+
+    // Monotonic source of InsertFeature::id. Never decremented, so ids are
+    // never reused within a session and a stale dialog reference resolves to
+    // "gone" rather than silently retargeting a different insert.
+    int                         m_nextInsertId = 0;
 
     // Ghost preview for ejector placement (follows mouse in PlaceEjector mode).
     // No normal field — see EjectorFeature comment in MouldFeature.h.

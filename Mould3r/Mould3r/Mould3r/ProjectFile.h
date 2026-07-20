@@ -123,6 +123,22 @@ struct ProjectEjectorData
     glm::vec3 point{ 0.0f };
 };
 
+// An imported insert body parented to a scene object (v6+). Stored as its
+// source path (re-imported on load, like an object) plus the local transform
+// relative to the parent: offset, rotation (deg, YXZ), and a UNIFORM scale.
+// parentIndex indexes ProjectData::objects; an insert whose parent didn't
+// restore is skipped on load. id and the resolved world matrix are runtime
+// state, rebuilt on load, so they aren't stored. Cut scale is a global card
+// parameter (ProjectParameters-style), not per-insert, so it isn't here either.
+struct ProjectInsertData
+{
+    std::string sourcePath;
+    int         parentIndex = -1;
+    glm::vec3   localOffset{ 0.0f };
+    glm::vec3   localRotDeg{ 0.0f };
+    float       localScale = 1.0f;
+};
+
 struct ProjectParameters
 {
     float ventWidth = 2.0f;
@@ -161,6 +177,7 @@ struct ProjectData
     std::vector<ProjectGateData>    gates;
     std::vector<ProjectVentData>    vents;
     std::vector<ProjectEjectorData> ejectors;
+    std::vector<ProjectInsertData>  inserts;
 };
 
 // ---------------------------------------------------------------------------

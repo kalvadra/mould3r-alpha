@@ -19,6 +19,9 @@
 class GLCanvas;
 class RoundedButton;   // forward decl — m_btnExport pointer below; full def
 // is included from MainFrame.cpp where it's used.
+class InsertEditDialog;  // forward decl — modeless insert-transform editor,
+                         // defined entirely in MainFrame.cpp (no header /
+                         // .vcxproj entry needed since only the frame uses it)
 class PreviewPanel;    // forward decl — m_previewPanel pointer; full def
 // is included from MainFrame.cpp where the panel is created.
 class wxSimplebook;    // forward decl — m_book pointer; the perspective pager.
@@ -96,6 +99,23 @@ public:
     // parent pick happens on the GL surface, but the file dialog and the
     // side-panel field reads belong to the frame.
     void PlaceInsertOnParent(int parentIdx);
+
+    // Insert Edit dialog lifecycle. OpenInsertEditor is called by the canvas
+    // when an insert is picked in EditInsert mode — it creates the modeless
+    // dialog or retargets the existing one at `insertId`. ValidateInsertEditor
+    // is called by the canvas after a structural insert change: it closes the
+    // dialog if its target insert is gone, else refreshes its fields.
+    // OnInsertEditorClosed is called by the dialog as it closes so the frame
+    // drops its pointer.
+    void OpenInsertEditor(int insertId);
+    void ValidateInsertEditor();
+    void OnInsertEditorClosed();
+
+    // Destroys the modeless editor if open (used by ~MainFrame). Defined after
+    // the InsertEditDialog class body in the .cpp — ~MainFrame precedes that
+    // class, where the type is still incomplete, so the destroy can't be inlined
+    // into the destructor.
+    void DestroyInsertEditor();
 
     // Project save/load support
     const FixtureDefinition& GetFixtureDefinition() const { return m_fixtureDef; }
@@ -285,6 +305,12 @@ private:
     // rows. Read at placement time and captured onto the InsertFeature, the
     // same convention the dimension fields use for every other feature.
     wxTextCtrl* m_insertCutScale = nullptr;
+
+    // The modeless insert-transform editor, or null when closed. Owned by
+    // wxWidgets (parented to this frame); ~MainFrame destroys it explicitly so
+    // it can't outlive the frame or fire a close-notify into a half-destroyed
+    // frame.
+    InsertEditDialog* m_insertEditDialog = nullptr;
 
     // Creates the top ribbon panel
     wxPanel* CreateRibbon(wxWindow* parent);
