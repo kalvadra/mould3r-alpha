@@ -3826,7 +3826,7 @@ wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
         static const wxString kIconRotate = "res/icons/rotate-2.svg";
         static const wxString kIconScale = "res/icons/resize.svg";
         static const wxString kIconPattern = "res/icons/pattern.svg";
-        static const wxString kIconPrecisionPlace = "";
+        static const wxString kIconPrecisionPlace = "res/icons/precision-place.svg";
         static const wxString kIconCenter = "res/icons/focus-centered.svg";
         static const wxString kIconAlignFace = "res/icons/align-face.svg";
         static const wxString kIconAlignMidplane = "res/icons/align-midplane.svg";
@@ -4043,23 +4043,16 @@ wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
 
         // Row 2 — Center / Pattern in halves. Center is the only non-toggle
         // (one-shot action); the rest of the model tools are modal toggles.
-        auto* toolsRow2 = new wxGridSizer(1, 2, 0, 4);
-        toolsRow2->Add(makeToolBtn(ID_ToolCenter, "Center", false, kIconCenter), 0, wxEXPAND);
-        toolsRow2->Add(makeToolBtn(ID_ToolPattern, "Pattern", true, kIconPattern), 0, wxEXPAND);
-        toolsSizer->Add(toolsRow2, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
-        toolsSizer->AddSpacer(4);
-
-        // Row 3 — Precision Place on its own full-width row. The label is too
-        // long to share a half/third with another tool, and it reads as a
-        // distinct "type an exact XZ target" action rather than a modal grab.
+        // Precision Place name reduced to "Place" for placement on row 2 for ui purposes.
         // Built toggle-style like the other transform dialogs so it gets the
         // same press feedback; OnToolPrecisionPlace clears the toggle as soon
         // as the dialog opens.
-        auto* toolsRow3 = new wxGridSizer(1, 1, 0, 4);
-        toolsRow3->Add(makeToolBtn(ID_ToolPrecisionPlace, "Precision Place", true), 0, wxEXPAND);
-        toolsSizer->Add(toolsRow3, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
-
-        toolsSizer->AddSpacer(14);  // gap before the next subsection header
+        auto* toolsRow2 = new wxGridSizer(1, 3, 0, 4);
+        toolsRow2->Add(makeToolBtn(ID_ToolCenter, "Center", false, kIconCenter), 0, wxEXPAND);
+        toolsRow2->Add(makeToolBtn(ID_ToolPattern, "Pattern", true, kIconPattern), 0, wxEXPAND);
+        toolsRow2->Add(makeToolBtn(ID_ToolPrecisionPlace, "Place", true, kIconPrecisionPlace), 0, wxEXPAND);
+        toolsSizer->Add(toolsRow2, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
+        toolsSizer->AddSpacer(10);// gap before the next subsection header
 
         // ---- Model Alignment subsection ------------------------------------
         // Same MODEL TOOLS header treatment plus an inline help indicator.
