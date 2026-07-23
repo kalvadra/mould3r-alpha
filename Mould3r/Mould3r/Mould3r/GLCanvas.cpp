@@ -3238,6 +3238,59 @@ void GLCanvas::ClearShotDebugSolid()
     Refresh(false);
 }
 
+// ---------------------------------------------------------------------------
+// ApplyLitLighting — sets every SHARED lit-shader uniform in one place so the
+// ~18 lit draw sites (objects, inserts, preview halves, vent/runner/gate
+// passes, overlay markers) can never drift apart again. Assumes m_program is
+// bound; leaves uModel / uView / uProj / uBaseColor / uAlpha to the caller.
+//
+// KEY light is world-anchored (keeps "up" meaningful for draft/demould reads).
+// FILL light is derived from the view matrix so it tracks the camera and the
+// near face never orbits into darkness. Per-pass coefficient overrides (the
+// feature passes run hotter) still work: call this first, then override.
+// ---------------------------------------------------------------------------
+void GLCanvas::ApplyLitLighting(const glm::mat4& view, const glm::vec3& camPos)
+{
+    // World-anchored key.
+    const glm::vec3 keyDir = glm::normalize(glm::vec3(0.4f, 0.8f, 0.2f));
+    const glm::vec3 keyColor = glm::vec3(1.0f);
+
+    // Camera-relative fill, from the view matrix's world-space basis. The
+    // camera looks down -Z in view space; -forward points back at the camera,
+    // and a small up/right offset keeps the fill from being a flat headlight.
+    const glm::vec3 camRight   = glm::vec3(view[0][0], view[1][0], view[2][0]);
+    const glm::vec3 camUp      = glm::vec3(view[0][1], view[1][1], view[2][1]);
+    const glm::vec3 camForward = -glm::vec3(view[0][2], view[1][2], view[2][2]);
+    const glm::vec3 fillDir = glm::normalize(-camForward + 0.35f * camUp + 0.25f * camRight);
+    const glm::vec3 fillColor = glm::vec3(0.35f, 0.38f, 0.45f);   // dim, slightly cool
+
+    // Hemisphere ambient: cool sky above, warm bounce below.
+    const glm::vec3 skyColor    = glm::vec3(0.90f, 0.95f, 1.00f);
+    const glm::vec3 groundColor = glm::vec3(0.34f, 0.30f, 0.26f);
+
+    // Fresnel silhouette rim — subtle, slightly cool edge highlight.
+    const glm::vec3 rimColor = glm::vec3(0.55f, 0.62f, 0.72f);
+
+    glUniform3fv(glGetUniformLocation(m_program, "uCameraPos"),   1, &camPos[0]);
+    glUniform3fv(glGetUniformLocation(m_program, "uLightDir"),    1, &keyDir[0]);
+    glUniform3fv(glGetUniformLocation(m_program, "uLightColor"),  1, &keyColor[0]);
+    glUniform3fv(glGetUniformLocation(m_program, "uFillDir"),     1, &fillDir[0]);
+    glUniform3fv(glGetUniformLocation(m_program, "uFillColor"),   1, &fillColor[0]);
+    glUniform3fv(glGetUniformLocation(m_program, "uSkyColor"),    1, &skyColor[0]);
+    glUniform3fv(glGetUniformLocation(m_program, "uGroundColor"), 1, &groundColor[0]);
+    glUniform3fv(glGetUniformLocation(m_program, "uRimColor"),    1, &rimColor[0]);
+    glUniform1f (glGetUniformLocation(m_program, "uRimStrength"), 0.22f);
+    glUniform1f (glGetUniformLocation(m_program, "uRimPower"),    3.5f);
+    glUniform1f (glGetUniformLocation(m_program, "uEmissive"),  0.0f);
+
+    // Default coefficients (mould body). Passes that want a different look
+    // override uAmbient/uDiffuse/uSpecular/uShininess after this call.
+    glUniform1f (glGetUniformLocation(m_program, "uAmbient"),   0.25f);
+    glUniform1f (glGetUniformLocation(m_program, "uDiffuse"),   0.85f);
+    glUniform1f (glGetUniformLocation(m_program, "uSpecular"),  0.20f);
+    glUniform1f (glGetUniformLocation(m_program, "uShininess"), 64.0f);
+}
+
 void GLCanvas::RenderPreview(const glm::mat4& view, const glm::mat4& proj,
     const glm::vec3& camPos)
 {
@@ -3245,12 +3298,8 @@ void GLCanvas::RenderPreview(const glm::mat4& view, const glm::mat4& proj,
     // identically to how objects look in the editor.
     glUseProgram(m_program);
 
-    const glm::vec3 lightDir = glm::normalize(glm::vec3(0.4f, 0.8f, 0.2f));
-    const glm::vec3 lightColor = glm::vec3(1.0f);
 
-    glUniform3fv(glGetUniformLocation(m_program, "uCameraPos"), 1, &camPos[0]);
-    glUniform3fv(glGetUniformLocation(m_program, "uLightDir"), 1, &lightDir[0]);
-    glUniform3fv(glGetUniformLocation(m_program, "uLightColor"), 1, &lightColor[0]);
+    ApplyLitLighting(view, camPos);
     glUniform1f(glGetUniformLocation(m_program, "uAmbient"), 0.25f);
     glUniform1f(glGetUniformLocation(m_program, "uDiffuse"), 0.85f);
     glUniform1f(glGetUniformLocation(m_program, "uSpecular"), 0.20f);
@@ -3278,6 +3327,7 @@ void GLCanvas::RenderPreview(const glm::mat4& view, const glm::mat4& proj,
             const GLint locAmb = glGetUniformLocation(m_program, "uAmbient");
             const GLint locDif = glGetUniformLocation(m_program, "uDiffuse");
             const GLint locSpe = glGetUniformLocation(m_program, "uSpecular");
+            const GLint locEmis = glGetUniformLocation(m_program, "uEmissive");
 
             glBindVertexArray(m_shotDebug.vao);
             bool flattened = false;
@@ -3295,6 +3345,7 @@ void GLCanvas::RenderPreview(const glm::mat4& view, const glm::mat4& proj,
                     glUniform1f(locAmb, 1.0f);
                     glUniform1f(locDif, 0.0f);
                     glUniform1f(locSpe, 0.0f);
+                    glUniform1f(locEmis, 1.0f);
                     flattened = true;
                 }
                 else if (!g.emissive && flattened)
@@ -3302,6 +3353,7 @@ void GLCanvas::RenderPreview(const glm::mat4& view, const glm::mat4& proj,
                     glUniform1f(locAmb, 0.25f);
                     glUniform1f(locDif, 0.85f);
                     glUniform1f(locSpe, 0.20f);
+                    glUniform1f(locEmis, 0.0f);
                     flattened = false;
                 }
 
@@ -3317,6 +3369,7 @@ void GLCanvas::RenderPreview(const glm::mat4& view, const glm::mat4& proj,
                 glUniform1f(locAmb, 0.25f);
                 glUniform1f(locDif, 0.85f);
                 glUniform1f(locSpe, 0.20f);
+                glUniform1f(locEmis, 0.0f);
             }
             continue;
         }
@@ -7886,13 +7939,9 @@ void GLCanvas::OnPaint(wxPaintEvent&)
     glUseProgram(m_program);
 
     // Shared lighting uniforms
-    const glm::vec3 lightDir = glm::normalize(glm::vec3(0.4f, 0.8f, 0.2f));
-    const glm::vec3 lightColor = glm::vec3(1.0f);
     const glm::vec3 baseColor = glm::vec3(0.80f, 0.80f, 0.85f);
 
-    glUniform3fv(glGetUniformLocation(m_program, "uCameraPos"), 1, &camPos[0]);
-    glUniform3fv(glGetUniformLocation(m_program, "uLightDir"), 1, &lightDir[0]);
-    glUniform3fv(glGetUniformLocation(m_program, "uLightColor"), 1, &lightColor[0]);
+    ApplyLitLighting(view, camPos);
     glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &baseColor[0]);
     glUniform1f(glGetUniformLocation(m_program, "uAmbient"), 0.25f);
     glUniform1f(glGetUniformLocation(m_program, "uDiffuse"), 0.85f);
@@ -8367,9 +8416,7 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         glEnable(GL_DEPTH_TEST);
         glUseProgram(m_program);
 
-        glUniform3fv(glGetUniformLocation(m_program, "uCameraPos"), 1, &camPos[0]);
-        glUniform3fv(glGetUniformLocation(m_program, "uLightDir"), 1, &lightDir[0]);
-        glUniform3fv(glGetUniformLocation(m_program, "uLightColor"), 1, &lightColor[0]);
+        ApplyLitLighting(view, camPos);
         glUniform1f(glGetUniformLocation(m_program, "uAmbient"), 0.35f);
         glUniform1f(glGetUniformLocation(m_program, "uDiffuse"), 0.75f);
         glUniform1f(glGetUniformLocation(m_program, "uSpecular"), 0.60f);
@@ -8485,9 +8532,7 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         glEnable(GL_DEPTH_TEST);
         glUseProgram(m_program);
 
-        glUniform3fv(glGetUniformLocation(m_program, "uCameraPos"), 1, &camPos[0]);
-        glUniform3fv(glGetUniformLocation(m_program, "uLightDir"), 1, &lightDir[0]);
-        glUniform3fv(glGetUniformLocation(m_program, "uLightColor"), 1, &lightColor[0]);
+        ApplyLitLighting(view, camPos);
         glUniform1f(glGetUniformLocation(m_program, "uAmbient"), 0.35f);
         glUniform1f(glGetUniformLocation(m_program, "uDiffuse"), 0.75f);
         glUniform1f(glGetUniformLocation(m_program, "uSpecular"), 0.60f);
@@ -8593,9 +8638,7 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         glEnable(GL_DEPTH_TEST);
         glUseProgram(m_program);
 
-        glUniform3fv(glGetUniformLocation(m_program, "uCameraPos"), 1, &camPos[0]);
-        glUniform3fv(glGetUniformLocation(m_program, "uLightDir"), 1, &lightDir[0]);
-        glUniform3fv(glGetUniformLocation(m_program, "uLightColor"), 1, &lightColor[0]);
+        ApplyLitLighting(view, camPos);
         glUniform1f(glGetUniformLocation(m_program, "uAmbient"), 0.35f);
         glUniform1f(glGetUniformLocation(m_program, "uDiffuse"), 0.75f);
         glUniform1f(glGetUniformLocation(m_program, "uSpecular"), 0.60f);
@@ -8708,9 +8751,7 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         glEnable(GL_DEPTH_TEST);
         glUseProgram(m_program);
 
-        glUniform3fv(glGetUniformLocation(m_program, "uCameraPos"), 1, &camPos[0]);
-        glUniform3fv(glGetUniformLocation(m_program, "uLightDir"), 1, &lightDir[0]);
-        glUniform3fv(glGetUniformLocation(m_program, "uLightColor"), 1, &lightColor[0]);
+        ApplyLitLighting(view, camPos);
         glUniform1f(glGetUniformLocation(m_program, "uAmbient"), 0.35f);
         glUniform1f(glGetUniformLocation(m_program, "uDiffuse"), 0.75f);
         glUniform1f(glGetUniformLocation(m_program, "uSpecular"), 0.60f);
@@ -8791,9 +8832,7 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         glEnable(GL_DEPTH_TEST);
         glUseProgram(m_program);
 
-        glUniform3fv(glGetUniformLocation(m_program, "uCameraPos"), 1, &camPos[0]);
-        glUniform3fv(glGetUniformLocation(m_program, "uLightDir"), 1, &lightDir[0]);
-        glUniform3fv(glGetUniformLocation(m_program, "uLightColor"), 1, &lightColor[0]);
+        ApplyLitLighting(view, camPos);
         glUniform1f(glGetUniformLocation(m_program, "uAmbient"), 0.35f);
         glUniform1f(glGetUniformLocation(m_program, "uDiffuse"), 0.75f);
         glUniform1f(glGetUniformLocation(m_program, "uSpecular"), 0.60f);
@@ -8821,9 +8860,7 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         glEnable(GL_DEPTH_TEST);
         glUseProgram(m_program);
 
-        glUniform3fv(glGetUniformLocation(m_program, "uCameraPos"), 1, &camPos[0]);
-        glUniform3fv(glGetUniformLocation(m_program, "uLightDir"), 1, &lightDir[0]);
-        glUniform3fv(glGetUniformLocation(m_program, "uLightColor"), 1, &lightColor[0]);
+        ApplyLitLighting(view, camPos);
         glUniform1f(glGetUniformLocation(m_program, "uAmbient"), 0.35f);
         glUniform1f(glGetUniformLocation(m_program, "uDiffuse"), 0.75f);
         glUniform1f(glGetUniformLocation(m_program, "uSpecular"), 0.60f);
@@ -8854,9 +8891,7 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         glEnable(GL_DEPTH_TEST);
         glUseProgram(m_program);
 
-        glUniform3fv(glGetUniformLocation(m_program, "uCameraPos"), 1, &camPos[0]);
-        glUniform3fv(glGetUniformLocation(m_program, "uLightDir"), 1, &lightDir[0]);
-        glUniform3fv(glGetUniformLocation(m_program, "uLightColor"), 1, &lightColor[0]);
+        ApplyLitLighting(view, camPos);
         glUniform1f(glGetUniformLocation(m_program, "uAmbient"), 0.35f);
         glUniform1f(glGetUniformLocation(m_program, "uDiffuse"), 0.75f);
         glUniform1f(glGetUniformLocation(m_program, "uSpecular"), 0.60f);
@@ -9058,9 +9093,7 @@ void GLCanvas::OnPaint(wxPaintEvent&)
 
         const glm::mat4 identity(1.0f);
         const glm::vec3 ventSolidColor(0.20f, 0.85f, 0.35f);
-        glUniform3fv(glGetUniformLocation(m_program, "uCameraPos"), 1, &camPos[0]);
-        glUniform3fv(glGetUniformLocation(m_program, "uLightDir"), 1, &lightDir[0]);
-        glUniform3fv(glGetUniformLocation(m_program, "uLightColor"), 1, &lightColor[0]);
+        ApplyLitLighting(view, camPos);
         glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &ventSolidColor[0]);
         glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 0.55f);
         glUniform1f(glGetUniformLocation(m_program, "uAmbient"), 0.30f);
@@ -9098,9 +9131,7 @@ void GLCanvas::OnPaint(wxPaintEvent&)
 
         glDisable(GL_DEPTH_TEST);          // overlay - control points never occluded
         glUseProgram(m_program);
-        glUniform3fv(glGetUniformLocation(m_program, "uCameraPos"), 1, &camPos[0]);
-        glUniform3fv(glGetUniformLocation(m_program, "uLightDir"), 1, &lightDir[0]);
-        glUniform3fv(glGetUniformLocation(m_program, "uLightColor"), 1, &lightColor[0]);
+        ApplyLitLighting(view, camPos);
         glUniform1f(glGetUniformLocation(m_program, "uAmbient"), 0.45f);
         glUniform1f(glGetUniformLocation(m_program, "uDiffuse"), 0.75f);
         glUniform1f(glGetUniformLocation(m_program, "uSpecular"), 0.40f);
@@ -9210,9 +9241,7 @@ void GLCanvas::OnPaint(wxPaintEvent&)
 
         const glm::mat4 identity(1.0f);
         const glm::vec3 runnerSolidColor(0.10f, 0.40f, 0.95f);   // blue, matches runner markers
-        glUniform3fv(glGetUniformLocation(m_program, "uCameraPos"), 1, &camPos[0]);
-        glUniform3fv(glGetUniformLocation(m_program, "uLightDir"), 1, &lightDir[0]);
-        glUniform3fv(glGetUniformLocation(m_program, "uLightColor"), 1, &lightColor[0]);
+        ApplyLitLighting(view, camPos);
         glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &runnerSolidColor[0]);
         glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 0.55f);
         glUniform1f(glGetUniformLocation(m_program, "uAmbient"), 0.30f);
@@ -9266,9 +9295,7 @@ void GLCanvas::OnPaint(wxPaintEvent&)
 
         glDisable(GL_DEPTH_TEST);
         glUseProgram(m_program);
-        glUniform3fv(glGetUniformLocation(m_program, "uCameraPos"), 1, &camPos[0]);
-        glUniform3fv(glGetUniformLocation(m_program, "uLightDir"), 1, &lightDir[0]);
-        glUniform3fv(glGetUniformLocation(m_program, "uLightColor"), 1, &lightColor[0]);
+        ApplyLitLighting(view, camPos);
         glUniform1f(glGetUniformLocation(m_program, "uAmbient"), 0.45f);
         glUniform1f(glGetUniformLocation(m_program, "uDiffuse"), 0.75f);
         glUniform1f(glGetUniformLocation(m_program, "uSpecular"), 0.40f);
@@ -9336,9 +9363,7 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         glUseProgram(m_program);
 
         const glm::mat4 identity(1.0f);
-        glUniform3fv(glGetUniformLocation(m_program, "uCameraPos"), 1, &camPos[0]);
-        glUniform3fv(glGetUniformLocation(m_program, "uLightDir"), 1, &lightDir[0]);
-        glUniform3fv(glGetUniformLocation(m_program, "uLightColor"), 1, &lightColor[0]);
+        ApplyLitLighting(view, camPos);
         glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 0.55f);
         glUniform1f(glGetUniformLocation(m_program, "uAmbient"), 0.30f);
         glUniform1f(glGetUniformLocation(m_program, "uDiffuse"), 0.80f);
@@ -9393,9 +9418,7 @@ void GLCanvas::OnPaint(wxPaintEvent&)
 
         glDisable(GL_DEPTH_TEST);
         glUseProgram(m_program);
-        glUniform3fv(glGetUniformLocation(m_program, "uCameraPos"), 1, &camPos[0]);
-        glUniform3fv(glGetUniformLocation(m_program, "uLightDir"), 1, &lightDir[0]);
-        glUniform3fv(glGetUniformLocation(m_program, "uLightColor"), 1, &lightColor[0]);
+        ApplyLitLighting(view, camPos);
         glUniform1f(glGetUniformLocation(m_program, "uAmbient"), 0.45f);
         glUniform1f(glGetUniformLocation(m_program, "uDiffuse"), 0.75f);
         glUniform1f(glGetUniformLocation(m_program, "uSpecular"), 0.40f);
@@ -9468,9 +9491,7 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         glUseProgram(m_program);
 
         const glm::mat4 identity(1.0f);
-        glUniform3fv(glGetUniformLocation(m_program, "uCameraPos"), 1, &camPos[0]);
-        glUniform3fv(glGetUniformLocation(m_program, "uLightDir"), 1, &lightDir[0]);
-        glUniform3fv(glGetUniformLocation(m_program, "uLightColor"), 1, &lightColor[0]);
+        ApplyLitLighting(view, camPos);
         glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 0.55f);
         glUniform1f(glGetUniformLocation(m_program, "uAmbient"), 0.30f);
         glUniform1f(glGetUniformLocation(m_program, "uDiffuse"), 0.80f);
@@ -9507,9 +9528,7 @@ void GLCanvas::OnPaint(wxPaintEvent&)
 
         const glm::mat4 identity(1.0f);
         const glm::vec3 sprueSolidColor(0.65f, 0.10f, 0.90f);   // purple
-        glUniform3fv(glGetUniformLocation(m_program, "uCameraPos"), 1, &camPos[0]);
-        glUniform3fv(glGetUniformLocation(m_program, "uLightDir"), 1, &lightDir[0]);
-        glUniform3fv(glGetUniformLocation(m_program, "uLightColor"), 1, &lightColor[0]);
+        ApplyLitLighting(view, camPos);
         glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &sprueSolidColor[0]);
         glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 0.55f);
         glUniform1f(glGetUniformLocation(m_program, "uAmbient"), 0.30f);
@@ -9541,9 +9560,7 @@ void GLCanvas::OnPaint(wxPaintEvent&)
 
         const glm::mat4 identity(1.0f);
         const glm::vec3 coldSlugColor(0.65f, 0.10f, 0.90f);   // purple, same as sprue
-        glUniform3fv(glGetUniformLocation(m_program, "uCameraPos"), 1, &camPos[0]);
-        glUniform3fv(glGetUniformLocation(m_program, "uLightDir"), 1, &lightDir[0]);
-        glUniform3fv(glGetUniformLocation(m_program, "uLightColor"), 1, &lightColor[0]);
+        ApplyLitLighting(view, camPos);
         glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &coldSlugColor[0]);
         glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 0.55f);
         glUniform1f(glGetUniformLocation(m_program, "uAmbient"), 0.30f);

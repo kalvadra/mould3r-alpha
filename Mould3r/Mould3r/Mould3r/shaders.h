@@ -56,7 +56,24 @@ public:
         }
         )GLSL";
 
-    //Define expanded fragment shader for more advanced lighting
+    //Define expanded fragment shader for more advanced lighting.
+    //
+    // Hybrid lighting rig (Tier 0):
+    //   * KEY   — one world-anchored directional light. Because it is fixed in
+    //             world space, "up" stays meaningful, so shading still encodes
+    //             orientation relative to the parting plane (draft / demould
+    //             reads). uLightDir points FROM the surface TOWARD the light.
+    //   * FILL  — one camera-relative directional light (uFillDir is derived
+    //             from the view matrix on the CPU). It follows the camera so
+    //             the near face never orbits into darkness, but it is dim and
+    //             diffuse-only so it lifts shadows without flattening form.
+    //   * AMBIENT — hemisphere term: cool sky from above, warm bounce from
+    //             below, instead of one flat constant. uAmbient is its strength.
+    //
+    // Shading is done in linear space (the base colour is sRGB-decoded on the
+    // way in and the result is re-encoded on the way out) because the default
+    // framebuffer is not sRGB. uEmissive drives a flat/unlit path used by the
+    // separation-test debug highlights, whose look must not change.
     const char* fsLit = R"GLSL(
         #version 330 core
         in vec3 vWorldPos;
@@ -65,30 +82,94 @@ public:
 
         uniform vec3 uCameraPos;
 
-        uniform vec3 uLightDir;   // direction *toward* surface (world), normalized
+        uniform vec3 uLightDir;    // KEY: surface->light (world), normalized
         uniform vec3 uLightColor;
+        uniform vec3 uFillDir;     // FILL: surface->light (camera-relative), normalized
+        uniform vec3 uFillColor;
+
+        uniform vec3 uSkyColor;    // hemisphere ambient, up
+        uniform vec3 uGroundColor; // hemisphere ambient, down
+
         uniform vec3 uBaseColor;
         uniform float uAlpha;
 
-        uniform float uAmbient;   // e.g. 0.25
-        uniform float uDiffuse;   // e.g. 0.85
-        uniform float uSpecular;  // e.g. 0.20
-        uniform float uShininess; // e.g. 64
+        uniform float uAmbient;    // hemisphere ambient strength (e.g. 0.25)
+        uniform float uDiffuse;    // e.g. 0.85
+        uniform float uSpecular;   // key specular strength (e.g. 0.20)
+        uniform float uShininess;  // e.g. 64
+
+        uniform float uEmissive;   // >0.5 => flat unlit base colour (debug)
+
+        uniform vec3  uRimColor;    // Fresnel silhouette rim tint
+        uniform float uRimStrength; // rim intensity (e.g. 0.22)
+        uniform float uRimPower;    // rim tightness (e.g. 3.5)
+
+        // Peak-normalized GGX (Trowbridge-Reitz) specular distribution. Peaks
+        // at 1.0 when NdotH == 1, so it drops straight into the existing
+        // uSpecular scale with no re-tuning, but carries the GGX shape: a
+        // tighter highlight core and a longer, softer tail than Blinn-Phong.
+        float ggxSpec(float NdotH, float rough)
+        {
+            float a  = rough * rough;
+            float a2 = a * a;
+            float d  = NdotH * NdotH * (a2 - 1.0) + 1.0;
+            return (a2 * a2) / max(d * d, 1e-8);
+        }
 
         void main()
         {
+            // Deliberately flat/unlit path — separation-test highlights. Keep
+            // the exact pre-existing look (authored display-space colour, no
+            // gamma round-trip), so this stays visually identical.
+            if (uEmissive > 0.5)
+            {
+                FragColor = vec4(uBaseColor, uAlpha);
+                return;
+            }
+
             vec3 N = normalize(vWorldNormal);
-            vec3 L = normalize(uLightDir);
             vec3 V = normalize(uCameraPos - vWorldPos);
 
-            float ndotl = max(dot(N, L), 0.0);
+            // sRGB-decode the base colour so lighting composes in linear space.
+            vec3 base = pow(uBaseColor, vec3(2.2));
 
-            // Blinn-Phong specular
-            vec3 H = normalize(L + V);
-            float spec = pow(max(dot(N, H), 0.0), uShininess) * step(0.0, ndotl);
+            // Hemisphere ambient: 1 = up-facing (sky), 0 = down-facing (ground).
+            float hemi = 0.5 * N.y + 0.5;
+            vec3 ambient = mix(uGroundColor, uSkyColor, hemi) * uAmbient;
 
-            vec3 color = uBaseColor * (uAmbient + uDiffuse * ndotl) * uLightColor;
-            color += uLightColor * (uSpecular * spec);
+            // Roughness from the legacy shininess knob so per-pass tuning
+            // (body 64, features 48) still applies unchanged.
+            float rough = clamp(sqrt(2.0 / (uShininess + 2.0)), 0.045, 1.0);
+
+            // Key light — diffuse + GGX specular. Specular is scaled by NdotL
+            // so it never appears on faces turned away from the key.
+            vec3 Lk = normalize(uLightDir);
+            float ndlK = max(dot(N, Lk), 0.0);
+            vec3 Hk = normalize(Lk + V);
+            float NdotHk = max(dot(N, Hk), 0.0);
+            float specK = ggxSpec(NdotHk, rough) * ndlK;
+
+            // Fill light — diffuse only, dim; keeps the viewer-facing side alive.
+            vec3 Lf = normalize(uFillDir);
+            float ndlF = max(dot(N, Lf), 0.0);
+
+            // Diffuse + ambient are tinted by the surface colour.
+            vec3 diffuse = uLightColor * (uDiffuse * ndlK)
+                         + uFillColor  * (uDiffuse * ndlF);
+            vec3 color = base * (ambient + diffuse);
+
+            // Key specular added untinted (dielectric highlight).
+            color += uLightColor * (uSpecular * specK);
+
+            // Fresnel silhouette rim — a view-dependent edge highlight that
+            // outlines the model from any angle, independent of the key
+            // direction. This is the "CAD inspection" edge pop; kept subtle so
+            // it reads as edge definition rather than emission.
+            float rim = pow(1.0 - max(dot(N, V), 0.0), uRimPower) * uRimStrength;
+            color += uRimColor * rim;
+
+            // Linear -> sRGB for display.
+            color = pow(color, vec3(1.0 / 2.2));
 
             FragColor = vec4(color, uAlpha);
         }

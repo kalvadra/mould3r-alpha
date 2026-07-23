@@ -717,6 +717,12 @@ private:
     void RenderPreview(const glm::mat4& view, const glm::mat4& proj,
         const glm::vec3& camPos);
 
+    // Sets every shared lit-shader uniform (key + camera-relative fill +
+    // hemisphere ambient + default coefficients) in one place. Call with
+    // m_program bound; per-pass coefficient overrides go after it. Keeps the
+    // ~18 lit draw sites from drifting apart.
+    void ApplyLitLighting(const glm::mat4& view, const glm::vec3& camPos);
+
     // Build the "shot" solid: the boolean union of every imported object
     // (transformed to world space) and the feed-system features — sprue +
     // cold slug, runners + cold plugs, gates + sub-runners — but NOT vents or

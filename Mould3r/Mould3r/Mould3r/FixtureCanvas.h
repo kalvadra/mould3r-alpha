@@ -342,12 +342,20 @@ private:
     GLint   m_uCameraPos = -1;
     GLint   m_uLightDir = -1;
     GLint   m_uLightColor = -1;
+    GLint   m_uFillDir = -1;
+    GLint   m_uFillColor = -1;
+    GLint   m_uSkyColor = -1;
+    GLint   m_uGroundColor = -1;
     GLint   m_uBaseColor = -1;
     GLint   m_uAlpha = -1;
     GLint   m_uAmbient = -1;
     GLint   m_uDiffuse = -1;
     GLint   m_uSpecular = -1;
     GLint   m_uShininess = -1;
+    GLint   m_uEmissive = -1;
+    GLint   m_uRimColor = -1;
+    GLint   m_uRimStrength = -1;
+    GLint   m_uRimPower = -1;
 
     // Up to one mesh per half slot. Either may be empty (.valid == false)
     // until the corresponding Import button has been used.

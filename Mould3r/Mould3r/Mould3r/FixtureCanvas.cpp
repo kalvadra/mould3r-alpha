@@ -302,6 +302,26 @@ glm::mat4 FixtureCanvas::FixtureMesh::BuildModelMatrix() const
 }
 
 // ---------------------------------------------------------------------------
+// Shared lit-shader lighting rig — mirrors GLCanvas::ApplyLitLighting so an
+// imported half is shaded identically in both viewports. World-anchored key +
+// camera-relative fill (derived from the view matrix) + hemisphere ambient.
+// The caller still sets uBaseColor / uAlpha / coefficients / matrices.
+// ---------------------------------------------------------------------------
+namespace {
+    glm::vec3 FixtureFillDir(const glm::mat4& view)
+    {
+        const glm::vec3 camRight   = glm::vec3(view[0][0], view[1][0], view[2][0]);
+        const glm::vec3 camUp      = glm::vec3(view[0][1], view[1][1], view[2][1]);
+        const glm::vec3 camForward = -glm::vec3(view[0][2], view[1][2], view[2][2]);
+        return glm::normalize(-camForward + 0.35f * camUp + 0.25f * camRight);
+    }
+    const glm::vec3 kFillColor(0.35f, 0.38f, 0.45f);
+    const glm::vec3 kSkyColor(0.90f, 0.95f, 1.00f);
+    const glm::vec3 kGroundColor(0.34f, 0.30f, 0.26f);
+    const glm::vec3 kRimColor(0.55f, 0.62f, 0.72f);
+}
+
+// ---------------------------------------------------------------------------
 // Lit program — compiled lazily on first use. Mirrors the main canvas's
 // shader setup so an imported half looks the same in both viewports.
 // ---------------------------------------------------------------------------
@@ -323,12 +343,20 @@ void FixtureCanvas::EnsureLitProgram()
     m_uCameraPos = glGetUniformLocation(m_litProgram, "uCameraPos");
     m_uLightDir = glGetUniformLocation(m_litProgram, "uLightDir");
     m_uLightColor = glGetUniformLocation(m_litProgram, "uLightColor");
+    m_uFillDir = glGetUniformLocation(m_litProgram, "uFillDir");
+    m_uFillColor = glGetUniformLocation(m_litProgram, "uFillColor");
+    m_uSkyColor = glGetUniformLocation(m_litProgram, "uSkyColor");
+    m_uGroundColor = glGetUniformLocation(m_litProgram, "uGroundColor");
     m_uBaseColor = glGetUniformLocation(m_litProgram, "uBaseColor");
     m_uAlpha = glGetUniformLocation(m_litProgram, "uAlpha");
     m_uAmbient = glGetUniformLocation(m_litProgram, "uAmbient");
     m_uDiffuse = glGetUniformLocation(m_litProgram, "uDiffuse");
     m_uSpecular = glGetUniformLocation(m_litProgram, "uSpecular");
     m_uShininess = glGetUniformLocation(m_litProgram, "uShininess");
+    m_uEmissive = glGetUniformLocation(m_litProgram, "uEmissive");
+    m_uRimColor = glGetUniformLocation(m_litProgram, "uRimColor");
+    m_uRimStrength = glGetUniformLocation(m_litProgram, "uRimStrength");
+    m_uRimPower = glGetUniformLocation(m_litProgram, "uRimPower");
 
     // Build the unit sphere used to render injection-point markers. Same
     // tessellation as the main canvas (12 stacks, 16 slices) so the dots
@@ -654,9 +682,18 @@ void FixtureCanvas::OnPaint(wxPaintEvent&)
 
         glUniformMatrix4fv(m_uView, 1, GL_FALSE, &view[0][0]);
         glUniformMatrix4fv(m_uProj, 1, GL_FALSE, &proj[0][0]);
+        const glm::vec3 fillDir = FixtureFillDir(view);
         glUniform3fv(m_uCameraPos, 1, &camPos[0]);
         glUniform3fv(m_uLightDir, 1, &lightDir[0]);
         glUniform3fv(m_uLightColor, 1, &lightColor[0]);
+        glUniform3fv(m_uFillDir, 1, &fillDir[0]);
+        glUniform3fv(m_uFillColor, 1, &kFillColor[0]);
+        glUniform3fv(m_uSkyColor, 1, &kSkyColor[0]);
+        glUniform3fv(m_uGroundColor, 1, &kGroundColor[0]);
+        glUniform3fv(m_uRimColor, 1, &kRimColor[0]);
+        glUniform1f(m_uRimStrength, 0.22f);
+        glUniform1f(m_uRimPower, 3.5f);
+        glUniform1f(m_uEmissive, 0.0f);
         glUniform1f(m_uAlpha, 1.0f);
         glUniform1f(m_uAmbient, 0.25f);
         glUniform1f(m_uDiffuse, 0.85f);
@@ -708,9 +745,18 @@ void FixtureCanvas::OnPaint(wxPaintEvent&)
 
         glUniformMatrix4fv(m_uView, 1, GL_FALSE, &view[0][0]);
         glUniformMatrix4fv(m_uProj, 1, GL_FALSE, &proj[0][0]);
+        const glm::vec3 fillDir = FixtureFillDir(view);
         glUniform3fv(m_uCameraPos, 1, &camPos[0]);
         glUniform3fv(m_uLightDir, 1, &lightDir[0]);
         glUniform3fv(m_uLightColor, 1, &lightColor[0]);
+        glUniform3fv(m_uFillDir, 1, &fillDir[0]);
+        glUniform3fv(m_uFillColor, 1, &kFillColor[0]);
+        glUniform3fv(m_uSkyColor, 1, &kSkyColor[0]);
+        glUniform3fv(m_uGroundColor, 1, &kGroundColor[0]);
+        glUniform3fv(m_uRimColor, 1, &kRimColor[0]);
+        glUniform1f(m_uRimStrength, 0.22f);
+        glUniform1f(m_uRimPower, 3.5f);
+        glUniform1f(m_uEmissive, 0.0f);
         glUniform1f(m_uAmbient, 0.35f);
         glUniform1f(m_uDiffuse, 0.75f);
         glUniform1f(m_uSpecular, 0.60f);
