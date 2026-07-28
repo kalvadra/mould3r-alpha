@@ -245,6 +245,13 @@ public:
     // Place-eligible, so callers can use it directly to gate the button.
     int  GetSelectedPlaceableNode() const;
 
+    // Index of the TERMINAL node of the selected feature's path in the active
+    // edit mode, or -1 when nothing suitable is selected. Selecting a path
+    // makes this its active node: the marker the user visually clicks to pick
+    // the feature sits ON the end node, so selecting the path but no node read
+    // as nothing having been picked.
+    int  EditEndNodeIndex() const;
+
     // Report the XZ centroid of the current selection (the value the
     // Precision Place dialog pre-fills). Returns false (leaving outputs
     // untouched) when nothing is selected.
@@ -472,6 +479,19 @@ public:
     // treats it as an opaque wxWindow* — it only needs to reposition it on
     // resize so it stays pinned to the top-centre of the viewport.
     void SetPathToolbar(wxWindow* w) { m_pathToolbar = w; RepositionPathToolbar(); }
+
+    // Register the bottom-centre hint overlay ("toast"). Same arrangement as
+    // the path toolbar - a SIBLING of the canvas raised above it, not a child,
+    // since SwapBuffers can overdraw a true child of a wxGLCanvas. The canvas
+    // only pins its position; the owner creates it and decides what it says
+    // and when it is visible.
+    void SetCanvasToast(wxWindow* w) { m_canvasToast = w; RepositionCanvasToast(); }
+
+    // Re-pin the toast to the bottom-centre of the viewport. PUBLIC (unlike its
+    // RepositionPathToolbar twin, which only the canvas calls): the toast sizes
+    // itself to its message, so the owner has to re-centre it after every text
+    // change, not just on canvas resize.
+    void RepositionCanvasToast();
 
     // State queried by the floating toolbar.
     bool         IsEditingVent()       const { return m_transformMode == TransformMode::EditVent; }
@@ -1361,7 +1381,17 @@ private:
     int          m_editVentNode = -1;   // node being dragged (Move tool), -1 = none
     int          m_editRunnerNode = -1; // runner node being dragged (Move tool), -1 = none
     int          m_editGateNode = -1;   // gate sub-runner node being dragged (Move tool), -1 = none
+
+    // m_edit*Node doubles as "selected node" (it survives the mouse release so
+    // the toolbar and the enlarged marker can act on it) AND as "node the next
+    // drag moves". Those two meanings diverged once selecting a PATH began
+    // auto-selecting its end node: a press on empty space would then have
+    // dragged the end node instead of re-placing / orbiting. This flag keeps
+    // them apart - set only when the mouse-down actually grabbed a node, and
+    // it alone licenses the deferred drag to move one.
+    bool         m_editNodeGrabbed = false;
     wxWindow*    m_pathToolbar  = nullptr;  // floating toolbar overlay (opaque)
+    wxWindow*    m_canvasToast  = nullptr;  // bottom-centre hint overlay (opaque)
     std::function<void()> m_onPathEditChanged;  // toolbar reconfigure hook
 
     // Add Node ghost — snaps onto an existing vent path under the cursor.

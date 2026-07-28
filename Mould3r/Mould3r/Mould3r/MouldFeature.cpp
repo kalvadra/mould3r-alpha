@@ -319,6 +319,30 @@ std::vector<PathStation> SamplePath(const FeaturePath& path, float spacing)
 // AutoComputeComplexHandles — derive symmetric Catmull-Rom tangent handles
 // for every node from the node positions. See header for the rule.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// MakeTwoNodePath - see the header for the contract (callers must only promote
+// an already-resolved path).
+// ---------------------------------------------------------------------------
+void MakeTwoNodePath(FeaturePath& path, const glm::vec3& a, const glm::vec3& b)
+{
+    path.kind = PathKind::Complex;
+    path.nodes.clear();
+
+    PathNode n0; n0.pos = a;
+    PathNode n1; n1.pos = b;
+    path.nodes.push_back(n0);
+    path.nodes.push_back(n1);
+
+    path.start = a;
+    path.end   = b;
+    path.valid = true;
+
+    // smooth is left as-is (a freshly derived path has it false). Handles are
+    // only meaningful when smooth, and Catmull-Rom over two nodes yields the
+    // straight chord either way.
+    if (path.smooth) AutoComputeComplexHandles(path);
+}
+
 void AutoComputeComplexHandles(FeaturePath& path)
 {
     if (path.kind != PathKind::Complex) return;

@@ -4,10 +4,28 @@
 #include <wx/dcbuffer.h>
 #include <wx/graphics.h>
 
+#ifdef __WXMSW__
+#include <wx/msw/wrapwin.h>   // windows.h with the wx-safe macro guards
+#endif
+
 // Fixed overlay size. The canvas pins it top-centre; cells are laid out within.
-static constexpr int kBarW = 602;   // +78 for the Place... cell
 static constexpr int kBarH = 90;
 static constexpr int kPad = 12;
+
+// The bar width is DERIVED from the cell run rather than hand-tuned, so the
+// two can no longer drift apart. Left to right:
+//   pad | Move 70 +2 | Add 82 +2 | Remove 100 +2 | Place 76 | gap | Smooth | pad
+// Dropping the Simple/Complex toggle left Smooth stranded against the right
+// edge with a wide gap in the middle; it now sits directly after the node
+// tools and the bar shrinks to suit (602 -> 456).
+static constexpr int kSmoothW = 84;
+static constexpr int kSmoothGap = 14;   // breathing room after Place...
+static constexpr int kBarW =
+    kPad + 72 + 84 + 102 + 76 + kSmoothGap + kSmoothW + kPad;   // = 456
+
+// Corner radius. Used for BOTH the painted card outline and the window shape,
+// so the clip and the border coincide.
+static constexpr double kCorner = 8.0;
 
 namespace {
 
@@ -34,9 +52,60 @@ VentEditToolbar::VentEditToolbar(wxWindow* parent)
     Bind(wxEVT_LEFT_DOWN, &VentEditToolbar::OnLeftDown, this);
     Bind(wxEVT_MOTION, &VentEditToolbar::OnMotion, this);
     Bind(wxEVT_LEAVE_WINDOW, &VentEditToolbar::OnLeave, this);
+    Bind(wxEVT_SIZE, &VentEditToolbar::OnSize, this);
 
     LayoutCells();
-    Hide();   // owner shows us only while a vent is being edited
+    ApplyRoundedShape();
+    Hide();   // owner shows us only while a path is being edited
+}
+
+// ---------------------------------------------------------------------------
+// ApplyRoundedShape - clip the window itself to the rounded card outline.
+//
+// Without this the panel is a plain rectangle: OnPaint clears the whole client
+// area to CardBg and then strokes a rounded border on top, so the four corners
+// keep their square block of card colour outside the arc. Clipping the HWND
+// cuts those corners away entirely, letting the viewport show through.
+//
+// NOTE: wxWindow has no SetShape - that lives on wxNonOwnedWindow (top-level
+// windows only), and this bar is a child panel. So we go native: a round-rect
+// HRGN handed to SetWindowRgn, which works on child HWNDs. SetWindowRgn takes
+// ownership of the region, so it must NOT be deleted here.
+//
+// The clip is a hard 1-bit region (no antialiasing), so the extreme outer edge
+// of each arc is crisp rather than feathered; the stroked border inside it
+// still antialiases normally, which is what the eye reads.
+//
+// Re-applied on size changes; harmless while the bar stays fixed-size.
+// ---------------------------------------------------------------------------
+void VentEditToolbar::ApplyRoundedShape()
+{
+#ifdef __WXMSW__
+    HWND hwnd = (HWND)GetHWND();
+    if (!hwnd) return;
+
+    const wxSize sz = GetSize();
+    if (sz.x <= 0 || sz.y <= 0) return;
+
+    // CreateRoundRectRgn treats the right/bottom bounds as exclusive, so pass
+    // one past the client extent - otherwise the region shaves the last row and
+    // column, eating the 1px card border along the right and bottom edges. Any
+    // overshoot beyond the window is clipped by the window itself.
+    const int d = (int)(kCorner * 2.0);   // ellipse axes = 2 * corner radius
+    HRGN rgn = ::CreateRoundRectRgn(0, 0, sz.x + 1, sz.y + 1, d, d);
+    if (!rgn) return;
+
+    // Ownership transfers to the system on success; on failure we must free it.
+    if (!::SetWindowRgn(hwnd, rgn, TRUE))
+        ::DeleteObject(rgn);
+#endif
+}
+
+void VentEditToolbar::OnSize(wxSizeEvent& evt)
+{
+    ApplyRoundedShape();
+    Refresh(false);
+    evt.Skip();
 }
 
 void VentEditToolbar::Configure(bool hasSelection, bool complex, bool smooth,
@@ -55,7 +124,7 @@ void VentEditToolbar::SetLabels(const wxString& title, const wxString& emptyStat
 {
     m_title = title;
     m_emptyStatus = emptyStatus;
-    // No Refresh here — the owner calls Configure() right after, which repaints.
+    // No Refresh here - the owner calls Configure() right after, which repaints.
 }
 
 void VentEditToolbar::LayoutCells()
@@ -67,16 +136,14 @@ void VentEditToolbar::LayoutCells()
     m_rMove = wxRect(x, y, 70, bh);   x += 72;
     m_rAdd = wxRect(x, y, 82, bh);   x += 84;
     m_rRemove = wxRect(x, y, 100, bh);  x += 102;
-    // Place... groups with the node tools — it acts on the selected node.
+    // Place... groups with the node tools - it acts on the selected node.
     m_rPlace = wxRect(x, y, 76, bh);   x += 76;
 
-    // Smooth checkbox cell after a small gap.
-    x += 14;
-    m_rSmooth = wxRect(x, y, 96, bh);
-
-    // Toggle button right-aligned.
-    const int togW = 116;
-    m_rToggle = wxRect(kBarW - kPad - togW, y, togW, bh);
+    // Smooth follows the node tools directly. kBarW is derived from this
+    // same run, so the cell lands flush against the right-hand padding with
+    // no leftover space.
+    x += kSmoothGap;
+    m_rSmooth = wxRect(x, y, kSmoothW, bh);
 }
 
 VentEditToolbar::Cell VentEditToolbar::HitTest(const wxPoint& p) const
@@ -86,7 +153,6 @@ VentEditToolbar::Cell VentEditToolbar::HitTest(const wxPoint& p) const
     if (m_rRemove.Contains(p)) return CELL_REMOVE;
     if (m_rPlace.Contains(p))  return CELL_PLACE;
     if (m_rSmooth.Contains(p)) return CELL_SMOOTH;
-    if (m_rToggle.Contains(p)) return CELL_TOGGLE;
     return CELL_NONE;
 }
 
@@ -94,12 +160,14 @@ bool VentEditToolbar::CellEnabled(Cell c) const
 {
     switch (c)
     {
-    case CELL_MOVE:   return true;   // select / drag tool — usable with no selection
+    case CELL_MOVE:   return true;   // select / drag tool - usable with no selection
     case CELL_ADD:    return true;   // snaps onto any existing path
-    case CELL_REMOVE: return m_hasSelection && m_complex;
+    // Only interior nodes can be removed: node[0] (origin / feed point) and
+    // the terminus are protected in every feature's Remove handler. So there
+    // is nothing to remove until the path carries at least three nodes.
+    case CELL_REMOVE: return m_hasSelection && m_complex && m_nodeCount >= 3;
     case CELL_PLACE:  return m_hasSelection && m_complex && m_canPlaceNode;
     case CELL_SMOOTH: return m_hasSelection && m_complex;
-    case CELL_TOGGLE: return m_hasSelection;
     default:          return false;
     }
 }
@@ -116,7 +184,6 @@ void VentEditToolbar::OnLeftDown(wxMouseEvent& evt)
     case CELL_REMOVE: if (m_onTool) m_onTool(PathEditTool::RemoveNode); break;
     case CELL_PLACE:  if (m_onPlaceNode) m_onPlaceNode();               break;
     case CELL_SMOOTH: if (m_onSmooth) m_onSmooth(!m_smooth);            break;
-    case CELL_TOGGLE: if (m_onToggleComplex) m_onToggleComplex(!m_complex); break;
     default: break;
     }
     // The owner pushes fresh state back via Configure(); no local mutation here.
@@ -146,9 +213,11 @@ void VentEditToolbar::OnPaint(wxPaintEvent&)
     const wxSize sz = GetClientSize();
 
     // ---- Card background ---------------------------------------------------
+    // Matches the window shape set in ApplyRoundedShape, so the corners the
+    // clip cuts away are exactly the corners this outline curves around.
     gc->SetBrush(wxBrush(Style::CardBg));
     gc->SetPen(wxPen(Style::Divider, 1));
-    gc->DrawRoundedRectangle(0.5, 0.5, sz.x - 1.0, sz.y - 1.0, 8.0);
+    gc->DrawRoundedRectangle(0.5, 0.5, sz.x - 1.0, sz.y - 1.0, kCorner);
 
     // ---- Header row --------------------------------------------------------
     wxFont titleFont = GetFont().Bold();
@@ -156,17 +225,19 @@ void VentEditToolbar::OnPaint(wxPaintEvent&)
     gc->SetFont(titleFont, Style::TextSubtle);
     gc->DrawText(m_title, kPad, 11);
 
+    // Status now reports node count only - Simple vs Complex is an internal
+    // distinction the user drives by adding nodes, not something to label. A
+    // Simple path reads as its implicit two nodes.
     wxString status;
     if (!m_hasSelection)
-        status = m_emptyStatus;
-    else if (m_complex)
     {
-        status = wxString::Format(wxT("Complex \u00B7 %d node"), m_nodeCount);
-        if (m_nodeCount != 1) status += wxT("s");
+        status = m_emptyStatus;
     }
     else
     {
-        status = wxT("Simple path");
+        const int n = DisplayNodeCount();
+        status = wxString::Format(wxT("%d node"), n);
+        if (n != 1) status += wxT("s");
     }
     gc->SetFont(GetFont(), Style::TextMuted);
     double tw, th;
@@ -241,28 +312,6 @@ void VentEditToolbar::OnPaint(wxPaintEvent&)
         double lw, lh;
         gc->GetTextExtent("Smooth", &lw, &lh);
         gc->DrawText("Smooth", r.x + box + 6, r.y + (r.height - lh) / 2.0);
-    }
-
-    // ---- Toggle (Make Complex / Make Simple) -------------------------------
-    {
-        const bool en = CellEnabled(CELL_TOGGLE);
-        const wxString label = m_complex ? "Make Simple" : "Make Complex";
-        const bool hovered = m_hover == CELL_TOGGLE;
-        wxColour bg;
-        if (!en)           bg = Mix(Style::CardBg, Style::BtnPlace, 0.30);
-        else if (hovered)  bg = Mix(Style::BtnPlace, *wxWHITE, 0.12);
-        else               bg = Style::BtnPlace;
-        gc->SetBrush(wxBrush(bg));
-        gc->SetPen(wxPen(Style::Divider, 1));
-        gc->DrawRoundedRectangle(m_rToggle.x, m_rToggle.y,
-            m_rToggle.width, m_rToggle.height, 5.0);
-
-        wxColour fg = en ? Style::TextPrimary : Mix(Style::TextMuted, Style::CardBg, 0.3);
-        gc->SetFont(GetFont(), fg);
-        double lw, lh;
-        gc->GetTextExtent(label, &lw, &lh);
-        gc->DrawText(label, m_rToggle.x + (m_rToggle.width - lw) / 2.0,
-            m_rToggle.y + (m_rToggle.height - lh) / 2.0);
     }
 
     delete gc;

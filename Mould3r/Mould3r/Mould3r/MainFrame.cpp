@@ -12,6 +12,11 @@
 #include <wx/statline.h>   // wxStaticLine — section separators in the insert editor
 #include <memory>
 
+#ifdef __WXMSW__
+#include <wx/msw/wrapwin.h>   // windows.h with the wx-safe macro guards —
+// SetWindowRgn for the CanvasToast pill shape
+#endif
+
 #include "MainFrame.h"
 #include "GLCanvas.h"
 #include "PreviewPanel.h"    // embedded post-cut mould preview perspective
@@ -22,6 +27,11 @@
 #include "ScaleDialog.h"
 #include "PrecisionPlaceDialog.h"
 #include "GridSettingsDialog.h"
+#include "AboutDialog.h"       // Help -> About Mould3r
+#include "UpdateCheckDialog.h" // Help -> Check for Updates...
+#include "UpdateChecker.h"     // background startup check + startup policy (U4)
+#include "Version.h"           // Mould3r::Version — website fallback for the
+                               // update banner's View action
 #include "AppConfig.h"
 #include "MeshImportSettings.h"
 #include "RoundedButton.h"     // rounded button for sidebar / toolbar action buttons
@@ -96,6 +106,327 @@ static wxBitmapBundle LoadSvgBundle(const wxString& svgPath,
 
     const wxScopedCharBuffer utf8 = svg.utf8_str();
     return wxBitmapBundle::FromSVG(utf8.data(), size);
+}
+
+// ---------------------------------------------------------------------------
+// CanvasToast — a small self-painted hint pill pinned to the bottom-centre of
+// the 3D viewport.
+//
+// Why: a few modes are signalled only by the cursor (PlaceInsert swaps to a
+// hand, meaning "click a body to parent to"), which is easy to miss. This says
+// it in words, without stealing focus or needing to be dismissed.
+//
+// Construction rules match VentEditToolbar: a SIBLING of the canvas raised
+// above it (a true child of a wxGLCanvas can be overdrawn by SwapBuffers), one
+// HWND, no nested native controls, everything painted here. Defined in this
+// .cpp rather than its own file pair so the .vcxproj needs no new entries —
+// same arrangement as InsertEditDialog further down.
+//
+// NOT time-limited: it appears when a mode raises it and goes away when that
+// mode ends. A guidance hint that fades out mid-task is worse than one that
+// stays put, and the mode is the natural lifetime. Swapping in an auto-fade is
+// a wxTimer away if that turns out to be the wrong call.
+//
+// The pill is opaque and does swallow clicks in its own footprint. It sits low
+// and is only as wide as its text, so it rarely covers anything you need to
+// click; if it ever does, WS_EX_TRANSPARENT on the HWND makes it click-through.
+// ---------------------------------------------------------------------------
+static constexpr int kToastH = 38;
+static constexpr int kToastPadX = 20;
+
+class CanvasToast : public wxPanel
+{
+public:
+    explicit CanvasToast(wxWindow* parent);
+
+    // Set the message, resize to fit it, show and raise. Re-showing the message
+    // already on screen is a no-op, so it is safe to call every mode change.
+    // The CALLER re-pins us afterwards (GLCanvas::RepositionCanvasToast) — the
+    // size just changed and the canvas owns the centring.
+    void ShowMessage(const wxString& msg);
+    void HideToast();
+
+private:
+    void OnPaint(wxPaintEvent&);
+    void ApplyPillShape();
+
+    wxString m_msg;
+};
+
+CanvasToast::CanvasToast(wxWindow* parent)
+    : wxPanel(parent, wxID_ANY, wxDefaultPosition, wxSize(200, kToastH),
+        wxBORDER_NONE)
+{
+    SetBackgroundStyle(wxBG_STYLE_PAINT);   // we paint everything ourselves
+    SetBackgroundColour(Style::CardBg);
+    Bind(wxEVT_PAINT, &CanvasToast::OnPaint, this);
+    Hide();   // nothing to say until a mode raises us
+}
+
+// Clip the HWND to a pill so the corners are genuinely cut away and the
+// viewport shows through, rather than the card colour squaring off outside the
+// drawn outline. wxWindow has no SetShape (that is wxNonOwnedWindow, top-level
+// only), so this goes native — same technique as VentEditToolbar. SetWindowRgn
+// takes ownership of the region on success, so it must not be deleted then.
+void CanvasToast::ApplyPillShape()
+{
+#ifdef __WXMSW__
+    HWND hwnd = (HWND)GetHWND();
+    if (!hwnd) return;
+
+    const wxSize sz = GetSize();
+    if (sz.x <= 0 || sz.y <= 0) return;
+
+    // +1 because CreateRoundRectRgn treats right/bottom as exclusive; without
+    // it the region shaves the last row and column and eats the 1px border.
+    HRGN rgn = ::CreateRoundRectRgn(0, 0, sz.x + 1, sz.y + 1, sz.y, sz.y);
+    if (!rgn) return;
+
+    if (!::SetWindowRgn(hwnd, rgn, TRUE))
+        ::DeleteObject(rgn);
+#endif
+}
+
+void CanvasToast::ShowMessage(const wxString& msg)
+{
+    if (IsShown() && msg == m_msg) return;
+    m_msg = msg;
+
+    // Size to the text. wxClientDC measures with this window's font, which is
+    // the same one OnPaint draws with.
+    int tw = 0, th = 0;
+    {
+        wxClientDC dc(this);
+        dc.SetFont(GetFont());
+        dc.GetTextExtent(m_msg, &tw, &th);
+    }
+    SetSize(tw + kToastPadX * 2, kToastH);
+    ApplyPillShape();   // re-clip: the width just changed
+
+    if (!IsShown()) Show();
+    Raise();            // keep above the GL surface
+    Refresh(false);
+}
+
+void CanvasToast::HideToast()
+{
+    if (IsShown()) Hide();
+}
+
+// ---------------------------------------------------------------------------
+// UpdateBanner — the U4 non-modal "an update is available" card, pinned to
+// the bottom-right of the viewport.
+//
+// Same construction rules as CanvasToast / VentEditToolbar above: a SIBLING
+// of the canvas raised above it, one HWND, no nested native controls,
+// everything painted here, corners cut with the CreateRoundRectRgn/
+// SetWindowRgn technique. Defined in this .cpp so the .vcxproj needs no new
+// entries.
+//
+// Three affordances, all self-hit-tested:
+//   "View Download Page"  -> browser (via callback), then dismiss
+//   "Skip this version"   -> suppress this version permanently (callback)
+//   x (top-right)         -> dismiss; the 24h throttle means the reminder
+//                            returns on a later launch, not next launch
+//
+// Deliberately NOT auto-fading and NOT foreground-stealing: it appears once
+// per throttle window, sits out of the way, and waits. Startup is the one
+// moment the user definitely isn't mid-edit, but they may still be reaching
+// for a tool — a banner that vanishes on its own timer punishes reading it
+// later.
+// ---------------------------------------------------------------------------
+static constexpr int kBannerW = 332;
+static constexpr int kBannerH = 78;
+static constexpr int kBannerPad = 16;
+static constexpr double kBannerCorner = 8.0;
+
+class UpdateBanner : public wxPanel
+{
+public:
+    explicit UpdateBanner(wxWindow* parent);
+
+    // Fill in the content and show. targetUrl is resolved by the caller
+    // (notes -> installer -> website) so this class knows nothing about
+    // manifests.
+    void ShowUpdate(const wxString& latestVersion);
+
+    std::function<void()> onView;
+    std::function<void()> onSkip;
+    std::function<void()> onDismiss;
+
+private:
+    void OnPaint(wxPaintEvent&);
+    void OnMouse(wxMouseEvent&);
+    void ApplyRoundedShape();
+
+    // Hit regions, recomputed each paint (text metrics live there).
+    wxRect m_rView, m_rSkip, m_rClose;
+    int    m_hover = -1;              // 0 view, 1 skip, 2 close
+
+    wxString m_headline;
+};
+
+UpdateBanner::UpdateBanner(wxWindow* parent)
+    : wxPanel(parent, wxID_ANY, wxDefaultPosition, wxSize(kBannerW, kBannerH),
+        wxBORDER_NONE)
+{
+    SetBackgroundStyle(wxBG_STYLE_PAINT);
+    SetBackgroundColour(Style::CardBg);
+    Bind(wxEVT_PAINT, &UpdateBanner::OnPaint, this);
+    Bind(wxEVT_MOTION, &UpdateBanner::OnMouse, this);
+    Bind(wxEVT_LEFT_UP, &UpdateBanner::OnMouse, this);
+    Bind(wxEVT_LEAVE_WINDOW, &UpdateBanner::OnMouse, this);
+    Hide();
+}
+
+void UpdateBanner::ApplyRoundedShape()
+{
+#ifdef __WXMSW__
+    HWND hwnd = (HWND)GetHWND();
+    if (!hwnd) return;
+
+    const wxSize sz = GetSize();
+    if (sz.x <= 0 || sz.y <= 0) return;
+
+    // +1: CreateRoundRectRgn treats right/bottom as exclusive (see
+    // CanvasToast::ApplyPillShape). SetWindowRgn owns the region on success.
+    const int d = (int)(kBannerCorner * 2);
+    HRGN rgn = ::CreateRoundRectRgn(0, 0, sz.x + 1, sz.y + 1, d, d);
+    if (!rgn) return;
+
+    if (!::SetWindowRgn(hwnd, rgn, TRUE))
+        ::DeleteObject(rgn);
+#endif
+}
+
+void UpdateBanner::ShowUpdate(const wxString& latestVersion)
+{
+    m_headline = wxString::Format("Mould3r %s is available", latestVersion);
+    ApplyRoundedShape();
+    if (!IsShown()) Show();
+    Raise();
+    Refresh(false);
+}
+
+void UpdateBanner::OnPaint(wxPaintEvent&)
+{
+    wxAutoBufferedPaintDC dc(this);
+    dc.SetBackground(wxBrush(Style::CardBg));
+    dc.Clear();
+
+    std::unique_ptr<wxGraphicsContext> gc(wxGraphicsContext::Create(dc));
+    if (!gc) return;
+
+    const wxSize sz = GetSize();
+
+    // Card face + hairline border, inset half a pixel so the stroke isn't
+    // clipped by the window region.
+    gc->SetBrush(wxBrush(Style::CardBg));
+    gc->SetPen(wxPen(Style::Divider, 1));
+    gc->DrawRoundedRectangle(0.5, 0.5, sz.x - 1.0, sz.y - 1.0, kBannerCorner);
+
+    const wxFont headFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI");
+    const wxFont actFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI");
+
+    // ---- headline ----------------------------------------------------------
+    gc->SetFont(headFont, Style::TextPrimary);
+    gc->DrawText(m_headline, kBannerPad, 16.0);
+
+    // ---- close x -----------------------------------------------------------
+    m_rClose = wxRect(sz.x - 30, 10, 20, 20);
+    gc->SetFont(headFont,
+        m_hover == 2 ? Style::TextPrimary : Style::TextMuted);
+    {
+        // Wide literal: a narrow "\u2715" is encoded through the execution
+        // charset and garbles without /utf-8; L"" is charset-independent.
+        static const wxString kCloseGlyph = L"\u2715";
+        double tw = 0, th = 0, d1, d2;
+        gc->GetTextExtent(kCloseGlyph, &tw, &th, &d1, &d2);
+        gc->DrawText(kCloseGlyph,
+            m_rClose.x + (m_rClose.width - tw) / 2.0,
+            m_rClose.y + (m_rClose.height - th) / 2.0);
+    }
+
+    // ---- actions -----------------------------------------------------------
+    const double actY = sz.y - 30.0;
+
+    gc->SetFont(actFont, m_hover == 0 ? Style::TextPrimary : Style::BtnPlace);
+    {
+        double tw = 0, th = 0, d1, d2;
+        gc->GetTextExtent("View Download Page", &tw, &th, &d1, &d2);
+        gc->DrawText("View Download Page", kBannerPad, actY);
+        m_rView = wxRect(kBannerPad - 4, (int)actY - 4,
+            (int)tw + 8, (int)th + 8);
+
+        gc->SetFont(actFont,
+            m_hover == 1 ? Style::TextSubtle : Style::TextMuted);
+        double sw = 0, sh = 0;
+        gc->GetTextExtent("Skip this version", &sw, &sh, &d1, &d2);
+        const double skipX = kBannerPad + tw + 22.0;
+        gc->DrawText("Skip this version", skipX, actY);
+        m_rSkip = wxRect((int)skipX - 4, (int)actY - 4,
+            (int)sw + 8, (int)sh + 8);
+    }
+}
+
+void UpdateBanner::OnMouse(wxMouseEvent& e)
+{
+    if (e.Leaving())
+    {
+        if (m_hover != -1) { m_hover = -1; Refresh(false); }
+        return;
+    }
+
+    const wxPoint p = e.GetPosition();
+    int over = -1;
+    if (m_rView.Contains(p))  over = 0;
+    else if (m_rSkip.Contains(p))  over = 1;
+    else if (m_rClose.Contains(p)) over = 2;
+
+    if (e.Moving() || e.Dragging())
+    {
+        if (over != m_hover) { m_hover = over; Refresh(false); }
+        SetCursor(over >= 0 ? wxCursor(wxCURSOR_HAND) : wxNullCursor);
+        return;
+    }
+
+    if (e.LeftUp() && over >= 0)
+    {
+        // Dismiss-first so a slow callback (browser launch) can't show a
+        // half-dead banner; the callbacks are owned by MainFrame and safe
+        // to run after Hide().
+        Hide();
+        if (over == 0 && onView)    onView();
+        else if (over == 1 && onSkip)    onSkip();
+        else if (over == 2 && onDismiss) onDismiss();
+    }
+}
+
+void CanvasToast::OnPaint(wxPaintEvent&)
+{
+    wxAutoBufferedPaintDC dc(this);
+    dc.SetBackground(wxBrush(Style::CardBg));
+    dc.Clear();
+
+    wxGraphicsContext* gc = wxGraphicsContext::Create(dc);
+    if (!gc) return;
+    gc->SetAntialiasMode(wxANTIALIAS_DEFAULT);
+
+    const wxSize sz = GetClientSize();
+    const double radius = (sz.y - 1.0) / 2.0;   // full pill
+
+    gc->SetBrush(wxBrush(Style::CardBg));
+    gc->SetPen(wxPen(Style::Divider, 1));
+    gc->DrawRoundedRectangle(0.5, 0.5, sz.x - 1.0, sz.y - 1.0, radius);
+
+    gc->SetFont(GetFont(), Style::TextPrimary);
+    double tw, th;
+    gc->GetTextExtent(m_msg, &tw, &th);
+    gc->DrawText(m_msg, (sz.x - tw) / 2.0, (sz.y - th) / 2.0);
+
+    delete gc;
 }
 
 // ---------------------------------------------------------------------------
@@ -207,6 +538,9 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
 
     // Grid menu: the consolidated settings dialog.
     Bind(wxEVT_MENU, &MainFrame::OnGridSettings, this, ID_GridSettings);
+    Bind(wxEVT_MENU, &MainFrame::OnAbout, this, wxID_ABOUT);
+    Bind(wxEVT_MENU, &MainFrame::OnCheckForUpdates, this, ID_CheckForUpdates);
+    Bind(wxEVT_MENU, &MainFrame::OnToggleAutoUpdateCheck, this, ID_AutoUpdateCheck);
 
     // Mesh quality radio items just persist the chosen preset; the next
     // import picks it up via MeshImportSettings::GetQuality().
@@ -265,7 +599,7 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
     m_canvas->SetOnSceneMutated([this] {
         if (m_mouldState == MouldState::Clean)
             m_mouldState = MouldState::Dirty;
-        });
+    });
 
     // ---- Part 5: floating complex-vent-path toolbar ------------------------
     // Created as a SIBLING of the canvas (child of the Prepare page) and raised
@@ -275,20 +609,20 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
     m_ventEditToolbar = new VentEditToolbar(m_preparePage);
     m_ventEditToolbar->SetOnTool([this](PathEditTool t) {
         if (m_canvas) m_canvas->SetPathEditTool(t);
-        });
+    });
     // Place... — Precision Place the selected node. The canvas vets eligibility,
     // and the cell is only enabled when GetSelectedPlaceableNode() is valid.
     m_ventEditToolbar->SetOnPlaceNode([this]() {
         if (!m_canvas) return;
         const int node = m_canvas->GetSelectedPlaceableNode();
         if (node >= 0) PrecisionPlaceEditNode(node);
-        });
+    });
     m_ventEditToolbar->SetOnSmooth([this](bool on) {
         if (!m_canvas) return;
-        if      (m_canvas->IsEditingRunner()) m_canvas->SetEditRunnerSmooth(on);
+        if (m_canvas->IsEditingRunner()) m_canvas->SetEditRunnerSmooth(on);
         else if (m_canvas->IsEditingGate())   m_canvas->SetEditGateSmooth(on);
         else                                  m_canvas->SetEditVentSmooth(on);
-        });
+    });
     m_ventEditToolbar->SetOnToggleComplex([this](bool wantComplex) {
         if (!m_canvas) return;
         if (m_canvas->IsEditingRunner())
@@ -306,10 +640,17 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
             if (wantComplex) m_canvas->ConvertEditVentToComplex();
             else             m_canvas->ConvertEditVentToSimple();
         }
-        });
+    });
     m_canvas->SetPathToolbar(m_ventEditToolbar);
     m_canvas->SetOnPathEditChanged([this] { UpdateVentEditToolbar(); });
     UpdateVentEditToolbar();   // initial (hidden) state
+
+    // ---- Bottom-centre hint overlay ----------------------------------------
+    // Same sibling-of-the-canvas arrangement as the toolbar above. Registered
+    // with the canvas so it stays pinned through viewport resizes; content and
+    // visibility are driven from SetActiveTool.
+    m_canvasToast = new CanvasToast(m_preparePage);
+    m_canvas->SetCanvasToast(m_canvasToast);
 
     contentSizer->Add(m_leftPanel, 0, wxEXPAND);
     contentSizer->Add(m_canvas, 1, wxEXPAND);
@@ -366,6 +707,125 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
     // Win11 DWM corner rounding for the main frame — matches the rest
     // of the app's window family.
     WindowEffects::ApplyRoundedCorners(this);
+
+    // ---- Background update check (U4) --------------------------------------
+    // Throttled to once per 24h and gated on the user preference; both live
+    // in UpdateStartupPolicy. The 3s delay keeps the network request out of
+    // the launch path entirely — GL init, fixture load and the startup
+    // dialog all settle first, and a slow DNS lookup can't lengthen any of
+    // them. Everything after this point is silent unless a genuinely newer,
+    // non-skipped version is published.
+    if (UpdateStartupPolicy::DueForAutoCheck())
+    {
+        m_startupUpdateTimer.SetOwner(this, ID_StartupUpdateTimer);
+        Bind(wxEVT_TIMER,
+            [this](wxTimerEvent&) { StartStartupUpdateCheck(); },
+            ID_StartupUpdateTimer);
+        m_startupUpdateTimer.StartOnce(3000);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// StartStartupUpdateCheck — the silent background check. Every failure path
+// is a no-op by design: errors, timeouts, malformed manifests, and
+// up-to-date all end here without a single pixel changing. Only "newer
+// version, not skipped" produces UI.
+// ---------------------------------------------------------------------------
+void MainFrame::StartStartupUpdateCheck()
+{
+    // The attempt is recorded up front (not on success), so an offline
+    // machine probes once per throttle window instead of on every launch.
+    UpdateStartupPolicy::RecordCheckAttempt();
+
+    m_startupChecker = std::make_unique<UpdateChecker>();
+
+    const bool started = m_startupChecker->Start(
+        [this](const UpdateChecker::Result& r)
+    {
+        if (r.outcome == UpdateChecker::Outcome::UpdateAvailable
+            && !UpdateStartupPolicy::IsVersionSkipped(r.latestVersion))
+        {
+            // Same preference chain as the manual dialog: changelog,
+            // then installer, then the website.
+            wxString target = r.notesUrl;
+            if (target.empty()) target = r.downloadUrl;
+            if (target.empty()) target = Mould3r::Version::Website;
+
+            ShowUpdateBanner(r.latestVersion, target);
+        }
+
+        // The checker must not be destroyed from inside its own
+        // callback (Finish() still has frames on the stack) — defer.
+        CallAfter([this] { m_startupChecker.reset(); });
+    });
+
+    if (!started)
+        m_startupChecker.reset();   // no backend — silently give up
+}
+
+// ---------------------------------------------------------------------------
+// ShowUpdateBanner — lazily builds the banner (child of m_preparePage,
+// sibling of the canvas, same overlay family as the toast and the path
+// toolbar) and pins it bottom-right.
+// ---------------------------------------------------------------------------
+void MainFrame::ShowUpdateBanner(const wxString& latestVersion,
+    const wxString& targetUrl)
+{
+    if (!m_updateBanner)
+    {
+        m_updateBanner = new UpdateBanner(m_preparePage);
+
+        // Keep it pinned through resizes. The toast and path toolbar are
+        // repinned by GLCanvas because they track the canvas rect; the
+        // banner tracks the PAGE's bottom-right corner, so the page's own
+        // size event is the right hook and GLCanvas stays untouched.
+        m_preparePage->Bind(wxEVT_SIZE, [this](wxSizeEvent& e)
+        {
+            PositionUpdateBanner();
+            e.Skip();
+        });
+    }
+
+    m_updateBanner->onView = [this, targetUrl]
+    {
+        wxLaunchDefaultBrowser(targetUrl);
+    };
+    m_updateBanner->onSkip = [latestVersion]
+    {
+        UpdateStartupPolicy::SkipVersion(latestVersion);
+    };
+    m_updateBanner->onDismiss = [] { /* 24h throttle is the snooze */ };
+
+    m_updateBanner->ShowUpdate(latestVersion);
+    PositionUpdateBanner();
+}
+
+void MainFrame::PositionUpdateBanner()
+{
+    if (!m_updateBanner || !m_preparePage)
+        return;
+
+    const wxSize page = m_preparePage->GetClientSize();
+    const wxSize sz = m_updateBanner->GetSize();
+    m_updateBanner->SetPosition(wxPoint(
+        page.x - sz.x - 16,
+        page.y - sz.y - 16));
+    m_updateBanner->Raise();
+}
+
+// ---------------------------------------------------------------------------
+// OnToggleAutoUpdateCheck — persists the preference and mirrors the checked
+// state onto both menu bars (each Help menu is a separate instance).
+// ---------------------------------------------------------------------------
+void MainFrame::OnToggleAutoUpdateCheck(wxCommandEvent& evt)
+{
+    const bool enabled = evt.IsChecked();
+    UpdateStartupPolicy::SetAutoCheckEnabled(enabled);
+
+    if (m_prepareMenuBar && m_prepareMenuBar->FindItem(ID_AutoUpdateCheck))
+        m_prepareMenuBar->Check(ID_AutoUpdateCheck, enabled);
+    if (m_previewMenuBar && m_previewMenuBar->FindItem(ID_AutoUpdateCheck))
+        m_previewMenuBar->Check(ID_AutoUpdateCheck, enabled);
 }
 
 // ---------------------------------------------------------------------------
@@ -451,6 +911,8 @@ wxMenuBar* MainFrame::BuildPrepareMenuBar()
         importMenu->Check(ID_MeshQualityHigh, q == MeshImportSettings::Quality::High);
     }
 
+    menuBar->Append(BuildHelpMenu(), "&Help");
+
     return menuBar;
 }
 
@@ -470,6 +932,31 @@ wxMenu* MainFrame::BuildGridMenu()
 }
 
 // ---------------------------------------------------------------------------
+// BuildHelpMenu — built fresh per call rather than shared, because a wxMenu
+// is owned by the wxMenuBar it's appended to; handing the same pointer to
+// both the Prepare and Preview bars would double-delete it on shutdown.
+// Both bars bind to the same wxID_ABOUT handler, so the two instances stay
+// behaviourally identical.
+//
+// ---------------------------------------------------------------------------
+wxMenu* MainFrame::BuildHelpMenu()
+{
+    auto* helpMenu = new wxMenu();
+    helpMenu->Append(ID_CheckForUpdates, "Check for Updates...");
+
+    // Built fresh per menu bar, so each instance reads its checked state
+    // from config here; the toggle handler re-syncs BOTH bars by id so the
+    // two can't disagree after a toggle.
+    auto* autoItem = helpMenu->AppendCheckItem(ID_AutoUpdateCheck,
+        "Check for Updates Automatically");
+    autoItem->Check(UpdateStartupPolicy::AutoCheckEnabled());
+
+    helpMenu->AppendSeparator();
+    helpMenu->Append(wxID_ABOUT, "About Mould3r...");
+    return helpMenu;
+}
+
+// ---------------------------------------------------------------------------
 // BuildPreviewMenuBar — minimal for now (File -> Exit). Grows as preview-
 // specific actions (e.g. a View menu for the debug overlays) are added.
 // ---------------------------------------------------------------------------
@@ -480,6 +967,7 @@ wxMenuBar* MainFrame::BuildPreviewMenuBar()
 
     auto* menuBar = new wxMenuBar();
     menuBar->Append(fileMenu, "&File");
+    menuBar->Append(BuildHelpMenu(), "&Help");
     return menuBar;
 }
 
@@ -496,7 +984,7 @@ void MainFrame::SetPerspective(Perspective which)
         m_book->SetSelection(which == Perspective::Preview ? 1 : 0);
 
     SetMenuBar(which == Perspective::Preview ? m_previewMenuBar
-                                             : m_prepareMenuBar);
+        : m_prepareMenuBar);
 
     // Primary action is perspective-specific: Generate Mould in Prepare,
     // Export in Preview. They share the top-right slot, so show one and hide
@@ -663,42 +1151,42 @@ wxPanel* MainFrame::CreateSidePanel(wxWindow* parent)
 
     // ---- Section label helper ----------------------------------------------
     auto addSection = [&](const wxString& text)
-        {
-            auto* lbl = new wxStaticText(panel, wxID_ANY, text);
-            lbl->SetForegroundColour(Style::Accent);
-            lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
-                wxFONTWEIGHT_BOLD, false, "Segoe UI"));
-            sizer->Add(lbl, 0, wxLEFT | wxTOP, 12);
+    {
+        auto* lbl = new wxStaticText(panel, wxID_ANY, text);
+        lbl->SetForegroundColour(Style::Accent);
+        lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_BOLD, false, "Segoe UI"));
+        sizer->Add(lbl, 0, wxLEFT | wxTOP, 12);
 
-            auto* line = new wxPanel(panel, wxID_ANY, wxDefaultPosition, wxSize(-1, 1));
-            line->SetBackgroundColour(Style::Divider);
-            sizer->Add(line, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 12);
-        };
+        auto* line = new wxPanel(panel, wxID_ANY, wxDefaultPosition, wxSize(-1, 1));
+        line->SetBackgroundColour(Style::Divider);
+        sizer->Add(line, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 12);
+    };
 
     // ---- Path row helper ---------------------------------------------------
     auto addPathRow = [&](const wxString& label, wxTextCtrl*& ctrl, int browseId)
-        {
-            auto* lbl = new wxStaticText(panel, wxID_ANY, label);
-            lbl->SetForegroundColour(kTextDefault);
-            lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
-                wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
-            sizer->Add(lbl, 0, wxLEFT | wxTOP, 12);
+    {
+        auto* lbl = new wxStaticText(panel, wxID_ANY, label);
+        lbl->SetForegroundColour(kTextDefault);
+        lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+        sizer->Add(lbl, 0, wxLEFT | wxTOP, 12);
 
-            auto* row = new wxBoxSizer(wxHORIZONTAL);
-            ctrl = new wxTextCtrl(panel, wxID_ANY, "",
-                wxDefaultPosition, wxSize(140, 24), wxTE_READONLY);
-            ctrl->SetBackgroundColour(Style::InputBg);
-            ctrl->SetForegroundColour(kTextDefault);
+        auto* row = new wxBoxSizer(wxHORIZONTAL);
+        ctrl = new wxTextCtrl(panel, wxID_ANY, "",
+            wxDefaultPosition, wxSize(140, 24), wxTE_READONLY);
+        ctrl->SetBackgroundColour(Style::InputBg);
+        ctrl->SetForegroundColour(kTextDefault);
 
-            auto* browse = new RoundedButton(panel, browseId, "...",
-                wxDefaultPosition, wxSize(28, 24));
-            browse->SetBackgroundColour(Style::InputBg);
-            browse->SetForegroundColour(kTextDefault);
+        auto* browse = new RoundedButton(panel, browseId, "...",
+            wxDefaultPosition, wxSize(28, 24));
+        browse->SetBackgroundColour(Style::InputBg);
+        browse->SetForegroundColour(kTextDefault);
 
-            row->Add(ctrl, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
-            row->Add(browse, 0, wxALIGN_CENTER_VERTICAL);
-            sizer->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 12);
-        };
+        row->Add(ctrl, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
+        row->Add(browse, 0, wxALIGN_CENTER_VERTICAL);
+        sizer->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 12);
+    };
 
     // ---- Export section ----------------------------------------------------
     addSection("EXPORT");
@@ -748,6 +1236,30 @@ void MainFrame::SetActiveTool(TransformMode mode)
 
     if (m_canvas)
         m_canvas->SetTransformMode(mode);
+
+    UpdateCanvasToast(mode);
+}
+
+// ---------------------------------------------------------------------------
+// UpdateCanvasToast — show the bottom-centre hint for modes whose only other
+// cue is the cursor shape, and clear it for everything else.
+//
+// Hung off SetActiveTool because that is the single sync point every mode
+// change routes through — ribbon buttons, Escape, and the canvas-internal
+// transitions that call back into the frame. Adding another mode here is a
+// one-line case.
+// ---------------------------------------------------------------------------
+void MainFrame::UpdateCanvasToast(TransformMode mode)
+{
+    if (!m_canvasToast) return;
+
+    if (mode == TransformMode::PlaceInsert)
+        m_canvasToast->ShowMessage("Select body to add insert to");
+    else
+        m_canvasToast->HideToast();
+
+    // ShowMessage resizes to the text, so the centring has to be redone.
+    if (m_canvas) m_canvas->RepositionCanvasToast();
 }
 
 // ---------------------------------------------------------------------------
@@ -1061,7 +1573,7 @@ void MainFrame::UpdateVentEditToolbar()
         // Visible as soon as Edit Vent mode is entered — even with nothing
         // selected — so Add Node (which snaps onto any path) is reachable and
         // the tools are discoverable. Per-cell enabling reflects the selection.
-        m_ventEditToolbar->SetLabels("VENT PATH", "Select a vent path");
+        m_ventEditToolbar->SetLabels("EDIT VENT PATH", "Select a vent path");
         m_ventEditToolbar->Configure(
             m_canvas->HasEditVentSelected(),
             m_canvas->IsEditVentComplex(),
@@ -1077,7 +1589,7 @@ void MainFrame::UpdateVentEditToolbar()
     {
         // Same shared overlay, retitled for runners. node[0] is pinned to the
         // sprue feed point and the endpoint is free (no perimeter snap).
-        m_ventEditToolbar->SetLabels("RUNNER PATH", "Select a runner");
+        m_ventEditToolbar->SetLabels("EDIT RUNNER PATH", "Select a runner");
         m_ventEditToolbar->Configure(
             m_canvas->HasEditRunnerSelected(),
             m_canvas->IsEditRunnerComplex(),
@@ -1094,7 +1606,7 @@ void MainFrame::UpdateVentEditToolbar()
         // Same shared overlay, retitled for the gate's SUB-RUNNER. node[0] is
         // pinned to the gate origin; only the sub-runner gets a complex route
         // (the gate frustum stays driven by the gate-card fields).
-        m_ventEditToolbar->SetLabels("SUB-RUNNER PATH", "Select a gate");
+        m_ventEditToolbar->SetLabels("EDIT SUB-RUNNER PATH", "Select a gate");
         m_ventEditToolbar->Configure(
             m_canvas->HasEditGateSelected(),
             m_canvas->IsEditGateComplex(),
@@ -1346,11 +1858,11 @@ private:
     {
         if (m_populating || !m_canvas) return;
         const glm::vec3 off((float)m_px->GetValue(),
-                            (float)m_py->GetValue(),
-                            (float)m_pz->GetValue());
+            (float)m_py->GetValue(),
+            (float)m_pz->GetValue());
         const glm::vec3 rot((float)m_rx->GetValue(),
-                            (float)m_ry->GetValue(),
-                            (float)m_rz->GetValue());
+            (float)m_ry->GetValue(),
+            (float)m_rz->GetValue());
         const float scale = (float)m_scale->GetValue();
         if (!m_canvas->SetInsertTransformById(m_insertId, off, rot, scale))
             Close();
@@ -1387,7 +1899,7 @@ private:
     }
 
     MainFrame* m_frame = nullptr;
-    GLCanvas*  m_canvas = nullptr;
+    GLCanvas* m_canvas = nullptr;
     int        m_insertId = -1;
     bool       m_populating = false;
 
@@ -1653,17 +2165,38 @@ void MainFrame::OnGridSettings(wxCommandEvent&)
         m_canvas->SetGridSettings(m_gridSettings);
 }
 
+// ---------------------------------------------------------------------------
+// OnAbout — modal About box. Stack-allocated: it owns no state worth
+// keeping between invocations, and the modal loop keeps it alive.
+// ---------------------------------------------------------------------------
+void MainFrame::OnAbout(wxCommandEvent&)
+{
+    AboutDialog dlg(this);
+    dlg.ShowModal();
+}
+
+// ---------------------------------------------------------------------------
+// OnCheckForUpdates — the manual, user-initiated check (Tier 1: notify
+// only). The dialog owns the whole flow — request, timeout, result UI —
+// and cancels the request if closed mid-check.
+// ---------------------------------------------------------------------------
+void MainFrame::OnCheckForUpdates(wxCommandEvent&)
+{
+    UpdateCheckDialog dlg(this);
+    dlg.ShowModal();
+}
+
 void MainFrame::GetVentDimensions(float& outLength, float& outWidth,
     float& outOverrunStart, float& outOverrunEnd) const
 {
     // Safe parse helper — returns defaultVal if text is empty or non-numeric
     auto parseField = [](wxTextCtrl* ctrl, float defaultVal) -> float
-        {
-            if (!ctrl) return defaultVal;
-            double v = defaultVal;
-            if (!ctrl->GetValue().ToDouble(&v)) return defaultVal;
-            return (v > 0.0) ? static_cast<float>(v) : defaultVal;
-        };
+    {
+        if (!ctrl) return defaultVal;
+        double v = defaultVal;
+        if (!ctrl->GetValue().ToDouble(&v)) return defaultVal;
+        return (v > 0.0) ? static_cast<float>(v) : defaultVal;
+    };
 
     const float conv = m_imperial ? 25.4f : 1.0f;
     outLength = parseField(m_ventLength, 5.0f) * conv;
@@ -1859,12 +2392,12 @@ void MainFrame::OnCreateFixture(wxCommandEvent&)
 
     createDlg.SetLoadHandler(
         [editor, &createDlg](CreateFixtureDialog::ProgressFn progress)
-        {
-            editor->SetInitialFixture(createDlg.GetFixtureName(),
-                createDlg.GetModelAPath(),
-                createDlg.GetModelBPath(),
-                progress);
-        });
+    {
+        editor->SetInitialFixture(createDlg.GetFixtureName(),
+            createDlg.GetModelAPath(),
+            createDlg.GetModelBPath(),
+            progress);
+    });
 
     if (createDlg.ShowModal() != wxID_OK)
     {
@@ -2204,11 +2737,11 @@ void MainFrame::OnSaveProject(wxCommandEvent&)
     for (const auto& in : m_canvas->GetInserts())
     {
         ProjectInsertData pi;
-        pi.sourcePath  = in.body.sourcePath;
+        pi.sourcePath = in.body.sourcePath;
         pi.parentIndex = in.parentIndex;
         pi.localOffset = in.localOffset;
         pi.localRotDeg = in.localRotDeg;
-        pi.localScale  = in.localScale;
+        pi.localScale = in.localScale;
         data.inserts.push_back(pi);
     }
 
@@ -2437,10 +2970,10 @@ void MainFrame::OnLoadProject(wxCommandEvent&)
 void MainFrame::SetParameterFields(const ProjectParameters& p)
 {
     auto setField = [](wxTextCtrl* ctrl, float value)
-        {
-            if (ctrl)
-                ctrl->SetValue(wxString::Format("%.4g", value));
-        };
+    {
+        if (ctrl)
+            ctrl->SetValue(wxString::Format("%.4g", value));
+    };
 
     // Project stores mm internally; convert for display if imperial
     const float conv = m_imperial ? (1.0f / 25.4f) : 1.0f;
@@ -2489,33 +3022,33 @@ void MainFrame::ApplyFixtureDefaults(const FixtureDefinition& def)
     const float lenConv = m_imperial ? (1.0f / 25.4f) : 1.0f;
 
     auto setLen = [&](wxTextCtrl* ctrl, const std::optional<float>& v)
-        {
-            if (ctrl && v)
-                ctrl->SetValue(wxString::Format("%.4g", *v * lenConv));
-        };
+    {
+        if (ctrl && v)
+            ctrl->SetValue(wxString::Format("%.4g", *v * lenConv));
+    };
     auto setDeg = [&](wxTextCtrl* ctrl, const std::optional<float>& v)
-        {
-            if (ctrl && v)
-                ctrl->SetValue(wxString::Format("%.4g", *v));
-        };
+    {
+        if (ctrl && v)
+            ctrl->SetValue(wxString::Format("%.4g", *v));
+    };
 
     // Type-choice override. We synthesise a wxEVT_CHOICE so any handlers
     // bound to the control (which currently show/hide the matching dimensions
     // panel) run the same way they would on a user click — keeps the UI
     // consistent if/when more than one type per category exists.
     auto setChoice = [](wxChoice* ctrl, const std::optional<std::string>& v)
-        {
-            if (!ctrl || !v) return;
-            const int idx = ctrl->FindString(wxString::FromUTF8(v->c_str()));
-            if (idx == wxNOT_FOUND) return;        // unknown type — ignore
-            if (idx == ctrl->GetSelection()) return; // already selected
-            ctrl->SetSelection(idx);
+    {
+        if (!ctrl || !v) return;
+        const int idx = ctrl->FindString(wxString::FromUTF8(v->c_str()));
+        if (idx == wxNOT_FOUND) return;        // unknown type — ignore
+        if (idx == ctrl->GetSelection()) return; // already selected
+        ctrl->SetSelection(idx);
 
-            wxCommandEvent evt(wxEVT_CHOICE, ctrl->GetId());
-            evt.SetEventObject(ctrl);
-            evt.SetInt(idx);
-            ctrl->GetEventHandler()->ProcessEvent(evt);
-        };
+        wxCommandEvent evt(wxEVT_CHOICE, ctrl->GetId());
+        evt.SetEventObject(ctrl);
+        evt.SetInt(idx);
+        ctrl->GetEventHandler()->ProcessEvent(evt);
+    };
 
     // ---- Vent ---------------------------------------------------------------
     setChoice(m_ventTypeChoice, def.ventDefaults.type);
@@ -2559,7 +3092,7 @@ void MainFrame::ApplyFixtureDefaults(const FixtureDefinition& def)
         const GridDefaults& g = def.gridDefaults;
         if (g.shape)
             m_gridSettings.shape = (*g.shape == "circular")
-                ? GridShape::Circular : GridShape::Rectangular;
+            ? GridShape::Circular : GridShape::Rectangular;
         if (g.sizeX)      m_gridSettings.sizeX = *g.sizeX;
         if (g.sizeY)      m_gridSettings.sizeY = *g.sizeY;
         if (g.radius)     m_gridSettings.radius = *g.radius;
@@ -2721,11 +3254,11 @@ void MainFrame::OnGenerateMould(wxCommandEvent&)
             ShotPreviewInput shot;
             if (m_canvas->HasLastShotMesh())
             {
-                shot.mesh      = &m_canvas->GetLastShotMesh();
-                shot.shape     = &m_canvas->GetLastShotShape();
-                shot.faceIds   = &m_canvas->GetLastShotFaceIds();
+                shot.mesh = &m_canvas->GetLastShotMesh();
+                shot.shape = &m_canvas->GetLastShotShape();
+                shot.faceIds = &m_canvas->GetLastShotFaceIds();
                 shot.volumeMm3 = m_canvas->GetLastShotVolumeMm3();
-                shot.halves    = &m_canvas->GetLastHalfShapes();
+                shot.halves = &m_canvas->GetLastHalfShapes();
             }
 
             // Inserts form their own preview category (one checkbox, yellow).
@@ -2786,15 +3319,15 @@ wxPanel* MainFrame::CreateCollapsibleSection(wxWindow* parent,
     wxPanel* contentRef = content;
     headerBtn->Bind(wxEVT_TOGGLEBUTTON, [headerBtn, contentRef,
         parent, title](wxCommandEvent&)
-        {
-            const bool expanded = headerBtn->GetValue();
-            headerBtn->SetBitmap(LoadSvgBundle(
-                expanded ? kChevronDownSvg : kChevronRightSvg,
-                wxSize(14, 14), true));
-            contentRef->Show(expanded);
-            parent->Layout();
-            parent->GetParent()->Layout();
-        });
+    {
+        const bool expanded = headerBtn->GetValue();
+        headerBtn->SetBitmap(LoadSvgBundle(
+            expanded ? kChevronDownSvg : kChevronRightSvg,
+            wxSize(14, 14), true));
+        contentRef->Show(expanded);
+        parent->Layout();
+        parent->GetParent()->Layout();
+    });
 
     return content;
 }
@@ -2822,7 +3355,7 @@ RoundedButton* MainFrame::MakePlaceButton(wxWindow* parent, int id,
         btn->SetBackgroundColour(active ? Style::BtnSecondarySelected
             : Style::BtnPlace);
         btn->Refresh();
-        };
+    };
 
     return btn;
 }
@@ -2851,15 +3384,15 @@ wxPanel* MainFrame::CreateVentsContent(wxWindow* parent)
     // ---- Edit / Remove / Clear all ------------------------------------------
     auto* actionGrid = new wxGridSizer(1, 3, 0, 4);
     auto makeSmallBtn = [&](const wxString& label) -> RoundedButton*
-        {
-            auto* btn = new RoundedButton(panel, wxID_ANY, label,
-                wxDefaultPosition, wxSize(-1, 26), wxBORDER_NONE);
-            btn->SetBackgroundColour(Style::BtnSmall);
-            btn->SetForegroundColour(Style::TextPrimary);
-            btn->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
-                wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
-            return btn;
-        };
+    {
+        auto* btn = new RoundedButton(panel, wxID_ANY, label,
+            wxDefaultPosition, wxSize(-1, 26), wxBORDER_NONE);
+        btn->SetBackgroundColour(Style::BtnSmall);
+        btn->SetForegroundColour(Style::TextPrimary);
+        btn->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+        return btn;
+    };
     auto* btnEdit = makeSmallBtn("Edit");
     btnEdit->SetId(ID_EditVent);
     auto* btnRemove = makeSmallBtn("Remove");
@@ -2915,28 +3448,28 @@ wxPanel* MainFrame::CreateVentsContent(wxWindow* parent)
 
     auto addDimRow = [&](const wxString& label, wxTextCtrl*& ctrl,
         const wxString& defaultVal)
-        {
-            auto* row = new wxBoxSizer(wxHORIZONTAL);
-            auto* lbl = new wxStaticText(m_ventDimsPanel, wxID_ANY, label);
-            lbl->SetForegroundColour(Style::TextMuted);
-            lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
-                wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
-            ctrl = new wxTextCtrl(m_ventDimsPanel, wxID_ANY, defaultVal,
-                wxDefaultPosition, wxSize(kFieldWidth, 22));
-            ctrl->SetBackgroundColour(Style::BtnSmall);
-            ctrl->SetForegroundColour(kTextDefault);
-            auto* unit = new wxStaticText(m_ventDimsPanel, wxID_ANY, "mm");
-            m_mmUnitLabels.push_back(unit);
-            unit->SetForegroundColour(Style::TextSubtle);
-            unit->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
-                wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
-            unit->SetMinSize(wxSize(kUnitWidth, -1));
-            row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL);
-            row->AddStretchSpacer(1);
-            row->Add(ctrl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, kFieldGap);
-            row->Add(unit, 0, wxALIGN_CENTER_VERTICAL);
-            dimsSizer->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
-        };
+    {
+        auto* row = new wxBoxSizer(wxHORIZONTAL);
+        auto* lbl = new wxStaticText(m_ventDimsPanel, wxID_ANY, label);
+        lbl->SetForegroundColour(Style::TextMuted);
+        lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+        ctrl = new wxTextCtrl(m_ventDimsPanel, wxID_ANY, defaultVal,
+            wxDefaultPosition, wxSize(kFieldWidth, 22));
+        ctrl->SetBackgroundColour(Style::BtnSmall);
+        ctrl->SetForegroundColour(kTextDefault);
+        auto* unit = new wxStaticText(m_ventDimsPanel, wxID_ANY, "mm");
+        m_mmUnitLabels.push_back(unit);
+        unit->SetForegroundColour(Style::TextSubtle);
+        unit->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+        unit->SetMinSize(wxSize(kUnitWidth, -1));
+        row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL);
+        row->AddStretchSpacer(1);
+        row->Add(ctrl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, kFieldGap);
+        row->Add(unit, 0, wxALIGN_CENTER_VERTICAL);
+        dimsSizer->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
+    };
 
     addDimRow("Length:", m_ventLength, "1.0");
     addDimRow("Width:", m_ventWidth, "2.0");
@@ -2951,27 +3484,27 @@ wxPanel* MainFrame::CreateVentsContent(wxWindow* parent)
     sizer->Add(settingsPanel, 0, wxEXPAND);
 
     m_ventTypeChoice->Bind(wxEVT_CHOICE, [this](wxCommandEvent&)
-        {
-            m_ventDimsPanel->Show(m_ventTypeChoice->GetStringSelection() == "Rectangular");
-            m_ventDimsPanel->GetParent()->Layout();
-            m_ventDimsPanel->GetParent()->GetParent()->Layout();
-            m_ventDimsPanel->GetParent()->GetParent()->GetParent()->Layout();
-        });
+    {
+        m_ventDimsPanel->Show(m_ventTypeChoice->GetStringSelection() == "Rectangular");
+        m_ventDimsPanel->GetParent()->Layout();
+        m_ventDimsPanel->GetParent()->GetParent()->Layout();
+        m_ventDimsPanel->GetParent()->GetParent()->GetParent()->Layout();
+    });
 
     settingsBtn->Bind(wxEVT_TOGGLEBUTTON, [settingsBtn, settingsPanel, panel](wxCommandEvent&)
-        {
-            static wxLongLong lastToggleMs = 0;
-            wxLongLong now = wxGetLocalTimeMillis();
-            if ((now - lastToggleMs).GetValue() < 200) { settingsBtn->SetValue(!settingsBtn->GetValue()); return; }
-            lastToggleMs = now;
-            const bool expanded = settingsBtn->GetValue();
-            settingsBtn->SetBitmap(LoadSvgBundle(
-                expanded ? kChevronDownSvg : kChevronRightSvg,
-                wxSize(12, 12), true));
-            settingsBtn->SetBitmapPosition(wxRIGHT);
-            settingsPanel->Show(expanded);
-            panel->Layout(); panel->GetParent()->Layout(); panel->GetParent()->GetParent()->Layout();
-        });
+    {
+        static wxLongLong lastToggleMs = 0;
+        wxLongLong now = wxGetLocalTimeMillis();
+        if ((now - lastToggleMs).GetValue() < 200) { settingsBtn->SetValue(!settingsBtn->GetValue()); return; }
+        lastToggleMs = now;
+        const bool expanded = settingsBtn->GetValue();
+        settingsBtn->SetBitmap(LoadSvgBundle(
+            expanded ? kChevronDownSvg : kChevronRightSvg,
+            wxSize(12, 12), true));
+        settingsBtn->SetBitmapPosition(wxRIGHT);
+        settingsPanel->Show(expanded);
+        panel->Layout(); panel->GetParent()->Layout(); panel->GetParent()->GetParent()->Layout();
+    });
 
     panel->SetSizer(sizer);
     return panel;
@@ -3010,7 +3543,7 @@ wxPanel* MainFrame::CreateSpruesContent(wxWindow* parent)
         btn->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
             wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
         return btn;
-        };
+    };
     auto* btnEdit = makeSmallBtn("Edit");
     btnEdit->SetId(ID_EditSprue);
     auto* btnRemove = makeSmallBtn("Remove");
@@ -3078,7 +3611,7 @@ wxPanel* MainFrame::CreateSpruesContent(wxWindow* parent)
         row->Add(ctrl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, kFieldGap);
         row->Add(u, 0, wxALIGN_CENTER_VERTICAL);
         dimsSizer->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
-        };
+    };
 
     addRow("Diameter:", m_sprueDiameter, "5.0", "mm");
     addRow("Draft angle:", m_sprueDraftAngle, "1.0", wxString::FromUTF8("\xC2\xB0"));
@@ -3095,7 +3628,7 @@ wxPanel* MainFrame::CreateSpruesContent(wxWindow* parent)
         dimsPanel->Show(m_sprueTypeChoice->GetStringSelection() == "Cylinder");
         dimsPanel->GetParent()->Layout(); dimsPanel->GetParent()->GetParent()->Layout();
         dimsPanel->GetParent()->GetParent()->GetParent()->Layout();
-        });
+    });
 
     settingsBtn->Bind(wxEVT_TOGGLEBUTTON, [settingsBtn, settingsPanel, panel](wxCommandEvent&) {
         static wxLongLong lastToggleMs = 0;
@@ -3109,7 +3642,7 @@ wxPanel* MainFrame::CreateSpruesContent(wxWindow* parent)
         settingsBtn->SetBitmapPosition(wxRIGHT);
         settingsPanel->Show(expanded);
         panel->Layout(); panel->GetParent()->Layout(); panel->GetParent()->GetParent()->Layout();
-        });
+    });
 
     panel->SetSizer(sizer);
     return panel;
@@ -3143,15 +3676,15 @@ wxPanel* MainFrame::CreateRunnersContent(wxWindow* parent)
     auto* actionGrid = new wxGridSizer(1, 3, 0, 4);   // 1 row, 3 cols, 4px h-gap
 
     auto makeSmallBtn = [&](const wxString& label) -> RoundedButton*
-        {
-            auto* btn = new RoundedButton(panel, wxID_ANY, label,
-                wxDefaultPosition, wxSize(-1, 26), wxBORDER_NONE);
-            btn->SetBackgroundColour(Style::BtnSmall);
-            btn->SetForegroundColour(Style::TextPrimary);
-            btn->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
-                wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
-            return btn;
-        };
+    {
+        auto* btn = new RoundedButton(panel, wxID_ANY, label,
+            wxDefaultPosition, wxSize(-1, 26), wxBORDER_NONE);
+        btn->SetBackgroundColour(Style::BtnSmall);
+        btn->SetForegroundColour(Style::TextPrimary);
+        btn->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+        return btn;
+    };
 
     auto* btnEdit = makeSmallBtn("Edit");
     btnEdit->SetId(ID_EditRunner);
@@ -3274,36 +3807,36 @@ wxPanel* MainFrame::CreateRunnersContent(wxWindow* parent)
 
     // Show/hide dims based on type selection (future-proofed for more types)
     m_runnerTypeChoice->Bind(wxEVT_CHOICE, [dimsPanel, this](wxCommandEvent&)
-        {
-            dimsPanel->Show(m_runnerTypeChoice->GetStringSelection() == "Cylindrical");
-            dimsPanel->GetParent()->Layout();
-            dimsPanel->GetParent()->GetParent()->Layout();
-            dimsPanel->GetParent()->GetParent()->GetParent()->Layout();
-        });
+    {
+        dimsPanel->Show(m_runnerTypeChoice->GetStringSelection() == "Cylindrical");
+        dimsPanel->GetParent()->Layout();
+        dimsPanel->GetParent()->GetParent()->Layout();
+        dimsPanel->GetParent()->GetParent()->GetParent()->Layout();
+    });
 
     // Toggle the Settings sub-section (debounced — 200ms cooldown)
     settingsBtn->Bind(wxEVT_TOGGLEBUTTON, [settingsBtn, settingsPanel, panel](wxCommandEvent&)
+    {
+        static wxLongLong lastToggleMs = 0;
+        wxLongLong now = wxGetLocalTimeMillis();
+        if ((now - lastToggleMs).GetValue() < 200)
         {
-            static wxLongLong lastToggleMs = 0;
-            wxLongLong now = wxGetLocalTimeMillis();
-            if ((now - lastToggleMs).GetValue() < 200)
-            {
-                // Too fast — revert the toggle state and ignore
-                settingsBtn->SetValue(!settingsBtn->GetValue());
-                return;
-            }
-            lastToggleMs = now;
+            // Too fast — revert the toggle state and ignore
+            settingsBtn->SetValue(!settingsBtn->GetValue());
+            return;
+        }
+        lastToggleMs = now;
 
-            const bool expanded = settingsBtn->GetValue();
-            settingsBtn->SetBitmap(LoadSvgBundle(
-                expanded ? kChevronDownSvg : kChevronRightSvg,
-                wxSize(12, 12), true));
-            settingsBtn->SetBitmapPosition(wxRIGHT);
-            settingsPanel->Show(expanded);
-            panel->Layout();
-            panel->GetParent()->Layout();
-            panel->GetParent()->GetParent()->Layout();
-        });
+        const bool expanded = settingsBtn->GetValue();
+        settingsBtn->SetBitmap(LoadSvgBundle(
+            expanded ? kChevronDownSvg : kChevronRightSvg,
+            wxSize(12, 12), true));
+        settingsBtn->SetBitmapPosition(wxRIGHT);
+        settingsPanel->Show(expanded);
+        panel->Layout();
+        panel->GetParent()->Layout();
+        panel->GetParent()->GetParent()->Layout();
+    });
 
     panel->SetSizer(sizer);
     return panel;
@@ -3336,7 +3869,7 @@ wxPanel* MainFrame::CreateGatesContent(wxWindow* parent)
         btn->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
             wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
         return btn;
-        };
+    };
     auto* btnEdit = makeSmallBtn("Edit");
     btnEdit->SetId(ID_EditGate);
     auto* btnRemove = makeSmallBtn("Remove");
@@ -3370,24 +3903,24 @@ wxPanel* MainFrame::CreateGatesContent(wxWindow* parent)
     auto addRow = [&](wxWindow* parent_, wxSizer* parentSz,
         const wxString& label, wxTextCtrl*& ctrl,
         const wxString& defVal, const wxString& unitStr, int lblW = 60)
-        {
-            auto* row = new wxBoxSizer(wxHORIZONTAL);
-            auto* lbl = new wxStaticText(parent_, wxID_ANY, label);
-            lbl->SetForegroundColour(Style::TextMuted);
-            lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
-            ctrl = new wxTextCtrl(parent_, wxID_ANY, defVal, wxDefaultPosition, wxSize(kFieldWidth, 22));
-            ctrl->SetBackgroundColour(Style::BtnSmall); ctrl->SetForegroundColour(kTextDefault);
-            auto* u = new wxStaticText(parent_, wxID_ANY, unitStr);
-            if (unitStr == "mm") m_mmUnitLabels.push_back(u);
-            u->SetForegroundColour(Style::TextSubtle);
-            u->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
-            u->SetMinSize(wxSize(kUnitWidth, -1));
-            row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL);
-            row->AddStretchSpacer(1);
-            row->Add(ctrl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, kFieldGap);
-            row->Add(u, 0, wxALIGN_CENTER_VERTICAL);
-            parentSz->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
-        };
+    {
+        auto* row = new wxBoxSizer(wxHORIZONTAL);
+        auto* lbl = new wxStaticText(parent_, wxID_ANY, label);
+        lbl->SetForegroundColour(Style::TextMuted);
+        lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+        ctrl = new wxTextCtrl(parent_, wxID_ANY, defVal, wxDefaultPosition, wxSize(kFieldWidth, 22));
+        ctrl->SetBackgroundColour(Style::BtnSmall); ctrl->SetForegroundColour(kTextDefault);
+        auto* u = new wxStaticText(parent_, wxID_ANY, unitStr);
+        if (unitStr == "mm") m_mmUnitLabels.push_back(u);
+        u->SetForegroundColour(Style::TextSubtle);
+        u->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+        u->SetMinSize(wxSize(kUnitWidth, -1));
+        row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL);
+        row->AddStretchSpacer(1);
+        row->Add(ctrl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, kFieldGap);
+        row->Add(u, 0, wxALIGN_CENTER_VERTICAL);
+        parentSz->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
+    };
 
     // ---- Gate type dropdown (inline with label) ------------------------------
     auto* typeRow = new wxBoxSizer(wxHORIZONTAL);
@@ -3461,7 +3994,7 @@ wxPanel* MainFrame::CreateGatesContent(wxWindow* parent)
         dimsPanel->Show(m_gateTypeChoice->GetStringSelection() == "Tapered Cylinder");
         dimsPanel->GetParent()->Layout(); dimsPanel->GetParent()->GetParent()->Layout();
         dimsPanel->GetParent()->GetParent()->GetParent()->Layout();
-        });
+    });
 
     settingsBtn->Bind(wxEVT_TOGGLEBUTTON, [settingsBtn, settingsPanel, panel](wxCommandEvent&) {
         static wxLongLong lastToggleMs = 0;
@@ -3475,7 +4008,7 @@ wxPanel* MainFrame::CreateGatesContent(wxWindow* parent)
         settingsBtn->SetBitmapPosition(wxRIGHT);
         settingsPanel->Show(expanded);
         panel->Layout(); panel->GetParent()->Layout(); panel->GetParent()->GetParent()->Layout();
-        });
+    });
 
     panel->SetSizer(sizer);
     return panel;
@@ -3522,7 +4055,7 @@ wxPanel* MainFrame::CreateEjectorsContent(wxWindow* parent)
         btn->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
             wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
         return btn;
-        };
+    };
     auto* btnEdit = makeSmallBtn("Edit");
     btnEdit->SetId(ID_EditEjector);
     auto* btnRemove = makeSmallBtn("Remove");
@@ -3556,24 +4089,24 @@ wxPanel* MainFrame::CreateEjectorsContent(wxWindow* parent)
     auto addRow = [&](wxWindow* parent_, wxSizer* parentSz,
         const wxString& label, wxTextCtrl*& ctrl,
         const wxString& defVal, const wxString& unitStr, int /*lblW*/ = 60)
-        {
-            auto* row = new wxBoxSizer(wxHORIZONTAL);
-            auto* lbl = new wxStaticText(parent_, wxID_ANY, label);
-            lbl->SetForegroundColour(Style::TextMuted);
-            lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
-            ctrl = new wxTextCtrl(parent_, wxID_ANY, defVal, wxDefaultPosition, wxSize(kFieldWidth, 22));
-            ctrl->SetBackgroundColour(Style::BtnSmall); ctrl->SetForegroundColour(kTextDefault);
-            auto* u = new wxStaticText(parent_, wxID_ANY, unitStr);
-            if (unitStr == "mm") m_mmUnitLabels.push_back(u);
-            u->SetForegroundColour(Style::TextSubtle);
-            u->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
-            u->SetMinSize(wxSize(kUnitWidth, -1));
-            row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL);
-            row->AddStretchSpacer(1);
-            row->Add(ctrl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, kFieldGap);
-            row->Add(u, 0, wxALIGN_CENTER_VERTICAL);
-            parentSz->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
-        };
+    {
+        auto* row = new wxBoxSizer(wxHORIZONTAL);
+        auto* lbl = new wxStaticText(parent_, wxID_ANY, label);
+        lbl->SetForegroundColour(Style::TextMuted);
+        lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+        ctrl = new wxTextCtrl(parent_, wxID_ANY, defVal, wxDefaultPosition, wxSize(kFieldWidth, 22));
+        ctrl->SetBackgroundColour(Style::BtnSmall); ctrl->SetForegroundColour(kTextDefault);
+        auto* u = new wxStaticText(parent_, wxID_ANY, unitStr);
+        if (unitStr == "mm") m_mmUnitLabels.push_back(u);
+        u->SetForegroundColour(Style::TextSubtle);
+        u->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+        u->SetMinSize(wxSize(kUnitWidth, -1));
+        row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL);
+        row->AddStretchSpacer(1);
+        row->Add(ctrl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, kFieldGap);
+        row->Add(u, 0, wxALIGN_CENTER_VERTICAL);
+        parentSz->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
+    };
 
     // ---- Ejector type dropdown (inline with label) ------------------------
     auto* typeRow = new wxBoxSizer(wxHORIZONTAL);
@@ -3616,7 +4149,7 @@ wxPanel* MainFrame::CreateEjectorsContent(wxWindow* parent)
         dimsPanel->GetParent()->Layout();
         dimsPanel->GetParent()->GetParent()->Layout();
         dimsPanel->GetParent()->GetParent()->GetParent()->Layout();
-        });
+    });
 
     settingsBtn->Bind(wxEVT_TOGGLEBUTTON, [settingsBtn, settingsPanel, panel](wxCommandEvent&) {
         // Same 200ms debounce as the other settings togglers — mid-frame
@@ -3633,7 +4166,7 @@ wxPanel* MainFrame::CreateEjectorsContent(wxWindow* parent)
         settingsBtn->SetBitmapPosition(wxRIGHT);
         settingsPanel->Show(expanded);
         panel->Layout(); panel->GetParent()->Layout(); panel->GetParent()->GetParent()->Layout();
-        });
+    });
 
     panel->SetSizer(sizer);
     return panel;
@@ -3684,7 +4217,7 @@ wxPanel* MainFrame::CreateInsertsContent(wxWindow* parent)
         btn->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
             wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
         return btn;
-        };
+    };
     auto* btnEdit = makeSmallBtn("Edit");
     btnEdit->SetId(ID_EditInsert);
     auto* btnRemove = makeSmallBtn("Remove");
@@ -3720,24 +4253,24 @@ wxPanel* MainFrame::CreateInsertsContent(wxWindow* parent)
     auto addRow = [&](wxWindow* parent_, wxSizer* parentSz,
         const wxString& label, wxTextCtrl*& ctrl,
         const wxString& defVal, const wxString& unitStr, int /*lblW*/ = 60)
-        {
-            auto* row = new wxBoxSizer(wxHORIZONTAL);
-            auto* lbl = new wxStaticText(parent_, wxID_ANY, label);
-            lbl->SetForegroundColour(Style::TextMuted);
-            lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
-            ctrl = new wxTextCtrl(parent_, wxID_ANY, defVal, wxDefaultPosition, wxSize(kFieldWidth, 22));
-            ctrl->SetBackgroundColour(Style::BtnSmall); ctrl->SetForegroundColour(kTextDefault);
-            auto* u = new wxStaticText(parent_, wxID_ANY, unitStr);
-            if (unitStr == "mm") m_mmUnitLabels.push_back(u);
-            u->SetForegroundColour(Style::TextSubtle);
-            u->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
-            u->SetMinSize(wxSize(kUnitWidth, -1));
-            row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL);
-            row->AddStretchSpacer(1);
-            row->Add(ctrl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, kFieldGap);
-            row->Add(u, 0, wxALIGN_CENTER_VERTICAL);
-            parentSz->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
-        };
+    {
+        auto* row = new wxBoxSizer(wxHORIZONTAL);
+        auto* lbl = new wxStaticText(parent_, wxID_ANY, label);
+        lbl->SetForegroundColour(Style::TextMuted);
+        lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+        ctrl = new wxTextCtrl(parent_, wxID_ANY, defVal, wxDefaultPosition, wxSize(kFieldWidth, 22));
+        ctrl->SetBackgroundColour(Style::BtnSmall); ctrl->SetForegroundColour(kTextDefault);
+        auto* u = new wxStaticText(parent_, wxID_ANY, unitStr);
+        if (unitStr == "mm") m_mmUnitLabels.push_back(u);
+        u->SetForegroundColour(Style::TextSubtle);
+        u->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+        u->SetMinSize(wxSize(kUnitWidth, -1));
+        row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL);
+        row->AddStretchSpacer(1);
+        row->Add(ctrl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, kFieldGap);
+        row->Add(u, 0, wxALIGN_CENTER_VERTICAL);
+        parentSz->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
+    };
 
     auto* dimsPanel = new wxPanel(settingsPanel, wxID_ANY);
     dimsPanel->SetBackgroundColour(Style::CardBg);
@@ -3765,7 +4298,7 @@ wxPanel* MainFrame::CreateInsertsContent(wxWindow* parent)
         settingsBtn->SetBitmapPosition(wxRIGHT);
         settingsPanel->Show(expanded);
         panel->Layout(); panel->GetParent()->Layout(); panel->GetParent()->GetParent()->Layout();
-        });
+    });
 
     panel->SetSizer(sizer);
     return panel;
@@ -3835,203 +4368,203 @@ wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
         // wxBitmapBundle.  Relative paths are anchored to the executable directory.
         // Returns an invalid bundle (IsOk() == false) if the path is empty or missing.
         auto LoadToolIcon = [](const wxString& svgPath) -> wxBitmapBundle
+        {
+            if (svgPath.IsEmpty())
+                return wxBitmapBundle();
+
+            wxFileName fn(svgPath);
+            if (fn.IsRelative())
             {
-                if (svgPath.IsEmpty())
-                    return wxBitmapBundle();
+                wxFileName exeDir(wxStandardPaths::Get().GetExecutablePath());
+                fn.MakeAbsolute(exeDir.GetPath());
+            }
 
-                wxFileName fn(svgPath);
-                if (fn.IsRelative())
-                {
-                    wxFileName exeDir(wxStandardPaths::Get().GetExecutablePath());
-                    fn.MakeAbsolute(exeDir.GetPath());
-                }
+            // Read raw SVG text so we can override its colors before rendering.
+            wxFile file(fn.GetFullPath());
+            if (!file.IsOpened())
+                return wxBitmapBundle();
+            wxString svg;
+            file.ReadAll(&svg);
 
-                // Read raw SVG text so we can override its colors before rendering.
-                wxFile file(fn.GetFullPath());
-                if (!file.IsOpened())
-                    return wxBitmapBundle();
-                wxString svg;
-                file.ReadAll(&svg);
+            // Replace the most common color tokens used by icon sets (e.g. Lucide)
+            // with plain white so the icon matches the button text color.
+            svg.Replace("currentColor", "white");
+            svg.Replace("\"black\"", "\"white\"");
+            svg.Replace("\"#000000\"", "\"white\"");
+            svg.Replace("\"#000\"", "\"white\"");
 
-                // Replace the most common color tokens used by icon sets (e.g. Lucide)
-                // with plain white so the icon matches the button text color.
-                svg.Replace("currentColor", "white");
-                svg.Replace("\"black\"", "\"white\"");
-                svg.Replace("\"#000000\"", "\"white\"");
-                svg.Replace("\"#000\"", "\"white\"");
-
-                const wxScopedCharBuffer utf8 = svg.utf8_str();
-                return wxBitmapBundle::FromSVG(utf8.data(), wxSize(18, 18));
-            };
+            const wxScopedCharBuffer utf8 = svg.utf8_str();
+            return wxBitmapBundle::FromSVG(utf8.data(), wxSize(18, 18));
+        };
 
         static const wxFont kToolBtnFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
             wxFONTWEIGHT_BOLD, false, "Segoe UI");
 
         auto makeToolBtn = [&](int id, const wxString& label, bool toggle,
             const wxString& svgPath = "") -> wxWindow*
+        {
+            // Use a plain wxPanel so we can freely position the icon+text
+            // with a sizer, giving true centred layout that native buttons
+            // won't provide once a bitmap is attached.
+            auto* panel = new wxPanel(toolsPanel, wxID_ANY,
+                wxDefaultPosition, wxSize(-1, 34), wxBORDER_NONE);
+            panel->SetBackgroundColour(Style::BtnSecondary);
+
+            // ---- Rounded-corner repaint -----------------------------------
+            // The panel paints itself: parent bg fills the whole client
+            // area first (so the four corner triangles outside the rounded
+            // shape pick up the toolbar's colour), then a filled rounded
+            // rectangle in the panel's *current* bg colour covers the rest.
+            // applyColours below mutates panel->SetBackgroundColour and
+            // calls Refresh(), so the existing hover / selected / idle
+            // state machine drives the paint with no extra wiring.
+            //
+            // wxBG_STYLE_PAINT promises wxWidgets we'll fill the client
+            // area ourselves — required when pairing with wxAutoBuffered-
+            // PaintDC, otherwise the default erase pass fights the buffer
+            // and the result flickers on hover.
+            //
+            // Matches the pattern used by RoundedButton.cpp; the 4 px
+            // radius keeps these in lockstep with the text-only
+            // RoundedButton's default. One constant to tune if the
+            // design ever wants a different number.
+            constexpr int kToolBtnCornerRadius = 4;
+            panel->SetBackgroundStyle(wxBG_STYLE_PAINT);
+            panel->Bind(wxEVT_PAINT, [panel](wxPaintEvent&) {
+                wxAutoBufferedPaintDC dc(panel);
+                const wxColour parentBg = panel->GetParent()
+                    ? panel->GetParent()->GetBackgroundColour()
+                    : panel->GetBackgroundColour();
+                dc.SetBackground(wxBrush(parentBg));
+                dc.Clear();
+
+                std::unique_ptr<wxGraphicsContext> gc(
+                    wxGraphicsContext::Create(dc));
+                if (!gc) return;
+                gc->SetAntialiasMode(wxANTIALIAS_DEFAULT);
+                gc->SetBrush(wxBrush(panel->GetBackgroundColour()));
+                gc->SetPen(*wxTRANSPARENT_PEN);
+                const wxSize sz = panel->GetClientSize();
+                gc->DrawRoundedRectangle(0, 0, sz.x, sz.y,
+                    kToolBtnCornerRadius);
+            });
+
+            // Inner horizontal sizer: [icon] [gap] [label]
+            auto* hSizer = new wxBoxSizer(wxHORIZONTAL);
+
+            wxStaticBitmap* bmpCtrl = nullptr;
+            wxBitmapBundle icon = LoadToolIcon(svgPath);
+            if (icon.IsOk())
             {
-                // Use a plain wxPanel so we can freely position the icon+text
-                // with a sizer, giving true centred layout that native buttons
-                // won't provide once a bitmap is attached.
-                auto* panel = new wxPanel(toolsPanel, wxID_ANY,
-                    wxDefaultPosition, wxSize(-1, 34), wxBORDER_NONE);
-                panel->SetBackgroundColour(Style::BtnSecondary);
+                bmpCtrl = new wxStaticBitmap(panel, wxID_ANY,
+                    icon.GetBitmapFor(panel));
+                hSizer->Add(bmpCtrl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 5);
+            }
 
-                // ---- Rounded-corner repaint -----------------------------------
-                // The panel paints itself: parent bg fills the whole client
-                // area first (so the four corner triangles outside the rounded
-                // shape pick up the toolbar's colour), then a filled rounded
-                // rectangle in the panel's *current* bg colour covers the rest.
-                // applyColours below mutates panel->SetBackgroundColour and
-                // calls Refresh(), so the existing hover / selected / idle
-                // state machine drives the paint with no extra wiring.
-                //
-                // wxBG_STYLE_PAINT promises wxWidgets we'll fill the client
-                // area ourselves — required when pairing with wxAutoBuffered-
-                // PaintDC, otherwise the default erase pass fights the buffer
-                // and the result flickers on hover.
-                //
-                // Matches the pattern used by RoundedButton.cpp; the 4 px
-                // radius keeps these in lockstep with the text-only
-                // RoundedButton's default. One constant to tune if the
-                // design ever wants a different number.
-                constexpr int kToolBtnCornerRadius = 4;
-                panel->SetBackgroundStyle(wxBG_STYLE_PAINT);
-                panel->Bind(wxEVT_PAINT, [panel](wxPaintEvent&) {
-                    wxAutoBufferedPaintDC dc(panel);
-                    const wxColour parentBg = panel->GetParent()
-                        ? panel->GetParent()->GetBackgroundColour()
-                        : panel->GetBackgroundColour();
-                    dc.SetBackground(wxBrush(parentBg));
-                    dc.Clear();
+            auto* txt = new wxStaticText(panel, wxID_ANY, label);
+            txt->SetForegroundColour(Style::TextPrimary);
+            txt->SetBackgroundColour(Style::BtnSecondary);
+            txt->SetFont(kToolBtnFont);
+            hSizer->Add(txt, 0, wxALIGN_CENTER_VERTICAL);
 
-                    std::unique_ptr<wxGraphicsContext> gc(
-                        wxGraphicsContext::Create(dc));
-                    if (!gc) return;
-                    gc->SetAntialiasMode(wxANTIALIAS_DEFAULT);
-                    gc->SetBrush(wxBrush(panel->GetBackgroundColour()));
-                    gc->SetPen(*wxTRANSPARENT_PEN);
-                    const wxSize sz = panel->GetClientSize();
-                    gc->DrawRoundedRectangle(0, 0, sz.x, sz.y,
-                        kToolBtnCornerRadius);
-                    });
+            // Wrap in a centering sizer using stretch spacers
+            auto* outer = new wxBoxSizer(wxHORIZONTAL);
+            outer->AddStretchSpacer(1);
+            outer->Add(hSizer, 0, wxALIGN_CENTER_VERTICAL);
+            outer->AddStretchSpacer(1);
+            panel->SetSizer(outer);
 
-                // Inner horizontal sizer: [icon] [gap] [label]
-                auto* hSizer = new wxBoxSizer(wxHORIZONTAL);
+            // Shared toggle state (avoids raw-pointer lifetime issues)
+            auto toggled = std::make_shared<bool>(false);
 
-                wxStaticBitmap* bmpCtrl = nullptr;
-                wxBitmapBundle icon = LoadToolIcon(svgPath);
-                if (icon.IsOk())
-                {
-                    bmpCtrl = new wxStaticBitmap(panel, wxID_ANY,
-                        icon.GetBitmapFor(panel));
-                    hSizer->Add(bmpCtrl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 5);
-                }
+            // Helpers to apply normal / hover / active colours
+            auto applyColours = [=](const wxColour& bg, const wxColour& fg) {
+                panel->SetBackgroundColour(bg);
+                txt->SetBackgroundColour(bg);
+                txt->SetForegroundColour(fg);
+                panel->Refresh();
+                txt->Refresh();
+            };
 
-                auto* txt = new wxStaticText(panel, wxID_ANY, label);
-                txt->SetForegroundColour(Style::TextPrimary);
-                txt->SetBackgroundColour(Style::BtnSecondary);
-                txt->SetFont(kToolBtnFont);
-                hSizer->Add(txt, 0, wxALIGN_CENTER_VERTICAL);
+            // Register a setter so SetActiveTool can drive this button's
+            // visual state externally (e.g. when Escape clears the mode).
+            // The lambda closes over the same `toggled` pointer the click
+            // handler uses, so both routes converge on the same state.
+            if (toggle)
+            {
+                m_toolBtnSetters[id] = [toggled, applyColours](bool active) {
+                    if (*toggled == active) return;  // already in target state
+                    *toggled = active;
+                    applyColours(active ? Style::BtnSecondarySelected : Style::BtnSecondary,
+                        active ? kTextActive : Style::TextPrimary);
+                };
+            }
 
-                // Wrap in a centering sizer using stretch spacers
-                auto* outer = new wxBoxSizer(wxHORIZONTAL);
-                outer->AddStretchSpacer(1);
-                outer->Add(hSizer, 0, wxALIGN_CENTER_VERTICAL);
-                outer->AddStretchSpacer(1);
-                panel->SetSizer(outer);
-
-                // Shared toggle state (avoids raw-pointer lifetime issues)
-                auto toggled = std::make_shared<bool>(false);
-
-                // Helpers to apply normal / hover / active colours
-                auto applyColours = [=](const wxColour& bg, const wxColour& fg) {
-                    panel->SetBackgroundColour(bg);
-                    txt->SetBackgroundColour(bg);
-                    txt->SetForegroundColour(fg);
-                    panel->Refresh();
-                    txt->Refresh();
-                    };
-
-                // Register a setter so SetActiveTool can drive this button's
-                // visual state externally (e.g. when Escape clears the mode).
-                // The lambda closes over the same `toggled` pointer the click
-                // handler uses, so both routes converge on the same state.
+            // Left-click: fire the appropriate command event and update visuals
+            auto onClick = [=](wxMouseEvent& e) {
                 if (toggle)
                 {
-                    m_toolBtnSetters[id] = [toggled, applyColours](bool active) {
-                        if (*toggled == active) return;  // already in target state
-                        *toggled = active;
-                        applyColours(active ? Style::BtnSecondarySelected : Style::BtnSecondary,
-                            active ? kTextActive : Style::TextPrimary);
-                        };
+                    *toggled = !*toggled;
+                    applyColours(*toggled ? Style::BtnSecondarySelected : Style::BtnSecondary,
+                        *toggled ? kTextActive : Style::TextPrimary);
+                    wxCommandEvent evt(wxEVT_TOGGLEBUTTON, id);
+                    evt.SetEventObject(panel);
+                    evt.SetInt(*toggled ? 1 : 0);
+                    panel->GetEventHandler()->ProcessEvent(evt);
                 }
-
-                // Left-click: fire the appropriate command event and update visuals
-                auto onClick = [=](wxMouseEvent& e) {
-                    if (toggle)
-                    {
-                        *toggled = !*toggled;
-                        applyColours(*toggled ? Style::BtnSecondarySelected : Style::BtnSecondary,
-                            *toggled ? kTextActive : Style::TextPrimary);
-                        wxCommandEvent evt(wxEVT_TOGGLEBUTTON, id);
-                        evt.SetEventObject(panel);
-                        evt.SetInt(*toggled ? 1 : 0);
-                        panel->GetEventHandler()->ProcessEvent(evt);
-                    }
-                    else
-                    {
-                        wxCommandEvent evt(wxEVT_BUTTON, id);
-                        evt.SetEventObject(panel);
-                        panel->GetEventHandler()->ProcessEvent(evt);
-                    }
-                    e.Skip();
-                    };
-
-                // Hover colours (only when not toggled-on)
-                auto onEnter = [=](wxMouseEvent& e) {
-                    if (!*toggled)
-                        applyColours(Style::BtnSecondaryHover, Style::TextPrimary);
-                    e.Skip();
-                    };
-                auto onLeave = [=](wxMouseEvent& e) {
-                    // Phantom-leave guard: txt and bmpCtrl are real child
-                    // windows of the panel, so the panel fires LEAVE as
-                    // soon as the cursor crosses onto either one — even
-                    // though, from the user's point of view, the cursor is
-                    // still very much on the button. The corollary ENTER
-                    // on the child does fire, but the relative ordering
-                    // between the two isn't guaranteed on Windows and we
-                    // were getting a stuck-off hover from the race.
-                    //
-                    // Fix: hit-test the cursor in screen coords against
-                    // the panel's screen rect. If it's still anywhere over
-                    // the composite, the leave is phantom — suppress it.
-                    // A genuine leave (cursor truly off the button) lands
-                    // outside the rect and falls through to the colour
-                    // reset.
-                    const wxRect screenRect(panel->GetScreenPosition(),
-                        panel->GetSize());
-                    if (!screenRect.Contains(wxGetMousePosition()))
-                    {
-                        if (!*toggled)
-                            applyColours(Style::BtnSecondary, Style::TextPrimary);
-                    }
-                    e.Skip();
-                    };
-
-                // Bind events to the panel and every child so the full hit-area works
-                for (wxWindow* w : { (wxWindow*)panel, (wxWindow*)txt,
-                                     (wxWindow*)bmpCtrl })
+                else
                 {
-                    if (!w) continue;
-                    w->Bind(wxEVT_LEFT_UP, onClick);
-                    w->Bind(wxEVT_ENTER_WINDOW, onEnter);
-                    w->Bind(wxEVT_LEAVE_WINDOW, onLeave);
+                    wxCommandEvent evt(wxEVT_BUTTON, id);
+                    evt.SetEventObject(panel);
+                    panel->GetEventHandler()->ProcessEvent(evt);
                 }
-
-                return panel;
+                e.Skip();
             };
+
+            // Hover colours (only when not toggled-on)
+            auto onEnter = [=](wxMouseEvent& e) {
+                if (!*toggled)
+                    applyColours(Style::BtnSecondaryHover, Style::TextPrimary);
+                e.Skip();
+            };
+            auto onLeave = [=](wxMouseEvent& e) {
+                // Phantom-leave guard: txt and bmpCtrl are real child
+                // windows of the panel, so the panel fires LEAVE as
+                // soon as the cursor crosses onto either one — even
+                // though, from the user's point of view, the cursor is
+                // still very much on the button. The corollary ENTER
+                // on the child does fire, but the relative ordering
+                // between the two isn't guaranteed on Windows and we
+                // were getting a stuck-off hover from the race.
+                //
+                // Fix: hit-test the cursor in screen coords against
+                // the panel's screen rect. If it's still anywhere over
+                // the composite, the leave is phantom — suppress it.
+                // A genuine leave (cursor truly off the button) lands
+                // outside the rect and falls through to the colour
+                // reset.
+                const wxRect screenRect(panel->GetScreenPosition(),
+                    panel->GetSize());
+                if (!screenRect.Contains(wxGetMousePosition()))
+                {
+                    if (!*toggled)
+                        applyColours(Style::BtnSecondary, Style::TextPrimary);
+                }
+                e.Skip();
+            };
+
+            // Bind events to the panel and every child so the full hit-area works
+            for (wxWindow* w : { (wxWindow*)panel, (wxWindow*)txt,
+                                 (wxWindow*)bmpCtrl })
+            {
+                if (!w) continue;
+                w->Bind(wxEVT_LEFT_UP, onClick);
+                w->Bind(wxEVT_ENTER_WINDOW, onEnter);
+                w->Bind(wxEVT_LEAVE_WINDOW, onLeave);
+            }
+
+            return panel;
+        };
 
         // Row 1 — Move / Rotate / Scale in equal thirds.
         auto* toolsRow1 = new wxGridSizer(1, 3, 0, 4);

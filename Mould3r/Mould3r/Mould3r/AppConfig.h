@@ -1,6 +1,18 @@
 #pragma once
 #include <string>
 
+// <windows.h> defines LoadString as a macro expanding to LoadStringW/A,
+// which mangles both this class's declaration and its call sites in any
+// translation unit where Windows headers were included first (wx pulls
+// them in via wrapwin.h). Undefining it HERE — before the class — keeps
+// the declaration and every downstream call on the same, real name.
+// (Only remaining hazard: including <windows.h> AFTER this header in the
+// same .cpp would re-poison later call sites; include order app-headers-
+// last avoids that, as every file in this project already does.)
+#ifdef LoadString
+#undef LoadString
+#endif
+
 class AppConfig
 {
 public:

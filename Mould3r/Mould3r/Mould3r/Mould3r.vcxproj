@@ -138,6 +138,7 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="AboutDialog.cpp" />
     <ClCompile Include="AppConfig.cpp" />
     <ClCompile Include="camera.cpp" />
     <ClCompile Include="CreateFixtureDialog.cpp" />
@@ -171,10 +172,13 @@
     <ClCompile Include="shaders.cpp" />
     <ClCompile Include="StartupDialog.cpp" />
     <ClCompile Include="TranslateDialog.cpp" />
+    <ClCompile Include="UpdateChecker.cpp" />
+    <ClCompile Include="UpdateCheckDialog.cpp" />
     <ClCompile Include="VentFeature.cpp" />
     <ClCompile Include="WindowEffects.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="AboutDialog.h" />
     <ClInclude Include="AppConfig.h" />
     <ClInclude Include="camera.h" />
     <ClInclude Include="CreateFixtureDialog.h" />
@@ -208,7 +212,10 @@
     <ClInclude Include="shaders.h" />
     <ClInclude Include="StartupDialog.h" />
     <ClInclude Include="style.h" />
+    <ClInclude Include="Version.h" />
     <ClInclude Include="TranslateDialog.h" />
+    <ClInclude Include="UpdateChecker.h" />
+    <ClInclude Include="UpdateCheckDialog.h" />
     <ClInclude Include="VentFeature.h" />
     <ClInclude Include="WindowEffects.h" />
   </ItemGroup>

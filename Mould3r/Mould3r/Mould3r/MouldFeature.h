@@ -169,6 +169,24 @@ std::vector<PathStation> SamplePath(const FeaturePath& path, float spacing = 1.5
 // ---------------------------------------------------------------------------
 void AutoComputeComplexHandles(FeaturePath& path);
 
+// ---------------------------------------------------------------------------
+// MakeTwoNodePath - turn a derived straight a->b route into the equivalent
+// 2-node Complex path.
+//
+// Every feature path is Complex now: PathKind::Simple survives only as the
+// transient state a path occupies between being derived and being promoted
+// (and as what an old project file loads as, until the first rebuild promotes
+// it). A 2-node Complex path samples to the same two stations a Simple one
+// did, so the swept preview and the OCC cut are unchanged.
+//
+// CALLERS MUST ONLY PROMOTE A RESOLVED PATH. A path that could not be derived
+// yet - a runner placed before the sprue exists, a gate with no feed to snap
+// to - has to stay Simple so the next rebuild re-derives it; promoting an
+// unresolved path freezes the placeholder forever, because the Complex branch
+// of every Compute*Path preserves what it finds instead of re-deriving.
+// ---------------------------------------------------------------------------
+void MakeTwoNodePath(FeaturePath& path, const glm::vec3& a, const glm::vec3& b);
+
 // Swept rectangular cross-section along a path on the parting plane.
 SolidMesh BuildBoxSweepMesh(const FeaturePath& path, float width, float depth,
     float overrunStart = 0.0f, float overrunEnd = 0.0f);

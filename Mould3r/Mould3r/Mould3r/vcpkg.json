@@ -1,8 +1,10 @@
 {
-  "name": "my-opencascade-app",
-  "version-string": "0.1.0",
+  "name": "mould3r",
+  "version-string": "0.5.0",
+  "description": "Mould3r - injection mould design",
   "dependencies": [
     "wxwidgets",
+    "nlohmann-json",
     "glad",
     "opencascade",
     "glm"

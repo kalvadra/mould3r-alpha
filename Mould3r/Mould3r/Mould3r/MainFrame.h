@@ -1,5 +1,6 @@
 #pragma once
 #include <wx/wx.h>
+#include <memory>   // std::unique_ptr — background update checker (U4)
 #include <wx/tglbtn.h>
 #include "RotateDialog.h"
 #include "TranslateDialog.h"
@@ -27,6 +28,12 @@ class PreviewPanel;    // forward decl — m_previewPanel pointer; full def
 class wxSimplebook;    // forward decl — m_book pointer; the perspective pager.
 class PerspectiveButton; // forward decl — m_btnPrepare/m_btnPreview tabs.
 class VentEditToolbar;   // forward decl — m_ventEditToolbar overlay (Part 5).
+class CanvasToast;       // forward decl — bottom-centre viewport hint pill,
+class UpdateBanner;      // forward decl — bottom-right update notification
+                         // card (U4); defined in MainFrame.cpp.
+class UpdateChecker;     // forward decl — background startup update check.
+                         // defined entirely in MainFrame.cpp (same no-header
+                         // arrangement as InsertEditDialog above)
 
 enum class TransformMode { Select, Translate, Rotate, Scale, Pattern, PlaceVent, PlaceRunner, PlaceGate, PlaceEjector, PlaceInsert, RemoveVent, RemoveRunner, RemoveGate, RemoveSprue, RemoveEjector, RemoveInsert, EditVent, EditRunner, EditGate, EditEjector, EditInsert, SelectInjectionPoint, AlignFace, AlignMidplane };
 
@@ -212,6 +219,9 @@ private:
     // major divisions), stores the result in m_gridSettings, and pushes it to
     // the canvas so the rendered grid updates.
     void OnGridSettings(wxCommandEvent&);
+    void OnAbout(wxCommandEvent&);
+    void OnCheckForUpdates(wxCommandEvent&);
+    void OnToggleAutoUpdateCheck(wxCommandEvent&);
 
     // ---- Workflow perspectives ---------------------------------------------
     // The window hosts two stacked perspectives in a wxSimplebook: "Prepare"
@@ -233,6 +243,7 @@ private:
     // Builds the Grid menu (Shape submenu + Change Size / Change Spacing),
     // reflecting the current m_gridSettings in the shape radio state.
     wxMenu* BuildGridMenu();
+    wxMenu* BuildHelpMenu();
 
     // Drive the two ribbon perspective tabs so the active one reads as
     // selected. Safe to call before either tab exists (no-ops).
@@ -321,6 +332,25 @@ private:
     // as a child of m_canvas, shown only while a vent is being edited.
     VentEditToolbar* m_ventEditToolbar = nullptr;
     void UpdateVentEditToolbar();   // canvas path-edit-changed hook target
+
+    // Bottom-centre hint overlay. Sibling of the canvas within m_preparePage,
+    // pinned by GLCanvas::RepositionCanvasToast. Driven from SetActiveTool so
+    // every route into a mode (button, Escape, canvas-internal transition)
+    // updates it through one place.
+    CanvasToast* m_canvasToast = nullptr;
+    void UpdateCanvasToast(TransformMode mode);
+
+    // ---- Background startup update check (U4) ----------------------------
+    // The checker is owned here so an in-flight request survives the timer
+    // handler returning, and is torn down (cancelling the request) with the
+    // frame. The banner is a child of m_preparePage, sibling of the canvas,
+    // pinned bottom-right; created lazily on the first notification.
+    std::unique_ptr<UpdateChecker> m_startupChecker;
+    UpdateBanner* m_updateBanner = nullptr;
+    wxTimer m_startupUpdateTimer;
+    void StartStartupUpdateCheck();
+    void ShowUpdateBanner(const wxString& latestVersion, const wxString& targetUrl);
+    void PositionUpdateBanner();
 
     // The two stacked workflow perspectives and the pager that switches between
     // them. m_preparePage wraps the left panel + main canvas; m_previewPanel is
@@ -468,6 +498,9 @@ private:
         ID_MeshQualityOff,
         ID_MeshQualityDraft,
         ID_MeshQualityNormal,
-        ID_MeshQualityHigh
+        ID_MeshQualityHigh,
+        ID_CheckForUpdates,
+        ID_AutoUpdateCheck,
+        ID_StartupUpdateTimer
     };
 };

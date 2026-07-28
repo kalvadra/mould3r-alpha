@@ -1178,6 +1178,19 @@ void GLCanvas::ComputeRunnerPath(RunnerFeature& rf) const
 
     rf.path.valid = m_sprue.hasPartingPoint &&
         glm::length(rf.path.end - rf.path.start) > 1e-6f;
+
+    // Promote to the equivalent 2-node Complex path, but ONLY once the route
+    // actually resolved. A runner placed before a sprue exists has no feed
+    // point yet; leaving it Simple keeps this function re-deriving it on every
+    // rebuild until the sprue lands, at which point it promotes. Promoting the
+    // unresolved placeholder would pin it forever, since the Complex branch
+    // above preserves rather than re-derives.
+    if (rf.path.valid)
+    {
+        const glm::vec3 a(rf.path.start.x, 0.0f, rf.path.start.z);
+        const glm::vec3 b(rf.path.end.x, 0.0f, rf.path.end.z);
+        MakeTwoNodePath(rf.path, a, b);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1330,6 +1343,17 @@ void GLCanvas::ComputeGatePath(GateFeature& gf) const
     gf.subPath.end    = gf.hasPath ? gf.pathEnd : origin;
     gf.subPath.valid  = gf.hasPath &&
         glm::length(gf.subPath.end - gf.subPath.start) > 1e-6f;
+
+    // Promote to the equivalent 2-node sub-runner, but ONLY once a feed was
+    // found. A gate with nothing to attach to must keep re-deriving here until
+    // a sprue / runner appears - see MakeTwoNodePath's contract.
+    //
+    // node[0] keeps the gate origin's full Y (decision 5: the first leg is
+    // allowed to tilt when the gate sits just off the parting plane); the
+    // endpoint is flattened to y=0. Matches the old "Make Complex" seeding.
+    if (gf.subPath.valid)
+        MakeTwoNodePath(gf.subPath, origin,
+            glm::vec3(gf.subPath.end.x, 0.0f, gf.subPath.end.z));
 }
 
 // ---------------------------------------------------------------------------
@@ -1425,12 +1449,15 @@ void GLCanvas::RebuildGateSolids()
         const glm::vec3 startPt = origin - pathDir * overrun;
         const float startRadius = std::max(0.01f, gateRadius - tanDraft * overrun);
 
-        // A Simple gate whose taper would swallow the entire straight path:
-        // emit one cone spanning the whole thing and no sub-runner — the
-        // historical degenerate, preserved exactly.  A Complex route never
-        // takes this branch; its cone is clamped to the first leg below.
+        // A STRAIGHT gate whose taper would swallow the entire path: emit one
+        // cone spanning the whole thing and no sub-runner — the historical
+        // degenerate, preserved exactly.  "Straight" is now a node COUNT test,
+        // not a PathKind test: every resolved sub-runner is Complex, so a
+        // 2-node route is the thing that used to be Simple. (An unresolved
+        // path still has no nodes at all, which the <= 2 also covers.)  A bent
+        // route never takes this branch; its cone is clamped to the first leg.
         const bool simpleFull =
-            gf.subPath.kind != PathKind::Complex && taperLen >= totalLen;
+            gf.subPath.nodes.size() <= 2 && taperLen >= totalLen;
 
         if (simpleFull)
         {
@@ -1456,14 +1483,32 @@ void GLCanvas::RebuildGateSolids()
             // AT the transition — running the full origin->endpoint curve at
             // constant radius (which ignored the gate cone) was the bug — and
             // gets a junction sphere so the straight cone blends into the curve
-            // that leaves the transition at an angle.  Non-smooth first legs are
-            // colinear with the cone, so no sphere (would be a redundant bulge).
+            // that leaves the transition at an angle.
+            //
+            // The spheres are gated on the sub-runner actually BENDING (> 2
+            // nodes), not on PathKind, so promoting every gate to Complex left
+            // straight-gate geometry byte-identical.  A straight route wants
+            // neither: the transition sphere would be colinear (a redundant
+            // bulge) and the feed end is a plain butt joint, as it always was.
+            //
+            // The test is on gf.subPath — the AUTHORED route — NOT on the
+            // trimmed subTubePath.  When the taper reaches the first node the
+            // trim collapses node[1] away (see GateSubRunnerCutPath), so a bent
+            // 3-node gate arrives here as a 2-node trimmed path.  Asking the
+            // trimmed path then reports "straight" and drops the spheres — in
+            // exactly the case that needs one most, because the cone is aimed
+            // down the ORIGINAL first leg while the tube leaves at the bend
+            // angle, and the collapsed node is no longer interior so the joint
+            // sphere in BuildRunnerCutPieces does not cover it either.
+            //
+            // KNOWN GAP: a 2-node route with Smooth on and hand-dragged handles
+            // CAN curve, and gets no spheres.
             const FeaturePath subTubePath =
                 GateSubRunnerCutPath(gf.subPath, transitionPt);
             gf.subRunnerSolid = BuildTubeSweepMesh(subTubePath, subRunnerRadius,
                 /*segments=*/32, /*overrunStart=*/0.0f, /*overrunEnd=*/0.0f,
-                /*sphereAtStart=*/subTubePath.kind == PathKind::Complex,
-                /*sphereAtEnd=*/subTubePath.kind == PathKind::Complex);
+                /*sphereAtStart=*/gf.subPath.nodes.size() > 2,
+                /*sphereAtEnd=*/gf.subPath.nodes.size() > 2);
         }
     }
 
@@ -2673,11 +2718,13 @@ bool GLCanvas::GenerateMould()
                 const float taperOnLeg    = std::min(taperLen, firstLegLen);
                 const float taperOnLegExt = taperOnLeg + backExt;
 
-                // A Simple gate whose taper swallows the whole straight path:
-                // one cone/cylinder, no sub-runner (historical degenerate).  A
-                // Complex route never takes this branch (cone clamped above).
+                // A STRAIGHT gate whose taper swallows the whole path: one
+                // cone/cylinder, no sub-runner (historical degenerate).  Node
+                // count, not PathKind — every resolved route is Complex now,
+                // so 2 nodes is what used to be Simple.  A bent route never
+                // takes this branch (cone clamped above).
                 const bool simpleFull =
-                    gf.subPath.kind != PathKind::Complex && taperLen >= totalLen;
+                    gf.subPath.nodes.size() <= 2 && taperLen >= totalLen;
 
                 if (simpleFull)
                 {
@@ -2751,7 +2798,7 @@ bool GLCanvas::GenerateMould()
                             GateSubRunnerCutPath(gf.subPath, transitionPt);
 
                         std::vector<TopoDS_Shape> subPieces;
-                        if (BuildRunnerCutPieces(subCutPath, subRunnerRadius, subPieces, /*sphereAtStart=*/subCutPath.kind == PathKind::Complex, /*sphereAtEnd=*/subCutPath.kind == PathKind::Complex))
+                        if (BuildRunnerCutPieces(subCutPath, subRunnerRadius, subPieces, /*sphereAtStart=*/gf.subPath.nodes.size() > 2, /*sphereAtEnd=*/gf.subPath.nodes.size() > 2))
                         {
                             for (const TopoDS_Shape& piece : subPieces)
                             {
@@ -3671,7 +3718,7 @@ bool GLCanvas::BuildShotModel(TopoDS_Shape& out)
             const float taperOnLegExt = taperOnLeg + backExt;
 
             const bool simpleFull =
-                gf.subPath.kind != PathKind::Complex && taperLen >= totalLen;
+                gf.subPath.nodes.size() <= 2 && taperLen >= totalLen;
 
             if (simpleFull)
             {
@@ -3709,7 +3756,7 @@ bool GLCanvas::BuildShotModel(TopoDS_Shape& out)
                     GateSubRunnerCutPath(gf.subPath, transitionPt);
 
                 std::vector<TopoDS_Shape> subPieces;
-                if (BuildRunnerCutPieces(subCutPath, subRunnerRadius, subPieces, /*sphereAtStart=*/subCutPath.kind == PathKind::Complex, /*sphereAtEnd=*/subCutPath.kind == PathKind::Complex))
+                if (BuildRunnerCutPieces(subCutPath, subRunnerRadius, subPieces, /*sphereAtStart=*/gf.subPath.nodes.size() > 2, /*sphereAtEnd=*/gf.subPath.nodes.size() > 2))
                     for (const TopoDS_Shape& piece : subPieces)
                         shapes.push_back(piece);
             }
@@ -5675,6 +5722,24 @@ VentPath GLCanvas::ComputeVentPath(const VentPoint& vp)
 
     result.end = glm::vec3(bestPt.x, 0.0f, bestPt.y);
     result.valid = true;
+
+    // Promote the derived straight route to the equivalent 2-node Complex
+    // path. Doing it HERE covers every caller at once - placement, the
+    // edit-drag re-derive, ReanchorVent, and load - so no vent ever reaches
+    // the rest of the app as Simple.
+    //
+    // Nodes are flattened to y=0, matching what the old "Make Complex" button
+    // produced (vent points come from RayCastParting, so worldPos.y is already
+    // ~0 and this is a no-op in practice).
+    //
+    // A degenerate route - vent point sitting exactly on the perimeter - is
+    // left Simple so the next rebuild re-derives it rather than freezing a
+    // zero-length pair of nodes.
+    const glm::vec3 a(result.start.x, 0.0f, result.start.z);
+    const glm::vec3 b(result.end.x, 0.0f, result.end.z);
+    if (glm::length(b - a) > 1e-6f)
+        MakeTwoNodePath(result, a, b);
+
     return result;
 }
 
@@ -5899,7 +5964,11 @@ void GLCanvas::ConvertEditVentToSimple()
         frame->GetVentDimensions(ventLength, ventWidth, oS, oE);
 
     vi.Destroy();
-    vi.path = ComputeVentPath(vi.point);   // kind = Simple, nodes cleared
+    // ComputeVentPath now returns a 2-node COMPLEX path, so this no longer
+    // yields a Simple one - but the result is the same straight route the
+    // caller wanted, so the behaviour is unchanged. (Unreachable from the UI
+    // since the Make Simple toggle was removed.)
+    vi.path = ComputeVentPath(vi.point);
     vi.path.overrunStart = ovS;
     vi.path.overrunEnd = ovE;
     vi.crossSection = BuildVentCrossSection(vi.path, ventWidth, ventLength);
@@ -6257,6 +6326,23 @@ int GLCanvas::PickPrecisePlaceableNode(int mouseX, int mouseY) const
         idx = PickEditRunnerNode(mouseX, mouseY);
 
     return IsEditNodePrecisePlaceable(idx) ? idx : -1;
+}
+
+// Terminal node of the selected feature's path in the active edit mode, or -1.
+// Backs "selecting a path also selects its end node": the marker the user
+// clicks to pick a runner / vent / gate sits ON that node, so leaving no node
+// selected looked like the click had not registered.
+int GLCanvas::EditEndNodeIndex() const
+{
+    int count = 0;
+    if (m_transformMode == TransformMode::EditVent)
+        count = IsEditVentComplex() ? EditVentNodeCount() : 0;
+    else if (m_transformMode == TransformMode::EditRunner)
+        count = IsEditRunnerComplex() ? EditRunnerNodeCount() : 0;
+    else if (m_transformMode == TransformMode::EditGate)
+        count = IsEditGateComplex() ? EditGateNodeCount() : 0;
+
+    return count >= 2 ? count - 1 : -1;   // a Simple path has no node array
 }
 
 // The node the Move tool last grabbed (it survives the mouse release so it acts
@@ -7184,6 +7270,26 @@ void GLCanvas::RepositionPathToolbar()
     const int x = cpos.x + std::max(8, (canvas.x - bar.x) / 2);
     const int y = cpos.y + 12;
     m_pathToolbar->Move(x, y);
+}
+
+// ---------------------------------------------------------------------------
+// RepositionCanvasToast - pin the hint overlay to the bottom-centre of the
+// viewport. Mirrors RepositionPathToolbar (same sibling-over-canvas trick,
+// opposite edge). Safe to call with no toast registered.
+//
+// The toast resizes itself to its message, so this has to run after every
+// message change as well as on canvas resize - hence the public entry point.
+// ---------------------------------------------------------------------------
+void GLCanvas::RepositionCanvasToast()
+{
+    if (!m_canvasToast) return;
+
+    const wxPoint cpos = GetPosition();            // canvas pos within parent
+    const wxSize  canvas = GetClientSize();
+    const wxSize  bar = m_canvasToast->GetSize();
+    const int x = cpos.x + std::max(8, (canvas.x - bar.x) / 2);
+    const int y = cpos.y + std::max(8, canvas.y - bar.y - 28);
+    m_canvasToast->Move(x, y);
 }
 
 // ---------------------------------------------------------------------------
@@ -8214,7 +8320,7 @@ void GLCanvas::OnPaint(wxPaintEvent&)
                 if (m_editHandleNode >= 0)
                     MoveEditVentHandle(m_editHandleNode, m_editHandleIsOut,
                         m_editMousePos.x, m_editMousePos.y, m_editHandleBreak);
-                else if (m_editVentNode >= 0)
+                else if (m_editNodeGrabbed && m_editVentNode >= 0)
                     MoveEditVentNode(m_editVentNode, m_editMousePos.x, m_editMousePos.y);
             }
             else
@@ -8277,7 +8383,7 @@ void GLCanvas::OnPaint(wxPaintEvent&)
                 if (m_editHandleNode >= 0)
                     MoveEditRunnerHandle(m_editHandleNode, m_editHandleIsOut,
                         m_editMousePos.x, m_editMousePos.y, m_editHandleBreak);
-                else if (m_editRunnerNode >= 0)
+                else if (m_editNodeGrabbed && m_editRunnerNode >= 0)
                     MoveEditRunnerNode(m_editRunnerNode, m_editMousePos.x, m_editMousePos.y);
             }
             else
@@ -8314,7 +8420,7 @@ void GLCanvas::OnPaint(wxPaintEvent&)
                 MoveEditGateHandle(m_editHandleNode, m_editHandleIsOut,
                     m_editMousePos.x, m_editMousePos.y, m_editHandleBreak);
             }
-            else if (m_editGateNode >= 0)
+            else if (m_editNodeGrabbed && m_editGateNode >= 0)
             {
                 MoveEditGateNode(m_editGateNode, m_editMousePos.x, m_editMousePos.y);
             }
@@ -10076,6 +10182,18 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
         {
             const wxPoint p = evt.GetPosition();
 
+            // The NODE selection gates the toolbar's Place... cell, so any
+            // change to it has to reach the toolbar. Every sub-branch below
+            // writes m_editVentNode, and all but one did so silently - which
+            // left Place... greyed out on a fresh node pick (and stale-enabled
+            // after a deselect). Snapshot here, fire one notify on exit.
+            const int prevNode = m_editVentNode;
+            const int prevFeature = m_editFeatureIndex;
+
+            // Cleared here and set ONLY by an actual node grab below, so a
+            // press on empty space never drags the auto-selected end node.
+            m_editNodeGrabbed = false;
+
             const bool haveSel =
                 m_editFeatureIndex >= 0 && m_editFeatureIndex < (int)m_vents.size();
             const bool selComplex =
@@ -10121,6 +10239,7 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
                 else if (grab >= 0)
                 {
                     m_editVentNode = grab;       // begin node drag
+                    m_editNodeGrabbed = true;
                     m_editHandleNode = -1;
                 }
                 else
@@ -10136,18 +10255,29 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
                         const float d = PointRayDistance(m_vents[i].point.worldPos, rayOrig, rayDir);
                         if (d < bestDist) { bestDist = d; bestIdx = i; }
                     }
-                    const bool selectionChanged = (bestIdx != m_editFeatureIndex);
                     m_editFeatureIndex = bestIdx;
-                    m_editVentNode = -1;
+                    // Selecting a path selects its END node too (see
+                    // EditEndNodeIndex). Not a grab, so no drag follows.
+                    m_editVentNode = EditEndNodeIndex();
                     m_editHandleNode = -1;
-                    if (selectionChanged) NotifyPathEditChanged();
+                    // Toolbar refresh handled by the branch-exit check below.
                 }
                 Refresh(false);
             }
+
+            if (m_editVentNode != prevNode || m_editFeatureIndex != prevFeature)
+                NotifyPathEditChanged();   // refresh the shared toolbar
         }
         else if (m_transformMode == TransformMode::EditRunner)
         {
             const wxPoint p = evt.GetPosition();
+
+            // Same reasoning as the vent branch above: node selection drives
+            // Place..., so snapshot it and notify once on the way out.
+            const int prevNode = m_editRunnerNode;
+            const int prevFeature = m_editFeatureIndex;
+
+            m_editNodeGrabbed = false;
 
             const bool haveSel =
                 m_editFeatureIndex >= 0 && m_editFeatureIndex < (int)m_runners.size();
@@ -10194,6 +10324,7 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
                 else if (grab >= 0)
                 {
                     m_editRunnerNode = grab;   // begin node drag
+                    m_editNodeGrabbed = true;
                     m_editHandleNode = -1;
                 }
                 else
@@ -10209,14 +10340,16 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
                         const float d = PointRayDistance(m_runners[i].point, rayOrig, rayDir);
                         if (d < bestDist) { bestDist = d; bestIdx = i; }
                     }
-                    const bool selectionChanged = (bestIdx != m_editFeatureIndex);
                     m_editFeatureIndex = bestIdx;
-                    m_editRunnerNode = -1;
+                    m_editRunnerNode = EditEndNodeIndex();   // select the end node
                     m_editHandleNode = -1;
-                    if (selectionChanged) NotifyPathEditChanged();   // refresh the shared toolbar
+                    // Toolbar refresh handled by the branch-exit check below.
                 }
                 Refresh(false);
             }
+
+            if (m_editRunnerNode != prevNode || m_editFeatureIndex != prevFeature)
+                NotifyPathEditChanged();   // refresh the shared toolbar
         }
         else if (m_transformMode == TransformMode::EditGate)
         {
@@ -10226,6 +10359,8 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
                 m_editFeatureIndex >= 0 && m_editFeatureIndex < (int)m_gates.size();
             const bool selComplex =
                 haveSel && m_gates[m_editFeatureIndex].subPath.kind == PathKind::Complex;
+
+            m_editNodeGrabbed = false;   // see the vent branch above
 
             if (m_pathEditTool == PathEditTool::AddNode)
             {
@@ -10268,6 +10403,7 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
                 else if (grab >= 0)
                 {
                     m_editGateNode = grab;   // begin node drag (interior / endpoint)
+                    m_editNodeGrabbed = true;
                     m_editHandleNode = -1;
                 }
                 else
@@ -10283,11 +10419,13 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
                         const float d = PointRayDistance(m_gates[i].point.worldPos, rayOrig, rayDir);
                         if (d < bestDist) { bestDist = d; bestIdx = i; }
                     }
+                    const int prevGateNode = m_editGateNode;
                     const bool selectionChanged = (bestIdx != m_editFeatureIndex);
                     m_editFeatureIndex = bestIdx;
-                    m_editGateNode = -1;
+                    m_editGateNode = EditEndNodeIndex();   // select the end node
                     m_editHandleNode = -1;
-                    if (selectionChanged) NotifyPathEditChanged();   // refresh the shared toolbar
+                    if (selectionChanged || m_editGateNode != prevGateNode)
+                        NotifyPathEditChanged();   // refresh the shared toolbar
                 }
                 Refresh(false);
             }
@@ -10994,6 +11132,7 @@ void GLCanvas::PasteFromClipboard()
 void GLCanvas::OnResize(wxSizeEvent& evt)
 {
     RepositionPathToolbar();   // Part 5: keep the overlay pinned top-centre
+    RepositionCanvasToast();   // ...and the hint overlay pinned bottom-centre
     Refresh(false);
     evt.Skip();
 }
