@@ -157,6 +157,7 @@
     <ClCompile Include="MeshOps.cpp" />
     <ClCompile Include="MeshSimplify.cpp" />
     <ClCompile Include="MeshUtils.cpp" />
+    <ClCompile Include="MeshBoolean.cpp" />
     <ClCompile Include="Mould3r.cpp" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="MouldFeature.cpp" />
@@ -198,6 +199,7 @@
     <ClInclude Include="MeshOps.h" />
     <ClInclude Include="MeshSimplify.h" />
     <ClInclude Include="MeshUtils.h" />
+    <ClInclude Include="MeshBoolean.h" />
     <ClInclude Include="Mould3r.h" />
     <ClInclude Include="MouldFeature.h" />
     <ClInclude Include="PatternDialog.h" />

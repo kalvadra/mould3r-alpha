@@ -3175,9 +3175,16 @@ void MainFrame::OnExport(wxCommandEvent&)
         suggestedName = fn.GetName();   // bare stem, no extension
     }
 
+    // Mesh scenes export STL (the halves are meshes); BREP scenes export STEP.
+    const bool meshScene = m_canvas->IsSceneMeshType();
+    const wxString ext = meshScene ? ".stl" : ".step";
+    const wxString wildcard = meshScene
+        ? "STL files (*.stl)|*.stl|All files (*.*)|*.*"
+        : "STEP files (*.step;*.stp)|*.step;*.stp|All files (*.*)|*.*";
+
     wxFileDialog dlg(this, "Export Mould Halves",
         suggestedDir, suggestedName,
-        "STEP files (*.step;*.stp)|*.step;*.stp|All files (*.*)|*.*",
+        wildcard,
         wxFD_SAVE);
 
     if (dlg.ShowModal() != wxID_OK)
@@ -3200,9 +3207,9 @@ void MainFrame::OnExport(wxCommandEvent&)
     }
 
     const wxString pathA = folder + wxFileName::GetPathSeparator()
-        + baseStem + "_a.step";
+        + baseStem + "_a" + ext;
     const wxString pathB = folder + wxFileName::GetPathSeparator()
-        + baseStem + "_b.step";
+        + baseStem + "_b" + ext;
 
     // Manual overwrite check on the real output paths. List only the
     // halves that actually exist so the prompt isn't misleading when
@@ -3252,6 +3259,7 @@ void MainFrame::OnGenerateMould(wxCommandEvent&)
         if (m_previewPanel && !halves.empty())
         {
             ShotPreviewInput shot;
+            shot.sceneIsMesh = m_canvas->IsSceneMeshType();
             if (m_canvas->HasLastShotMesh())
             {
                 shot.mesh = &m_canvas->GetLastShotMesh();

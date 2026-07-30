@@ -45,6 +45,9 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <fstream>
 #include <limits>
 #include <string>
 #include <vector>
@@ -58,6 +61,7 @@
 #include "shaders.h"
 #include "MeshUtils.h"
 #include "MeshOps.h"
+#include "MeshBoolean.h"
 #include "MouldFeature.h"
 
 // Radius of the green sphere drawn at each vent placement point (world units)
@@ -502,6 +506,7 @@ void GLCanvas::ApplyCircularPattern(int count, bool overrideRadius, float radius
         // unset — the user re-generates the mould after patterning.
         clone.role = orig.role;
         clone.sourcePath = orig.sourcePath;
+        clone.format = orig.format;
         clone.sourceShape = orig.sourceShape;
         clone.hasSourceShape = orig.hasSourceShape;
         clone.cpuVerts = orig.cpuVerts;
@@ -798,6 +803,7 @@ void GLCanvas::ApplyGridPattern(int numH, int numV, bool mirrorH, bool mirrorV,
             // left unset - the user re-generates the mould after patterning.
             clone.role = orig.role;
             clone.sourcePath = orig.sourcePath;
+            clone.format = orig.format;
             clone.sourceShape = orig.sourceShape;
             clone.hasSourceShape = orig.hasSourceShape;
             clone.cpuVerts = orig.cpuVerts;
@@ -942,6 +948,7 @@ void GLCanvas::CloneInsertOnto(int cloneIdx,
     in.localScale = localScale;   // seed's edit scale propagates to clones
     in.id = m_nextInsertId++;
     in.body.sourcePath = sourcePath;
+    in.body.format = FormatFromPath(sourcePath);
     in.body.cpuVerts = cpuVerts;
     in.body.cpuIndices = cpuIndices;
     in.body.sourceShape = sourceShape;
@@ -2435,6 +2442,11 @@ bool GLCanvas::GenerateMould()
                 std::to_string(oi + 1) + " of " +
                 std::to_string((int)m_objects.size()) + "...");
 
+            // Mesh-format objects have no BREP to cut — they're carved out of
+            // the tessellated half by a mesh boolean after this loop. Skip them
+            // here (this only ever fires in a mesh-toolpath scene).
+            if (obj.format == SourceFormat::Mesh) continue;
+
             if (obj.sourcePath.empty() && !obj.hasSourceShape) continue;
 
             TopoDS_Shape objShape;
@@ -2499,6 +2511,10 @@ bool GLCanvas::GenerateMould()
                 std::to_string((int)m_inserts.size()) + "...");
 
             const InsertFeature& in = m_inserts[ii];
+
+            // Mesh-format insert bodies are carved from the tessellated half by
+            // a mesh boolean after this loop, same as mesh objects.
+            if (in.body.format == SourceFormat::Mesh) continue;
 
             TopoDS_Shape insertCut;
             if (!BuildInsertCutSolid(in, insertCutScale, insertCut) || insertCut.IsNull())
@@ -2971,6 +2987,7 @@ bool GLCanvas::GenerateMould()
 
         fix.mouldShape = result;
         fix.hasMould = true;
+        fix.hasMouldMesh = false;   // set below iff the mesh cut yields a half
 
         BRepMesh_IncrementalMesh mesher(result, 0.05, false, 0.5, true);
 
@@ -2986,6 +3003,20 @@ bool GLCanvas::GenerateMould()
             if (tri.IsNull()) continue;
 
             const gp_Trsf tr = loc.Transformation();
+
+            // Emit triangles wound consistently outward. OCC stores each face's
+            // triangulation in the face's own sense; a REVERSED face flag means
+            // that sense is opposite the solid's outward normal, and a mirror in
+            // the placement transform flips winding again. Boolean-cut solids
+            // (features, STEP objects) routinely contain REVERSED faces, so
+            // without this the half has mixed winding and Manifold rejects it as
+            // "not an oriented 2-manifold" — breaking the mesh cut and producing
+            // non-watertight STL exports. A plain fixture block happens to be all
+            // consistent, which is why mesh-only scenes worked.
+            const bool faceRev  = (face.Orientation() == TopAbs_REVERSED);
+            const bool trMirror = (tr.VectorialPart().Determinant() < 0.0);
+            const bool flipWinding = (faceRev != trMirror);
+
             const uint32_t baseIndex = (uint32_t)(meshData.vertices.size() / 3);
 
             for (int i = 1; i <= tri->NbNodes(); ++i)
@@ -3000,6 +3031,7 @@ bool GLCanvas::GenerateMould()
             {
                 int n1, n2, n3;
                 tri->Triangle(t).Get(n1, n2, n3);
+                if (flipWinding) std::swap(n2, n3);
                 meshData.indices.push_back(baseIndex + (uint32_t)(n1 - 1));
                 meshData.indices.push_back(baseIndex + (uint32_t)(n2 - 1));
                 meshData.indices.push_back(baseIndex + (uint32_t)(n3 - 1));
@@ -3008,6 +3040,64 @@ bool GLCanvas::GenerateMould()
 
         if (meshData.vertices.empty() || meshData.indices.empty())
             continue;
+
+        // ---- Mesh toolpath: carve the mesh-format bodies -------------------
+        // The BREP cuts above subtracted only the BREP bodies (STEP objects,
+        // features, BREP inserts). meshData now holds this half tessellated in
+        // world space (positions + indices, pre crease-split). Difference the
+        // world-space mesh objects and mesh inserts out of it with Manifold, so
+        // high-poly STL/OBJ parts never pay the OCC faceted-BREP cost. A cut
+        // that fails (non-manifold operand, empty result) is warned and skipped,
+        // leaving the half as it was — matching the BREP loops' behaviour.
+        if (m_sceneIsMesh)
+        {
+            MeshBoolean::Mesh half{ std::move(meshData.vertices),
+                                    std::move(meshData.indices) };
+
+            auto carve = [&](MeshBoolean::Mesh&& tool, const std::string& what)
+            {
+                if (tool.empty()) return;
+                MeshBoolean::Mesh cut;
+                std::string err;
+                if (MeshBoolean::Difference(half, tool, cut, err))
+                    half = std::move(cut);
+                else
+                    wxMessageBox("Mesh cut failed for " + wxString(what) +
+                        ":\n" + wxString(err),
+                        "Generate Mould", wxOK | wxICON_WARNING, this);
+            };
+
+            for (int oi = 0; oi < (int)m_objects.size(); ++oi)
+            {
+                const SceneObject& obj = m_objects[oi];
+                if (obj.format != SourceFormat::Mesh) continue;
+                if (obj.cpuVerts.empty() || obj.cpuIndices.empty()) continue;
+                carve(WorldMeshFromLocal(obj.cpuVerts, obj.cpuIndices,
+                          obj.BuildModelMatrix()),
+                      "object " + std::to_string(oi + 1));
+            }
+
+            for (int ii = 0; ii < (int)m_inserts.size(); ++ii)
+            {
+                const InsertFeature& in = m_inserts[ii];
+                if (in.body.format != SourceFormat::Mesh) continue;
+                if (in.body.cpuVerts.empty() || in.body.cpuIndices.empty()) continue;
+                if (insertCutScale < 1e-4f) continue;
+                // Same placement as BuildInsertCutSolid: scale about the local
+                // origin by the card's cut scale, then the insert's world
+                // matrix (which already bakes in the per-insert edit scale).
+                const glm::mat4 m = in.worldMatrix *
+                    glm::scale(glm::mat4(1.0f), glm::vec3(insertCutScale));
+                carve(WorldMeshFromLocal(in.body.cpuVerts, in.body.cpuIndices, m),
+                      "insert " + std::to_string(ii + 1));
+            }
+
+            meshData.vertices = std::move(half.verts);
+            meshData.indices  = std::move(half.indices);
+
+            if (meshData.vertices.empty() || meshData.indices.empty())
+                continue;   // fully carved away, or every cut failed
+        }
 
         ComputeVertexNormals_Pos3(meshData.vertices, meshData.indices, meshData.posNorm);
         auto split = SplitByCreaseAngle_Pos3(meshData.vertices, meshData.indices, 35.0f);
@@ -3022,6 +3112,16 @@ bool GLCanvas::GenerateMould()
         // mould halves after generation. The mesh captured here is already in
         // world space (the fixture transform was baked into `result` above),
         // so the preview renders it at an identity pose.
+        // In a mesh scene, keep this fixture's carved half for STL export.
+        // Stored per-fixture (like mouldShape) so export maps halves to fixtures
+        // even if some fixture was skipped, rather than positionally indexing
+        // m_lastMouldMeshes.
+        if (m_sceneIsMesh)
+        {
+            fix.mouldMesh = meshData;
+            fix.hasMouldMesh = true;
+        }
+
         m_lastMouldMeshes.push_back(meshData);
 
         // Retain the half solid (world space, post-cut) for the separation
@@ -3031,11 +3131,12 @@ bool GLCanvas::GenerateMould()
 
     // ---- Shot model -------------------------------------------------------
     // Build the body of injected material (objects + feed system, excluding
-    // vents and ejectors) and tessellate it for the preview / future
-    // simulation. Done once after the per-fixture loop since the shot is a
-    // single world-space body independent of which half it sits between. A
-    // failed or empty build just leaves m_hasLastShotMesh false — generation
-    // still succeeds; the preview simply won't show a "Shot" part.
+    // vents and ejectors) and tessellate it for the preview / volume readout.
+    // Done once after the per-fixture loop since the shot is a single
+    // world-space body independent of which half it sits between. A failed or
+    // empty build just leaves m_hasLastShotMesh false — generation still
+    // succeeds; the preview simply won't show a "Shot" part.
+    if (!m_sceneIsMesh)
     {
         TopoDS_Shape shotShape;
         if (BuildShotModel(shotShape))
@@ -3050,6 +3151,34 @@ bool GLCanvas::GenerateMould()
             // a per-triangle face map so face results map back to display tris.
             m_lastShotShape = shotShape;
             TessellateShapeToMesh(shotShape, m_lastShotMesh, &m_lastShotFaceIds);
+            m_hasLastShotMesh =
+                !m_lastShotMesh.posNorm.empty() && !m_lastShotMesh.indices.empty();
+        }
+    }
+    else
+    {
+        // Mesh toolpath: union the STEP-object + feed-system shot with the
+        // native mesh objects into a single mesh shot body, and read its volume
+        // off that mesh. No BREP shot is retained (m_lastShotShape stays null),
+        // so the BREP design checks remain gated — but the shot displays and the
+        // volume readout works.
+        MeshBoolean::Mesh shotMesh;
+        double vol = 0.0;
+        if (BuildMeshShotModel(shotMesh, vol) && !shotMesh.empty())
+        {
+            // Build the display mesh (normals + crease split) from the shot.
+            FileImporter::MeshData md;
+            md.vertices = shotMesh.verts;
+            md.indices  = shotMesh.indices;
+            ComputeVertexNormals_Pos3(md.vertices, md.indices, md.posNorm);
+            auto split = SplitByCreaseAngle_Pos3(md.vertices, md.indices, 35.0f);
+            md.posNorm = std::move(split.posNorm);
+            md.indices = std::move(split.indices);
+
+            m_lastShotMesh = std::move(md);
+            m_lastShotVolumeMm3 = vol;
+            m_lastShotShape = TopoDS_Shape();   // no BREP shot in a mesh scene
+            m_lastShotFaceIds.clear();
             m_hasLastShotMesh =
                 !m_lastShotMesh.posNorm.empty() && !m_lastShotMesh.indices.empty();
         }
@@ -3805,6 +3934,85 @@ bool GLCanvas::BuildShotModel(TopoDS_Shape& out)
 
     if (acc.IsNull()) return false;
     out = acc;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// MeshFromPosNorm — extract a position-only MeshBoolean::Mesh from a display
+// MeshData's interleaved posNorm buffer (stride 6, position at offset 0). The
+// indices already reference the posNorm vertex layout, so the pair is
+// self-consistent; Manifold's Merge welds the crease-split duplicate verts back
+// together by position on the way into the boolean.
+// ---------------------------------------------------------------------------
+static MeshBoolean::Mesh MeshFromPosNorm(const FileImporter::MeshData& md)
+{
+    MeshBoolean::Mesh m;
+    const size_t nv = md.posNorm.size() / 6;
+    m.verts.reserve(nv * 3);
+    for (size_t v = 0; v < nv; ++v)
+    {
+        m.verts.push_back(md.posNorm[v * 6 + 0]);
+        m.verts.push_back(md.posNorm[v * 6 + 1]);
+        m.verts.push_back(md.posNorm[v * 6 + 2]);
+    }
+    m.indices = md.indices;
+    return m;
+}
+
+bool GLCanvas::BuildMeshShotModel(MeshBoolean::Mesh& outMesh, double& outVolumeMm3)
+{
+    outMesh = MeshBoolean::Mesh{};
+    outVolumeMm3 = 0.0;
+
+    std::vector<MeshBoolean::Mesh> parts;
+
+    // 1. The BREP shot — STEP objects + feed system, minus BREP inserts.
+    //    BuildShotModel naturally excludes mesh objects (they have no
+    //    sourceShape), so it yields exactly the "convert the STEP geometry to a
+    //    mesh" portion. Tessellate it (orientation-aware) and add it as a part.
+    TopoDS_Shape brepShot;
+    if (BuildShotModel(brepShot) && !brepShot.IsNull())
+    {
+        FileImporter::MeshData md;
+        TessellateShapeToMesh(brepShot, md, nullptr);
+        MeshBoolean::Mesh m = MeshFromPosNorm(md);
+        if (!m.empty()) parts.push_back(std::move(m));
+    }
+
+    // 2. Native mesh objects, in world space.
+    for (const SceneObject& obj : m_objects)
+    {
+        if (obj.format != SourceFormat::Mesh) continue;
+        if (obj.cpuVerts.empty() || obj.cpuIndices.empty()) continue;
+        parts.push_back(WorldMeshFromLocal(obj.cpuVerts, obj.cpuIndices,
+            obj.BuildModelMatrix()));
+    }
+
+    if (parts.empty()) return false;
+
+    std::string err;
+    MeshBoolean::Mesh shot;
+    if (!MeshBoolean::Union(parts, shot, err))
+        return false;
+
+    // 3. Subtract mesh inserts (their true, UNSCALED body — they occupy space
+    //    the plastic doesn't fill), mirroring BuildShotModel's insert handling.
+    for (const InsertFeature& in : m_inserts)
+    {
+        if (in.body.format != SourceFormat::Mesh) continue;
+        if (in.body.cpuVerts.empty() || in.body.cpuIndices.empty()) continue;
+        MeshBoolean::Mesh ins = WorldMeshFromLocal(
+            in.body.cpuVerts, in.body.cpuIndices, in.worldMatrix);
+        MeshBoolean::Mesh diff;
+        std::string derr;
+        if (MeshBoolean::Difference(shot, ins, diff, derr))
+            shot = std::move(diff);
+        // else: keep shot as-is, skip this insert (matches the BREP path's
+        // "drop the piece rather than abort" behaviour).
+    }
+
+    outMesh = std::move(shot);
+    outVolumeMm3 = MeshBoolean::Volume(outMesh);
     return true;
 }
 
@@ -5464,6 +5672,10 @@ void GLCanvas::RemoveInsertAtMouse(int mouseX, int mouseY)
 
     m_inserts[bestIdx].Destroy();
     m_inserts.erase(m_inserts.begin() + bestIdx);
+
+    // Removing an insert may have dropped the last mesh body (downward-only,
+    // so the notice never fires here).
+    RecomputeSceneMeshType(true);
 
     Refresh(false);
     NotifySceneMutated();
@@ -7629,6 +7841,65 @@ void GLCanvas::UploadMeshToGPU(const FileImporter::MeshData& mesh, SceneObject& 
     obj.mesh = newMesh;
 }
 
+// ---------------------------------------------------------------------------
+// WriteBinaryStl — write a MeshData (posNorm + indices, already in world space)
+// as a binary STL. Per-facet normals are recomputed from triangle geometry, so
+// the stored vertex normals don't matter. The 80-byte header deliberately does
+// NOT start with "solid" (that marks ASCII STL to some readers). Little-endian,
+// which matches the target (Windows x86/x64). Returns false on any file error.
+// ---------------------------------------------------------------------------
+static bool WriteBinaryStl(const std::string& path,
+    const FileImporter::MeshData& mesh)
+{
+    if (mesh.posNorm.empty() || mesh.indices.empty()) return false;
+    if (mesh.indices.size() % 3 != 0)                 return false;
+
+    std::ofstream out(path, std::ios::binary);
+    if (!out) return false;
+
+    char header[80] = { 0 };
+    const char* tag = "Mould3r mesh export";
+    std::memcpy(header, tag, std::strlen(tag));   // fits in 80; rest stays zero
+    out.write(header, sizeof(header));
+
+    const uint32_t triCount = (uint32_t)(mesh.indices.size() / 3);
+    out.write(reinterpret_cast<const char*>(&triCount), sizeof(triCount));
+
+    const size_t vertCount = mesh.posNorm.size() / 6;
+    auto pos = [&](uint32_t idx, int k) -> float {
+        return mesh.posNorm[(size_t)idx * 6 + (size_t)k];
+    };
+
+    for (size_t t = 0; t < mesh.indices.size(); t += 3)
+    {
+        const uint32_t i0 = mesh.indices[t + 0];
+        const uint32_t i1 = mesh.indices[t + 1];
+        const uint32_t i2 = mesh.indices[t + 2];
+        if (i0 >= vertCount || i1 >= vertCount || i2 >= vertCount)
+            return false;
+
+        const glm::vec3 v0(pos(i0, 0), pos(i0, 1), pos(i0, 2));
+        const glm::vec3 v1(pos(i1, 0), pos(i1, 1), pos(i1, 2));
+        const glm::vec3 v2(pos(i2, 0), pos(i2, 1), pos(i2, 2));
+
+        glm::vec3 n = glm::cross(v1 - v0, v2 - v0);
+        const float len = glm::length(n);
+        n = (len > 1e-20f) ? n / len : glm::vec3(0.0f);
+
+        const float rec[12] = {
+            n.x,  n.y,  n.z,
+            v0.x, v0.y, v0.z,
+            v1.x, v1.y, v1.z,
+            v2.x, v2.y, v2.z
+        };
+        out.write(reinterpret_cast<const char*>(rec), sizeof(rec));
+        const uint16_t attr = 0;
+        out.write(reinterpret_cast<const char*>(&attr), sizeof(attr));
+    }
+
+    return static_cast<bool>(out);
+}
+
 void GLCanvas::ExportFixtures(const std::string& pathA, const std::string& pathB)
 {
     if (m_fixtures.empty())
@@ -7639,6 +7910,41 @@ void GLCanvas::ExportFixtures(const std::string& pathA, const std::string& pathB
     }
 
     const std::vector<std::string> outPaths = { pathA, pathB };
+
+    // Mesh toolpath: the final halves are meshes, so export STL from each
+    // fixture's carved half (posNorm + indices). There's no clean BREP to write
+    // — mouldShape holds only the pre-mesh-cut half — so this path is entirely
+    // separate from the STEP path below.
+    if (m_sceneIsMesh)
+    {
+        int written = 0;
+        for (int i = 0; i < (int)m_fixtures.size() && i < 2; ++i)
+        {
+            const SceneObject& fix = m_fixtures[i];
+            if (outPaths[i].empty()) continue;
+            if (!fix.hasMouldMesh)
+            {
+                wxMessageBox(
+                    "Fixture " + std::to_string(i + 1) + " has no mesh half to "
+                    "export (it may have been fully carved away, or the mesh cut "
+                    "failed). Skipping it.",
+                    "Export", wxOK | wxICON_WARNING, this);
+                continue;
+            }
+            if (!WriteBinaryStl(outPaths[i], fix.mouldMesh))
+            {
+                wxMessageBox("Failed to write: " + outPaths[i],
+                    "Export Failed", wxOK | wxICON_ERROR, this);
+                continue;
+            }
+            ++written;
+        }
+
+        if (written > 0)
+            wxMessageBox("Mould halves exported successfully (STL).",
+                "Export Complete", wxOK | wxICON_INFORMATION, this);
+        return;
+    }
 
     for (int i = 0; i < (int)m_fixtures.size() && i < 2; ++i)
     {
@@ -7702,6 +8008,79 @@ void GLCanvas::ExportFixtures(const std::string& pathA, const std::string& pathB
 }
 
 // ---------------------------------------------------------------------------
+// FormatFromPath — lineage from the file extension. Mirrors the dispatch in
+// FileImporter::ImportAuto: .stl / .obj are mesh formats; .step / .stp (and
+// anything unrecognised) are treated as BREP. Case-insensitive.
+// ---------------------------------------------------------------------------
+SourceFormat GLCanvas::FormatFromPath(const std::string& path)
+{
+    const auto dot = path.find_last_of('.');
+    if (dot == std::string::npos) return SourceFormat::Brep;
+    std::string ext = path.substr(dot + 1);
+    for (char& c : ext) c = (char)std::tolower((unsigned char)c);
+    if (ext == "stl" || ext == "obj") return SourceFormat::Mesh;
+    return SourceFormat::Brep;
+}
+
+// ---------------------------------------------------------------------------
+// RecomputeSceneMeshType — refresh m_sceneIsMesh from the current scene and,
+// on a false->true transition, tell the user the scene has moved onto the
+// mesh toolpath. Called from every path that adds or removes an imported body
+// (objects and inserts alike). See the header for the notify contract.
+// ---------------------------------------------------------------------------
+void GLCanvas::RecomputeSceneMeshType(bool notify)
+{
+    bool anyMesh = false;
+    for (const SceneObject& o : m_objects)
+        if (o.format == SourceFormat::Mesh) { anyMesh = true; break; }
+    if (!anyMesh)
+        for (const InsertFeature& in : m_inserts)
+            if (in.body.format == SourceFormat::Mesh) { anyMesh = true; break; }
+
+    const bool wasMesh = m_sceneIsMesh;
+    m_sceneIsMesh = anyMesh;
+
+    if (notify && !wasMesh && anyMesh)
+    {
+        wxMessageBox(
+            "This scene now contains a mesh-format body (STL/OBJ), so it has "
+            "switched to the mesh toolpath.\n\n"
+            "Generated moulds and exported halves will use mesh (STL) output "
+            "rather than STEP.",
+            "Mesh Toolpath", wxOK | wxICON_INFORMATION, this);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WorldMeshFromLocal — bake a local position-only mesh into world space for the
+// mesh-toolpath boolean. A mirror (negative-determinant model matrix) flips
+// triangle orientation, so we reverse winding to keep the solid outward-facing;
+// Manifold requires CCW-from-outside triangles.
+// ---------------------------------------------------------------------------
+MeshBoolean::Mesh GLCanvas::WorldMeshFromLocal(
+    const std::vector<float>& cpuVerts,
+    const std::vector<uint32_t>& cpuIndices,
+    const glm::mat4& model)
+{
+    MeshBoolean::Mesh m;
+    const size_t nv = cpuVerts.size() / 3;
+    m.verts.resize(nv * 3);
+    for (size_t v = 0; v < nv; ++v)
+    {
+        const glm::vec4 w = model * glm::vec4(
+            cpuVerts[v * 3 + 0], cpuVerts[v * 3 + 1], cpuVerts[v * 3 + 2], 1.0f);
+        m.verts[v * 3 + 0] = w.x;
+        m.verts[v * 3 + 1] = w.y;
+        m.verts[v * 3 + 2] = w.z;
+    }
+    m.indices = cpuIndices;
+    if (glm::determinant(glm::mat3(model)) < 0.0f)
+        for (size_t t = 0; t + 2 < m.indices.size(); t += 3)
+            std::swap(m.indices[t + 1], m.indices[t + 2]);
+    return m;
+}
+
+// ---------------------------------------------------------------------------
 // ImportBodyInto — the shared import pipeline, factored out of ImportFile so
 // inserts can reuse it verbatim rather than growing a third near-copy of it.
 // Parses via FileImporter, computes vertex normals, splits by crease angle,
@@ -7719,9 +8098,8 @@ bool GLCanvas::ImportBodyInto(const std::string& path, SceneObject& out,
     SetCurrent(*m_context);
     InitGLOnce();
 
-    // Give mesh-format imports a more accurate progress label, since
-    // BuildFacetedShape() runs synchronously inside ImportAuto and can be
-    // the dominant cost for large meshes.
+    // Give mesh-format imports an accurate progress label. Mesh imports no
+    // longer sew a faceted BREP (mesh toolpath), so parsing is the main cost.
     auto lower = [](std::string s) {
         for (char& c : s) c = (char)std::tolower((unsigned char)c);
         return s;
@@ -7731,7 +8109,7 @@ bool GLCanvas::ImportBodyInto(const std::string& path, SceneObject& out,
         : lower(path.substr(path.find_last_of('.') + 1));
     const bool isMeshFormat = (ext == "stl" || ext == "obj");
     const wxString firstMsg = isMeshFormat
-        ? "Parsing mesh and building solid (may take a while)..."
+        ? "Parsing mesh..."
         : "Reading STEP file...";
 
     wxProgressDialog progress(
@@ -7746,11 +8124,52 @@ bool GLCanvas::ImportBodyInto(const std::string& path, SceneObject& out,
 
     progress.Update(step++, firstMsg);
     FileImporter importer;
-    auto res = importer.ImportAuto(path, 0.05, 0.5);
+    // buildMeshSolid=false: mesh formats stay as raw triangles (mesh toolpath);
+    // we never build the faceted BREP. STEP is unaffected and still carries a
+    // native BREP.
+    auto res = importer.ImportAuto(path, 0.05, 0.5, /*buildMeshSolid=*/false);
 
     if (!res.ok()) {
         wxMessageBox(res.error, "Import failed", wxOK | wxICON_ERROR, this);
         return false;
+    }
+
+    // Mesh toolpath: the mould cut is a mesh boolean, which needs a watertight
+    // solid. Clean meshes pass straight through. A non-watertight one prompts
+    // the user; on Continue we attempt the one simple repair this tool does
+    // (weld coincident verts / collapse degenerate tris). If that can't make it
+    // watertight, or the user cancels, the import is aborted — no faceted-BREP
+    // fallback exists any more, and in-depth repair is out of scope.
+    if (isMeshFormat)
+    {
+        MeshBoolean::Mesh raw{ res.meshes[0].vertices, res.meshes[0].indices };
+        if (!MeshBoolean::IsManifold(raw))
+        {
+            wxMessageDialog dlg(this,
+                "This mesh isn't a watertight solid, so the mould cut may be "
+                "unreliable against it.\n\n"
+                "Continue to attempt a simple repair (not guaranteed), or "
+                "Cancel to abort the import.",
+                "Non-watertight mesh",
+                wxOK | wxCANCEL | wxICON_WARNING | wxCENTRE);
+            dlg.SetOKCancelLabels("Continue", "Cancel");
+            if (dlg.ShowModal() != wxID_OK)
+                return false;   // Cancel — abort the import entirely
+
+            MeshBoolean::RepairResult rr = MeshBoolean::ValidateAndRepair(raw);
+            if (!rr.ok)
+            {
+                wxMessageBox(
+                    "The mesh couldn't be patched into a watertight solid, so "
+                    "it can't be used on the mesh toolpath. Import aborted.\n\n"
+                    "Details: " + wxString(rr.message),
+                    "Repair failed", wxOK | wxICON_ERROR, this);
+                return false;   // repair failed entirely — abort
+            }
+            // Adopt the repaired geometry for display, picking, and the cut.
+            res.meshes[0].vertices = std::move(rr.mesh.verts);
+            res.meshes[0].indices  = std::move(rr.mesh.indices);
+        }
     }
 
     progress.Update(step++, "Computing vertex normals...");
@@ -7772,6 +8191,7 @@ bool GLCanvas::ImportBodyInto(const std::string& path, SceneObject& out,
 
     progress.Update(step++, "Uploading to GPU...");
     out.sourcePath = path;
+    out.format = FormatFromPath(path);
     out.cpuVerts = std::move(cpuVerts);
     out.cpuIndices = std::move(cpuIndices);
     if (res.hasShape) {
@@ -7782,24 +8202,13 @@ bool GLCanvas::ImportBodyInto(const std::string& path, SceneObject& out,
 
     progress.Update(step++, "Done.");
 
-    // For mesh imports that couldn't be sewn into a closed solid, warn the
-    // user: booleans (mould cut) against an open shell are unreliable.
-    if (isMeshFormat && res.hasShape && !res.shapeIsClosedSolid) {
-        wxMessageBox(
-            "The imported mesh could not be sewn into a closed solid. "
-            "It will display correctly, but the mould cut may produce "
-            "incorrect results against this object. Consider repairing "
-            "the mesh (e.g. with MeshLab or Blender) so it is watertight.",
-            "Non-manifold mesh", wxOK | wxICON_WARNING, this);
-    }
-
     return true;
 }
 
 // ---------------------------------------------------------------------------
 // Import — appends a new SceneObject (STEP / STL / OBJ)
 // ---------------------------------------------------------------------------
-void GLCanvas::ImportFile(const std::string& path)
+void GLCanvas::ImportFile(const std::string& path, bool notify)
 {
     // Build into a local first so a failed import doesn't leave an empty
     // SceneObject in the list. SceneObject has no destructor and GPUMesh
@@ -7810,6 +8219,9 @@ void GLCanvas::ImportFile(const std::string& path)
         return;
 
     m_objects.push_back(std::move(obj));
+    // A mesh-format object may have just moved the scene onto the mesh
+    // toolpath. notify is false on project restore so a bulk load is silent.
+    RecomputeSceneMeshType(notify);
     Refresh(false);
 }
 
@@ -7843,6 +8255,9 @@ bool GLCanvas::PlaceInsertOnObject(int parentIdx, const std::string& path)
 
     m_inserts.push_back(std::move(in));
     ReanchorInsert(m_inserts.back());
+
+    // A mesh-format insert switches the scene onto the mesh toolpath.
+    RecomputeSceneMeshType(true);
 
     Refresh(false);
     NotifySceneMutated();
@@ -10980,6 +11395,10 @@ void GLCanvas::OnKeyDown(wxKeyEvent& evt)
             m_objects[idx].mesh.Destroy();
             m_objects.erase(m_objects.begin() + idx);
         }
+        // Deleting an object (and any child inserts) may have removed the last
+        // mesh body. Never an upward transition, so this only ever clears the
+        // flag — passing true is harmless (the notice fires only false->true).
+        RecomputeSceneMeshType(true);
         m_selectedIndices.clear();
         // VBOs that aggregate vent / gate state need refreshing in case
         // we deleted any.
@@ -11044,6 +11463,7 @@ void GLCanvas::CopySelectedToClipboard()
         e.sourcePath = src.sourcePath;
         e.sourceShape = src.sourceShape;
         e.hasSourceShape = src.hasSourceShape;
+        e.format = src.format;
         e.role = src.role;
         e.yawDeg = src.yawDeg;
         e.pitchDeg = src.pitchDeg;
@@ -11086,6 +11506,7 @@ void GLCanvas::PasteFromClipboard()
         obj.sourcePath = e.sourcePath;
         obj.sourceShape = e.sourceShape;
         obj.hasSourceShape = e.hasSourceShape;
+        obj.format = e.format;
         obj.cpuVerts = e.cpuVerts;
         obj.cpuIndices = e.cpuIndices;
         // triNeighbors / adjacencyBuilt left at defaults — rebuilt lazily
@@ -11125,6 +11546,8 @@ void GLCanvas::PasteFromClipboard()
         // matches the conventional behavior of paste in editors that
         // have a notion of selection.
         m_selectedIndices = std::move(newIndices);
+        // Pasting can bring a mesh body into a scene that had none.
+        RecomputeSceneMeshType(true);
         Refresh(false);
     }
 }
@@ -11314,6 +11737,10 @@ void GLCanvas::ClearAll()
     m_objects.clear();
     m_selectedIndices.clear();
 
+    // Scene is empty again — drop back to the BREP/STEP toolpath. Silent:
+    // this is a reset, not a transition the user needs to hear about.
+    m_sceneIsMesh = false;
+
     // Vents
     for (auto& v : m_vents) v.Destroy();
     m_vents.clear();
@@ -11364,8 +11791,10 @@ void GLCanvas::RestoreObject(const std::string& path, const glm::vec3& pos,
     float yaw, float pitch, float roll, float scl,
     bool mirrorX, bool mirrorZ)
 {
-    // Import the model normally (dispatches on extension, uploads GPU mesh)
-    ImportFile(path);
+    // Import the model normally (dispatches on extension, uploads GPU mesh).
+    // notify=false: a project load must not pop the mesh-toolpath notice per
+    // restored object — the flag is refreshed silently inside ImportFile.
+    ImportFile(path, /*notify=*/false);
 
     // Apply the saved transform to the last-added object
     if (!m_objects.empty())
@@ -11406,6 +11835,10 @@ void GLCanvas::RestoreInsert(const std::string& path, int parentIndex,
 
     m_inserts.push_back(std::move(in));
     ReanchorInsert(m_inserts.back());
+
+    // Keep the flag correct if a restored insert is mesh-format. Silent —
+    // project load never pops the mesh-toolpath notice.
+    RecomputeSceneMeshType(/*notify=*/false);
 }
 
 void GLCanvas::RestoreSprue(const ProjectSprueData& data)

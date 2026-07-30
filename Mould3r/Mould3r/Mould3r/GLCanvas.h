@@ -25,6 +25,7 @@
 
 #include "camera.h"
 #include "FileImporter.h"
+#include "MeshBoolean.h"
 #include "GridRenderer.h"
 #include "shaders.h"
 #include "MainFrame.h"
@@ -49,13 +50,33 @@ struct GPUMesh
 
 enum class ObjectRole { Fixture, Imported };
 
+// The geometry lineage of an imported body, decided at import time from the
+// file extension: STEP/STP -> Brep (native BREP, STEP toolchain), STL/OBJ ->
+// Mesh (kept as triangles, mesh toolchain). Drives the scene-level mesh-type
+// flag (see GLCanvas::m_sceneIsMesh) and, in later stages, whether a body is
+// cut as a BREP solid or as a mesh, and whether the scene exports STEP or STL.
+enum class SourceFormat { Brep, Mesh };
+
 struct SceneObject
 {
     GPUMesh    mesh;
     ObjectRole role = ObjectRole::Imported;
+    // Lineage of this body's source file. Defaults to Brep so STEP objects and
+    // any non-imported body (e.g. a fixture) read as BREP without extra work;
+    // ImportBodyInto sets it to Mesh for STL/OBJ. Always derivable from
+    // sourcePath's extension, so it need not be persisted — project load
+    // re-derives it by re-importing (see RestoreObject / RestoreInsert).
+    SourceFormat format = SourceFormat::Brep;
     std::string sourcePath;
     TopoDS_Shape mouldShape;
     bool         hasMould = false;
+
+    // Mesh-toolpath counterpart of mouldShape: the fully-carved half as a
+    // triangle mesh (posNorm + indices, world space). Set on a fixture by
+    // GenerateMould only in a mesh scene, and only when the mesh cut yields a
+    // non-empty half. Export reads this for STL output; BREP scenes ignore it.
+    FileImporter::MeshData mouldMesh;
+    bool                   hasMouldMesh = false;
 
     // Cached BREP shape from import (native for STEP, faceted shell/solid
     // for mesh formats). Populated at import time so boolean operations and
@@ -182,7 +203,10 @@ public:
     ~GLCanvas() override;
 
     // Imports any supported format (STEP, STL, OBJ) based on file extension.
-    void ImportFile(const std::string& path);
+    // notify: when true (interactive import), a false->true flip of the
+    // scene mesh-type flag pops the one-time "switched to mesh toolpath"
+    // notice. Project restore passes false so a bulk load stays silent.
+    void ImportFile(const std::string& path, bool notify = true);
 
     // Import a single fixture half. The optional `xform` carries the per-half
     // pose authored in the FixtureEditor and persisted to the .fixture file
@@ -303,6 +327,13 @@ public:
     // matching the existing success-message-box behaviour.
     bool GenerateMould();
     void ExportFixtures(const std::string& pathA, const std::string& pathB);
+
+    // True once the scene holds at least one mesh-format body (STL/OBJ) among
+    // the imported objects or inserts — i.e. the scene is on the mesh toolpath.
+    // Maintained by RecomputeSceneMeshType at every add/remove/clear. Later
+    // stages read this to route GenerateMould, gate exports to STL, and refuse
+    // the BREP-only design checks.
+    bool IsSceneMeshType() const { return m_sceneIsMesh; }
 
     // ---- Preview perspective ------------------------------------------------
     // A second GLCanvas instance (hosted by PreviewPanel) is put into preview
@@ -752,6 +783,13 @@ private:
     // nothing contributed or the fuse failed outright. Read by GenerateMould.
     bool BuildShotModel(TopoDS_Shape& out);
 
+    // Mesh-toolpath shot: union the STEP-object + feed-system shot (from
+    // BuildShotModel, tessellated) with the native mesh objects, then subtract
+    // the mesh inserts (unscaled), producing a single mesh shot body and its
+    // volume in mm^3. Returns false if there's nothing to build. Used only in
+    // mesh scenes (the BREP shot has no mesh objects in it).
+    bool BuildMeshShotModel(MeshBoolean::Mesh& outMesh, double& outVolumeMm3);
+
     // Build the world-space solid one insert removes: its body scaled about the
     // local origin by `scalePct` (1.0 == exact body), then placed by the
     // insert's worldMatrix. GenerateMould passes the card's Cut scale for the
@@ -1149,6 +1187,7 @@ private:
         TopoDS_Shape          sourceShape;
         bool                  hasSourceShape = false;
         ObjectRole            role = ObjectRole::Imported;
+        SourceFormat          format = SourceFormat::Brep;
 
         float yawDeg = 0.0f;
         float pitchDeg = 0.0f;
@@ -1457,4 +1496,31 @@ private:
     {
         if (m_onSceneMutated) m_onSceneMutated();
     }
+
+    // ---- Scene mesh-type tracking ------------------------------------------
+    // True when at least one mesh-format (STL/OBJ) body is in the scene. See
+    // IsSceneMeshType() for the public contract.
+    bool m_sceneIsMesh = false;
+
+    // Rescan m_objects + m_inserts and refresh m_sceneIsMesh. When `notify`
+    // is true and the flag transitions false->true, shows the one-time
+    // "switched to mesh toolpath" notice. A downward true->false transition
+    // (last mesh body removed) is silent — the user only asked to be told
+    // when the scene BECOMES a mesh scene. Cheap (linear scan); safe to call
+    // after any add/remove.
+    void RecomputeSceneMeshType(bool notify);
+
+    // Map a source-file extension to its lineage: .stl / .obj -> Mesh, every
+    // other (including .step / .stp and unknown) -> Brep.
+    static SourceFormat FormatFromPath(const std::string& path);
+
+    // Transform a local position-only mesh (cpuVerts/cpuIndices) into a
+    // world-space MeshBoolean::Mesh by `model`. If `model` has negative
+    // determinant (a mirror), triangle winding is reversed so the solid stays
+    // outward-oriented for the mesh boolean. Used to place mesh objects/inserts
+    // into world space for the mesh-toolpath cut in GenerateMould.
+    static MeshBoolean::Mesh WorldMeshFromLocal(
+        const std::vector<float>& cpuVerts,
+        const std::vector<uint32_t>& cpuIndices,
+        const glm::mat4& model);
 };

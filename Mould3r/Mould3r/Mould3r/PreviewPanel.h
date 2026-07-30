@@ -25,6 +25,11 @@ struct ShotPreviewInput
     const std::vector<int>*       faceIds = nullptr;  // per display tri -> face
     double                        volumeMm3 = 0.0;
     const std::vector<TopoDS_Shape>* halves = nullptr;  // half solids (separation)
+
+    // True when the last generation was a mesh-toolpath scene. The BREP design
+    // checks can't run on it, so the panel refuses them (see OnStartSimulation).
+    // Carried here so it's set even when there's no BREP shot to attach.
+    bool sceneIsMesh = false;
 };
 
 // ===========================================================================
@@ -229,6 +234,9 @@ private:
     std::vector<TopoDS_Shape>           m_halfShapes;   // for the separation test
     bool                                m_hasShot = false;
     double                              m_shotVolumeMm3 = 0.0;
+
+    // Last generation was a mesh-toolpath scene — the BREP design checks refuse.
+    bool                                m_sceneIsMesh = false;
 
     // True when SetData has staged new meshes that have not yet been uploaded
     // to the canvas's GL context (the upload waits until the panel is visible).

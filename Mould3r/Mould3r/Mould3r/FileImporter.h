@@ -36,9 +36,13 @@ public:
 public:
     // Dispatches based on file extension: .step/.stp, .stl, .obj (case-insensitive).
     // linearDeflection / angularDeflection are only used by STEP.
+    // buildMeshSolid: when false, STL/OBJ imports skip the (expensive) sew of
+    // triangles into a faceted TopoDS_Shape — the caller wants the raw mesh only
+    // (mesh toolpath). Ignored by STEP, which always carries a native BREP.
     ImportResult ImportAuto(const std::string& path,
         double linearDeflection = 0.1,
-        double angularDeflection = 0.5);
+        double angularDeflection = 0.5,
+        bool buildMeshSolid = true);
 
     // STEP -> one or more triangulated meshes.
     // linearDeflection: smaller = more triangles
@@ -48,11 +52,13 @@ public:
         double angularDeflection = 0.5);
 
     // STL (binary or ASCII) -> triangulated mesh + faceted BREP.
-    ImportResult ImportSTL(const std::string& path);
+    // buildSolid: when false, skip the faceted-BREP sew and return the mesh only.
+    ImportResult ImportSTL(const std::string& path, bool buildSolid = true);
 
     // OBJ (vertex positions + triangular/polygonal faces) -> triangulated mesh
     // + faceted BREP. Texture coords and normals in the OBJ are ignored.
-    ImportResult ImportOBJ(const std::string& path);
+    // buildSolid: when false, skip the faceted-BREP sew and return the mesh only.
+    ImportResult ImportOBJ(const std::string& path, bool buildSolid = true);
 
 private:
     static void UpdateAABB(glm::vec3& mn, glm::vec3& mx, const glm::vec3& p);
