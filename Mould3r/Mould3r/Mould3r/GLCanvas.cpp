@@ -2341,6 +2341,12 @@ static FeaturePath GateSubRunnerCutPath(const FeaturePath& subPath,
     return p;
 }
 
+// Forward decl — defined later alongside the other mesh-toolpath helpers.
+// Turns a raw position mesh into a render-ready MeshData (normals + crease
+// split); used by GenerateMould's mesh-scene shot and insert preview bodies.
+static FileImporter::MeshData MakeDisplayMesh(std::vector<float> verts,
+    std::vector<uint32_t> indices);
+
 // ---------------------------------------------------------------------------
 // Generate Mould Operation — Cuts objects, vents, runners, and sprues from blank mold halves
 // ---------------------------------------------------------------------------
@@ -3166,16 +3172,8 @@ bool GLCanvas::GenerateMould()
         double vol = 0.0;
         if (BuildMeshShotModel(shotMesh, vol) && !shotMesh.empty())
         {
-            // Build the display mesh (normals + crease split) from the shot.
-            FileImporter::MeshData md;
-            md.vertices = shotMesh.verts;
-            md.indices  = shotMesh.indices;
-            ComputeVertexNormals_Pos3(md.vertices, md.indices, md.posNorm);
-            auto split = SplitByCreaseAngle_Pos3(md.vertices, md.indices, 35.0f);
-            md.posNorm = std::move(split.posNorm);
-            md.indices = std::move(split.indices);
-
-            m_lastShotMesh = std::move(md);
+            m_lastShotMesh = MakeDisplayMesh(std::move(shotMesh.verts),
+                                             std::move(shotMesh.indices));
             m_lastShotVolumeMm3 = vol;
             m_lastShotShape = TopoDS_Shape();   // no BREP shot in a mesh scene
             m_lastShotFaceIds.clear();
@@ -3193,6 +3191,22 @@ bool GLCanvas::GenerateMould()
     // preview body, matching its absence from the shot cut.
     for (const InsertFeature& in : m_inserts)
     {
+        // Mesh-format insert: no BREP body to tessellate. Build the display
+        // body straight from the insert's world-space mesh (unscaled — the true
+        // body, matching the BREP path's 1.0 cut scale), so mesh inserts show
+        // the same yellow preview body as BREP inserts.
+        if (in.body.format == SourceFormat::Mesh)
+        {
+            if (in.body.cpuVerts.empty() || in.body.cpuIndices.empty()) continue;
+            MeshBoolean::Mesh world = WorldMeshFromLocal(
+                in.body.cpuVerts, in.body.cpuIndices, in.worldMatrix);
+            FileImporter::MeshData mesh =
+                MakeDisplayMesh(std::move(world.verts), std::move(world.indices));
+            if (!mesh.posNorm.empty() && !mesh.indices.empty())
+                m_lastInsertMeshes.push_back(std::move(mesh));
+            continue;
+        }
+
         TopoDS_Shape insertSolid;
         if (!BuildInsertCutSolid(in, 1.0f, insertSolid) || insertSolid.IsNull())
             continue;
@@ -3957,6 +3971,27 @@ static MeshBoolean::Mesh MeshFromPosNorm(const FileImporter::MeshData& md)
     }
     m.indices = md.indices;
     return m;
+}
+
+// ---------------------------------------------------------------------------
+// MakeDisplayMesh — turn a raw position mesh (verts + indices) into a
+// render-ready MeshData (per-vertex normals + crease-split posNorm/indices).
+// Shared by the mesh-toolpath preview parts (shot body, insert bodies) so they
+// shade identically to the mould halves.
+// ---------------------------------------------------------------------------
+static FileImporter::MeshData MakeDisplayMesh(std::vector<float> verts,
+    std::vector<uint32_t> indices)
+{
+    FileImporter::MeshData md;
+    md.vertices = std::move(verts);
+    md.indices  = std::move(indices);
+    if (md.vertices.empty() || md.indices.empty()) return md;
+
+    ComputeVertexNormals_Pos3(md.vertices, md.indices, md.posNorm);
+    auto split = SplitByCreaseAngle_Pos3(md.vertices, md.indices, 35.0f);
+    md.posNorm = std::move(split.posNorm);
+    md.indices = std::move(split.indices);
+    return md;
 }
 
 bool GLCanvas::BuildMeshShotModel(MeshBoolean::Mesh& outMesh, double& outVolumeMm3)
