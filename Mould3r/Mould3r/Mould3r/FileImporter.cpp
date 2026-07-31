@@ -396,7 +396,7 @@ namespace {
 
 } // namespace
 
-FileImporter::ImportResult FileImporter::ImportSTL(const std::string& path)
+FileImporter::ImportResult FileImporter::ImportSTL(const std::string& path, bool buildSolid)
 {
     ImportResult result;
 
@@ -447,11 +447,15 @@ FileImporter::ImportResult FileImporter::ImportSTL(const std::string& path)
         }
     }
 
-    // Build BREP for booleans.
-    result.shape = BuildFacetedShape(mesh.vertices, mesh.indices, mesh.aabbMin, mesh.aabbMax);
-    result.hasShape = !result.shape.IsNull();
-    result.shapeIsClosedSolid = result.hasShape &&
-        result.shape.ShapeType() == TopAbs_SOLID;
+    // Build BREP for booleans — unless the caller only wants the mesh (mesh
+    // toolpath), in which case we skip the sew and leave hasShape false.
+    if (buildSolid)
+    {
+        result.shape = BuildFacetedShape(mesh.vertices, mesh.indices, mesh.aabbMin, mesh.aabbMax);
+        result.hasShape = !result.shape.IsNull();
+        result.shapeIsClosedSolid = result.hasShape &&
+            result.shape.ShapeType() == TopAbs_SOLID;
+    }
 
     result.meshes.push_back(std::move(mesh));
     return result;
@@ -478,7 +482,7 @@ namespace {
 
 } // namespace
 
-FileImporter::ImportResult FileImporter::ImportOBJ(const std::string& path)
+FileImporter::ImportResult FileImporter::ImportOBJ(const std::string& path, bool buildSolid)
 {
     ImportResult result;
 
@@ -596,11 +600,15 @@ FileImporter::ImportResult FileImporter::ImportOBJ(const std::string& path)
         }
     }
 
-    // Build BREP for booleans.
-    result.shape = BuildFacetedShape(mesh.vertices, mesh.indices, mesh.aabbMin, mesh.aabbMax);
-    result.hasShape = !result.shape.IsNull();
-    result.shapeIsClosedSolid = result.hasShape &&
-        result.shape.ShapeType() == TopAbs_SOLID;
+    // Build BREP for booleans — unless the caller only wants the mesh (mesh
+    // toolpath), in which case we skip the sew and leave hasShape false.
+    if (buildSolid)
+    {
+        result.shape = BuildFacetedShape(mesh.vertices, mesh.indices, mesh.aabbMin, mesh.aabbMax);
+        result.hasShape = !result.shape.IsNull();
+        result.shapeIsClosedSolid = result.hasShape &&
+            result.shape.ShapeType() == TopAbs_SOLID;
+    }
 
     result.meshes.push_back(std::move(mesh));
     return result;
@@ -611,15 +619,16 @@ FileImporter::ImportResult FileImporter::ImportOBJ(const std::string& path)
 // ---------------------------------------------------------------------------
 FileImporter::ImportResult FileImporter::ImportAuto(const std::string& path,
     double linearDeflection,
-    double angularDeflection)
+    double angularDeflection,
+    bool buildMeshSolid)
 {
     const std::string ext = ExtensionLower(path);
     if (ext == "step" || ext == "stp")
         return ImportSTEP(path, linearDeflection, angularDeflection);
     if (ext == "stl")
-        return ImportSTL(path);
+        return ImportSTL(path, buildMeshSolid);
     if (ext == "obj")
-        return ImportOBJ(path);
+        return ImportOBJ(path, buildMeshSolid);
 
     ImportResult result;
     result.error = "Unsupported file extension: '." + ext +

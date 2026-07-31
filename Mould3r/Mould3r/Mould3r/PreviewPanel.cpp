@@ -166,6 +166,8 @@ void PreviewPanel::SetData(const std::vector<FileImporter::MeshData>& halves,
     m_halfShapes.clear();
     m_hasShot = false;
     m_shotVolumeMm3 = 0.0;
+    // Set unconditionally (a mesh scene has no BREP shot to attach below).
+    m_sceneIsMesh = shot.sceneIsMesh;
 
     if (shot.mesh)
     {
@@ -236,6 +238,7 @@ void PreviewPanel::ClearData()
     m_hasShot = false;
     m_shotVolumeMm3 = 0.0;
     m_shotHalfIndex = -1;
+    m_sceneIsMesh = false;
 
     m_hasResult = false;
     m_activeDebugCategory = -1;
@@ -632,6 +635,20 @@ void PreviewPanel::UpdateInfoPanel()
 // ---------------------------------------------------------------------------
 void PreviewPanel::OnStartSimulation(const wxString& simName)
 {
+    // Mesh toolpath: the design checks are BREP-only (they analyse the shot's
+    // faces and half solids, which a mesh scene doesn't produce). Refuse every
+    // simulation with a clear message rather than the generic "no shot model"
+    // one. Mesh-native checks are a separate, later step.
+    if (m_sceneIsMesh)
+    {
+        wxMessageBox(
+            "This simulation can't be run on a mesh-type scene.\n\n"
+            "The design checks require a BREP (STEP) mould. Mesh-scene "
+            "simulations aren't available yet.",
+            simName, wxOK | wxICON_INFORMATION, this);
+        return;
+    }
+
     if (simName == "Draft Angle Checks")
     {
         RunDemoldabilityCheck();
