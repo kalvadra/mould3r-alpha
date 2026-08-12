@@ -167,6 +167,7 @@
     <ClCompile Include="ProjectFile.cpp" />
     <ClCompile Include="RotateDialog.cpp" />
     <ClCompile Include="RoundedButton.cpp" />
+    <ClCompile Include="SplitButton.cpp" />
     <ClCompile Include="PerspectiveButton.cpp" />
     <ClCompile Include="VentEditToolbar.cpp" />
     <ClCompile Include="ScaleDialog.cpp" />
@@ -208,6 +209,7 @@
     <ClInclude Include="ProjectFile.h" />
     <ClInclude Include="RotateDialog.h" />
     <ClInclude Include="RoundedButton.h" />
+    <ClInclude Include="SplitButton.h" />
     <ClInclude Include="PerspectiveButton.h" />
     <ClInclude Include="VentEditToolbar.h" />
     <ClInclude Include="ScaleDialog.h" />

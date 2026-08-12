@@ -8042,6 +8042,53 @@ void GLCanvas::ExportFixtures(const std::string& pathA, const std::string& pathB
         "Export Complete", wxOK | wxICON_INFORMATION, this);
 }
 
+void GLCanvas::ExportShotBody(const std::string& path)
+{
+    if (!m_hasLastShotMesh)
+    {
+        wxMessageBox("No shot body loaded to export.",
+            "Export Failed", wxOK | wxICON_WARNING, this);
+        return;
+    }
+
+    // Mesh toolpath: no BREP shot is retained (m_lastShotShape stays null —
+    // see the "Shot model" section of GenerateMould), so export the
+    // tessellated display mesh as STL via the same writer used for mould-half
+    // STL export.
+    if (m_sceneIsMesh)
+    {
+        if (!WriteBinaryStl(path, m_lastShotMesh))
+        {
+            wxMessageBox("Failed to write: " + path,
+                "Export Failed", wxOK | wxICON_ERROR, this);
+            return;
+        }
+        wxMessageBox("Shot body exported successfully (STL).",
+            "Export Complete", wxOK | wxICON_INFORMATION, this);
+        return;
+    }
+
+    // BREP toolpath: export the exact fused solid, not its tessellation.
+    if (m_lastShotShape.IsNull())
+    {
+        wxMessageBox("No shot body loaded to export.",
+            "Export Failed", wxOK | wxICON_WARNING, this);
+        return;
+    }
+
+    STEPControl_Writer writer;
+    writer.Transfer(m_lastShotShape, STEPControl_AsIs);
+    if (writer.Write(path.c_str()) != IFSelect_RetDone)
+    {
+        wxMessageBox("Failed to write: " + path,
+            "Export Failed", wxOK | wxICON_ERROR, this);
+        return;
+    }
+
+    wxMessageBox("Shot body exported successfully.",
+        "Export Complete", wxOK | wxICON_INFORMATION, this);
+}
+
 // ---------------------------------------------------------------------------
 // FormatFromPath — lineage from the file extension. Mirrors the dispatch in
 // FileImporter::ImportAuto: .stl / .obj are mesh formats; .step / .stp (and

@@ -35,6 +35,7 @@
 #include "AppConfig.h"
 #include "MeshImportSettings.h"
 #include "RoundedButton.h"     // rounded button for sidebar / toolbar action buttons
+#include "SplitButton.h"       // split action+dropdown button for Export mode
 #include "PerspectiveButton.h" // flat tab-style perspective switch
 #include "VentEditToolbar.h"   // Part 5: floating complex-vent-path toolbar
 #include "WindowEffects.h"     // DWM corner rounding for the main frame
@@ -1074,11 +1075,12 @@ wxPanel* MainFrame::CreateRibbon(wxWindow* parent)
     hSizer->AddStretchSpacer();
 
     // ---- Primary action (right-aligned) ------------------------------------
-    // Perspective-specific and mutually exclusive: "Generate Mould" shows in the
-    // Prepare perspective, "Export" shows in Preview. They occupy the same
-    // top-right slot (only one is ever visible — SetPerspective toggles them)
-    // and share the green primary-action style. Both are added after the
-    // stretch spacer, so whichever is shown sits at the far right.
+    // Perspective-specific: "Generate Mould" shows in the Prepare perspective,
+    // the Export split button shows in Preview. They occupy the same top-right
+    // slot (only one is ever visible — SetPerspective toggles them). Generate
+    // is a plain green pill; Export is a split button whose dropdown zone picks
+    // the mode. Both are added after the stretch spacer, so whichever is shown
+    // sits flush right.
     auto* btnGenerate = new RoundedButton(panel, ID_GenerateMould, "Generate Mould",
         wxDefaultPosition, wxSize(130, 32), wxBORDER_NONE);
     btnGenerate->SetBackgroundColour(Style::BtnGenerate);
@@ -1088,12 +1090,17 @@ wxPanel* MainFrame::CreateRibbon(wxWindow* parent)
     m_btnGenerate = btnGenerate;
     hSizer->Add(btnGenerate, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 12);
 
-    auto* btnExport = new RoundedButton(panel, ID_Export, "Export",
-        wxDefaultPosition, wxSize(130, 32), wxBORDER_NONE);
+    // Export split button. Action zone runs the current mode; dropdown zone
+    // picks it. Menu-item order is fixed and mirrored by MainFrame::ExportMode:
+    //   index 0 -> Mould, index 1 -> Shot body.
+    auto* btnExport = new SplitButton(panel, ID_Export, "Export Mould",
+        wxDefaultPosition, wxSize(170, 32), wxBORDER_NONE);
     btnExport->SetBackgroundColour(Style::BtnGenerate);
     btnExport->SetForegroundColour(*wxWHITE);
     btnExport->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
+    btnExport->SetMenuItems({ "Mould", "Shot body" });
+    btnExport->SetSelection(0);
     m_btnExport = btnExport;
     btnExport->Hide();   // Prepare is the initial perspective
     hSizer->Add(btnExport, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 12);
@@ -1138,6 +1145,7 @@ wxPanel* MainFrame::CreateRibbon(wxWindow* parent)
     Bind(wxEVT_BUTTON, &MainFrame::OnEditInsert, this, ID_EditInsert);
     Bind(wxEVT_BUTTON, &MainFrame::OnGenerateMould, this, ID_GenerateMould);
     Bind(wxEVT_BUTTON, &MainFrame::OnExport, this, ID_Export);
+    Bind(wxEVT_CHOICE, &MainFrame::OnExportModeChanged, this, ID_Export);
 
     return panel;
 }
@@ -3115,6 +3123,32 @@ void MainFrame::OnBrowseExport(wxCommandEvent&)
 
 void MainFrame::OnExport(wxCommandEvent&)
 {
+    // Action zone of the export split button: run whichever mode the dropdown
+    // currently selects. Each DoExport* keeps its own gate + file dialog.
+    switch (m_exportMode)
+    {
+    case ExportMode::Mould:    DoExportMould();    break;
+    case ExportMode::ShotBody: DoExportShotBody(); break;
+    }
+}
+
+void MainFrame::OnExportModeChanged(wxCommandEvent& e)
+{
+    // Menu-item order is fixed in CreateRibbon: 0 = Mould, 1 = Shot body.
+    m_exportMode = (e.GetInt() == 1) ? ExportMode::ShotBody
+                                     : ExportMode::Mould;
+    UpdateExportButtonLabel();
+}
+
+void MainFrame::UpdateExportButtonLabel()
+{
+    if (!m_btnExport) return;
+    m_btnExport->SetLabel(m_exportMode == ExportMode::ShotBody
+        ? "Export Shot Body" : "Export Mould");
+}
+
+void MainFrame::DoExportMould()
+{
     // Gate: tri-state model (see MouldState enum in MainFrame.h).
     //   NeverGenerated  - nothing to export. Hard block with an
     //                     informational popup, then return.
@@ -3227,6 +3261,80 @@ void MainFrame::OnExport(wxCommandEvent&)
     }
 
     m_canvas->ExportFixtures(pathA.ToStdString(), pathB.ToStdString());
+}
+
+void MainFrame::DoExportShotBody()
+{
+    // Same tri-state gate as DoExportMould (see MouldState enum in
+    // MainFrame.h) — the shot body is a by-product of the same Generate Mould
+    // run as the mould halves, so it goes stale on the same schedule.
+    switch (m_mouldState)
+    {
+    case MouldState::NeverGenerated:
+        wxMessageBox("Mould must be generated before the shot body can be exported.",
+            "Export Shot Body", wxOK | wxICON_INFORMATION, this);
+        return;
+
+    case MouldState::Dirty:
+    {
+        const int ans = wxMessageBox(
+            "An edit has been made since the last Mould Generation, "
+            "some features may not be reflected. Would you like to continue?",
+            "Export Shot Body", wxYES_NO | wxICON_WARNING, this);
+        if (ans != wxYES) return;
+        break;
+    }
+
+    case MouldState::Clean:
+        break;
+    }
+
+    // The mould as a whole can be Clean while the shot specifically failed
+    // to build (e.g. no objects/feed features, or the fuse came back empty —
+    // see the "Shot model" section of GenerateMould), so check separately
+    // rather than assuming Clean implies a shot exists.
+    if (!m_canvas->HasLastShotMesh())
+    {
+        wxMessageBox("No shot body is available to export (it may be empty, "
+            "or the last generation failed to build one).",
+            "Export Shot Body", wxOK | wxICON_INFORMATION, this);
+        return;
+    }
+
+    // Single-file export (unlike the two-half Export Mould dialog above), so
+    // the path the user picks IS the path we write — wxFD_OVERWRITE_PROMPT
+    // is safe to use here, no manual existence check needed.
+    wxString suggestedDir;
+    wxString suggestedName;
+    if (!m_projectPath.empty())
+    {
+        wxFileName fn(m_projectPath);
+        suggestedDir = fn.GetPath();
+        suggestedName = fn.GetName() + "_shot";
+    }
+
+    // Mesh scenes export STL (the shot has no BREP — see GenerateMould);
+    // BREP scenes export STEP, matching Export Mould's routing.
+    const bool meshScene = m_canvas->IsSceneMeshType();
+    const wxString wildcard = meshScene
+        ? "STL files (*.stl)|*.stl|All files (*.*)|*.*"
+        : "STEP files (*.step;*.stp)|*.step;*.stp|All files (*.*)|*.*";
+
+    wxFileDialog dlg(this, "Export Shot Body",
+        suggestedDir, suggestedName,
+        wildcard,
+        wxFD_SAVE | wxFD_OVERWRITE_PROMPT);
+
+    if (dlg.ShowModal() != wxID_OK)
+        return;
+
+    // wxFileName strips only a trailing extension; if the user typed a bare
+    // name with no extension, supply the correct one for the scene type.
+    wxFileName picked(dlg.GetPath());
+    if (picked.GetExt().IsEmpty())
+        picked.SetExt(meshScene ? "stl" : "step");
+
+    m_canvas->ExportShotBody(picked.GetFullPath().ToStdString());
 }
 
 void MainFrame::OnGenerateMould(wxCommandEvent&)

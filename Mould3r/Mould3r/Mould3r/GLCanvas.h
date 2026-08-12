@@ -328,6 +328,13 @@ public:
     bool GenerateMould();
     void ExportFixtures(const std::string& pathA, const std::string& pathB);
 
+    // Export just the shot body (see GetLastShotShape/GetLastShotMesh) to a
+    // single file: the exact fused BREP as STEP for a BREP scene, or the
+    // tessellated shot mesh as STL for a mesh scene (no BREP shot exists in
+    // that case — see the "Shot model" section of GenerateMould). No-op with
+    // a warning dialog if the last GenerateMould run didn't produce a shot.
+    void ExportShotBody(const std::string& path);
+
     // True once the scene holds at least one mesh-format body (STL/OBJ) among
     // the imported objects or inserts — i.e. the scene is on the mesh toolpath.
     // Maintained by RecomputeSceneMeshType at every add/remove/clear. Later

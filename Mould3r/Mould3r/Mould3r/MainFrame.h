@@ -18,7 +18,9 @@
 #include <unordered_map>
 
 class GLCanvas;
-class RoundedButton;   // forward decl — m_btnExport pointer below; full def
+class RoundedButton;   // forward decl — m_btnGenerate pointer below; full def
+// is included from MainFrame.cpp where it's used.
+class SplitButton;     // forward decl — m_btnExport pointer below; full def
 // is included from MainFrame.cpp where it's used.
 class InsertEditDialog;  // forward decl — modeless insert-transform editor,
                          // defined entirely in MainFrame.cpp (no header /
@@ -403,7 +405,20 @@ private:
     // perspective and Export in Preview; SetPerspective toggles their
     // visibility so exactly one occupies the top-right slot at a time.
     RoundedButton* m_btnGenerate = nullptr;
-    RoundedButton* m_btnExport = nullptr;
+
+    // Export is a split button: its action zone runs the current export mode
+    // and its dropdown zone picks the mode ("Mould" / "Shot body"). The mode
+    // lives here rather than in the widget so the export handlers can branch
+    // on it; the widget just reports picks via wxEVT_CHOICE.
+    SplitButton* m_btnExport = nullptr;
+
+    enum class ExportMode { Mould, ShotBody };
+    ExportMode m_exportMode = ExportMode::Mould;
+
+    // Order MUST match the SplitButton's menu-item order (see CreateRibbon):
+    // index 0 = Mould, index 1 = Shot body. UpdateExportButtonLabel keeps the
+    // action-zone label in sync with m_exportMode.
+    void UpdateExportButtonLabel();
 
     // Tri-state model for "is the Export button about to do something
     // reasonable?". Replaces an earlier bool that conflated the
@@ -441,9 +456,20 @@ private:
     MouldState m_mouldState = MouldState::NeverGenerated;
 
     void OnBrowseExport(wxCommandEvent&);
+    // Action-zone click on the export split button: dispatches to the current
+    // mode's exporter (DoExportMould / DoExportShotBody).
     void OnExport(wxCommandEvent&);
+    // Dropdown pick on the export split button (wxEVT_CHOICE): updates
+    // m_exportMode and the action-zone label. Does not export.
+    void OnExportModeChanged(wxCommandEvent&);
     void OnGenerateMould(wxCommandEvent&);
     void OnClearVentPoints(wxCommandEvent&);
+
+    // The actual export routines behind the split button's action zone. Split
+    // out from OnExport so the dispatcher stays a thin mode switch; each keeps
+    // the tri-state MouldState gate + file-dialog flow for its own output.
+    void DoExportMould();
+    void DoExportShotBody();
 
     wxPanel* CreateSidePanel(wxWindow* parent);
 
