@@ -95,9 +95,29 @@ bool ProjectFile::Save(const std::string& path,
     // tolerant (presence of pathKind/node lines drives it, not the version
     // number), so older readers ignore the new lines and older files load as
     // simple — the version is informational.
-    file << "version = 6\n";
-    if (!data.fixturePath.empty())
+    file << "version = 7\n";
+    // Fixture: a Library fixture stores its .fixture path (as before). A
+    // procedural fixture stores a kind + its parameters instead — no path, no
+    // geometry (Dynamic re-fits the scene on load). Absence of fixture_kind
+    // means Library, so pre-v7 files round-trip unchanged.
+    if (data.fixtureKind == FixtureKind::Parametric)
+    {
+        file << "fixture_kind   = parametric\n";
+        file << "fixture_size_x = " << data.fixtureParametric.sizeX << "\n";
+        file << "fixture_size_y = " << data.fixtureParametric.sizeY << "\n";
+        file << "fixture_size_z = " << data.fixtureParametric.sizeZ << "\n";
+    }
+    else if (data.fixtureKind == FixtureKind::Dynamic)
+    {
+        file << "fixture_kind        = dynamic\n";
+        file << "fixture_clearance_x = " << data.fixtureDynamic.clearanceX << "\n";
+        file << "fixture_clearance_y = " << data.fixtureDynamic.clearanceY << "\n";
+        file << "fixture_clearance_z = " << data.fixtureDynamic.clearanceZ << "\n";
+    }
+    else if (!data.fixturePath.empty())
+    {
         file << "fixture = " << MakeRelative(data.fixturePath, baseDir) << "\n";
+    }
 
     // -- [parameters] --------------------------------------------------------
     file << "\n[parameters]\n";
@@ -109,6 +129,7 @@ bool ProjectFile::Save(const std::string& path,
     file << "sprueDraftAngle  = " << data.params.sprueDraftAngle << "\n";
     file << "sprueColdSlugDepth = " << data.params.sprueColdSlugDepth << "\n";
     file << "sprueLength      = " << data.params.sprueLength << "\n";
+    file << "sprueOverrun     = " << data.params.sprueOverrun << "\n";
     file << "runnerDiameter   = " << data.params.runnerDiameter << "\n";
     file << "runnerColdPlugDist = " << data.params.runnerColdPlugDist << "\n";
     file << "gateDiameter     = " << data.params.gateDiameter << "\n";
@@ -163,6 +184,8 @@ bool ProjectFile::Save(const std::string& path,
         file << "ipX     = " << sp.injectionPoint.x << "\n";
         file << "ipY     = " << sp.injectionPoint.y << "\n";
         file << "ipZ     = " << sp.injectionPoint.z << "\n";
+        if (sp.injectionPoint.perimeter)
+            file << "ipPerimeter = true\n";
     }
 
     // -- [runner.N] ----------------------------------------------------------
@@ -402,6 +425,18 @@ bool ProjectFile::Load(const std::string& path,
         case Section::Project:
             if (key == "version")      out.version = ParseInt(val, 1);
             else if (key == "fixture") out.fixturePath = ResolveRelative(val, baseDir);
+            else if (key == "fixture_kind")
+            {
+                if (val == "parametric")   out.fixtureKind = FixtureKind::Parametric;
+                else if (val == "dynamic") out.fixtureKind = FixtureKind::Dynamic;
+                else                       out.fixtureKind = FixtureKind::Library;
+            }
+            else if (key == "fixture_size_x") out.fixtureParametric.sizeX = ParseFloat(val, out.fixtureParametric.sizeX);
+            else if (key == "fixture_size_y") out.fixtureParametric.sizeY = ParseFloat(val, out.fixtureParametric.sizeY);
+            else if (key == "fixture_size_z") out.fixtureParametric.sizeZ = ParseFloat(val, out.fixtureParametric.sizeZ);
+            else if (key == "fixture_clearance_x") out.fixtureDynamic.clearanceX = ParseFloat(val, out.fixtureDynamic.clearanceX);
+            else if (key == "fixture_clearance_y") out.fixtureDynamic.clearanceY = ParseFloat(val, out.fixtureDynamic.clearanceY);
+            else if (key == "fixture_clearance_z") out.fixtureDynamic.clearanceZ = ParseFloat(val, out.fixtureDynamic.clearanceZ);
             break;
 
         case Section::Parameters:
@@ -415,6 +450,7 @@ bool ProjectFile::Load(const std::string& path,
             else if (key == "sprueDraftAngle")   p.sprueDraftAngle = ParseFloat(val, p.sprueDraftAngle);
             else if (key == "sprueColdSlugDepth") p.sprueColdSlugDepth = ParseFloat(val, p.sprueColdSlugDepth);
             else if (key == "sprueLength")       p.sprueLength = ParseFloat(val, p.sprueLength);
+            else if (key == "sprueOverrun")      p.sprueOverrun = ParseFloat(val, p.sprueOverrun);
             else if (key == "runnerDiameter")    p.runnerDiameter = ParseFloat(val, p.runnerDiameter);
             else if (key == "runnerColdPlugDist") p.runnerColdPlugDist = ParseFloat(val, p.runnerColdPlugDist);
             else if (key == "gateDiameter")      p.gateDiameter = ParseFloat(val, p.gateDiameter);
@@ -463,6 +499,7 @@ bool ProjectFile::Load(const std::string& path,
             else if (key == "ipX")           sp.injectionPoint.x = ParseFloat(val, 0.0f);
             else if (key == "ipY")           sp.injectionPoint.y = ParseFloat(val, 0.0f);
             else if (key == "ipZ")           sp.injectionPoint.z = ParseFloat(val, 0.0f);
+            else if (key == "ipPerimeter")   sp.injectionPoint.perimeter = (val == "true" || val == "1" || val == "yes");
             break;
         }
 
@@ -604,8 +641,15 @@ bool ProjectFile::Load(const std::string& path,
     // existed, or hand-edited) get normalised here.
     if (out.sprue.placed)
     {
-        out.sprue.injectionPoint.type =
-            InjectionPoint::TypeFor(out.sprue.injectionPoint.y);
+        // Perimeter injection points are always Radial by definition; their
+        // stored local y can be non-zero (fixture pose), so skip the
+        // y-derived type — otherwise a perimeter point loads as Axial and its
+        // radial editing / geometry break.
+        if (out.sprue.injectionPoint.perimeter)
+            out.sprue.injectionPoint.type = InjectionType::Radial;
+        else
+            out.sprue.injectionPoint.type =
+                InjectionPoint::TypeFor(out.sprue.injectionPoint.y);
     }
 
     return true;

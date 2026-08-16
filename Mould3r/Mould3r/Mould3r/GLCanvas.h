@@ -219,6 +219,24 @@ public:
     void ImportFileAsFixture(const std::string& path,
         const HalfTransform& xform = HalfTransform{});
 
+    // Build a procedural (Parametric or Dynamic) fixture's two box halves
+    // directly into m_fixtures — the fileless counterpart to
+    // ImportFileAsFixture. Clears any existing fixtures first, gives each half
+    // a cached OCC blank (sourceShape) + preview mesh, enables perimeter
+    // injection, and rebuilds the parting perimeter. For a Dynamic fixture the
+    // box is sized to envelope the current scene; for Parametric it is the
+    // fixed authored dimensions. Reads def.kind + def.parametric / def.dynamic;
+    // a FixtureKind::Library def is ignored (that path uses ImportFileAsFixture).
+    void CreateProceduralFixture(const FixtureDefinition& def);
+
+    // Resize the active Dynamic fixture's two halves to the current scene
+    // envelope + the stored clearance and rebuild the perimeter. No-op unless a
+    // Dynamic fixture is loaded, so it's safe to call unconditionally. Fired
+    // internally from NotifySceneMutated (transforms/features), object add /
+    // delete / paste, and object drag-release; also called by MainFrame once
+    // after a project load restores the scene.
+    void RebuildDynamicFixture();
+
     // Called by MainFrame ribbon buttons
     void SetTransformMode(TransformMode mode);
 
@@ -518,6 +536,11 @@ public:
     // resize so it stays pinned to the top-centre of the viewport.
     void SetPathToolbar(wxWindow* w) { m_pathToolbar = w; RepositionPathToolbar(); }
 
+    // The Edit Sprue toolbar rides the same top-centre slot as the path
+    // toolbar (they never show together), but is a distinct window, so it gets
+    // its own pointer. RepositionPathToolbar pins both.
+    void SetSprueToolbar(wxWindow* w) { m_sprueToolbar = w; RepositionPathToolbar(); }
+
     // Register the bottom-centre hint overlay ("toast"). Same arrangement as
     // the path toolbar - a SIBLING of the canvas raised above it, not a child,
     // since SwapBuffers can overdraw a true child of a wxGLCanvas. The canvas
@@ -586,6 +609,53 @@ public:
     void ConvertEditGateToComplex();  // seed [gate origin, feed attach]; no-op if already Complex
     void ConvertEditGateToSimple();   // drop nodes, collapse to the straight sub-runner
     void SetEditGateSmooth(bool smooth);
+
+    // ---- Sprue editing (Edit Sprue environment) ---------------------------
+    // Unlike the path-edit modes above, the sprue has no node model — its edit
+    // environment offers a Move sub-tool (drag a RADIAL sprue's endpoint on the
+    // parting plane) and a Select Injection Point sub-tool (re-pick the feeding
+    // injection point). Driven by the floating SprueEditToolbar. Axial sprues
+    // are NOT movable (moving the endpoint would compromise demolding), so Move
+    // is gated on IsActiveSprueRadial().
+    bool IsEditingSprue() const { return m_transformMode == TransformMode::EditSprue; }
+    bool HasSprueForEdit() const { return m_sprue.hasPoint; }
+    bool IsActiveSprueRadial() const
+    {
+        return m_hasActiveInjectionPoint &&
+            m_activeInjectionPoint.type == InjectionType::Radial;
+    }
+    // The Select Injection Point sub-tool is worth offering only when the
+    // fixture actually gives a choice (>1 point); with a single point there is
+    // nothing to switch to.
+    bool HasInjectionChoices() const { return m_injectionPoints.size() > 1; }
+
+    // "Fixture Perimeter" injection (see FixtureDefinition::allowPerimeterInjection):
+    // the fixture permits placing the sprue's injection point anywhere on the
+    // perimeter. Set from the fixture on load.
+    void SetAllowPerimeterInjection(bool b) { m_allowPerimeterInjection = b; }
+    bool AllowsPerimeterInjection() const { return m_allowPerimeterInjection; }
+    // True when the ACTIVE injection point is a perimeter-placed one — its
+    // location is draggable along the perimeter (vs a fixed point, whose
+    // Move drags the sprue endpoint instead).
+    bool IsActivePerimeterInjection() const
+    {
+        return m_hasActiveInjectionPoint && m_activeInjectionPoint.perimeter;
+    }
+
+    SprueEditTool GetSprueEditTool() const { return m_sprueEditTool; }
+    void SetSprueEditTool(SprueEditTool t);
+
+    // Drag the radial sprue endpoint to the parting-plane point under the mouse
+    // and rebuild the sprue (and dependent runner/gate) geometry. No-op for an
+    // axial sprue or when no sprue is placed. Does not fire the scene-mutation
+    // hook itself — the mouse-up in EditSprue does, once per drag gesture.
+    void MoveSprueEndpoint(int mouseX, int mouseY);
+
+    // Drag a PERIMETER injection point along the fixture perimeter (snapping to
+    // it) and re-place the sprue from the new location. No-op unless the active
+    // injection point is a perimeter one. Like MoveSprueEndpoint, leaves the
+    // scene-mutation notify to the mouse-up.
+    void MoveSprueInjectionPoint(int mouseX, int mouseY);
 
     void ClearFixtures();
 
@@ -963,6 +1033,20 @@ private:
     // the endpoint snaps to the fixture perimeter, interior nodes move freely.
     void MoveEditVentNode(int idx, int mouseX, int mouseY);
 
+    // Hit-test the injection-point markers against the mouse ray; on a hit,
+    // activate that point and (re)place the sprue. Returns true iff a point was
+    // picked. Shared by SelectInjectionPoint mode and the EditSprue > Select
+    // Injection Point sub-tool; the caller owns any mode transition.
+    bool PickActivateInjectionPoint(int mouseX, int mouseY);
+
+    // Map a world-space point into fixture-local space (injection-point coords).
+    glm::vec3 WorldToFixtureLocal(const glm::vec3& world) const;
+
+    // Unit inward normal (world XZ, y=0) of the fixture-perimeter edge nearest
+    // ptXZ, oriented toward the origin — the default sprue direction for a
+    // perimeter injection point (into the mould).
+    glm::vec2 InwardPerimeterNormal(const glm::vec2& ptXZ) const;
+
     // ---- Part 7 / R5b: runner node authoring (parallels the vent methods) ----
     // The runner deltas: node[0] is PINNED to the sprue feed point (not
     // grabbable), the endpoint is FREE inside the perimeter (no snap), and all
@@ -1072,6 +1156,28 @@ private:
     void                   BuildFixturePerimeter();
     std::vector<glm::vec2> m_fixturePerimeter;   // hull vertices in CCW order
 
+    // World-space AABB enclosing every scene body (m_objects + m_inserts) with
+    // the origin folded in as a zero-size point, so the result always contains
+    // (0,0,0). An empty scene returns the degenerate origin-only box (min ==
+    // max == 0). Used to size Dynamic fixtures (see CreateProceduralFixture).
+    void ComputeSceneEnvelope(glm::vec3& outMin, glm::vec3& outMax) const;
+
+    // (Re)build one procedural fixture half's box geometry (OCC blank + preview
+    // mesh) in place for the given world-space corners, leaving role /
+    // sourcePath / pose alone. Shared by CreateProceduralFixture and the
+    // Dynamic live-resize path.
+    void UpdateBoxHalf(SceneObject& half, const glm::vec3& lo, const glm::vec3& hi);
+
+    // Project a ray from the origin along dirXZ onto the fixture perimeter's
+    // axis-aligned bounds; returns the world boundary point at y=0. Gives a
+    // perimeter location that tracks a chosen direction as a Dynamic box
+    // resizes (vs. drifting to the nearest edge).
+    glm::vec3 PerimeterPointInDirection(const glm::vec2& dirXZ) const;
+
+    // Activate a default (front-centre) perimeter injection point on a fresh
+    // procedural fixture so the sprue tools work immediately.
+    void SeedPerimeterInjectionPoint();
+
     // Sphere mesh for vent point markers
     void BuildSphereGPU(float radius, int stacks, int slices);
 
@@ -1159,6 +1265,20 @@ private:
 
     // Scene
     std::vector<SceneObject> m_fixtures;
+
+    // Active fixture kind + the Dynamic clearance, remembered so scene
+    // mutations can resize a Dynamic fixture's halves (Part 4). Set by
+    // CreateProceduralFixture; reset to Library by the file-fixture path
+    // (ImportFileAsFixture) so a swap back to a library fixture stops any
+    // dynamic resizing. Unused for Library / Parametric fixtures.
+    FixtureKind m_fixtureKind = FixtureKind::Library;
+    glm::vec3   m_dynamicClearance{ 10.0f };
+
+    // Guards RebuildDynamicFixture against re-entry: its re-projection step
+    // calls PlaceSprue, which fires NotifySceneMutated, which would call back
+    // into RebuildDynamicFixture — infinite recursion without this latch.
+    bool        m_rebuildingDynamicFixture = false;
+
     std::vector<SceneObject> m_objects;
     // Selected object indices into m_objects, in click order.
     // Last entry is the "primary" selection (used by single-seed operations
@@ -1394,6 +1514,12 @@ private:
     GLint  m_flat_uVP = -1;
     GLint  m_flat_uColor = -1;
 
+    // Fixture-perimeter highlight loop (Fixture Perimeter injection). A dynamic
+    // GL_LINE_LOOP uploaded from m_fixturePerimeter in the render pass while the
+    // Select Injection Point tool is active and perimeter injection is allowed.
+    GLuint m_perimeterVAO = 0;
+    GLuint m_perimeterVBO = 0;
+
     // Uniform locations — picking
     GLint m_pick_uMVP = -1;
     GLint m_pick_uObjectId = -1;
@@ -1428,6 +1554,12 @@ private:
     int          m_editRunnerNode = -1; // runner node being dragged (Move tool), -1 = none
     int          m_editGateNode = -1;   // gate sub-runner node being dragged (Move tool), -1 = none
 
+    // ---- Edit Sprue environment state --------------------------------------
+    SprueEditTool m_sprueEditTool = SprueEditTool::Move;  // active EditSprue sub-tool
+    bool          m_sprueEndpointGrabbed = false;         // radial endpoint held (Move drag)
+    bool          m_sprueInjectionGrabbed = false;        // perimeter injection point held (Move drag)
+    bool          m_allowPerimeterInjection = false;      // fixture permits perimeter injection
+
     // m_edit*Node doubles as "selected node" (it survives the mouse release so
     // the toolbar and the enlarged marker can act on it) AND as "node the next
     // drag moves". Those two meanings diverged once selecting a PATH began
@@ -1437,6 +1569,7 @@ private:
     // it alone licenses the deferred drag to move one.
     bool         m_editNodeGrabbed = false;
     wxWindow*    m_pathToolbar  = nullptr;  // floating toolbar overlay (opaque)
+    wxWindow*    m_sprueToolbar = nullptr;  // Edit Sprue toolbar overlay (opaque)
     wxWindow*    m_canvasToast  = nullptr;  // bottom-centre hint overlay (opaque)
     std::function<void()> m_onPathEditChanged;  // toolbar reconfigure hook
 
@@ -1501,6 +1634,13 @@ private:
     // runs on the wxWidgets main thread before the mutating method returns.
     void NotifySceneMutated()
     {
+        // A Dynamic fixture auto-fits the scene, so resize it on every change
+        // that routes through here — transforms, patterns, and feature/insert
+        // edits. (Object import / delete / paste don't call this, so they
+        // resize at their own sites.) No-op for Library / Parametric fixtures.
+        // Done before the external callback so observers see the up-to-date
+        // fixture geometry.
+        RebuildDynamicFixture();
         if (m_onSceneMutated) m_onSceneMutated();
     }
 

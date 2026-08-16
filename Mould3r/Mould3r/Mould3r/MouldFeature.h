@@ -364,6 +364,27 @@ struct SprueFeature
     bool      hasPartingPoint = false;
     bool      isDirectInjection = false;
 
+    // Radial endpoint override (Edit Sprue > Move). When the user drags the
+    // endpoint of a RADIAL sprue, the dragged world position lands here and
+    // hasEndpointOverride is set; PlaceSprue then uses it verbatim for pathEnd
+    // instead of auto-deriving the terminus from the perimeter / an inward
+    // ray. Only ever set for radial sprues — axial endpoints are not movable
+    // (moving one would compromise demolding), so this stays false there.
+    // Cleared by SetActiveInjectionPoint (a fresh injection-point pick starts
+    // the sprue over) and by Clear(). The override lives on pathEnd once
+    // applied, so save/load round-trips it through the existing pathEnd field
+    // with no format change; this flag only matters while the sprue can still
+    // be rebuilt in-session.
+    bool      hasEndpointOverride = false;
+    glm::vec3 endpointOverride{ 0.0f };
+
+    // Whether the overridden radial endpoint sits ON a part (Edit Sprue > Move
+    // snapped it to an object's parting-plane outline). When true the moved
+    // sprue is a DIRECT-INJECTION sprue (ends at the model contact, no cold
+    // slug); when false it's a free terminus with the usual cold slug. Only
+    // meaningful while hasEndpointOverride is set; reset with it in Clear().
+    bool      overrideDirectInjection = false;
+
     // Dimensions (read from UI at placement time)
     float     radius = 2.5f;
     float     draftAngleDeg = 1.0f;
@@ -388,6 +409,8 @@ struct SprueFeature
         hasPoint = false;
         hasPartingPoint = false;
         isDirectInjection = false;
+        hasEndpointOverride = false;
+        overrideDirectInjection = false;
         solid.Destroy();
         coldSlugSolid.Destroy();
     }

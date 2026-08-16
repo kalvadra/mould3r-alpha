@@ -30,6 +30,7 @@ class PreviewPanel;    // forward decl — m_previewPanel pointer; full def
 class wxSimplebook;    // forward decl — m_book pointer; the perspective pager.
 class PerspectiveButton; // forward decl — m_btnPrepare/m_btnPreview tabs.
 class VentEditToolbar;   // forward decl — m_ventEditToolbar overlay (Part 5).
+class SprueEditToolbar;  // forward decl — m_sprueEditToolbar overlay (Edit Sprue).
 class CanvasToast;       // forward decl — bottom-centre viewport hint pill,
 class UpdateBanner;      // forward decl — bottom-right update notification
                          // card (U4); defined in MainFrame.cpp.
@@ -37,13 +38,20 @@ class UpdateChecker;     // forward decl — background startup update check.
                          // defined entirely in MainFrame.cpp (same no-header
                          // arrangement as InsertEditDialog above)
 
-enum class TransformMode { Select, Translate, Rotate, Scale, Pattern, PlaceVent, PlaceRunner, PlaceGate, PlaceEjector, PlaceInsert, RemoveVent, RemoveRunner, RemoveGate, RemoveSprue, RemoveEjector, RemoveInsert, EditVent, EditRunner, EditGate, EditEjector, EditInsert, SelectInjectionPoint, AlignFace, AlignMidplane };
+enum class TransformMode { Select, Translate, Rotate, Scale, Pattern, PlaceVent, PlaceRunner, PlaceGate, PlaceEjector, PlaceInsert, RemoveVent, RemoveRunner, RemoveGate, RemoveSprue, RemoveEjector, RemoveInsert, EditVent, EditRunner, EditGate, EditEjector, EditInsert, EditSprue, SelectInjectionPoint, AlignFace, AlignMidplane };
 
 // Sub-tool active while editing a Complex vent path (Part 5). Shared between
 // GLCanvas (which owns the authoring logic) and the floating VentEditToolbar
 // (which drives it). Lives here, next to TransformMode, so the lightweight
 // toolbar header doesn't have to pull in the heavy GLCanvas header.
 enum class PathEditTool { Move, AddNode, RemoveNode };
+
+// Sub-tool active while in EditSprue mode, driven by the floating
+// SprueEditToolbar. Move drags a radial sprue's endpoint on the parting
+// plane; SelectInjectionPoint re-picks which injection point the sprue feeds
+// from (the pre-edit-environment behaviour, now one tool among two). Lives
+// here next to PathEditTool for the same lightweight-header reason.
+enum class SprueEditTool { Move, SelectInjectionPoint };
 
 class MainFrame : public wxFrame
 {
@@ -82,6 +90,7 @@ public:
     float GetSprueDraftAngle() const;
     float GetSprueColdSlugDepth() const;
     float GetSprueLength() const;
+    float GetSprueOverrun() const;
     float GetRunnerColdPlugDist() const;
 
     // Unit system
@@ -145,6 +154,13 @@ public:
     // reference types this build doesn't know about yet.
     void ApplyFixtureDefaults(const FixtureDefinition& def);
 
+    // Materialise a selected fixture's geometry into the canvas: for a Library
+    // fixture this imports the two STEP/mesh halves; for a Parametric / Dynamic
+    // fixture it builds the procedural box halves. ONLY the geometry differs by
+    // kind — each call site still handles clearing, injection state, defaults
+    // and mould state around this call exactly as it did before.
+    void LoadFixtureIntoScene(const FixtureDefinition& fixture);
+
     // If no fixture has been loaded yet, show the selection dialog and load
     // whatever the user chooses. Intended to be called once, right after the
     // frame is shown on app startup. If the user cancels, the frame stays
@@ -156,6 +172,12 @@ private:
     void OnImport(wxCommandEvent& evt);
     void OnCreateFixture(wxCommandEvent&);
     void OnChangeFixture(wxCommandEvent&);
+
+    // Re-open the procedural fixture's dimension/clearance dialog to edit it in
+    // place. Only meaningful for Parametric / Dynamic fixtures; the menu item is
+    // disabled (via OnUpdateEditFixture) for a library fixture.
+    void OnEditFixture(wxCommandEvent&);
+    void OnUpdateEditFixture(wxUpdateUIEvent&);
     void OnExit(wxCommandEvent& evt);
     void OnSaveProject(wxCommandEvent&);
     void OnLoadProject(wxCommandEvent&);
@@ -288,6 +310,7 @@ private:
     wxTextCtrl* m_sprueDraftAngle = nullptr;
     wxTextCtrl* m_sprueColdSlugDepth = nullptr;
     wxTextCtrl* m_sprueLength = nullptr;
+    wxTextCtrl* m_sprueOverrun = nullptr;
 
     // Runner field members
     wxChoice* m_runnerTypeChoice = nullptr;
@@ -334,6 +357,13 @@ private:
     // as a child of m_canvas, shown only while a vent is being edited.
     VentEditToolbar* m_ventEditToolbar = nullptr;
     void UpdateVentEditToolbar();   // canvas path-edit-changed hook target
+
+    // Floating overlay toolbar for the Edit Sprue environment (Move / Select
+    // Injection Point). Separate window from the vent path toolbar — the two
+    // never show at once (their modes are mutually exclusive), both pinned
+    // top-centre. Same canvas path-edit-changed hook drives both updaters.
+    SprueEditToolbar* m_sprueEditToolbar = nullptr;
+    void UpdateSprueEditToolbar();
 
     // Bottom-centre hint overlay. Sibling of the canvas within m_preparePage,
     // pinned by GLCanvas::RepositionCanvasToast. Driven from SetActiveTool so
@@ -492,6 +522,7 @@ private:
         ID_GenerateMould,
         ID_CreateFixture,
         ID_ChangeFixture,
+        ID_EditFixture,
         ID_ClearVentPoints,
         ID_PlaceSprue,
         ID_ClearSprue,

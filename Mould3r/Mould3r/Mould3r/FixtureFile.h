@@ -22,6 +22,16 @@ struct InjectionPoint
     float         z = 0.0f;
     InjectionType type = InjectionType::Radial;
 
+    // "Fixture Perimeter" injection point (see FixtureDefinition::
+    // allowPerimeterInjection). When true this point isn't a fixed location
+    // authored in the fixture — it was placed by the user anywhere on the
+    // fixture perimeter and is always Radial (y = 0). The distinction matters
+    // at edit time: a perimeter point's injection LOCATION is draggable along
+    // the perimeter (Edit Sprue > Move), whereas a fixed point's location is
+    // immutable and Move instead drags the sprue endpoint. Fixed points loaded
+    // from a fixture always leave this false.
+    bool          perimeter = false;
+
     // Derive the injection type from a Y coordinate. The rule is fixed:
     // points sitting exactly on the parting plane (y = 0) are Radial —
     // material flows sideways into the cavity from the parting line.
@@ -71,6 +81,7 @@ struct SprueDefaults
     std::optional<float>       draftAngle;
     std::optional<float>       coldSlugLength;
     std::optional<float>       length;
+    std::optional<float>       overrun;
 };
 
 struct RunnerDefaults
@@ -159,11 +170,68 @@ struct HalfTransform
     }
 };
 
+// ---------------------------------------------------------------------------
+// FixtureKind — where a fixture's blank geometry comes from.
+//
+//   Library    — the two mould halves are loaded from the modelA / modelB
+//                STEP (or mesh) files. This is the only kind that exists on
+//                disk as a .fixture file and the only kind IsValid() requires
+//                model paths for.
+//   Parametric — a generic rectangular-prism fixture generated at select time
+//                from fixed X/Y/Z dimensions (see ParametricFixtureParams).
+//                Centred on the origin and split into two equal halves at the
+//                y = 0 parting plane.
+//   Dynamic    — a rectangular-prism fixture that resizes to envelope every
+//                scene body (with the origin folded in) plus a per-axis
+//                minimum clearance (see DynamicFixtureParams). Rebuilt
+//                whenever the scene changes.
+//
+// Parametric and Dynamic fixtures are NEVER read from the fixture library —
+// they are chosen directly from the fixture-select menu and their geometry is
+// built by GLCanvas::CreateProceduralFixture rather than ImportFileAsFixture.
+// modelAPath / modelBPath stay empty for both.
+// ---------------------------------------------------------------------------
+enum class FixtureKind { Library, Parametric, Dynamic };
+
+// Fixed dimensions for a Parametric fixture. Total extents in millimetres;
+// the box is centred on the origin, so each half spans sizeY/2 above and
+// below the y = 0 parting plane (and +/-sizeX/2, +/-sizeZ/2 in the other two
+// axes).
+struct ParametricFixtureParams
+{
+    float sizeX = 100.0f;   // mm, total width  (X)
+    float sizeY = 60.0f;    // mm, total height (Y) — split evenly at y = 0
+    float sizeZ = 100.0f;   // mm, total depth  (Z)
+};
+
+// Per-axis minimum clearance for a Dynamic fixture, in millimetres. The box
+// extends past the scene's bounding box (with the origin folded in as a
+// zero-size body) by at least this much on every side — so an empty scene, or
+// one where everything sits at the origin, yields a 2*clearance box.
+struct DynamicFixtureParams
+{
+    float clearanceX = 10.0f;
+    float clearanceY = 10.0f;
+    float clearanceZ = 10.0f;
+};
+
 struct FixtureDefinition
 {
     std::string modelAPath;   // always stored as absolute internally
     std::string modelBPath;
     std::string fixturePath;  // directory anchor for relative path resolution
+
+    // Which kind of fixture this is. Library (the default) uses the modelA /
+    // modelB paths above; Parametric / Dynamic ignore them and generate box
+    // geometry from the params below via GLCanvas::CreateProceduralFixture.
+    // See FixtureKind.
+    FixtureKind kind = FixtureKind::Library;
+
+    // Procedural parameters. Only the struct matching `kind` is meaningful;
+    // the other is ignored. Both default to sensible starting dimensions so a
+    // freshly-chosen procedural fixture is valid before the user edits it.
+    ParametricFixtureParams parametric;
+    DynamicFixtureParams    dynamic;
 
     // Per-half pose. Identity by default — no pose data on disk means the
     // half loads at origin with no rotation / unit scale. The FixtureEditor
@@ -176,6 +244,14 @@ struct FixtureDefinition
     HalfTransform halfBTransform;
 
     std::vector<InjectionPoint> injectionPoints;
+
+    // "Fixture Perimeter" injection option. When true, in addition to any fixed
+    // injectionPoints above, the user may place the sprue's injection point
+    // anywhere on the fixture perimeter (snapping to it) during Edit Sprue >
+    // Select Injection Point, and drag it along the perimeter with Move. See
+    // GLCanvas::PickActivateInjectionPoint / MoveSprueInjectionPoint. Authored
+    // via a checkbox on the FixtureEditor injection-points card.
+    bool allowPerimeterInjection = false;
 
     // Optional per-feature defaults. All fields default-construct to empty
     // optionals — i.e. "no override". MainFrame::ApplyFixtureDefaults walks
@@ -193,6 +269,11 @@ struct FixtureDefinition
 
     bool IsValid() const
     {
+        // Procedural fixtures carry no file paths — their geometry is
+        // generated from `kind` + params, so they are always valid. Only a
+        // Library fixture needs both half models present.
+        if (kind != FixtureKind::Library)
+            return true;
         return !modelAPath.empty() && !modelBPath.empty();
     }
 };

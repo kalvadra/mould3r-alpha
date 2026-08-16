@@ -22,6 +22,7 @@
 #include "PreviewPanel.h"    // embedded post-cut mould preview perspective
 #include "FixtureEditor.h"
 #include "CreateFixtureDialog.h"
+#include "ProceduralFixtureDialog.h"   // re-open dims/clearances for Edit Fixture
 #include "RotateDialog.h"
 #include "TranslateDialog.h"
 #include "ScaleDialog.h"
@@ -38,6 +39,7 @@
 #include "SplitButton.h"       // split action+dropdown button for Export mode
 #include "PerspectiveButton.h" // flat tab-style perspective switch
 #include "VentEditToolbar.h"   // Part 5: floating complex-vent-path toolbar
+#include "SprueEditToolbar.h"  // Edit Sprue floating toolbar
 #include "WindowEffects.h"     // DWM corner rounding for the main frame
 #include "style.h"
 
@@ -531,6 +533,8 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
     Bind(wxEVT_MENU, &MainFrame::OnImport, this, ID_Import);
     Bind(wxEVT_MENU, &MainFrame::OnCreateFixture, this, ID_CreateFixture);
     Bind(wxEVT_MENU, &MainFrame::OnChangeFixture, this, ID_ChangeFixture);
+    Bind(wxEVT_MENU, &MainFrame::OnEditFixture, this, ID_EditFixture);
+    Bind(wxEVT_UPDATE_UI, &MainFrame::OnUpdateEditFixture, this, ID_EditFixture);
     Bind(wxEVT_MENU, &MainFrame::OnSaveProject, this, ID_SaveProject);
     Bind(wxEVT_MENU, &MainFrame::OnLoadProject, this, ID_LoadProject);
     Bind(wxEVT_MENU, &MainFrame::OnNewProject, this, ID_NewProject);
@@ -643,8 +647,24 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
         }
     });
     m_canvas->SetPathToolbar(m_ventEditToolbar);
-    m_canvas->SetOnPathEditChanged([this] { UpdateVentEditToolbar(); });
-    UpdateVentEditToolbar();   // initial (hidden) state
+
+    // ---- Edit Sprue floating toolbar ---------------------------------------
+    // Same sibling-of-the-canvas arrangement as the vent toolbar; the two never
+    // show together (their modes are exclusive) and share the top-centre slot.
+    m_sprueEditToolbar = new SprueEditToolbar(m_preparePage);
+    m_sprueEditToolbar->SetOnTool([this](SprueEditTool t) {
+        if (m_canvas) m_canvas->SetSprueEditTool(t);
+    });
+    m_canvas->SetSprueToolbar(m_sprueEditToolbar);
+
+    // One canvas hook drives BOTH edit toolbars; each shows itself only in its
+    // own mode and hides otherwise.
+    m_canvas->SetOnPathEditChanged([this] {
+        UpdateVentEditToolbar();
+        UpdateSprueEditToolbar();
+    });
+    UpdateVentEditToolbar();    // initial (hidden) state
+    UpdateSprueEditToolbar();   // initial (hidden) state
 
     // ---- Bottom-centre hint overlay ----------------------------------------
     // Same sibling-of-the-canvas arrangement as the toolbar above. Registered
@@ -687,17 +707,13 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
     // PromptForFixtureIfMissing()).
     if (fixture.IsValid())
     {
-        if (!fixture.modelAPath.empty())
-            m_canvas->ImportFileAsFixture(fixture.modelAPath, fixture.halfATransform);
-        if (!fixture.modelBPath.empty())
-            m_canvas->ImportFileAsFixture(fixture.modelBPath, fixture.halfBTransform);
+        LoadFixtureIntoScene(fixture);
 
         // Set the active injection point (first in the list for now)
+        m_canvas->SetInjectionPoints(fixture.injectionPoints);
+        m_canvas->SetAllowPerimeterInjection(fixture.allowPerimeterInjection);
         if (!fixture.injectionPoints.empty())
-        {
             m_canvas->SetActiveInjectionPoint(fixture.injectionPoints[0]);
-            m_canvas->SetInjectionPoints(fixture.injectionPoints);
-        }
 
         // Apply any per-feature default overrides the fixture supplied.
         // Safe here because CreateLeftPanel ran above, so all field/choice
@@ -877,6 +893,7 @@ wxMenuBar* MainFrame::BuildPrepareMenuBar()
     auto* fixtureMenu = new wxMenu();
     fixtureMenu->Append(ID_CreateFixture, "Create Fixture...");
     fixtureMenu->Append(ID_ChangeFixture, "Change Fixture...");
+    fixtureMenu->Append(ID_EditFixture, "Edit Fixture Dimensions...");
     menuBar->Append(fixtureMenu, "&Fixture");
 
     // Grid menu — edit the ground-plane grid's shape, size and spacing.
@@ -1633,6 +1650,33 @@ void MainFrame::UpdateVentEditToolbar()
     }
 }
 
+// ---------------------------------------------------------------------------
+// UpdateSprueEditToolbar — sync the Edit Sprue floating toolbar to the canvas.
+// Bound (with UpdateVentEditToolbar) to the canvas path-edit-changed hook, so
+// it fires on mode changes and on sub-tool / injection-point changes. Shown
+// only in EditSprue mode; hidden otherwise.
+// ---------------------------------------------------------------------------
+void MainFrame::UpdateSprueEditToolbar()
+{
+    if (!m_canvas || !m_sprueEditToolbar) return;
+
+    if (m_canvas->IsEditingSprue())
+    {
+        m_sprueEditToolbar->Configure(
+            m_canvas->HasSprueForEdit() && m_canvas->IsActiveSprueRadial(),
+            m_canvas->HasInjectionChoices() || m_canvas->AllowsPerimeterInjection(),
+            m_canvas->GetSprueEditTool());
+        if (!m_sprueEditToolbar->IsShown())
+            m_sprueEditToolbar->Show();
+        m_sprueEditToolbar->Raise();   // keep above the GL surface
+    }
+    else
+    {
+        if (m_sprueEditToolbar->IsShown())
+            m_sprueEditToolbar->Hide();
+    }
+}
+
 void MainFrame::OnEditRunner(wxCommandEvent&)
 {
     if (m_canvas && m_canvas->GetTransformMode() == TransformMode::EditRunner)
@@ -2065,12 +2109,23 @@ void MainFrame::OnEditInsert(wxCommandEvent&)
 
 void MainFrame::OnEditSprue(wxCommandEvent&)
 {
-    if (m_fixtureDef.injectionPoints.size() <= 1) return;  // nothing to choose
+    if (!m_canvas) return;
 
-    if (m_canvas && m_canvas->GetTransformMode() == TransformMode::SelectInjectionPoint)
+    // Enter the Edit Sprue environment (floating toolbar with Move + Select
+    // Injection Point). Worth opening only when there's something to edit: a
+    // placed sprue to move, or a choice of injection points to switch between.
+    // Toggle back out if already in it.
+    if (m_canvas->GetTransformMode() == TransformMode::EditSprue)
+    {
         SetActiveTool(TransformMode::Select);
-    else
-        SetActiveTool(TransformMode::SelectInjectionPoint);
+        return;
+    }
+
+    if (!m_canvas->HasSprueForEdit() && !m_canvas->HasInjectionChoices() &&
+        !m_canvas->AllowsPerimeterInjection())
+        return;   // nothing to edit
+
+    SetActiveTool(TransformMode::EditSprue);
 }
 
 // ---------------------------------------------------------------------------
@@ -2111,7 +2166,7 @@ void MainFrame::OnSetMetric(wxCommandEvent&)
     // Convert all mm-based field values: displayed inches → mm
     wxTextCtrl* mmFields[] = {
         m_ventLength, m_ventWidth, m_ventOverrunStart, m_ventOverrunEnd,
-        m_sprueDiameter, m_sprueColdSlugDepth, m_sprueLength,
+        m_sprueDiameter, m_sprueColdSlugDepth, m_sprueLength, m_sprueOverrun,
         m_runnerDiameter, m_runnerColdSlugDepth,
         m_gateDiameter, m_subRunnerDiameter
     };
@@ -2137,7 +2192,7 @@ void MainFrame::OnSetImperial(wxCommandEvent&)
     // Convert all mm-based field values: displayed mm → inches
     wxTextCtrl* mmFields[] = {
         m_ventLength, m_ventWidth, m_ventOverrunStart, m_ventOverrunEnd,
-        m_sprueDiameter, m_sprueColdSlugDepth, m_sprueLength,
+        m_sprueDiameter, m_sprueColdSlugDepth, m_sprueLength, m_sprueOverrun,
         m_runnerDiameter, m_runnerColdSlugDepth,
         m_gateDiameter, m_subRunnerDiameter
     };
@@ -2247,6 +2302,17 @@ float MainFrame::GetSprueLength() const
     double v = 20.0;
     if (!m_sprueLength->GetValue().ToDouble(&v)) return 20.0f;
     if (v <= 0.0) v = 20.0;
+    return static_cast<float>(v) * (m_imperial ? 25.4f : 1.0f);
+}
+
+float MainFrame::GetSprueOverrun() const
+{
+    // Direct-injection gate overrun (mm). Defaults to 0 (no overrun); negatives
+    // clamp to 0. Read and converted like the other length fields.
+    if (!m_sprueOverrun) return 0.0f;
+    double v = 0.0;
+    if (!m_sprueOverrun->GetValue().ToDouble(&v)) return 0.0f;
+    if (v < 0.0) v = 0.0;
     return static_cast<float>(v) * (m_imperial ? 25.4f : 1.0f);
 }
 
@@ -2416,6 +2482,24 @@ void MainFrame::OnCreateFixture(wxCommandEvent&)
     editor->Show();
 }
 
+void MainFrame::LoadFixtureIntoScene(const FixtureDefinition& fixture)
+{
+    if (fixture.kind == FixtureKind::Library)
+    {
+        if (!fixture.modelAPath.empty())
+            m_canvas->ImportFileAsFixture(fixture.modelAPath, fixture.halfATransform);
+        if (!fixture.modelBPath.empty())
+            m_canvas->ImportFileAsFixture(fixture.modelBPath, fixture.halfBTransform);
+    }
+    else
+    {
+        // Parametric / Dynamic: build the two box halves procedurally. This
+        // clears and repopulates m_fixtures internally, so callers that already
+        // ClearFixtures()/ClearAll() beforehand stay correct either way.
+        m_canvas->CreateProceduralFixture(fixture);
+    }
+}
+
 void MainFrame::OnChangeFixture(wxCommandEvent&)
 {
     const std::string lastFixture = AppConfig::LoadLastFixture();
@@ -2427,22 +2511,21 @@ void MainFrame::OnChangeFixture(wxCommandEvent&)
         return;
 
     FixtureDefinition fixture = dlg.GetFixture();
-    AppConfig::SaveLastFixture(fixture.fixturePath);
+    // Procedural fixtures have no path — don't overwrite the remembered library
+    // fixture with an empty string. Project save persists procedural fixtures.
+    if (!fixture.fixturePath.empty())
+        AppConfig::SaveLastFixture(fixture.fixturePath);
     m_fixtureDef = fixture;   // keep for project save
 
     // Clear existing fixtures and reload
     m_canvas->ClearFixtures();
 
-    if (!fixture.modelAPath.empty())
-        m_canvas->ImportFileAsFixture(fixture.modelAPath, fixture.halfATransform);
-    if (!fixture.modelBPath.empty())
-        m_canvas->ImportFileAsFixture(fixture.modelBPath, fixture.halfBTransform);
+    LoadFixtureIntoScene(fixture);
 
+    m_canvas->SetInjectionPoints(fixture.injectionPoints);
+    m_canvas->SetAllowPerimeterInjection(fixture.allowPerimeterInjection);
     if (!fixture.injectionPoints.empty())
-    {
         m_canvas->SetActiveInjectionPoint(fixture.injectionPoints[0]);
-        m_canvas->SetInjectionPoints(fixture.injectionPoints);
-    }
 
     // Reset side-panel fields to the new fixture's per-feature defaults.
     ApplyFixtureDefaults(fixture);
@@ -2451,6 +2534,44 @@ void MainFrame::OnChangeFixture(wxCommandEvent&)
     // mould was built against the old fixture(s) and is meaningless now —
     // back to "nothing to export until you Generate".
     m_mouldState = MouldState::NeverGenerated;
+}
+
+void MainFrame::OnEditFixture(wxCommandEvent&)
+{
+    if (!m_canvas) return;
+
+    // Editable dimensions only exist for procedural fixtures. The menu item is
+    // disabled for a library fixture (OnUpdateEditFixture), but guard anyway.
+    if (m_fixtureDef.kind == FixtureKind::Library)
+        return;
+
+    // Re-open the same dialog used at creation, seeded with the current values.
+    ProceduralFixtureDialog dlg(this, m_fixtureDef);
+    if (dlg.ShowModal() != wxID_OK)
+        return;
+
+    if (m_fixtureDef.kind == FixtureKind::Parametric)
+        m_fixtureDef.parametric = dlg.GetParametric();
+    else
+        m_fixtureDef.dynamic = dlg.GetDynamic();
+
+    // Rebuild the fixture at the new size. LoadFixtureIntoScene ->
+    // CreateProceduralFixture clears the old fixture (and its vents) and seeds a
+    // fresh perimeter injection point, so the sprue resets to match the new
+    // dimensions. A Dynamic fixture re-fits the current scene with the edited
+    // clearances.
+    LoadFixtureIntoScene(m_fixtureDef);
+    m_canvas->SetInjectionPoints(m_fixtureDef.injectionPoints);
+    m_canvas->SetAllowPerimeterInjection(m_fixtureDef.allowPerimeterInjection);
+
+    // The blank geometry changed, so any previously-generated mould is stale.
+    m_mouldState = MouldState::NeverGenerated;
+}
+
+void MainFrame::OnUpdateEditFixture(wxUpdateUIEvent& evt)
+{
+    // Grey the item out unless a procedural fixture (with dimensions) is active.
+    evt.Enable(m_fixtureDef.kind != FixtureKind::Library);
 }
 
 // ---------------------------------------------------------------------------
@@ -2472,20 +2593,17 @@ void MainFrame::PromptForFixtureIfMissing()
         return;  // user cancelled — leave the app open with no fixture loaded
 
     FixtureDefinition fixture = dlg.GetFixture();
-    AppConfig::SaveLastFixture(fixture.fixturePath);
+    if (!fixture.fixturePath.empty())   // keep last library fixture; procedural has no path
+        AppConfig::SaveLastFixture(fixture.fixturePath);
     m_fixtureDef = fixture;
 
     // Fresh frame, so no need to ClearFixtures() — just load.
-    if (!fixture.modelAPath.empty())
-        m_canvas->ImportFileAsFixture(fixture.modelAPath, fixture.halfATransform);
-    if (!fixture.modelBPath.empty())
-        m_canvas->ImportFileAsFixture(fixture.modelBPath, fixture.halfBTransform);
+    LoadFixtureIntoScene(fixture);
 
+    m_canvas->SetInjectionPoints(fixture.injectionPoints);
+    m_canvas->SetAllowPerimeterInjection(fixture.allowPerimeterInjection);
     if (!fixture.injectionPoints.empty())
-    {
         m_canvas->SetActiveInjectionPoint(fixture.injectionPoints[0]);
-        m_canvas->SetInjectionPoints(fixture.injectionPoints);
-    }
 
     ApplyFixtureDefaults(fixture);
 }
@@ -2515,7 +2633,8 @@ void MainFrame::OnNewProject(wxCommandEvent&)
             return;
 
         fixture = dlg.GetFixture();
-        AppConfig::SaveLastFixture(fixture.fixturePath);
+        if (!fixture.fixturePath.empty())   // keep last library fixture; procedural has no path
+            AppConfig::SaveLastFixture(fixture.fixturePath);
     }
 
     // Clear the entire scene
@@ -2524,16 +2643,12 @@ void MainFrame::OnNewProject(wxCommandEvent&)
     // Load the selected fixture
     m_fixtureDef = fixture;
 
-    if (!fixture.modelAPath.empty())
-        m_canvas->ImportFileAsFixture(fixture.modelAPath, fixture.halfATransform);
-    if (!fixture.modelBPath.empty())
-        m_canvas->ImportFileAsFixture(fixture.modelBPath, fixture.halfBTransform);
+    LoadFixtureIntoScene(fixture);
 
+    m_canvas->SetInjectionPoints(fixture.injectionPoints);
+    m_canvas->SetAllowPerimeterInjection(fixture.allowPerimeterInjection);
     if (!fixture.injectionPoints.empty())
-    {
         m_canvas->SetActiveInjectionPoint(fixture.injectionPoints[0]);
-        m_canvas->SetInjectionPoints(fixture.injectionPoints);
-    }
 
     ApplyFixtureDefaults(fixture);
 
@@ -2576,6 +2691,11 @@ void MainFrame::OnSaveProject(wxCommandEvent&)
     ProjectData data;
     data.version = 1;
     data.fixturePath = m_fixtureDef.fixturePath;
+    // Procedural fixtures persist as kind + params instead of a path; Save()
+    // writes whichever applies. Library fixtures leave these at their defaults.
+    data.fixtureKind = m_fixtureDef.kind;
+    data.fixtureParametric = m_fixtureDef.parametric;
+    data.fixtureDynamic = m_fixtureDef.dynamic;
 
     // Objects
     for (const auto& obj : m_canvas->GetObjects())
@@ -2605,6 +2725,7 @@ void MainFrame::OnSaveProject(wxCommandEvent&)
         p.sprueDraftAngle = GetSprueDraftAngle();
         p.sprueColdSlugDepth = GetSprueColdSlugDepth();
         p.sprueLength = GetSprueLength();
+        p.sprueOverrun = GetSprueOverrun();
         p.runnerDiameter = GetRunnerDiameter();
         p.runnerColdPlugDist = GetRunnerColdPlugDist();
         p.gateDiameter = GetGateDiameter();
@@ -2792,7 +2913,30 @@ void MainFrame::OnLoadProject(wxCommandEvent&)
     m_canvas->ClearAll();
 
     // ---- Load fixture ------------------------------------------------------
-    if (!data.fixturePath.empty())
+    if (data.fixtureKind != FixtureKind::Library)
+    {
+        // Procedural fixture — rebuild from the saved kind + params. No file and
+        // no stored geometry: CreateProceduralFixture builds the box now (the
+        // scene is still empty from ClearAll above). For a Dynamic fixture the
+        // single RebuildDynamicFixture() after the object/insert restore below
+        // re-fits it to the fully-loaded scene.
+        FixtureDefinition fixDef;
+        fixDef.kind = data.fixtureKind;
+        fixDef.parametric = data.fixtureParametric;
+        fixDef.dynamic = data.fixtureDynamic;
+        fixDef.allowPerimeterInjection = true;   // procedural default (Part 3)
+        m_fixtureDef = fixDef;
+
+        LoadFixtureIntoScene(fixDef);
+
+        // Procedural fixtures carry no injection points of their own; a saved
+        // sprue still restores its active point, and perimeter injection is on.
+        if (data.sprue.placed)
+            m_canvas->SetActiveInjectionPoint(data.sprue.injectionPoint);
+        m_canvas->SetInjectionPoints(fixDef.injectionPoints);
+        m_canvas->SetAllowPerimeterInjection(true);
+    }
+    else if (!data.fixturePath.empty())
     {
         FixtureDefinition fixDef;
         std::string fixError;
@@ -2801,10 +2945,7 @@ void MainFrame::OnLoadProject(wxCommandEvent&)
             m_fixtureDef = fixDef;
             AppConfig::SaveLastFixture(fixDef.fixturePath);
 
-            if (!fixDef.modelAPath.empty())
-                m_canvas->ImportFileAsFixture(fixDef.modelAPath, fixDef.halfATransform);
-            if (!fixDef.modelBPath.empty())
-                m_canvas->ImportFileAsFixture(fixDef.modelBPath, fixDef.halfBTransform);
+            LoadFixtureIntoScene(fixDef);
 
             // Set injection point (use the one from the sprue data if available,
             // otherwise fall back to the first in the fixture)
@@ -2850,6 +2991,12 @@ void MainFrame::OnLoadProject(wxCommandEvent&)
         m_canvas->RestoreInsert(in.sourcePath, in.parentIndex,
             in.localOffset, in.localRotDeg, in.localScale);
     }
+
+    // A Dynamic fixture was built against the empty scene during fixture load
+    // above; now that every object and insert is restored, re-fit it once to
+    // the full scene (and rebuild its perimeter before the sprue/feature
+    // restores below rely on it). No-op for Library / Parametric fixtures.
+    m_canvas->RebuildDynamicFixture();
 
     // ---- Restore sprue -----------------------------------------------------
     if (data.sprue.placed)
@@ -2994,6 +3141,7 @@ void MainFrame::SetParameterFields(const ProjectParameters& p)
     setField(m_sprueDraftAngle, p.sprueDraftAngle);          // degrees — no conversion
     setField(m_sprueColdSlugDepth, p.sprueColdSlugDepth * conv);
     setField(m_sprueLength, p.sprueLength * conv);
+    setField(m_sprueOverrun, p.sprueOverrun * conv);
     setField(m_runnerDiameter, p.runnerDiameter * conv);
     setField(m_runnerColdSlugDepth, p.runnerColdPlugDist * conv);
     setField(m_gateDiameter, p.gateDiameter * conv);
@@ -3071,6 +3219,7 @@ void MainFrame::ApplyFixtureDefaults(const FixtureDefinition& def)
     setDeg(m_sprueDraftAngle, def.sprueDefaults.draftAngle);
     setLen(m_sprueColdSlugDepth, def.sprueDefaults.coldSlugLength);
     setLen(m_sprueLength, def.sprueDefaults.length);
+    setLen(m_sprueOverrun, def.sprueDefaults.overrun);
 
     // ---- Runner -------------------------------------------------------------
     setChoice(m_runnerTypeChoice, def.runnerDefaults.type);
@@ -3733,6 +3882,7 @@ wxPanel* MainFrame::CreateSpruesContent(wxWindow* parent)
     addRow("Draft angle:", m_sprueDraftAngle, "1.0", wxString::FromUTF8("\xC2\xB0"));
     addRow("Cold slug:", m_sprueColdSlugDepth, "5.0", "mm");
     addRow("Sprue length:", m_sprueLength, "20.0", "mm");
+    addRow("Overrun:", m_sprueOverrun, "0.0", "mm");
 
     dimsPanel->SetSizer(dimsSizer);
     settingsSizer->Add(dimsPanel, 0, wxEXPAND | wxBOTTOM, 10);

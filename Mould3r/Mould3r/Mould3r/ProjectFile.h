@@ -150,6 +150,7 @@ struct ProjectParameters
     float sprueDraftAngle = 1.0f;
     float sprueColdSlugDepth = 5.0f;
     float sprueLength = 20.0f;
+    float sprueOverrun = 0.0f;
 
     float runnerDiameter = 5.0f;
     float runnerColdPlugDist = 5.0f;
@@ -166,7 +167,16 @@ struct ProjectParameters
 struct ProjectData
 {
     int         version = 1;
-    std::string fixturePath;         // path to the .fixture file
+    std::string fixturePath;         // path to the .fixture file (Library only)
+
+    // Procedural fixtures (v7+). fixtureKind == Library uses fixturePath above;
+    // Parametric / Dynamic ignore the path and rebuild box geometry from these
+    // params on load (Dynamic re-fits the restored scene). Older files have no
+    // fixture_kind key, so fixtureKind defaults to Library and they round-trip
+    // unchanged. The box geometry itself is never stored — only the recipe.
+    FixtureKind             fixtureKind = FixtureKind::Library;
+    ParametricFixtureParams fixtureParametric;
+    DynamicFixtureParams    fixtureDynamic;
 
     std::vector<ProjectObjectData> objects;
 

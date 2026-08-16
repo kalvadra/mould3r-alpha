@@ -18,6 +18,13 @@ private:
     void OnNewFixture(wxCommandEvent&);
     void OnOK(wxCommandEvent&);
 
+    // Shared confirm path for the Select button and list double-click. Rejects
+    // an empty selection, and for a procedural (Parametric / Dynamic) row opens
+    // ProceduralFixtureDialog to collect dimensions/clearances before accepting
+    // — cancelling that dialog leaves the picker open. Ends the dialog with
+    // wxID_OK once a valid fixture (library or procedural) is ready.
+    void AcceptSelection();
+
     // Frameless drag handling — the custom title row stands in for the
     // missing system title bar so the user can still move the window.
     // wxMouseCaptureLost is required: wxWidgets asserts in debug builds if

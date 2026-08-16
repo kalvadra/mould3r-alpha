@@ -63,6 +63,9 @@
     <ClCompile Include="StartupDialog.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="ProceduralFixtureDialog.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="TranslateDialog.cpp">
       <Filter>Source Files\TransformHandlers</Filter>
     </ClCompile>
@@ -126,6 +129,9 @@
     <ClCompile Include="SplitButton.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="SprueEditToolbar.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="PerspectiveButton.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -185,6 +191,9 @@
     <ClInclude Include="StartupDialog.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="ProceduralFixtureDialog.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="RotateDialog.h">
       <Filter>Header Files\TransformHandlers</Filter>
     </ClInclude>
@@ -237,6 +246,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="SplitButton.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="SprueEditToolbar.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="PerspectiveButton.h">

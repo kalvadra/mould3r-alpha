@@ -954,6 +954,15 @@ wxPanel* FixtureEditor::CreateInjectionPointsContent(wxWindow* parent)
 
     sizer->AddSpacer(10);
 
+    // "Fixture Perimeter" injection option — when checked, the sprue's
+    // injection point can be placed (and dragged) anywhere on the fixture
+    // perimeter, in addition to any fixed points listed above. Read into
+    // FixtureDefinition::allowPerimeterInjection at save time.
+    m_allowPerimeterInjection = new wxCheckBox(card, wxID_ANY,
+        "Fixture Perimeter (place injection point anywhere on perimeter)");
+    m_allowPerimeterInjection->SetForegroundColour(Style::TextPrimary);
+    sizer->Add(m_allowPerimeterInjection, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
+
     // Render the (empty) initial state. RebuildInjectionList draws a
     // muted "No injection points" placeholder when the vector is empty,
     // so the card doesn't collapse to a thin sliver before the user adds
@@ -1193,6 +1202,11 @@ wxPanel* FixtureEditor::CreateSpruesContent(wxWindow* parent)
         wxStaticText* ul = nullptr;
         AddDimRow(m_sprueDimsPanel, dimSizer, "Sprue length:", m_sprueLength, "20.0", "mm", &ul);
         m_mmFields.push_back(m_sprueLength); m_mmUnitLabels.push_back(ul);
+    }
+    {
+        wxStaticText* ul = nullptr;
+        AddDimRow(m_sprueDimsPanel, dimSizer, "Overrun:", m_sprueOverrun, "0.0", "mm", &ul);
+        m_mmFields.push_back(m_sprueOverrun); m_mmUnitLabels.push_back(ul);
     }
     dimSizer->AddSpacer(4);
 
@@ -2006,6 +2020,7 @@ void FixtureEditor::OnGenerateFixture(wxCommandEvent&)
         readField(m_sprueDraftAngle, def.sprueDefaults.draftAngle);
         readFieldMM(m_sprueColdSlugDepth, def.sprueDefaults.coldSlugLength);
         readFieldMM(m_sprueLength, def.sprueDefaults.length);
+        readFieldMM(m_sprueOverrun, def.sprueDefaults.overrun);
     }
 
     // Runners — skipped entirely when type is "No Override" (index 0).
@@ -2068,6 +2083,8 @@ void FixtureEditor::OnGenerateFixture(wxCommandEvent&)
     // is preserved so the saved file's [injection_point.0..N] sections
     // come out in the same order the user added them in the sidebar.
     def.injectionPoints = m_injectionPoints;
+    def.allowPerimeterInjection =
+        m_allowPerimeterInjection && m_allowPerimeterInjection->GetValue();
 
     // ---- Write ------------------------------------------------------------
     std::string error;

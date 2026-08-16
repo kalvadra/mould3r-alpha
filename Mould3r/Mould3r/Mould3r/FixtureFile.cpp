@@ -221,6 +221,9 @@ bool FixtureFile::Load(const std::string& path,
                 out.modelAPath = ResolveRelative(value, baseDir);
             else if (key == "modelB")
                 out.modelBPath = ResolveRelative(value, baseDir);
+            else if (key == "allow_perimeter_injection")
+                out.allowPerimeterInjection =
+                    (value == "true" || value == "1" || value == "yes");
         }
         else if (currentSection == Section::InjectionPoint && hasPending)
         {
@@ -269,6 +272,7 @@ bool FixtureFile::Load(const std::string& path,
             else if (key == "draft_angle")      parseOptFloat(value, out.sprueDefaults.draftAngle);
             else if (key == "cold_slug_length") parseOptFloat(value, out.sprueDefaults.coldSlugLength);
             else if (key == "length")           parseOptFloat(value, out.sprueDefaults.length);
+            else if (key == "overrun")          parseOptFloat(value, out.sprueDefaults.overrun);
         }
         else if (currentSection == Section::RunnerDefaults)
         {
@@ -357,6 +361,8 @@ bool FixtureFile::Save(const std::string& path,
     file << "[fixture]\n";
     file << "modelA = " << relA << "\n";
     file << "modelB = " << relB << "\n";
+    if (def.allowPerimeterInjection)
+        file << "allow_perimeter_injection = true\n";
 
     // Write each injection point as its own numbered section
     for (int i = 0; i < (int)def.injectionPoints.size(); ++i)
@@ -404,7 +410,7 @@ bool FixtureFile::Save(const std::string& path,
     }
     {
         const SprueDefaults& d = def.sprueDefaults;
-        if (d.type || d.diameter || d.draftAngle || d.coldSlugLength || d.length)
+        if (d.type || d.diameter || d.draftAngle || d.coldSlugLength || d.length || d.overrun)
         {
             file << "\n[sprue_defaults]\n";
             writeKey("type", d.type);
@@ -412,6 +418,7 @@ bool FixtureFile::Save(const std::string& path,
             writeKeyF("draft_angle", d.draftAngle);
             writeKeyF("cold_slug_length", d.coldSlugLength);
             writeKeyF("length", d.length);
+            writeKeyF("overrun", d.overrun);
         }
     }
     {

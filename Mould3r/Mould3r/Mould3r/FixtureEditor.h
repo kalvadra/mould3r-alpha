@@ -279,6 +279,7 @@ private:
     wxTextCtrl* m_sprueDraftAngle = nullptr;
     wxTextCtrl* m_sprueColdSlugDepth = nullptr;
     wxTextCtrl* m_sprueLength = nullptr;
+    wxTextCtrl* m_sprueOverrun = nullptr;
 
     // Runner
     wxChoice* m_runnerTypeChoice = nullptr;
@@ -331,6 +332,7 @@ private:
     // Remove without re-finding it through the widget tree. Owned by the
     // wxWidgets parent-child hierarchy.
     wxPanel* m_injectionListPanel = nullptr;
+    wxCheckBox* m_allowPerimeterInjection = nullptr;  // "Fixture Perimeter" option
 
     enum
     {

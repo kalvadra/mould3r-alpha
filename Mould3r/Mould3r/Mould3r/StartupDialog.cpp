@@ -5,6 +5,7 @@
 #include "style.h"
 #include "FixtureEditor.h"
 #include "CreateFixtureDialog.h"
+#include "ProceduralFixtureDialog.h"  // dimension/clearance prompt for procedural rows
 #include "RoundedButton.h"     // rounded button for the dialog's action buttons
 #include "WindowEffects.h"     // DWM corner rounding for the frameless dialog
 
@@ -12,6 +13,13 @@ namespace fs = std::filesystem;
 
 namespace
 {
+    // Sentinels stored in m_fixturePaths for the two synthetic, non-file rows
+    // at the top of the list. They can't collide with a real fixture path
+    // (no filesystem path contains these), so a simple string compare in the
+    // selection handlers distinguishes a procedural row from a library file.
+    constexpr const char* kParametricRow = "<<procedural:parametric>>";
+    constexpr const char* kDynamicRow    = "<<procedural:dynamic>>";
+
     // Shared font for all dialog buttons — matches the ribbon buttons in
     // MainFrame (9pt Segoe UI semibold).
     wxFont DialogBtnFont()
@@ -321,6 +329,22 @@ void StartupDialog::ScanFixturesFolder()
     m_fixture = FixtureDefinition{};
     RefreshPreview();
 
+    // Two synthetic rows at the top: the procedural fixtures. They're always
+    // available (independent of the fixtures folder) and carry a sentinel in
+    // m_fixturePaths instead of a file path — the selection handlers branch on
+    // it. Inserting them first means the scanned file rows below naturally
+    // continue from index 2 via the existing m_fixturePaths.size() pattern.
+    auto addProceduralRow = [&](const char* sentinel, const wxString& name,
+        const wxString& halfLabel)
+    {
+        const long idx = m_list->InsertItem((long)m_fixturePaths.size(), name);
+        m_list->SetItem(idx, 1, halfLabel);
+        m_list->SetItem(idx, 2, halfLabel);
+        m_fixturePaths.push_back(sentinel);
+    };
+    addProceduralRow(kParametricRow, "Parametric Box", "(fixed size)");
+    addProceduralRow(kDynamicRow, "Dynamic Box", "(auto-fit)");
+
     if (!fs::exists(m_fixturesFolder) || !fs::is_directory(m_fixturesFolder))
     {
         // Folder missing — surface the empty-state via the preview labels
@@ -361,8 +385,22 @@ void StartupDialog::OnListSelect(wxListEvent& evt)
     const long idx = evt.GetIndex();
     if (idx < 0 || idx >= (long)m_fixturePaths.size()) return;
 
+    const std::string& path = m_fixturePaths[idx];
+
+    // Procedural rows carry a sentinel, not a file. Set the kind (with default
+    // params) now; the dimension/clearance prompt is deferred to
+    // AcceptSelection so a single click just previews it.
+    if (path == kParametricRow || path == kDynamicRow)
+    {
+        m_fixture = FixtureDefinition{};
+        m_fixture.kind = (path == kParametricRow)
+            ? FixtureKind::Parametric : FixtureKind::Dynamic;
+        RefreshPreview();
+        return;
+    }
+
     std::string error;
-    if (!FixtureFile::Load(m_fixturePaths[idx], m_fixture, error))
+    if (!FixtureFile::Load(path, m_fixture, error))
     {
         wxMessageBox(error, "Load Error", wxOK | wxICON_ERROR, this);
         return;
@@ -374,8 +412,7 @@ void StartupDialog::OnListSelect(wxListEvent& evt)
 void StartupDialog::OnListDoubleClick(wxListEvent& evt)
 {
     OnListSelect(evt);
-    if (m_fixture.IsValid())
-        EndModal(wxID_OK);
+    AcceptSelection();
 }
 
 void StartupDialog::OnNewFixture(wxCommandEvent&)
@@ -421,18 +458,52 @@ void StartupDialog::OnNewFixture(wxCommandEvent&)
 
 void StartupDialog::OnOK(wxCommandEvent&)
 {
+    AcceptSelection();
+}
+
+void StartupDialog::AcceptSelection()
+{
     if (!m_fixture.IsValid())
     {
         wxMessageBox("Please select a fixture before continuing.",
             "No Fixture Selected", wxOK | wxICON_WARNING, this);
         return;
     }
+
+    // Procedural fixtures need their dimensions / clearances before we commit.
+    // A cancel here leaves the picker open so the user can choose again.
+    if (m_fixture.kind != FixtureKind::Library)
+    {
+        ProceduralFixtureDialog dlg(this, m_fixture);
+        if (dlg.ShowModal() != wxID_OK)
+            return;
+
+        if (m_fixture.kind == FixtureKind::Parametric)
+            m_fixture.parametric = dlg.GetParametric();
+        else
+            m_fixture.dynamic = dlg.GetDynamic();
+
+        // Procedural fixtures allow perimeter injection by default — that's the
+        // feature these box fixtures are meant to make usable.
+        m_fixture.allowPerimeterInjection = true;
+    }
+
     EndModal(wxID_OK);
 }
 
 void StartupDialog::RefreshPreview()
 {
-    if (m_fixture.IsValid())
+    if (m_fixture.kind == FixtureKind::Parametric)
+    {
+        m_lblModelA->SetLabel("Parametric box — fixed size, split at the parting plane");
+        m_lblModelB->SetLabel("You'll set the X/Y/Z dimensions after Select.");
+    }
+    else if (m_fixture.kind == FixtureKind::Dynamic)
+    {
+        m_lblModelA->SetLabel("Dynamic box — auto-fits the scene with clearance");
+        m_lblModelB->SetLabel("You'll set the per-axis clearance after Select.");
+    }
+    else if (m_fixture.IsValid())
     {
         m_lblModelA->SetLabel("Mould Half A: " + m_fixture.modelAPath);
         m_lblModelB->SetLabel("Mould Half B: " + m_fixture.modelBPath);

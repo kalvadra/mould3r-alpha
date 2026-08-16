@@ -37,6 +37,7 @@
 #include <opencascade/BRepPrimAPI_MakeCylinder.hxx>
 #include <opencascade/BRepPrimAPI_MakeCone.hxx>
 #include <opencascade/BRepPrimAPI_MakeSphere.hxx>
+#include <opencascade/BRepPrimAPI_MakeBox.hxx>
 #include <opencascade/gp_Circ.hxx>
 #include <opencascade/gp_Ax2.hxx>
 #include <opencascade/gp_Dir.hxx>
@@ -192,6 +193,9 @@ void GLCanvas::SetTransformMode(TransformMode mode)
         m_pathEditTool = PathEditTool::Move;   // Part 5: reset sub-tool
         m_pathNodeGhostActive = false;         // Part 5: drop Add Node ghost
         m_editHandleNode = -1;                 // Part 6: drop handle grab
+        m_sprueEditTool = SprueEditTool::Move; // Edit Sprue: reset sub-tool
+        m_sprueEndpointGrabbed = false;        // Edit Sprue: drop endpoint grab
+        m_sprueInjectionGrabbed = false;       // Edit Sprue: drop injection grab
     }
 
     // Clear AlignFace hover state and highlight VBO when leaving AlignFace.
@@ -257,6 +261,8 @@ void GLCanvas::SetTransformMode(TransformMode mode)
     case TransformMode::EditGate:
     case TransformMode::EditEjector:
     case TransformMode::EditInsert:
+        SetCursor(wxCursor(wxCURSOR_HAND));     break;
+    case TransformMode::EditSprue:
         SetCursor(wxCursor(wxCURSOR_HAND));     break;
     case TransformMode::SelectInjectionPoint:
         SetCursor(wxCursor(wxCURSOR_HAND));     break;
@@ -1699,6 +1705,9 @@ void GLCanvas::SetActiveInjectionPoint(const InjectionPoint& ip)
     m_sprue.isDirectInjection = false;
     m_sprue.hasPoint = false;
     m_sprue.hasPartingPoint = false;
+    // A fresh injection-point pick starts the sprue over, so any dragged radial
+    // endpoint from a previous placement no longer applies.
+    m_sprue.hasEndpointOverride = false;
     m_sprue.solid.Destroy();
     m_sprue.coldSlugSolid.Destroy();
     RebuildSpruePathVBO();
@@ -1713,6 +1722,103 @@ void GLCanvas::SetActiveInjectionPoint(const InjectionPoint& ip)
 void GLCanvas::SetInjectionPoints(const std::vector<InjectionPoint>& pts)
 {
     m_injectionPoints = pts;
+}
+
+// Forward declaration — PointRayDistance is a file-local static defined lower
+// down (next to the marker-pick helpers); PickActivateInjectionPoint below is
+// the earliest use, so it needs the prototype in scope here.
+static float PointRayDistance(const glm::vec3& point,
+    const glm::vec3& origin, const glm::vec3& dir);
+
+// ---------------------------------------------------------------------------
+// PickActivateInjectionPoint — hit-test the injection-point markers against the
+// mouse ray; on a hit, activate that point, notify the frame (so type-dependent
+// UI like Draft Angle updates before the sprue is built), and (re)place the
+// sprue. Returns true iff a point was picked. Caller owns any mode transition.
+// Shared by the standalone SelectInjectionPoint mode and the EditSprue > Select
+// Injection Point sub-tool.
+// ---------------------------------------------------------------------------
+bool GLCanvas::PickActivateInjectionPoint(int mouseX, int mouseY)
+{
+    // Don't bail on an empty fixed-point list when the fixture allows perimeter
+    // injection: a procedural (perimeter-only) fixture has no fixed markers, and
+    // the perimeter branch below is the entire point. Only give up when there's
+    // nothing at all to hit — no markers and no perimeter injection.
+    if (m_injectionPoints.empty() && !m_allowPerimeterInjection) return false;
+
+    glm::vec3 rayOrig, rayDir;
+    BuildMouseRay(mouseX, mouseY, rayOrig, rayDir);
+
+    glm::mat4 fixtureMatrix(1.0f);
+    if (!m_fixtures.empty())
+        fixtureMatrix = m_fixtures[0].BuildModelMatrix();
+
+    const float hitRadius = kVentMarkerRadius * 3.5f;
+    float bestDist = hitRadius;
+    int   bestIdx = -1;
+    for (int i = 0; i < (int)m_injectionPoints.size(); ++i)
+    {
+        const auto& ip = m_injectionPoints[i];
+        glm::vec3 worldPos = glm::vec3(fixtureMatrix *
+            glm::vec4(ip.x, ip.y, ip.z, 1.0f));
+        const float d = PointRayDistance(worldPos, rayOrig, rayDir);
+        if (d < bestDist) { bestDist = d; bestIdx = i; }
+    }
+
+    if (bestIdx < 0)
+    {
+        // No fixed marker hit. If the fixture permits perimeter injection, let
+        // the click land anywhere on the perimeter: snap the cursor's parting-
+        // plane hit onto the perimeter polygon and, if reasonably close, place
+        // a perimeter injection point there. This is the continuous analog of
+        // picking a fixed marker.
+        if (m_allowPerimeterInjection && m_fixturePerimeter.size() >= 2)
+        {
+            glm::vec3 plane;
+            if (RayCastToPartingPlane(mouseX, mouseY, plane))
+            {
+                const glm::vec3 snapped = SnapToFixturePerimeter(plane);
+                const float d = glm::length(glm::vec2(snapped.x - plane.x,
+                    snapped.z - plane.z));
+                // Generous threshold so the perimeter is easy to grab; the snap
+                // itself pins the point exactly onto the edge regardless.
+                if (d <= kVentSnapRadius * 4.0f)
+                {
+                    // Convert the world-space perimeter point to fixture-local,
+                    // since PlaceSprue re-applies the fixture matrix. Storing
+                    // the full inverse-transformed point makes worldPos round-
+                    // trip exactly; the radial path flattens y regardless.
+                    const glm::vec3 local = WorldToFixtureLocal(snapped);
+
+                    InjectionPoint ip;
+                    ip.label = "Fixture Perimeter";
+                    ip.x = local.x;
+                    ip.y = local.y;
+                    ip.z = local.z;
+                    ip.type = InjectionType::Radial;   // perimeter points are always radial
+                    ip.perimeter = true;
+
+                    SetActiveInjectionPoint(ip);
+                    if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+                        frame->OnInjectionPointSelected(ip);
+                    PlaceSprue();
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    SetActiveInjectionPoint(m_injectionPoints[bestIdx]);
+
+    // Notify MainFrame BEFORE PlaceSprue so any UI fields whose value depends
+    // on injection-point type (currently just the Draft Angle) update first —
+    // PlaceSprue reads those fields back when building the sprue.
+    if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+        frame->OnInjectionPointSelected(m_injectionPoints[bestIdx]);
+
+    PlaceSprue();
+    return true;
 }
 
 void GLCanvas::PlaceSprue()
@@ -1733,15 +1839,78 @@ void GLCanvas::PlaceSprue()
     m_sprue.hasPoint = true;
 
     // Read sprue dimensions from the left-panel UI
+    float overrun = 0.0f;
     if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
     {
         m_sprue.radius = frame->GetSprueDiameter() * 0.5f;
         m_sprue.draftAngleDeg = frame->GetSprueDraftAngle();
         m_sprue.coldSlugDepth = frame->GetSprueColdSlugDepth();
+        overrun = frame->GetSprueOverrun();
     }
 
     if (m_activeInjectionPoint.type == InjectionType::Radial)
     {
+        // Project injection point onto the parting plane (y=0). The sprue
+        // always starts here regardless of how the endpoint is chosen.
+        const glm::vec3 ipAtParting(m_sprue.worldPos.x, 0.0f, m_sprue.worldPos.z);
+        m_sprue.pathStart = ipAtParting;
+
+        // ---- User-authored endpoint (Edit Sprue > Move) --------------------
+        // When the user has dragged this radial sprue's endpoint, honour that
+        // position verbatim instead of auto-deriving a terminus. If the drag
+        // snapped the endpoint onto a part (overrideDirectInjection), the sprue
+        // is a DIRECT-INJECTION sprue: it ends at the model contact, the feed
+        // point stays at the injection point, and the cold slug is suppressed
+        // (handled by the common build below via isDirectInjection). Otherwise
+        // it's a free terminus (partingPos = pathEnd, cold slug per UI depth).
+        // Either way this short-circuits the perimeter search / inward-ray cast.
+        if (m_sprue.hasEndpointOverride)
+        {
+            m_sprue.pathEnd = glm::vec3(m_sprue.endpointOverride.x, 0.0f,
+                m_sprue.endpointOverride.z);
+            m_sprue.isDirectInjection = m_sprue.overrideDirectInjection;
+            m_sprue.partingPos = m_sprue.overrideDirectInjection
+                ? ipAtParting          // feed at the injection point
+                : m_sprue.pathEnd;     // feed at the free terminus
+            m_sprue.hasPartingPoint = true;
+        }
+        else if (m_activeInjectionPoint.perimeter)
+        {
+            // ---- Perimeter injection default direction --------------------
+            // The injection point sits ON the perimeter, so there's no "toward
+            // the perimeter" direction to derive. Instead head inward along the
+            // edge normal (toward the origin / into the mould). Cast that ray:
+            // if it meets a part, this is a direct-injection sprue ending at
+            // the contact (overrun then extends it); otherwise fall back to a
+            // fixed inward length. The endpoint stays independently draggable
+            // (which sets an override and takes the branch above instead).
+            const glm::vec2 ipXZ(ipAtParting.x, ipAtParting.z);
+            const glm::vec2 nrm = InwardPerimeterNormal(ipXZ);
+            const glm::vec3 inDir(nrm.x, 0.0f, nrm.y);
+
+            constexpr float kMaxDist = 1000.0f;
+            glm::vec3 hitPos;
+            if (RayCastWorldRay(ipAtParting, inDir, kMaxDist, hitPos))
+            {
+                m_sprue.pathEnd = hitPos;
+                m_sprue.partingPos = ipAtParting;
+                m_sprue.hasPartingPoint = true;
+                m_sprue.isDirectInjection = true;
+            }
+            else
+            {
+                float sprueLength = 20.0f;
+                if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+                    sprueLength = frame->GetSprueLength();
+
+                m_sprue.pathEnd = ipAtParting + inDir * sprueLength;
+                m_sprue.partingPos = m_sprue.pathEnd;
+                m_sprue.hasPartingPoint = true;
+                m_sprue.isDirectInjection = false;
+            }
+        }
+        else
+        {
         // ---- Radial sprue: lies on the parting plane (y=0). Path direction
         // depends on whether a model is in the way:
         //   - Direct injection: cast a ray inward (from the injection point
@@ -1756,7 +1925,6 @@ void GLCanvas::PlaceSprue()
         // isDirectInjection.
 
         // Project injection point onto the parting plane (y=0)
-        const glm::vec3 ipAtParting(m_sprue.worldPos.x, 0.0f, m_sprue.worldPos.z);
         const glm::vec2 ipXZ(ipAtParting.x, ipAtParting.z);
 
         // Find nearest point on the fixture perimeter. Used to derive the
@@ -1796,8 +1964,6 @@ void GLCanvas::PlaceSprue()
         if (bestDist > 1e-6f)
             outDir = glm::normalize(bestPt - ipXZ);
 
-        m_sprue.pathStart = ipAtParting;
-
         // Try direct injection first: cast a ray from the injection point
         // INWARD along the parting plane and see if it hits a model. The
         // inward direction is -outDir, pointing from the injection point
@@ -1833,6 +1999,7 @@ void GLCanvas::PlaceSprue()
             m_sprue.hasPartingPoint = true;
             m_sprue.isDirectInjection = false;
         }
+        }   // end else (auto-derived radial endpoint)
     }
     else
     {
@@ -1893,6 +2060,22 @@ void GLCanvas::PlaceSprue()
     // identically as far as the geometry below is concerned, so the sprue
     // cylinder and cold-slug well are built once here.
 
+    // Direct-injection overrun: in a direct-injection mould the sprue doubles
+    // as the gate, so its end sits right on the model-contact surface. Extend
+    // that end further along the path direction (into the cavity) by the UI
+    // overrun amount so the cut fully penetrates the surface rather than just
+    // grazing it. Non-direct sprues terminate at a free point / past the
+    // perimeter and use the cold-slug well instead, so they skip this. Applied
+    // to the freshly-derived contact end on every call, so it never
+    // accumulates across rebuilds.
+    if (m_sprue.isDirectInjection && overrun > 1e-6f)
+    {
+        const glm::vec3 dir = m_sprue.pathEnd - m_sprue.pathStart;
+        const float len = glm::length(dir);
+        if (len > 1e-6f)
+            m_sprue.pathEnd += (dir / len) * overrun;
+    }
+
     // Build the swept sprue cylinder preview mesh.
     m_sprue.solid.Destroy();
     m_sprue.solid = BuildCylinderMesh(m_sprue.pathStart, m_sprue.pathEnd,
@@ -1935,6 +2118,160 @@ void GLCanvas::PlaceSprue()
     RebuildGateSolids();
     Refresh(false);
     NotifySceneMutated();
+}
+
+// ---------------------------------------------------------------------------
+// SetSprueEditTool — switch the Edit Sprue sub-tool. Dropping any in-progress
+// endpoint grab and refreshing the floating toolbar (via NotifyPathEditChanged,
+// which the frame also routes the SprueEditToolbar update through).
+// ---------------------------------------------------------------------------
+void GLCanvas::SetSprueEditTool(SprueEditTool t)
+{
+    if (m_sprueEditTool == t && !m_sprueEndpointGrabbed) { NotifyPathEditChanged(); return; }
+    m_sprueEditTool = t;
+    m_sprueEndpointGrabbed = false;
+    NotifyPathEditChanged();
+    Refresh(false);
+}
+
+// ---------------------------------------------------------------------------
+// MoveSprueEndpoint — drag the endpoint of a RADIAL sprue to the parting-plane
+// point under the cursor and rebuild. Refuses on an axial sprue (moving that
+// endpoint would compromise demolding) or when no sprue is placed. Records the
+// dragged position as an override so PlaceSprue keeps honouring it on later
+// rebuilds. Does NOT fire the scene-mutation hook — the EditSprue mouse-up does
+// that once per gesture (PlaceSprue's own NotifySceneMutated still runs, which
+// is fine: it only bumps Clean -> Dirty).
+// ---------------------------------------------------------------------------
+void GLCanvas::MoveSprueEndpoint(int mouseX, int mouseY)
+{
+    if (m_transformMode != TransformMode::EditSprue) return;
+    if (!m_sprue.hasPoint) return;
+    if (!IsActiveSprueRadial()) return;   // axial endpoints are locked
+
+    glm::vec3 endpoint;
+    bool      directInjection = false;
+
+    // Ctrl = grid snap (mirrors the ejector / runner idiom): the endpoint lands
+    // on the nearest grid point on the parting plane, as a free terminus — no
+    // object snap while gridding. Runs in the paint pass, so read live key state.
+    if (wxGetKeyState(WXK_CONTROL))
+    {
+        if (!RayCastToPartingPlane(mouseX, mouseY, endpoint)) return;
+        const glm::vec2 s = SnapToGrid(glm::vec2(endpoint.x, endpoint.z));
+        endpoint = glm::vec3(s.x, 0.0f, s.y);
+    }
+    else
+    {
+        // No Ctrl: a slight magnetic snap to a part. RayCastParting snaps the
+        // cursor's parting-plane hit onto the nearest object's cross-section
+        // outline within kVentSnapRadius and reports the object. Landing on a
+        // part makes this a DIRECT-INJECTION sprue (ends at the model contact).
+        glm::vec3 snapPos, snapNormal;
+        int       hitObj = -1;
+        if (RayCastParting(mouseX, mouseY, snapPos, snapNormal, &hitObj) && hitObj >= 0)
+        {
+            endpoint = glm::vec3(snapPos.x, 0.0f, snapPos.z);
+            directInjection = true;
+        }
+        else
+        {
+            // Empty parting plane — free terminus.
+            if (!RayCastToPartingPlane(mouseX, mouseY, endpoint)) return;
+            endpoint.y = 0.0f;
+        }
+    }
+
+    m_sprue.endpointOverride = endpoint;
+    m_sprue.overrideDirectInjection = directInjection;
+    m_sprue.hasEndpointOverride = true;
+
+    // Rebuild the sprue (and dependent runner/gate) from the override. PlaceSprue
+    // short-circuits the perimeter/ray derivation when hasEndpointOverride is set,
+    // so this is inexpensive enough to run per drag frame.
+    PlaceSprue();
+}
+
+// ---------------------------------------------------------------------------
+// WorldToFixtureLocal — map a world-space point into fixture-local space (the
+// space injection-point coordinates live in, since PlaceSprue re-applies the
+// fixture matrix). Identity when no fixture is loaded.
+// ---------------------------------------------------------------------------
+glm::vec3 GLCanvas::WorldToFixtureLocal(const glm::vec3& world) const
+{
+    if (m_fixtures.empty()) return world;
+    const glm::mat4 inv = glm::inverse(m_fixtures[0].BuildModelMatrix());
+    return glm::vec3(inv * glm::vec4(world, 1.0f));
+}
+
+// ---------------------------------------------------------------------------
+// InwardPerimeterNormal — unit normal (world XZ) of the perimeter edge nearest
+// ptXZ, flipped to point toward the origin. This is the default sprue direction
+// for a perimeter injection point: normal to the edge, heading inward into the
+// mould (the direction that brings the endpoint closest to the origin).
+// ---------------------------------------------------------------------------
+glm::vec2 GLCanvas::InwardPerimeterNormal(const glm::vec2& ptXZ) const
+{
+    if (m_fixturePerimeter.size() < 2) return glm::vec2(0.0f, -1.0f);
+
+    float     bestDist = std::numeric_limits<float>::max();
+    glm::vec2 bestEdgeDir(1.0f, 0.0f);
+
+    const int n = (int)m_fixturePerimeter.size();
+    for (int i = 0; i < n; ++i)
+    {
+        const glm::vec2& A = m_fixturePerimeter[i];
+        const glm::vec2& B = m_fixturePerimeter[(i + 1) % n];
+        const glm::vec2  AB = B - A;
+        const float      len2 = glm::dot(AB, AB);
+        float            t = 0.0f;
+        if (len2 > 1e-10f)
+            t = glm::clamp(glm::dot(ptXZ - A, AB) / len2, 0.0f, 1.0f);
+        const glm::vec2 closest = A + t * AB;
+        const float     dist = glm::length(closest - ptXZ);
+        if (dist < bestDist)
+        {
+            bestDist = dist;
+            bestEdgeDir = (len2 > 1e-10f) ? glm::normalize(AB) : glm::vec2(1.0f, 0.0f);
+        }
+    }
+
+    // Perpendicular to the edge, then orient toward the origin: of the two
+    // opposite normals, the inward one satisfies dot(n, origin - pt) > 0.
+    glm::vec2 nrm(-bestEdgeDir.y, bestEdgeDir.x);
+    if (glm::dot(nrm, -ptXZ) < 0.0f) nrm = -nrm;
+    const float l = glm::length(nrm);
+    return (l > 1e-6f) ? nrm / l : glm::vec2(0.0f, -1.0f);
+}
+
+// ---------------------------------------------------------------------------
+// MoveSprueInjectionPoint — drag a PERIMETER injection point along the fixture
+// perimeter (snapping to it) and re-place the sprue from the new location. The
+// endpoint auto-derives radially, so no endpoint override is used. No-op unless
+// the active injection point is a perimeter one. Leaves the scene-mutation
+// notify to the EditSprue mouse-up (PlaceSprue's own notify only flips
+// Clean->Dirty, which is fine to repeat).
+// ---------------------------------------------------------------------------
+void GLCanvas::MoveSprueInjectionPoint(int mouseX, int mouseY)
+{
+    if (m_transformMode != TransformMode::EditSprue) return;
+    if (!IsActivePerimeterInjection()) return;
+
+    glm::vec3 plane;
+    if (!RayCastToPartingPlane(mouseX, mouseY, plane)) return;
+    const glm::vec3 snapped = SnapToFixturePerimeter(plane);   // world, y=0
+
+    const glm::vec3 local = WorldToFixtureLocal(snapped);
+    m_activeInjectionPoint.x = local.x;
+    m_activeInjectionPoint.y = local.y;
+    m_activeInjectionPoint.z = local.z;
+    m_activeInjectionPoint.type = InjectionType::Radial;   // stays radial
+    // perimeter flag stays true. The endpoint is an INDEPENDENT degree of
+    // freedom for a perimeter sprue: if the user has dragged it (override set),
+    // it stays put while the injection point moves; if not, PlaceSprue re-
+    // derives it along the inward perimeter normal from the new location.
+
+    PlaceSprue();   // recomputes worldPos + (default or overridden) endpoint
 }
 
 void GLCanvas::ClearSprue()
@@ -2397,7 +2734,11 @@ bool GLCanvas::GenerateMould()
     for (int fi = 0; fi < (int)m_fixtures.size(); ++fi)
     {
         SceneObject& fix = m_fixtures[fi];
-        if (fix.sourcePath.empty()) continue;
+        // Gate on "do we have geometry to cut", not "do we have a file path".
+        // Procedural fixtures carry a cached box shape (hasSourceShape) with no
+        // sourcePath, so the file-path-only test used to skip them. Matches the
+        // object loop's guard below.
+        if (fix.sourcePath.empty() && !fix.hasSourceShape) continue;
 
         const std::string fixLabel = "Fixture " + std::to_string(fi + 1);
 
@@ -7506,17 +7847,22 @@ void GLCanvas::MoveEditVentNode(int idx, int mouseX, int mouseY)
 // ---------------------------------------------------------------------------
 void GLCanvas::RepositionPathToolbar()
 {
-    if (!m_pathToolbar) return;
-    // The toolbar is a SIBLING of this canvas (a child of the shared parent),
-    // raised above it — the robust way to overlay wx controls on a GL surface,
-    // since SwapBuffers can overdraw a true child window. Position it in the
-    // parent's coordinate space at the top-centre of the canvas rect.
+    // Both the path-edit toolbar and the Edit Sprue toolbar ride the same
+    // top-centre slot (they never show at once). Pin whichever exist; each is a
+    // SIBLING of this canvas raised above it — the robust way to overlay wx
+    // controls on a GL surface, since SwapBuffers can overdraw a true child.
     const wxPoint cpos = GetPosition();            // canvas pos within parent
     const wxSize  canvas = GetClientSize();
-    const wxSize  bar = m_pathToolbar->GetSize();
-    const int x = cpos.x + std::max(8, (canvas.x - bar.x) / 2);
-    const int y = cpos.y + 12;
-    m_pathToolbar->Move(x, y);
+    auto pin = [&](wxWindow* bar)
+    {
+        if (!bar) return;
+        const wxSize sz = bar->GetSize();
+        const int x = cpos.x + std::max(8, (canvas.x - sz.x) / 2);
+        const int y = cpos.y + 12;
+        bar->Move(x, y);
+    };
+    pin(m_pathToolbar);
+    pin(m_sprueToolbar);
 }
 
 // ---------------------------------------------------------------------------
@@ -7751,6 +8097,17 @@ void GLCanvas::InitGLOnce()
     glEnableVertexAttribArray(0);
     glBindVertexArray(0);
 
+    // Fixture-perimeter highlight VBO (dynamic, uploaded as a GL_LINE_LOOP from
+    // m_fixturePerimeter in the render pass — see the Fixture Perimeter
+    // injection highlight block in OnPaint).
+    glGenVertexArrays(1, &m_perimeterVAO);
+    glGenBuffers(1, &m_perimeterVBO);
+    glBindVertexArray(m_perimeterVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, m_perimeterVBO);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glBindVertexArray(0);
+
     // Runner path line VBO (dynamic, sprue parting point → runner points)
     glGenVertexArrays(1, &m_runnerPathVAO);
     glGenBuffers(1, &m_runnerPathVBO);
@@ -7810,6 +8167,8 @@ void GLCanvas::DestroyGL()
     if (m_sphereEBO) { glDeleteBuffers(1, &m_sphereEBO);          m_sphereEBO = 0; }
     if (m_sphereVBO) { glDeleteBuffers(1, &m_sphereVBO);          m_sphereVBO = 0; }
     if (m_sphereVAO) { glDeleteVertexArrays(1, &m_sphereVAO);     m_sphereVAO = 0; }
+    if (m_perimeterVBO) { glDeleteBuffers(1, &m_perimeterVBO);       m_perimeterVBO = 0; }
+    if (m_perimeterVAO) { glDeleteVertexArrays(1, &m_perimeterVAO);  m_perimeterVAO = 0; }
     // Preview debug overlays (shot colouring groups + ray/contact geometry).
     for (auto& g : m_shotDebug.groups)
         if (g.ebo) { glDeleteBuffers(1, &g.ebo); g.ebo = 0; }
@@ -8304,6 +8663,13 @@ void GLCanvas::ImportFile(const std::string& path, bool notify)
     // A mesh-format object may have just moved the scene onto the mesh
     // toolpath. notify is false on project restore so a bulk load is silent.
     RecomputeSceneMeshType(notify);
+    // Adding a body may grow a Dynamic fixture. Interactive imports (notify) do
+    // this immediately; a silent bulk restore (notify == false) skips it —
+    // RestoreObject applies each object's transform only AFTER this returns, so
+    // a per-object resize here would fit the wrong pose and be O(N^2). The load
+    // path resizes once at the end instead (MainFrame calls RebuildDynamicFixture).
+    if (notify)
+        RebuildDynamicFixture();
     Refresh(false);
 }
 
@@ -8446,6 +8812,11 @@ void GLCanvas::ImportFileAsFixture(const std::string& path,
     res.meshes[0].indices = std::move(split.indices);
 
     progress.Update(step++, "Uploading to GPU...");
+
+    // A file-loaded fixture is not procedural — clear any dynamic-resize state
+    // left over from a previously-active Parametric/Dynamic fixture.
+    m_fixtureKind = FixtureKind::Library;
+
     m_fixtures.emplace_back();
     m_fixtures.back().role = ObjectRole::Fixture;
     m_fixtures.back().sourcePath = path;
@@ -8491,6 +8862,299 @@ void GLCanvas::ImportFileAsFixture(const std::string& path,
 
     BuildFixturePerimeter();
     Refresh(false);
+}
+
+// ---------------------------------------------------------------------------
+// Procedural (Parametric / Dynamic) fixtures
+//
+// The fileless counterpart to ImportFileAsFixture: instead of loading two STEP
+// halves, generate two axis-aligned box halves split at the y = 0 parting
+// plane and drop them into m_fixtures with the same runtime shape a file
+// fixture has — a cached OCC blank (sourceShape) plus a faceted preview mesh —
+// so GenerateMould / preview / export need no special handling.
+// ---------------------------------------------------------------------------
+
+// AppendBoxPosMesh — append an axis-aligned box (mn..mx corners) as a
+// position-only triangle soup: 8 shared corners + 12 triangles, wound so every
+// face points outward (verified: each triangle normal points away from the box
+// centre). Normals are derived afterwards by the same
+// ComputeVertexNormals_Pos3 + SplitByCreaseAngle_Pos3 pass used for imported
+// fixtures, so the 90-degree edges facet correctly.
+static void AppendBoxPosMesh(const glm::vec3& mn, const glm::vec3& mx,
+    std::vector<float>& verts, std::vector<uint32_t>& idx)
+{
+    const uint32_t base = (uint32_t)(verts.size() / 3);
+    const glm::vec3 c[8] = {
+        { mn.x, mn.y, mn.z }, { mx.x, mn.y, mn.z },
+        { mx.x, mx.y, mn.z }, { mn.x, mx.y, mn.z },
+        { mn.x, mn.y, mx.z }, { mx.x, mn.y, mx.z },
+        { mx.x, mx.y, mx.z }, { mn.x, mx.y, mx.z },
+    };
+    for (const glm::vec3& p : c) {
+        verts.push_back(p.x); verts.push_back(p.y); verts.push_back(p.z);
+    }
+    // Faces in order: -Z, +Z, -Y, +Y, -X, +X (two triangles each).
+    static const uint32_t tris[36] = {
+        1, 0, 3,  1, 3, 2,
+        4, 5, 6,  4, 6, 7,
+        0, 1, 5,  0, 5, 4,
+        3, 7, 6,  3, 6, 2,
+        0, 4, 7,  0, 7, 3,
+        1, 2, 6,  1, 6, 5,
+    };
+    for (uint32_t t : tris) idx.push_back(base + t);
+}
+
+void GLCanvas::ComputeSceneEnvelope(glm::vec3& outMin, glm::vec3& outMax) const
+{
+    // Seed with the origin so the envelope always contains (0,0,0) and an
+    // empty scene collapses to the degenerate origin-only box — the caller's
+    // clearance then expands it to the 2*clearance minimum in every axis.
+    outMin = glm::vec3(0.0f);
+    outMax = glm::vec3(0.0f);
+
+    auto expand = [&](const glm::vec3& w) {
+        outMin = glm::min(outMin, w);
+        outMax = glm::max(outMax, w);
+    };
+
+    auto expandBody = [&](const std::vector<float>& cpuVerts, const glm::mat4& m) {
+        const size_t vc = cpuVerts.size() / 3;
+        for (size_t i = 0; i < vc; ++i) {
+            const glm::vec4 w = m * glm::vec4(
+                cpuVerts[i * 3 + 0], cpuVerts[i * 3 + 1], cpuVerts[i * 3 + 2], 1.0f);
+            expand(glm::vec3(w));
+        }
+    };
+
+    // Imported bodies — the cavity-forming objects.
+    for (const SceneObject& obj : m_objects)
+        expandBody(obj.cpuVerts, obj.BuildModelMatrix());
+
+    // Inserts — an insert's placement lives in worldMatrix (its pose fields and
+    // BuildModelMatrix are never valid), so transform its body by that.
+    for (const InsertFeature& ins : m_inserts)
+        expandBody(ins.body.cpuVerts, ins.worldMatrix);
+}
+
+void GLCanvas::CreateProceduralFixture(const FixtureDefinition& def)
+{
+    // Library fixtures are materialised by ImportFileAsFixture, not here.
+    if (def.kind == FixtureKind::Library) return;
+
+    SetCurrent(*m_context);
+    InitGLOnce();
+
+    // A procedural fixture fully owns m_fixtures — clear whatever was there.
+    ClearFixtures();
+    m_fixtureKind = def.kind;
+
+    // Resolve the box's world-space min/max corners.
+    glm::vec3 mn, mx;
+    if (def.kind == FixtureKind::Dynamic)
+    {
+        m_dynamicClearance = glm::vec3(def.dynamic.clearanceX,
+            def.dynamic.clearanceY,
+            def.dynamic.clearanceZ);
+        glm::vec3 envMin, envMax;
+        ComputeSceneEnvelope(envMin, envMax);   // already contains the origin
+        mn = envMin - m_dynamicClearance;
+        mx = envMax + m_dynamicClearance;
+    }
+    else // Parametric — fixed dimensions, centred on the origin.
+    {
+        const glm::vec3 h(def.parametric.sizeX * 0.5f,
+            def.parametric.sizeY * 0.5f,
+            def.parametric.sizeZ * 0.5f);
+        mn = -h;
+        mx = h;
+    }
+
+    // Split at the y = 0 parting plane into a top (+Y) and bottom (-Y) half.
+    // The envelope (origin folded in) and the centred parametric box both
+    // guarantee mn.y < 0 < mx.y, so neither half is degenerate.
+    const glm::vec3 topMin(mn.x, 0.0f, mn.z), topMax(mx.x, mx.y, mx.z);
+    const glm::vec3 botMin(mn.x, mn.y, mn.z), botMax(mx.x, 0.0f, mx.z);
+
+    // Build one half: OCC box blank + faceted preview mesh, identity pose. The
+    // box is authored directly in world space, so GenerateMould's per-fixture
+    // transform is a no-op (no double application).
+    // Build one half: an empty fixture SceneObject with its geometry filled in
+    // by UpdateBoxHalf (shared with the Dynamic live-resize path). Pose is left
+    // identity — the box is authored directly in world space, so
+    // GenerateMould's per-fixture transform is a no-op (no double application).
+    auto buildHalf = [this](const glm::vec3& lo, const glm::vec3& hi,
+        const char* label)
+    {
+        m_fixtures.emplace_back();
+        SceneObject& half = m_fixtures.back();
+        half.role = ObjectRole::Fixture;
+        half.sourcePath = label;          // descriptive sentinel — no file on disk
+        UpdateBoxHalf(half, lo, hi);
+    };
+
+    buildHalf(topMin, topMax, "<procedural fixture: top>");
+    buildHalf(botMin, botMax, "<procedural fixture: bottom>");
+
+    BuildFixturePerimeter();
+    // Activate a default perimeter injection point so the sprue tools work
+    // immediately — a procedural fixture has no fixed points to auto-activate.
+    SeedPerimeterInjectionPoint();
+    Refresh(false);
+}
+
+// UpdateBoxHalf — (re)build one fixture half's box geometry for the given
+// world-space corners: the OCC blank (BRepPrimAPI_MakeBox) plus the faceted
+// preview mesh, replacing whatever the half held before. Leaves role /
+// sourcePath / pose untouched, so it serves both first-time creation
+// (CreateProceduralFixture) and a Dynamic live-resize (RebuildDynamicFixture).
+void GLCanvas::UpdateBoxHalf(SceneObject& half,
+    const glm::vec3& lo, const glm::vec3& hi)
+{
+    const glm::vec3 d = hi - lo;
+
+    // OCC blank for the cut. MakeBox is a lazy MakeOneAxis primitive — Build()
+    // before Shape(), or Shape() comes back null and the half silently
+    // vanishes from the cut.
+    BRepPrimAPI_MakeBox mk(gp_Pnt(lo.x, lo.y, lo.z), d.x, d.y, d.z);
+    mk.Build();
+
+    // Preview mesh — mirrors ImportFileAsFixture's normal pipeline so the box
+    // facets identically to an imported one.
+    std::vector<float>    boxVerts;
+    std::vector<uint32_t> boxIdx;
+    AppendBoxPosMesh(lo, hi, boxVerts, boxIdx);
+
+    FileImporter::MeshData md;
+    ComputeVertexNormals_Pos3(boxVerts, boxIdx, md.posNorm);
+    auto split = SplitByCreaseAngle_Pos3(boxVerts, boxIdx, 35.0f);
+    md.posNorm = std::move(split.posNorm);
+    md.indices = std::move(split.indices);
+
+    half.cpuVerts = std::move(boxVerts);   // ray-cast soup (8 corners)
+    half.cpuIndices = std::move(boxIdx);
+    half.adjacencyBuilt = false;           // geometry changed — drop cached adjacency
+    half.triNeighbors.clear();
+    half.hasSourceShape = false;
+    if (mk.IsDone())
+    {
+        half.sourceShape = mk.Shape();
+        half.hasSourceShape = true;
+    }
+    UploadMeshToGPU(md, half);   // destroys the old GPU mesh before replacing it
+}
+
+// RebuildDynamicFixture — resize the active Dynamic fixture's two halves to the
+// current scene envelope (+ the stored clearance) and rebuild the parting
+// perimeter. A no-op unless a Dynamic fixture is actually loaded, so it's safe
+// to call unconditionally from NotifySceneMutated and from the object move-drag
+// loop. Deliberately does NOT clear/replace the m_fixtures entries (that would
+// wipe vents via ClearFixtures and churn the vector every drag frame) — it
+// updates the two existing halves in place and leaves all other features alone.
+void GLCanvas::RebuildDynamicFixture()
+{
+    if (m_fixtureKind != FixtureKind::Dynamic) return;
+    if (m_fixtures.size() != 2) return;   // a Dynamic fixture is always two halves
+
+    // Re-entrancy guard: the re-projection below calls PlaceSprue, which fires
+    // NotifySceneMutated, which calls back here. Latch out that recursion so the
+    // rebuild runs exactly once per triggering event.
+    if (m_rebuildingDynamicFixture) return;
+    m_rebuildingDynamicFixture = true;
+
+    SetCurrent(*m_context);
+    InitGLOnce();
+
+    glm::vec3 envMin, envMax;
+    ComputeSceneEnvelope(envMin, envMax);   // origin already folded in
+    const glm::vec3 mn = envMin - m_dynamicClearance;
+    const glm::vec3 mx = envMax + m_dynamicClearance;
+
+    const glm::vec3 topMin(mn.x, 0.0f, mn.z), topMax(mx.x, mx.y, mx.z);
+    const glm::vec3 botMin(mn.x, mn.y, mn.z), botMax(mx.x, 0.0f, mx.z);
+
+    UpdateBoxHalf(m_fixtures[0], topMin, topMax);
+    UpdateBoxHalf(m_fixtures[1], botMin, botMax);
+
+    BuildFixturePerimeter();
+
+    // Keep the active perimeter injection point on the resized edge: re-project
+    // it along its direction from the origin onto the new perimeter, then
+    // re-place the sprue so it follows. Updated in place (NOT via
+    // SetActiveInjectionPoint, which would clear the placed sprue). A fixed
+    // (non-perimeter) point is left alone.
+    if (m_hasActiveInjectionPoint && m_activeInjectionPoint.perimeter &&
+        m_fixturePerimeter.size() >= 3)
+    {
+        const glm::vec2 dir(m_activeInjectionPoint.x, m_activeInjectionPoint.z);
+        const glm::vec3 world = PerimeterPointInDirection(dir);
+        const glm::vec3 local = WorldToFixtureLocal(world);
+        m_activeInjectionPoint.x = local.x;
+        m_activeInjectionPoint.y = local.y;
+        m_activeInjectionPoint.z = local.z;
+        if (m_sprue.hasPoint)
+            PlaceSprue();   // rebuild the sprue from the moved injection point
+    }
+
+    m_rebuildingDynamicFixture = false;
+    Refresh(false);
+}
+
+// PerimeterPointInDirection — project a ray from the origin along dirXZ onto the
+// fixture perimeter's axis-aligned bounds; returns the world-space boundary
+// point at y=0. The origin always lies inside the perimeter (the envelope folds
+// it in), so a positive hit exists. Gives a perimeter location that stays on the
+// same side as a Dynamic box resizes, rather than drifting to the nearest edge.
+glm::vec3 GLCanvas::PerimeterPointInDirection(const glm::vec2& dirXZ) const
+{
+    if (m_fixturePerimeter.size() < 3) return glm::vec3(0.0f);
+
+    float minX = std::numeric_limits<float>::max();
+    float maxX = std::numeric_limits<float>::lowest();
+    float minZ = std::numeric_limits<float>::max();
+    float maxZ = std::numeric_limits<float>::lowest();
+    for (const glm::vec2& p : m_fixturePerimeter)   // p = (x, z)
+    {
+        minX = std::min(minX, p.x); maxX = std::max(maxX, p.x);
+        minZ = std::min(minZ, p.y); maxZ = std::max(maxZ, p.y);
+    }
+
+    glm::vec2 d = dirXZ;
+    if (glm::dot(d, d) < 1e-12f) d = glm::vec2(0.0f, 1.0f);   // default front (+Z)
+    d = glm::normalize(d);
+
+    // Largest t with (t*d) still inside the bounds; the origin is interior, so
+    // each active half-plane gives an upper bound and the smallest wins.
+    float t = std::numeric_limits<float>::max();
+    if (d.x >  1e-6f) t = std::min(t, maxX / d.x);
+    if (d.x < -1e-6f) t = std::min(t, minX / d.x);
+    if (d.y >  1e-6f) t = std::min(t, maxZ / d.y);
+    if (d.y < -1e-6f) t = std::min(t, minZ / d.y);
+    if (!(t > 0.0f) || t == std::numeric_limits<float>::max()) t = 0.0f;
+
+    return glm::vec3(d.x * t, 0.0f, d.y * t);
+}
+
+// SeedPerimeterInjectionPoint — give a freshly-built procedural fixture a
+// default ACTIVE perimeter injection point (front-centre) so the sprue tools
+// work immediately, the way a fixed-injection fixture activates its first point.
+// Placed via SetActiveInjectionPoint (which resets any stale sprue — a no-op on
+// a fresh fixture).
+void GLCanvas::SeedPerimeterInjectionPoint()
+{
+    if (m_fixturePerimeter.size() < 3) return;
+
+    const glm::vec3 world = PerimeterPointInDirection(glm::vec2(0.0f, 1.0f));
+    const glm::vec3 local = WorldToFixtureLocal(world);
+
+    InjectionPoint ip;
+    ip.label = "Fixture Perimeter";
+    ip.x = local.x;
+    ip.y = local.y;
+    ip.z = local.z;
+    ip.type = InjectionType::Radial;
+    ip.perimeter = true;
+    SetActiveInjectionPoint(ip);
 }
 
 // ---------------------------------------------------------------------------
@@ -8968,6 +9632,15 @@ void GLCanvas::OnPaint(wxPaintEvent&)
                 m_ejectors[m_editFeatureIndex].point = hitPos;
                 RebuildEjectorSolids();
             }
+        }
+        else if (m_transformMode == TransformMode::EditSprue)
+        {
+            // Set on mouse-down (mutually exclusive): drag the perimeter
+            // injection point along the perimeter, or the radial endpoint.
+            if (m_sprueInjectionGrabbed)
+                MoveSprueInjectionPoint(m_editMousePos.x, m_editMousePos.y);
+            else if (m_sprueEndpointGrabbed)
+                MoveSprueEndpoint(m_editMousePos.x, m_editMousePos.y);
         }
     }
 
@@ -9485,10 +10158,64 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         glUseProgram(0);
     }
 
-    // ---- Injection point selection markers (purple spheres) -----------------
-    // Shown only in SelectInjectionPoint mode so the user can pick one.
+    // ---- Sprue Move drag handles (orange endpoint, teal injection) ----------
+    // Edit Sprue > Move, RADIAL sprues only (axial endpoints are locked):
+    //   * endpoint handle (orange) at pathEnd — grabbable for every radial
+    //     sprue, fixed or perimeter;
+    //   * injection handle (teal) at pathStart — ADDITIONALLY for a perimeter
+    //     injection point, dragged along the perimeter. Fixed radial points
+    //     have a static start, so they get no injection handle.
+    // Each brightens while actively grabbed.
     if (m_program && m_sphereVAO && m_sphereIndexCount > 0 &&
-        m_transformMode == TransformMode::SelectInjectionPoint &&
+        m_transformMode == TransformMode::EditSprue &&
+        m_sprueEditTool == SprueEditTool::Move &&
+        IsActiveSprueRadial() && m_sprue.hasPoint)
+    {
+        glEnable(GL_DEPTH_TEST);
+        glUseProgram(m_program);
+
+        ApplyLitLighting(view, camPos);
+        glUniform1f(glGetUniformLocation(m_program, "uAmbient"), 0.40f);
+        glUniform1f(glGetUniformLocation(m_program, "uDiffuse"), 0.80f);
+        glUniform1f(glGetUniformLocation(m_program, "uSpecular"), 0.60f);
+        glUniform1f(glGetUniformLocation(m_program, "uShininess"), 48.0f);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uView"), 1, GL_FALSE, &view[0][0]);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uProj"), 1, GL_FALSE, &proj[0][0]);
+        glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 1.0f);
+
+        const GLint uModel = glGetUniformLocation(m_program, "uModel");
+        const GLint uColor = glGetUniformLocation(m_program, "uBaseColor");
+        glBindVertexArray(m_sphereVAO);
+
+        auto drawHandle = [&](const glm::vec3& pos, const glm::vec3& color)
+        {
+            glUniform3fv(uColor, 1, &color[0]);
+            glm::mat4 model = glm::translate(glm::mat4(1.0f), pos);
+            model = glm::scale(model, glm::vec3(kVentMarkerRadius * 1.8f));  // grabbable size
+            glUniformMatrix4fv(uModel, 1, GL_FALSE, &model[0][0]);
+            glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
+        };
+
+        // Endpoint handle (orange) — always.
+        drawHandle(m_sprue.pathEnd, m_sprueEndpointGrabbed
+            ? glm::vec3(1.00f, 0.75f, 0.20f) : glm::vec3(1.00f, 0.55f, 0.05f));
+
+        // Injection handle (teal) — perimeter points only.
+        if (IsActivePerimeterInjection())
+            drawHandle(m_sprue.pathStart, m_sprueInjectionGrabbed
+                ? glm::vec3(0.30f, 1.00f, 1.00f) : glm::vec3(0.10f, 0.80f, 0.80f));
+
+        glBindVertexArray(0);
+        glUseProgram(0);
+    }
+
+    // ---- Injection point selection markers (purple spheres) -----------------
+    // Shown while picking an injection point: the standalone SelectInjectionPoint
+    // mode, or the EditSprue > Select Injection Point sub-tool.
+    if (m_program && m_sphereVAO && m_sphereIndexCount > 0 &&
+        (m_transformMode == TransformMode::SelectInjectionPoint ||
+         (m_transformMode == TransformMode::EditSprue &&
+          m_sprueEditTool == SprueEditTool::SelectInjectionPoint)) &&
         !m_injectionPoints.empty())
     {
         glEnable(GL_DEPTH_TEST);
@@ -9525,7 +10252,49 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         glUseProgram(0);
     }
 
-    // ---- Sprue path line (purple) ------------------------------------------
+    // ---- Fixture-perimeter injection highlight (purple outline) ------------
+    // When the fixture permits perimeter injection, outline the whole perimeter
+    // during Select Injection Point so it reads as one continuous clickable
+    // edge. Uploaded fresh from m_fixturePerimeter (tiny convex loop) and drawn
+    // with the flat line shader as a GL_LINE_LOOP.
+    if (m_flatProgram && m_perimeterVAO &&
+        m_allowPerimeterInjection && m_fixturePerimeter.size() >= 2 &&
+        (m_transformMode == TransformMode::SelectInjectionPoint ||
+         (m_transformMode == TransformMode::EditSprue &&
+          m_sprueEditTool == SprueEditTool::SelectInjectionPoint)))
+    {
+        std::vector<float> verts;
+        verts.reserve(m_fixturePerimeter.size() * 3);
+        for (const glm::vec2& p : m_fixturePerimeter)
+        {
+            verts.push_back(p.x);
+            verts.push_back(0.0f);
+            verts.push_back(p.y);
+        }
+
+        glBindVertexArray(m_perimeterVAO);
+        glBindBuffer(GL_ARRAY_BUFFER, m_perimeterVBO);
+        glBufferData(GL_ARRAY_BUFFER, verts.size() * sizeof(float),
+            verts.data(), GL_DYNAMIC_DRAW);
+
+        // Overlay: the perimeter lies on the box surface at y=0, so depth
+        // testing z-fights it against the fixture faces and it disappears.
+        // Draw with depth test off so the highlight always reads on top.
+        glDisable(GL_DEPTH_TEST);
+        glLineWidth(3.0f);
+        glUseProgram(m_flatProgram);
+        const glm::mat4 VP = proj * view;
+        glUniformMatrix4fv(m_flat_uVP, 1, GL_FALSE, &VP[0][0]);
+        const glm::vec4 perimColor(0.65f, 0.10f, 0.90f, 1.0f);   // purple — matches
+        // the injection-point markers, since a valid perimeter is a continuous
+        // injection target the user can click along.
+        glUniform4fv(m_flat_uColor, 1, &perimColor[0]);
+        glDrawArrays(GL_LINE_LOOP, 0, (GLsizei)m_fixturePerimeter.size());
+        glBindVertexArray(0);
+        glLineWidth(1.0f);
+        glEnable(GL_DEPTH_TEST);   // restore for the passes that follow
+        glUseProgram(0);
+    }
     if (m_flatProgram && m_sprue.pathVAO && m_sprue.pathVertexCount > 0)
     {
         glEnable(GL_DEPTH_TEST);
@@ -10631,48 +11400,58 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
         }
         else if (m_transformMode == TransformMode::SelectInjectionPoint)
         {
-            if (m_injectionPoints.empty()) { /* nothing to pick */ }
-            else
+            const wxPoint p = evt.GetPosition();
+            if (PickActivateInjectionPoint(p.x, p.y))
             {
-                const wxPoint p = evt.GetPosition();
-                glm::vec3 rayOrig, rayDir;
-                BuildMouseRay(p.x, p.y, rayOrig, rayDir);
-
-                glm::mat4 fixtureMatrix(1.0f);
-                if (!m_fixtures.empty())
-                    fixtureMatrix = m_fixtures[0].BuildModelMatrix();
-
-                const float hitRadius = kVentMarkerRadius * 3.5f;
-                float bestDist = hitRadius;
-                int   bestIdx = -1;
-                for (int i = 0; i < (int)m_injectionPoints.size(); ++i)
+                // Exit selection mode back to Select
+                m_transformMode = TransformMode::Select;
+                if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+                    frame->SetActiveTool(TransformMode::Select);
+                Refresh(false);
+            }
+        }
+        else if (m_transformMode == TransformMode::EditSprue)
+        {
+            const wxPoint p = evt.GetPosition();
+            if (m_sprueEditTool == SprueEditTool::SelectInjectionPoint)
+            {
+                // Re-pick the feeding injection point but STAY in the edit
+                // environment. A new pick can flip radial<->axial, which
+                // enables/disables the Move cell — so refresh the toolbar.
+                if (PickActivateInjectionPoint(p.x, p.y))
                 {
-                    const auto& ip = m_injectionPoints[i];
-                    glm::vec3 worldPos = glm::vec3(fixtureMatrix *
-                        glm::vec4(ip.x, ip.y, ip.z, 1.0f));
-                    const float d = PointRayDistance(worldPos, rayOrig, rayDir);
-                    if (d < bestDist) { bestDist = d; bestIdx = i; }
-                }
-
-                if (bestIdx >= 0)
-                {
-                    SetActiveInjectionPoint(m_injectionPoints[bestIdx]);
-
-                    // Notify MainFrame BEFORE PlaceSprue so any UI fields
-                    // whose value depends on injection-point type (currently
-                    // just the Draft Angle) update first — PlaceSprue reads
-                    // those fields back when building the sprue.
-                    if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
-                        frame->OnInjectionPointSelected(m_injectionPoints[bestIdx]);
-
-                    PlaceSprue();
-
-                    // Exit selection mode back to Select
-                    m_transformMode = TransformMode::Select;
-                    if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
-                        frame->SetActiveTool(TransformMode::Select);
+                    NotifyPathEditChanged();
                     Refresh(false);
                 }
+            }
+            else   // SprueEditTool::Move
+            {
+                // Which handles are grabbable depends on the injection kind:
+                //   perimeter point -> BOTH the injection point (drag along the
+                //                      perimeter) and the endpoint;
+                //   fixed radial    -> the endpoint only (its start is a fixed
+                //                      point in space and must stay put).
+                // Axial sprues have no movable handle. When both are in range,
+                // grab whichever is nearer to the ray.
+                m_sprueEndpointGrabbed = false;
+                m_sprueInjectionGrabbed = false;
+                if (IsActiveSprueRadial() && m_sprue.hasPoint)
+                {
+                    glm::vec3 rayOrig, rayDir;
+                    BuildMouseRay(p.x, p.y, rayOrig, rayDir);
+                    const float hitRadius = kVentMarkerRadius * 2.5f;
+
+                    const float dEnd = PointRayDistance(m_sprue.pathEnd, rayOrig, rayDir);
+                    float dInj = std::numeric_limits<float>::max();
+                    if (IsActivePerimeterInjection())
+                        dInj = PointRayDistance(m_sprue.pathStart, rayOrig, rayDir);
+
+                    if (dInj < hitRadius && dInj <= dEnd)
+                        m_sprueInjectionGrabbed = true;
+                    else if (dEnd < hitRadius)
+                        m_sprueEndpointGrabbed = true;
+                }
+                Refresh(false);
             }
         }
         else if (m_transformMode == TransformMode::EditVent)
@@ -10957,9 +11736,17 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
     if (evt.LeftUp())
     {
         m_lmb = false;
+        // If an object move-drag was in progress (m_snapDragActive is set only
+        // by that path), resize a Dynamic fixture now — once, on release —
+        // instead of every frame during the drag. No-op for Library /
+        // Parametric, or for a click / camera-orbit that never moved a body.
+        if (m_snapDragActive)
+            RebuildDynamicFixture();
         m_snapDragActive = false;
         m_editGateNode = -1;
         m_editHandleNode = -1;
+        m_sprueEndpointGrabbed = false;   // Edit Sprue: end any endpoint drag
+        m_sprueInjectionGrabbed = false;  // Edit Sprue: end any injection-point drag
         if (HasCapture()) ReleaseMouse();
 
         // The released node is now the selection, which decides whether the
@@ -11193,7 +11980,8 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
     else if (m_lmb && (m_transformMode == TransformMode::EditVent ||
         m_transformMode == TransformMode::EditRunner ||
         m_transformMode == TransformMode::EditGate ||
-        m_transformMode == TransformMode::EditEjector))
+        m_transformMode == TransformMode::EditEjector ||
+        m_transformMode == TransformMode::EditSprue))
     {
         // For a Complex vent, dragging only does something when a node was
         // grabbed on mouse-down; otherwise the gesture orbits. Simple vents and
@@ -11227,6 +12015,13 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
             deferDrag = true;
             if (m_editHandleNode >= 0)
                 m_editHandleBreak = evt.AltDown();   // live Alt = independent
+        }
+        else if (m_transformMode == TransformMode::EditSprue)
+        {
+            // Sprue: a drag only does something when the radial endpoint or a
+            // perimeter injection point was grabbed on mouse-down; otherwise
+            // (axial, or a miss) it orbits.
+            deferDrag = m_sprueEndpointGrabbed || m_sprueInjectionGrabbed;
         }
         else
         {
@@ -11481,6 +12276,9 @@ void GLCanvas::OnKeyDown(wxKeyEvent& evt)
         // mesh body. Never an upward transition, so this only ever clears the
         // flag — passing true is harmless (the notice fires only false->true).
         RecomputeSceneMeshType(true);
+        // Removing a body may shrink a Dynamic fixture (delete doesn't route
+        // through NotifySceneMutated). No-op otherwise.
+        RebuildDynamicFixture();
         m_selectedIndices.clear();
         // VBOs that aggregate vent / gate state need refreshing in case
         // we deleted any.
@@ -11630,6 +12428,7 @@ void GLCanvas::PasteFromClipboard()
         m_selectedIndices = std::move(newIndices);
         // Pasting can bring a mesh body into a scene that had none.
         RecomputeSceneMeshType(true);
+        RebuildDynamicFixture();   // pasted bodies may grow a Dynamic fixture
         Refresh(false);
     }
 }
@@ -11796,6 +12595,7 @@ void GLCanvas::ClearFixtures()
     for (auto& fix : m_fixtures)
         fix.mesh.Destroy();
     m_fixtures.clear();
+    m_fixtureKind = FixtureKind::Library;   // no procedural fixture active now
     m_fixturePerimeter.clear();
     for (auto& v : m_vents) v.Destroy(); m_vents.clear(); RebuildPathVBO(); RebuildCrossSectionVBO();
     Refresh(false);
@@ -11812,6 +12612,7 @@ void GLCanvas::ClearAll()
     // Fixtures
     for (auto& fix : m_fixtures) fix.mesh.Destroy();
     m_fixtures.clear();
+    m_fixtureKind = FixtureKind::Library;   // no procedural fixture active now
     m_fixturePerimeter.clear();
 
     // Objects
