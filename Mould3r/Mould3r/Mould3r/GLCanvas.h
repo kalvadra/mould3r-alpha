@@ -399,6 +399,13 @@ public:
     // with no context current only if nothing has been uploaded yet.
     void ClearPreviewHalves();
 
+    // Drop preview parts from index `keepCount` onward (freeing their GPU
+    // resources), keeping the first `keepCount` intact. Lets the preview strip
+    // off appended cast bodies before regenerating them without disturbing the
+    // mould halves / shot / inserts (whose CPU-side meshes have already been
+    // released). keepCount <= 0 clears all; keepCount >= count is a no-op.
+    void TruncatePreviewHalves(int keepCount);
+
     // ---- Design-check debug colouring --------------------------------------
     // One flat-coloured group of facets for the debug overlay: every triangle
     // in `indices` (vertex-index triples into the part's own vertex buffer)
@@ -488,6 +495,17 @@ public:
     // The shot solid as a BREP, for design-check analysis at the face level.
     // Valid only when HasLastShotMesh() is true.
     const TopoDS_Shape& GetLastShotShape() const { return m_lastShotShape; }
+
+    // The "Cast Shot Body" from the most recent GenerateMould: the standard
+    // shot PLUS the features normally left out of it — vents, inserts (grown by
+    // the insert Cut scale), and ejector pins — fused into one solid. Not shown
+    // to the user; the cast-mould bases consume it (each base fuses in a y-split
+    // half). Valid only when HasLastCastShotMesh() is true.
+    bool HasLastCastShotMesh() const { return m_hasLastCastShotMesh; }
+    const FileImporter::MeshData& GetLastCastShotMesh() const
+    {
+        return m_lastCastShotMesh;
+    }
 
     // Per display-triangle source-face index (1-based, into a
     // TopExp::MapShapes(shot, TopAbs_FACE) map of GetLastShotShape()). One
@@ -859,6 +877,14 @@ private:
     // true and fills `out` when a non-null union results; returns false when
     // nothing contributed or the fuse failed outright. Read by GenerateMould.
     bool BuildShotModel(TopoDS_Shape& out);
+
+    // Build the "Cast Shot Body": BuildShotModel's shot fused with the features
+    // deliberately excluded from it — vents (their cut channels), inserts grown
+    // by the insert Cut scale, and ejector pins (straight cylinders down -Y).
+    // World-space BREP, fused pairwise (disjoint pieces are fine). Returns true
+    // and fills `out` when at least one piece contributed; false when the scene
+    // had nothing to build. Consumed by GenerateMould to seed m_lastCastShotMesh.
+    bool BuildCastShotModel(TopoDS_Shape& out);
 
     // Mesh-toolpath shot: union the STEP-object + feed-system shot (from
     // BuildShotModel, tessellated) with the native mesh objects, then subtract
@@ -1402,6 +1428,12 @@ private:
     // Volume of the shot solid (cubic mm), computed from the fused BREP at
     // generation time. Zero when no shot was built.
     double                 m_lastShotVolumeMm3 = 0.0;
+
+    // The "Cast Shot Body": the standard shot fused with the features left out
+    // of it — vents, inserts (grown by the Cut scale) and ejector pins. Built
+    // at generation time for the cast-mould bases; not displayed on its own.
+    FileImporter::MeshData m_lastCastShotMesh;
+    bool                   m_hasLastCastShotMesh = false;
 
     // The shot solid (BREP) and a per-display-triangle face-index map, kept so
     // design checks can run at the face level and map results back to the

@@ -2727,6 +2727,8 @@ bool GLCanvas::GenerateMould()
     m_lastShotFaceIds.clear();
     m_lastHalfShapes.clear();
     m_lastInsertMeshes.clear();
+    m_lastCastShotMesh = FileImporter::MeshData{};
+    m_hasLastCastShotMesh = false;
 
     SetCurrent(*m_context);
     InitGLOnce();
@@ -3523,6 +3525,21 @@ bool GLCanvas::GenerateMould()
         }
     }
 
+    // ---- Cast Shot Body ---------------------------------------------------
+    // A private augmented shot for the cast-mould bases: the standard shot plus
+    // vents, inserts (grown by the Cut scale), and ejector pins. Built here so
+    // it rides the same generation as the shot; a failure just leaves
+    // m_hasLastCastShotMesh false and the bases fall back to the plain shot.
+    {
+        TopoDS_Shape castShape;
+        if (BuildCastShotModel(castShape) && !castShape.IsNull())
+        {
+            TessellateShapeToMesh(castShape, m_lastCastShotMesh, nullptr);
+            m_hasLastCastShotMesh =
+                !m_lastCastShotMesh.posNorm.empty() && !m_lastCastShotMesh.indices.empty();
+        }
+    }
+
     // ---- Insert display bodies --------------------------------------------
     // Tessellate each insert's UNSCALED world solid for the preview. This is
     // the same geometry subtracted from the shot (BuildInsertCutSolid at 1.0),
@@ -3626,6 +3643,19 @@ void GLCanvas::ClearPreviewHalves()
     for (auto& h : m_previewHalves)
         h.obj.mesh.Destroy();
     m_previewHalves.clear();
+    Refresh(false);
+}
+
+void GLCanvas::TruncatePreviewHalves(int keepCount)
+{
+    if (keepCount < 0) keepCount = 0;
+    if (keepCount >= (int)m_previewHalves.size()) return;
+
+    if (m_context) SetCurrent(*m_context);
+    for (int i = keepCount; i < (int)m_previewHalves.size(); ++i)
+        m_previewHalves[i].obj.mesh.Destroy();
+    m_previewHalves.erase(m_previewHalves.begin() + keepCount,
+        m_previewHalves.end());
     Refresh(false);
 }
 
@@ -4285,6 +4315,90 @@ bool GLCanvas::BuildShotModel(TopoDS_Shape& out)
         if (cut.IsDone() && !cut.Shape().IsNull())
             acc = cut.Shape();
         // else: keep acc, skip this insert.
+    }
+
+    if (acc.IsNull()) return false;
+    out = acc;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// BuildCastShotModel — the standard shot plus the features normally left out of
+// it: vents, inserts (grown by the insert Cut scale), and ejector pins. Used by
+// the cast-mould bases, never displayed on its own. All pieces are fused (union)
+// so the enlarged inserts overwrite the unscaled voids BuildShotModel left, the
+// vent channels are added back as solid, and the ejector pins are included.
+// ---------------------------------------------------------------------------
+bool GLCanvas::BuildCastShotModel(TopoDS_Shape& out)
+{
+    std::vector<TopoDS_Shape> pieces;
+
+    // Seed with the standard shot (objects + feed system). May be absent in a
+    // scene with no BREP contributors — the features below can still stand on
+    // their own, so this is not fatal.
+    TopoDS_Shape baseShot;
+    if (BuildShotModel(baseShot) && !baseShot.IsNull())
+        pieces.push_back(baseShot);
+
+    // Vents — the same cut channels BuildVentCutPieces produces for the mould,
+    // added here as positive material.
+    for (const VentInstance& vent : m_vents)
+    {
+        std::vector<TopoDS_Shape> ventPieces;
+        if (BuildVentCutPieces(vent, ventPieces))
+            for (const TopoDS_Shape& p : ventPieces)
+                if (!p.IsNull()) pieces.push_back(p);
+    }
+
+    // Inserts — grown by the insert Cut scale (the same enlarged solid the mould
+    // cut uses), so the cast shot reflects the actual pocket the inserts open.
+    float insertCutScale = 1.0f;
+    if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+        insertCutScale = frame->GetInsertCutScale();
+    for (const InsertFeature& in : m_inserts)
+    {
+        TopoDS_Shape insertSolid;
+        if (BuildInsertCutSolid(in, insertCutScale, insertSolid) && !insertSolid.IsNull())
+            pieces.push_back(insertSolid);
+    }
+
+    // Ejector pins — straight cylinders from each ejector point down the -Y
+    // axis, matching RebuildEjectorSolids' preview geometry (diameter + length
+    // from the side panel; no draft).
+    if (!m_ejectors.empty())
+    {
+        float ejectorRadius = 1.5f, ejectorLength = 25.0f;
+        if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+        {
+            ejectorRadius = frame->GetEjectorDiameter() * 0.5f;
+            ejectorLength = frame->GetEjectorLength();
+        }
+        if (ejectorRadius > 1e-4f && ejectorLength > 1e-4f)
+        {
+            for (const EjectorFeature& ef : m_ejectors)
+            {
+                const glm::vec3 start = ef.point;
+                gp_Ax2 ax(gp_Pnt(start.x, start.y, start.z),
+                          gp_Dir(0.0, -1.0, 0.0));
+                BRepPrimAPI_MakeCylinder cyl(ax, ejectorRadius, ejectorLength);
+                cyl.Build();
+                if (cyl.IsDone() && !cyl.Shape().IsNull())
+                    pieces.push_back(cyl.Shape());
+            }
+        }
+    }
+
+    if (pieces.empty()) return false;
+
+    // Fuse pairwise. Disjoint pieces fuse into a valid compound; a failed
+    // individual fuse drops that piece rather than aborting.
+    TopoDS_Shape acc = pieces[0];
+    for (size_t i = 1; i < pieces.size(); ++i)
+    {
+        BRepAlgoAPI_Fuse fuse(acc, pieces[i]);
+        fuse.Build();
+        if (fuse.IsDone() && !fuse.Shape().IsNull())
+            acc = fuse.Shape();
     }
 
     if (acc.IsNull()) return false;

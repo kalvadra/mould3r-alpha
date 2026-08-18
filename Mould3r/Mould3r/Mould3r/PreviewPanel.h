@@ -11,6 +11,9 @@
 #include "FileImporter.h"   // FileImporter::MeshData
 #include "DesignChecks.h"   // DesignChecks::DemoldabilityResult
 #include "GridSettings.h"   // GridSettings — forwarded to the preview canvas
+#include "FixtureFile.h"    // FixtureKind — gates cast generation
+
+#include <glm/glm.hpp>      // cached half bounds (perimeter of the cast bases)
 
 class GLCanvas;
 class wxSpinCtrlDouble;
@@ -26,10 +29,21 @@ struct ShotPreviewInput
     double                        volumeMm3 = 0.0;
     const std::vector<TopoDS_Shape>* halves = nullptr;  // half solids (separation)
 
+    // The "Cast Shot Body" (standard shot + vents + scaled inserts + ejector
+    // pins), used only by cast-mould base generation. May be null (no cast shot
+    // was built); the base generation then falls back to `mesh`.
+    const FileImporter::MeshData* castMesh = nullptr;
+
     // True when the last generation was a mesh-toolpath scene. The BREP design
     // checks can't run on it, so the panel refuses them (see OnStartSimulation).
     // Carried here so it's set even when there's no BREP shot to attach.
     bool sceneIsMesh = false;
+
+    // Which kind of mould produced this generation. Cast generation is locked
+    // to procedural moulds — Parametric (fixed box) and Dynamic (adaptive box)
+    // — whose perimeter is a clean rectangle; a Library mould can't be cast.
+    // Carried here so PreviewPanel can gate the Generate Mould Casts flow.
+    FixtureKind mouldKind = FixtureKind::Library;
 };
 
 // ===========================================================================
@@ -87,6 +101,16 @@ private:
     void BuildVisibilityChecks(int halfCount, bool hasShot, int insertCount);
     void ClearVisibilityChecks();
 
+    // Append one cast body (a generated base / wall) to the preview: upload its
+    // mesh to the canvas at the next free part index, and add a matching
+    // show/hide checkbox in the Preview Output Bodies card. The cast checkboxes
+    // are tracked separately (m_castChecks) so a re-generation can drop just
+    // them via ClearCastChecks without disturbing the half / shot / insert
+    // toggles. Returns the preview-part index the body was loaded at.
+    int  AddCastBody(const FileImporter::MeshData& mesh, const wxString& label,
+        const glm::vec3& color, const wxString& tip);
+    void ClearCastChecks();
+
     // Left panel: a list of runnable simulations, each with its own Start
     // button. Right panel: read-only information about the shot. Both are built
     // once in the constructor; the info panel's value labels are updated in
@@ -99,6 +123,12 @@ private:
     // demoldability assessment (see RunDemoldabilityCheck); any other named
     // simulation reports that it isn't implemented yet.
     void OnStartSimulation(const wxString& simName);
+
+    // Open the "Generate Mould Casts" dialog (wall + base characteristics for
+    // silicone / sand casting). UI scaffolding only for now — it collects the
+    // user's settings; building the wall + shot-cavity base geometry and adding
+    // them to the preview scene is a later step.
+    void OnGenerateMouldCasts();
 
     // Run the demoldability check on the retained shot mesh using the draft
     // thresholds from the left-panel fields, then report the verdict (results
@@ -174,6 +204,11 @@ private:
     wxStaticText* m_visEmptyLabel = nullptr;
     std::vector<wxCheckBox*> m_halfChecks;
 
+    // Show/hide checkboxes for the generated cast bodies (bases, and later
+    // walls). Kept apart from m_halfChecks so a cast re-generation can drop and
+    // rebuild just these. Their preview-part indices start at m_castAnchorCount.
+    std::vector<wxCheckBox*> m_castChecks;
+
     // Insert preview bodies. Unlike halves and the shot, ALL inserts share a
     // SINGLE show/hide checkbox (m_insertCheck) rather than one each — the user
     // treats "the inserts" as one category. m_pendingInserts stages the meshes
@@ -223,6 +258,19 @@ private:
     int m_shotHalfIndex = -1;
     int m_activeDebugCategory = -1;
 
+    // Cast generation state. m_mouldKind gates the flow (only Parametric /
+    // Dynamic can be cast). m_castAnchorCount is the number of non-cast preview
+    // parts (halves + shot + inserts) — cast bodies append at and above this
+    // index, and a re-generation truncates the canvas back to it. m_halves*
+    // cache the combined bounding box of the mould halves (computed in SetData
+    // before the CPU meshes are dropped) so the bases can match their XZ
+    // perimeter.
+    FixtureKind m_mouldKind = FixtureKind::Library;
+    int         m_castAnchorCount = 0;
+    glm::vec3   m_halvesMin{ 0.0f };
+    glm::vec3   m_halvesMax{ 0.0f };
+    bool        m_hasHalvesBounds = false;
+
     // Mould-half meshes are uploaded then dropped; the shot artefacts are
     // RETAINED (CPU-side) because the design checks analyse them on demand:
     // the display mesh (for the overlay), the BREP shape (for face analysis),
@@ -234,6 +282,12 @@ private:
     std::vector<TopoDS_Shape>           m_halfShapes;   // for the separation test
     bool                                m_hasShot = false;
     double                              m_shotVolumeMm3 = 0.0;
+
+    // The Cast Shot Body (augmented shot) retained for base generation: the
+    // standard shot plus vents, scaled inserts and ejector pins. Empty when the
+    // last generation didn't build one — base generation then uses m_shotMesh.
+    FileImporter::MeshData              m_castShotMesh;
+    bool                                m_hasCastShot = false;
 
     // Last generation was a mesh-toolpath scene — the BREP design checks refuse.
     bool                                m_sceneIsMesh = false;

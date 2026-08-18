@@ -3517,6 +3517,9 @@ void MainFrame::OnGenerateMould(wxCommandEvent&)
         {
             ShotPreviewInput shot;
             shot.sceneIsMesh = m_canvas->IsSceneMeshType();
+            // Which mould kind produced this run — the preview locks cast
+            // generation to procedural (Parametric / Dynamic) moulds.
+            shot.mouldKind = m_fixtureDef.kind;
             if (m_canvas->HasLastShotMesh())
             {
                 shot.mesh = &m_canvas->GetLastShotMesh();
@@ -3524,6 +3527,10 @@ void MainFrame::OnGenerateMould(wxCommandEvent&)
                 shot.faceIds = &m_canvas->GetLastShotFaceIds();
                 shot.volumeMm3 = m_canvas->GetLastShotVolumeMm3();
                 shot.halves = &m_canvas->GetLastHalfShapes();
+                // Augmented shot (vents + scaled inserts + ejectors) for the
+                // cast-mould bases; null-safe when none was built.
+                if (m_canvas->HasLastCastShotMesh())
+                    shot.castMesh = &m_canvas->GetLastCastShotMesh();
             }
 
             // Inserts form their own preview category (one checkbox, yellow).

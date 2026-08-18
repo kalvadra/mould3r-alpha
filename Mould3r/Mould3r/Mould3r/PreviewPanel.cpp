@@ -3,6 +3,8 @@
 #include "style.h"
 #include "DesignChecks.h"
 #include "RoundedButton.h"
+#include "MouldCastDialog.h"
+#include "MeshBoolean.h"   // split the shot at y=0 and fuse a half into each base
 
 #include <wx/spinctrl.h>
 #include <wx/scrolwin.h>
@@ -117,6 +119,203 @@ static double ParseField(wxTextCtrl* ctrl, double defaultVal)
     return defaultVal;
 }
 
+// Accumulate a mesh's position extents into [mn, mx]. Reads whichever position
+// buffer the mesh carries (interleaved pos+normal, else bare positions). No-op
+// on an empty mesh. `any` tracks whether anything has been folded in yet so the
+// first point seeds the box rather than unioning against a zero default.
+static void AccumulateMeshBounds(const FileImporter::MeshData& m,
+    glm::vec3& mn, glm::vec3& mx, bool& any)
+{
+    const std::vector<float>* buf = nullptr;
+    int stride = 3;
+    if (!m.posNorm.empty()) { buf = &m.posNorm; stride = 6; }
+    else if (!m.vertices.empty()) { buf = &m.vertices; stride = 3; }
+    if (!buf) return;
+
+    for (size_t i = 0; i + 2 < buf->size(); i += stride)
+    {
+        const glm::vec3 p((*buf)[i], (*buf)[i + 1], (*buf)[i + 2]);
+        if (!any) { mn = mx = p; any = true; }
+        else { mn = glm::min(mn, p); mx = glm::max(mx, p); }
+    }
+}
+
+// Build an axis-aligned box mesh spanning [mn, mx], as an interleaved
+// position+normal buffer (6 floats/vertex) with flat per-face normals so it
+// shades like the other preview parts. 24 vertices (4 per face) + 36 indices.
+static FileImporter::MeshData MakeBoxMesh(const glm::vec3& mn, const glm::vec3& mx)
+{
+    FileImporter::MeshData mesh;
+    mesh.aabbMin = mn;
+    mesh.aabbMax = mx;
+
+    // Six faces, each: outward normal + four corner positions wound CCW as seen
+    // from outside. (Back-face culling is off in the preview, so winding only
+    // affects nothing visible — the explicit normals drive the shading.)
+    struct Face { glm::vec3 n; glm::vec3 v[4]; };
+    const Face faces[6] = {
+        { {  1.0f, 0.0f, 0.0f }, { { mx.x, mn.y, mn.z }, { mx.x, mx.y, mn.z }, { mx.x, mx.y, mx.z }, { mx.x, mn.y, mx.z } } },
+        { { -1.0f, 0.0f, 0.0f }, { { mn.x, mn.y, mx.z }, { mn.x, mx.y, mx.z }, { mn.x, mx.y, mn.z }, { mn.x, mn.y, mn.z } } },
+        { { 0.0f,  1.0f, 0.0f }, { { mn.x, mx.y, mn.z }, { mn.x, mx.y, mx.z }, { mx.x, mx.y, mx.z }, { mx.x, mx.y, mn.z } } },
+        { { 0.0f, -1.0f, 0.0f }, { { mn.x, mn.y, mx.z }, { mn.x, mn.y, mn.z }, { mx.x, mn.y, mn.z }, { mx.x, mn.y, mx.z } } },
+        { { 0.0f, 0.0f,  1.0f }, { { mn.x, mn.y, mx.z }, { mx.x, mn.y, mx.z }, { mx.x, mx.y, mx.z }, { mn.x, mx.y, mx.z } } },
+        { { 0.0f, 0.0f, -1.0f }, { { mx.x, mn.y, mn.z }, { mn.x, mn.y, mn.z }, { mn.x, mx.y, mn.z }, { mx.x, mx.y, mn.z } } },
+    };
+
+    mesh.posNorm.reserve(6 * 4 * 6);
+    mesh.indices.reserve(6 * 6);
+    for (int f = 0; f < 6; ++f)
+    {
+        const uint32_t base = (uint32_t)f * 4;
+        for (int k = 0; k < 4; ++k)
+        {
+            const glm::vec3& p = faces[f].v[k];
+            const glm::vec3& n = faces[f].n;
+            mesh.posNorm.insert(mesh.posNorm.end(),
+                { p.x, p.y, p.z, n.x, n.y, n.z });
+        }
+        mesh.indices.insert(mesh.indices.end(),
+            { base + 0, base + 1, base + 2, base + 0, base + 2, base + 3 });
+    }
+    return mesh;
+}
+
+// ---------------------------------------------------------------------------
+// Boolean helpers — the cast bases fuse a split half of the shot into each
+// base body. The booleans run on the MeshBoolean (Manifold) exchange mesh
+// ([x,y,z] positions + triangle indices), so these convert between it and the
+// display MeshData the preview canvas draws.
+// ---------------------------------------------------------------------------
+
+// A manifold box (8 shared corner vertices, 12 triangles) spanning [mn, mx],
+// suitable as a boolean operand.
+static MeshBoolean::Mesh MakeBoxBool(const glm::vec3& mn, const glm::vec3& mx)
+{
+    MeshBoolean::Mesh m;
+    m.verts = {
+        mn.x, mn.y, mn.z,  mx.x, mn.y, mn.z,  mx.x, mx.y, mn.z,  mn.x, mx.y, mn.z,
+        mn.x, mn.y, mx.z,  mx.x, mn.y, mx.z,  mx.x, mx.y, mx.z,  mn.x, mx.y, mx.z,
+    };
+    // 12 triangles, outward-consistent winding (winding is immaterial to the
+    // boolean, which re-derives orientation, but keep it sane).
+    m.indices = {
+        0,2,1, 0,3,2,   // -Z
+        4,5,6, 4,6,7,   // +Z
+        0,1,5, 0,5,4,   // -Y
+        3,7,6, 3,6,2,   // +Y
+        0,4,7, 0,7,3,   // -X
+        1,2,6, 1,6,5,   // +X
+    };
+    return m;
+}
+
+// Extract a boolean operand from a display mesh: pull [x,y,z] from whichever
+// position buffer the mesh carries (interleaved pos+normal, else bare pos) and
+// copy the triangle indices verbatim (they index the same vertices either way).
+static MeshBoolean::Mesh ToBoolMesh(const FileImporter::MeshData& src)
+{
+    MeshBoolean::Mesh m;
+    const std::vector<float>* buf = nullptr;
+    int stride = 3;
+    if (!src.posNorm.empty()) { buf = &src.posNorm; stride = 6; }
+    else if (!src.vertices.empty()) { buf = &src.vertices; stride = 3; }
+    if (!buf) return m;
+
+    m.verts.reserve(buf->size() / stride * 3);
+    for (size_t i = 0; i + 2 < buf->size(); i += stride)
+    {
+        m.verts.push_back((*buf)[i]);
+        m.verts.push_back((*buf)[i + 1]);
+        m.verts.push_back((*buf)[i + 2]);
+    }
+    m.indices = src.indices;
+    return m;
+}
+
+// Position extent of a boolean mesh. Returns false on an empty mesh.
+static bool BoolMeshBounds(const MeshBoolean::Mesh& m, glm::vec3& mn, glm::vec3& mx)
+{
+    bool any = false;
+    for (size_t i = 0; i + 2 < m.verts.size(); i += 3)
+    {
+        const glm::vec3 p(m.verts[i], m.verts[i + 1], m.verts[i + 2]);
+        if (!any) { mn = mx = p; any = true; }
+        else { mn = glm::min(mn, p); mx = glm::max(mx, p); }
+    }
+    return any;
+}
+
+// Clip a boolean mesh to a rectangular XZ perimeter by subtracting a slab on
+// each side that overhangs it: everything with x < pxMin, x > pxMax, z < pzMin,
+// or z > pzMax is removed. Slabs are only applied where the mesh actually
+// overhangs, and any failed/empty difference leaves the running mesh intact.
+static MeshBoolean::Mesh ClipMeshToPerimeterXZ(const MeshBoolean::Mesh& in,
+    float pxMin, float pxMax, float pzMin, float pzMax)
+{
+    glm::vec3 mn, mx;
+    if (!BoolMeshBounds(in, mn, mx)) return in;
+
+    const float e = 1.0f;
+    const float yLo = mn.y - e, yHi = mx.y + e;
+    MeshBoolean::Mesh m = in;
+    std::string err;
+
+    auto subtract = [&](const glm::vec3& bmin, const glm::vec3& bmax)
+    {
+        MeshBoolean::Mesh out;
+        if (MeshBoolean::Difference(m, MakeBoxBool(bmin, bmax), out, err) && !out.empty())
+            m = out;
+    };
+
+    if (mn.x < pxMin) subtract(glm::vec3(mn.x - e, yLo, mn.z - e),
+                               glm::vec3(pxMin,    yHi, mx.z + e));
+    if (mx.x > pxMax) subtract(glm::vec3(pxMax,    yLo, mn.z - e),
+                               glm::vec3(mx.x + e,  yHi, mx.z + e));
+    if (mn.z < pzMin) subtract(glm::vec3(mn.x - e, yLo, mn.z - e),
+                               glm::vec3(mx.x + e,  yHi, pzMin));
+    if (mx.z > pzMax) subtract(glm::vec3(mn.x - e, yLo, pzMax),
+                               glm::vec3(mx.x + e,  yHi, mx.z + e));
+    return m;
+}
+
+// Convert a boolean result back to a display mesh with flat (per-face) normals:
+// each triangle becomes three unique vertices carrying the triangle's normal,
+// so the fused body shades like the other preview parts. Also fills the AABB.
+static FileImporter::MeshData FlatDisplayMesh(const MeshBoolean::Mesh& src)
+{
+    FileImporter::MeshData out;
+    if (src.verts.empty() || src.indices.empty()) return out;
+
+    auto pos = [&](uint32_t v) {
+        return glm::vec3(src.verts[v * 3 + 0], src.verts[v * 3 + 1],
+                         src.verts[v * 3 + 2]);
+    };
+
+    bool any = false;
+    out.posNorm.reserve(src.indices.size() * 6);
+    out.indices.reserve(src.indices.size());
+    uint32_t next = 0;
+    for (size_t t = 0; t + 2 < src.indices.size(); t += 3)
+    {
+        const glm::vec3 a = pos(src.indices[t + 0]);
+        const glm::vec3 b = pos(src.indices[t + 1]);
+        const glm::vec3 c = pos(src.indices[t + 2]);
+        glm::vec3 n = glm::cross(b - a, c - a);
+        const float len = glm::length(n);
+        n = (len > 1e-12f) ? n / len : glm::vec3(0.0f, 1.0f, 0.0f);
+
+        for (const glm::vec3& p : { a, b, c })
+        {
+            out.posNorm.insert(out.posNorm.end(),
+                { p.x, p.y, p.z, n.x, n.y, n.z });
+            out.indices.push_back(next++);
+            if (!any) { out.aabbMin = out.aabbMax = p; any = true; }
+            else { out.aabbMin = glm::min(out.aabbMin, p); out.aabbMax = glm::max(out.aabbMax, p); }
+        }
+    }
+    return out;
+}
+
 // ---------------------------------------------------------------------------
 // Construction — builds the static perspective UI (left simulations panel with
 // the show/hide checkboxes, preview canvas, info panel) with no data loaded.
@@ -160,12 +359,28 @@ void PreviewPanel::SetData(const std::vector<FileImporter::MeshData>& halves,
     m_pendingHalves = halves;
     m_pendingInserts = inserts;
 
+    // Cache the combined bounding box of the mould halves now, while we still
+    // hold their meshes — LoadHalves drops the CPU copies afterwards. The cast
+    // bases use the XZ span as their perimeter.
+    m_hasHalvesBounds = false;
+    {
+        bool any = false;
+        for (const FileImporter::MeshData& h : halves)
+            AccumulateMeshBounds(h, m_halvesMin, m_halvesMax, any);
+        m_hasHalvesBounds = any;
+    }
+
+    // Which mould kind produced this generation (gates cast generation).
+    m_mouldKind = shot.mouldKind;
+
     m_shotMesh = FileImporter::MeshData();
     m_shotShape = TopoDS_Shape();
     m_shotFaceIds.clear();
     m_halfShapes.clear();
     m_hasShot = false;
     m_shotVolumeMm3 = 0.0;
+    m_castShotMesh = FileImporter::MeshData();
+    m_hasCastShot = false;
     // Set unconditionally (a mesh scene has no BREP shot to attach below).
     m_sceneIsMesh = shot.sceneIsMesh;
 
@@ -178,6 +393,15 @@ void PreviewPanel::SetData(const std::vector<FileImporter::MeshData>& halves,
         m_shotVolumeMm3 = shot.volumeMm3;
         m_hasShot = true;
     }
+
+    // Cast Shot Body — retained separately for base generation (may be present
+    // even independent of what the shot toggle shows).
+    if (shot.castMesh && !shot.castMesh->posNorm.empty()
+        && !shot.castMesh->indices.empty())
+    {
+        m_castShotMesh = *shot.castMesh;
+        m_hasCastShot = true;
+    }
     // The shot is appended after the mould halves in LoadHalves, so its
     // preview-part index is the half count.
     m_shotHalfIndex = m_hasShot ? (int)halves.size() : -1;
@@ -189,6 +413,10 @@ void PreviewPanel::SetData(const std::vector<FileImporter::MeshData>& halves,
     m_insertFirstIndex = (m_insertCount > 0)
         ? (int)halves.size() + (m_hasShot ? 1 : 0)
         : -1;
+
+    // Cast bodies (bases / walls) append after the halves, shot and inserts.
+    // Record that boundary so a cast re-generation can truncate back to it.
+    m_castAnchorCount = (int)halves.size() + (m_hasShot ? 1 : 0) + m_insertCount;
 
     // Reset any debug overlay state carried over from the previous generation.
     m_hasResult = false;
@@ -237,8 +465,14 @@ void PreviewPanel::ClearData()
     m_halfShapes.clear();
     m_hasShot = false;
     m_shotVolumeMm3 = 0.0;
+    m_castShotMesh = FileImporter::MeshData();
+    m_hasCastShot = false;
     m_shotHalfIndex = -1;
     m_sceneIsMesh = false;
+
+    m_mouldKind = FixtureKind::Library;
+    m_castAnchorCount = 0;
+    m_hasHalvesBounds = false;
 
     m_hasResult = false;
     m_activeDebugCategory = -1;
@@ -458,6 +692,26 @@ wxPanel* PreviewPanel::BuildSimPanel(wxWindow* parent)
     scrollWin->SetSizer(sizer);
     colSizer->Add(scrollWin, 1, wxEXPAND);
 
+    // ---- Generate Mould Casts --------------------------------------------
+    // Fixed action at the bottom of the column (always visible, below the
+    // scrollable simulations). Opens the wall/base cast dialog. Styled like
+    // the Prepare-side "Generate Mould" button (green RoundedButton).
+    auto* castDivider = new wxPanel(column, wxID_ANY,
+        wxDefaultPosition, wxSize(-1, 1));
+    castDivider->SetBackgroundColour(Style::Divider);
+    colSizer->Add(castDivider, 0, wxEXPAND | wxLEFT | wxRIGHT, 10);
+
+    auto* castBtn = new RoundedButton(column, wxID_ANY, "Generate Mould Casts",
+        wxDefaultPosition, wxSize(-1, 34), wxBORDER_NONE);
+    castBtn->SetBackgroundColour(Style::BtnGenerate);
+    castBtn->SetForegroundColour(*wxWHITE);
+    castBtn->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
+    castBtn->SetToolTip("Generate the walls and base that hold the sand / silicone");
+    castBtn->Bind(wxEVT_BUTTON,
+        [this](wxCommandEvent&) { OnGenerateMouldCasts(); });
+    colSizer->Add(castBtn, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP | wxBOTTOM, 12);
+
     column->SetSizer(colSizer);
     outerSizer->Add(column, 1, wxEXPAND);
 
@@ -662,6 +916,220 @@ void PreviewPanel::OnStartSimulation(const wxString& simName)
 
     wxMessageBox(simName + " is not implemented yet.",
         "Simulation", wxOK | wxICON_INFORMATION, this);
+}
+
+// ---------------------------------------------------------------------------
+// "Generate Mould Casts" — prompt for the wall + base characteristics used to
+// hold the sand / silicone around the finished mould, then build them. Locked
+// to procedural (Parametric / Dynamic) moulds. The base generates two boxes
+// straddling the y = 0 parting plane, grown past the perimeter by the Extra
+// Flange Distance, each fused with the matching y-split half of the Cast Shot
+// Body (clipped to the mould perimeter first). Walls are not built yet.
+// ---------------------------------------------------------------------------
+void PreviewPanel::OnGenerateMouldCasts()
+{
+    MouldCastDialog dlg(this);
+    if (dlg.ShowModal() != wxID_OK)
+        return;
+
+    // Cast generation is locked to procedural moulds — Parametric (fixed box)
+    // and Dynamic (adaptive box) — whose perimeter is a clean rectangle. On any
+    // other mould kind, pressing "Generate Casts" warns and cancels.
+    if (m_mouldKind != FixtureKind::Parametric &&
+        m_mouldKind != FixtureKind::Dynamic)
+    {
+        wxMessageBox(
+            "Mould casts can only be generated for parametric or adaptive "
+            "moulds.\n\nRegenerate the mould from a Parametric or Adaptive "
+            "(Dynamic) fixture, then try again.",
+            "Generate Mould Casts", wxOK | wxICON_WARNING, this);
+        return;
+    }
+
+    const MouldCastValues v = dlg.GetValues();
+
+    if (!v.base.enabled && !v.walls.enabled)
+    {
+        wxMessageBox("No cast parts were enabled.",
+            "Generate Mould Casts", wxOK | wxICON_INFORMATION, this);
+        return;
+    }
+
+    // Both base and walls need the mould perimeter (halves bounds).
+    if (!m_hasHalvesBounds || !m_canvas)
+    {
+        wxMessageBox("There are no mould halves to build casts from.",
+            "Generate Mould Casts", wxOK | wxICON_WARNING, this);
+        return;
+    }
+
+    // Idempotent re-generation: strip off any previously generated cast bodies
+    // (and their toggles) once, up front, then rebuild whatever is enabled.
+    m_canvas->TruncatePreviewHalves(m_castAnchorCount);
+    ClearCastChecks();
+
+    const glm::vec3 mn = m_halvesMin;
+    const glm::vec3 mx = m_halvesMax;
+
+    int generated = 0;
+    wxString notes;
+
+    // ---- Base — two boxes straddling the y = 0 parting plane --------------
+    if (v.base.enabled && v.base.ThicknessMm() <= 0.0)
+        notes << "Base skipped: thickness must be greater than zero\n";
+    else if (v.base.enabled)
+    {
+        const double thk = v.base.ThicknessMm();
+
+        // Perimeter = the mould halves' XZ footprint, grown on every side by the
+        // Extra Flange Distance. The two bases straddle the y = 0 parting plane:
+        // the top base fills [-thk, 0] (extrudes in -Y), the bottom base fills
+        // [0, +thk] (extrudes in +Y).
+        const float t = (float)thk;
+        const float fl = (float)v.base.ExtraDistanceMm();   // per-side flange (mm)
+
+        const glm::vec3 topBoxMin(mn.x - fl, -t, mn.z - fl);
+        const glm::vec3 topBoxMax(mx.x + fl, 0.0f, mx.z + fl);
+        const glm::vec3 botBoxMin(mn.x - fl, 0.0f, mn.z - fl);
+        const glm::vec3 botBoxMax(mx.x + fl, t, mx.z + fl);
+
+        // The cast shot body (shot + vents + scaled inserts + ejectors) drives
+        // the fused half; fall back to the plain shot when no cast body exists.
+        const FileImporter::MeshData& shotSrc =
+            m_hasCastShot ? m_castShotMesh : m_shotMesh;
+        const bool haveShotSrc = m_hasCastShot || m_hasShot;
+
+        // Split the (perimeter-clipped) cast shot at y = 0 and fuse a half into
+        // each base: the y > 0 section joins the top base, the y < 0 section the
+        // bottom base. Any boolean failure degrades gracefully to a plain box.
+        bool shotUsed = false;
+        FileImporter::MeshData topMeshD, botMeshD;
+
+        MeshBoolean::Mesh shotBool;
+        if (haveShotSrc) shotBool = ToBoolMesh(shotSrc);
+
+        if (!shotBool.empty())
+        {
+            // Requirement: trim anything outside the mould perimeter BEFORE the
+            // split/join. Clip to the (un-flanged) mould footprint.
+            shotBool = ClipMeshToPerimeterXZ(shotBool,
+                mn.x, mx.x, mn.z, mx.z);
+        }
+
+        glm::vec3 sMin, sMax;
+        if (!shotBool.empty() && BoolMeshBounds(shotBool, sMin, sMax))
+        {
+            const float pad = 1.0f;
+            const MeshBoolean::Mesh belowSlab = MakeBoxBool(
+                glm::vec3(sMin.x - pad, sMin.y - pad, sMin.z - pad),
+                glm::vec3(sMax.x + pad, 0.0f,         sMax.z + pad));
+            const MeshBoolean::Mesh aboveSlab = MakeBoxBool(
+                glm::vec3(sMin.x - pad, 0.0f,         sMin.z - pad),
+                glm::vec3(sMax.x + pad, sMax.y + pad, sMax.z + pad));
+
+            std::string err;
+            MeshBoolean::Mesh upperHalf, lowerHalf, topFused, botFused;
+            const bool haveUpper =
+                MeshBoolean::Difference(shotBool, belowSlab, upperHalf, err)
+                && !upperHalf.empty();
+            const bool haveLower =
+                MeshBoolean::Difference(shotBool, aboveSlab, lowerHalf, err)
+                && !lowerHalf.empty();
+
+            const bool topOk = haveUpper &&
+                MeshBoolean::Union({ MakeBoxBool(topBoxMin, topBoxMax), upperHalf },
+                    topFused, err) && !topFused.empty();
+            const bool botOk = haveLower &&
+                MeshBoolean::Union({ MakeBoxBool(botBoxMin, botBoxMax), lowerHalf },
+                    botFused, err) && !botFused.empty();
+
+            if (topOk && botOk)
+            {
+                topMeshD = FlatDisplayMesh(topFused);
+                botMeshD = FlatDisplayMesh(botFused);
+                shotUsed = true;
+            }
+        }
+
+        // Fallback (no usable shot): plain base boxes.
+        if (!shotUsed)
+        {
+            topMeshD = MakeBoxMesh(topBoxMin, topBoxMax);
+            botMeshD = MakeBoxMesh(botBoxMin, botBoxMax);
+        }
+
+        const glm::vec3 baseColor(0.40f, 0.55f, 0.68f);  // steel blue
+        AddCastBody(topMeshD, "Top Base", baseColor,
+            "Show / hide the top base (extrudes -Y; shot y>0 half fused in)");
+        AddCastBody(botMeshD, "Bottom Base", baseColor,
+            "Show / hide the bottom base (extrudes +Y; shot y<0 half fused in)");
+
+        generated += 2;
+        notes << wxString::Format("Base: %s, %g mm thick",
+            wxString::FromUTF8(v.base.type.c_str()), thk);
+        if (fl > 0.0f) notes << wxString::Format(", +%g mm flange/side", fl);
+        notes << (shotUsed
+            ? (m_hasCastShot ? " (cast shot halves fused)" : " (shot halves fused)")
+            : " (shot not fused)");
+        notes << "\n";
+    }
+
+    // ---- Walls — four boxes around the perimeter at mould height ----------
+    if (v.walls.enabled && v.walls.ThicknessMm() <= 0.0)
+        notes << "Walls skipped: thickness must be greater than zero\n";
+    else if (v.walls.enabled)
+    {
+        const float w = (float)v.walls.ThicknessMm();     // wall thickness
+        const bool  clover = (v.walls.type == "Clover");
+        const float ext = clover ? (float)v.walls.ExtraDistanceMm() : 0.0f;
+
+        // Clover: each wall overhangs the perimeter at its right end (viewed from
+        // outside the mould looking in) by the wall thickness PLUS the Extra Wall
+        // Distance, producing the interlocking pinwheel. `e` is that overhang.
+        const float e = clover ? (w + ext) : 0.0f;
+
+        // Perimeter rectangle + mould height. Walls sit OUTSIDE each edge (out by
+        // the thickness) and rise the full mould height, matching it.
+        const float X0 = mn.x, X1 = mx.x, Z0 = mn.z, Z1 = mx.z;
+        const float Y0 = mn.y, Y1 = mx.y;
+
+        const glm::vec3 wallColor(0.62f, 0.55f, 0.42f);   // warm tan
+        // Overhang assignment forms a consistent (CCW-from-top) pinwheel:
+        //   -Z wall overhangs -X,  +Z wall overhangs +X,
+        //   +X wall overhangs -Z,  -X wall overhangs +Z.
+        AddCastBody(MakeBoxMesh(glm::vec3(X0 - e, Y0, Z0 - w),
+                                glm::vec3(X1,     Y1, Z0)),
+            "Wall -Z", wallColor, "Show / hide the -Z wall");
+        AddCastBody(MakeBoxMesh(glm::vec3(X0,     Y0, Z1),
+                                glm::vec3(X1 + e, Y1, Z1 + w)),
+            "Wall +Z", wallColor, "Show / hide the +Z wall");
+        AddCastBody(MakeBoxMesh(glm::vec3(X1,     Y0, Z0 - e),
+                                glm::vec3(X1 + w, Y1, Z1)),
+            "Wall +X", wallColor, "Show / hide the +X wall");
+        AddCastBody(MakeBoxMesh(glm::vec3(X0 - w, Y0, Z0),
+                                glm::vec3(X0,     Y1, Z1 + e)),
+            "Wall -X", wallColor, "Show / hide the -X wall");
+
+        generated += 4;
+        notes << wxString::Format("Walls: %s, %g mm thick",
+            wxString::FromUTF8(v.walls.type.c_str()), (double)w);
+        if (clover && ext > 0.0f)
+            notes << wxString::Format(", +%g mm extra overhang", (double)ext);
+        notes << " (4 bodies)\n";
+    }
+
+    // One relayout / repaint after all cast bodies are added.
+    if (m_visPanel)
+    {
+        m_visPanel->Layout();
+        if (m_visPanel->GetParent()) m_visPanel->GetParent()->Layout();
+    }
+    m_canvas->Refresh(false);
+
+    wxString msg;
+    msg << "Generated " << generated << " cast bod"
+        << (generated == 1 ? "y" : "ies") << ".\n\n" << notes;
+    wxMessageBox(msg, "Generate Mould Casts", wxOK | wxICON_INFORMATION, this);
 }
 
 // ---------------------------------------------------------------------------
@@ -1168,8 +1636,57 @@ void PreviewPanel::ClearVisibilityChecks()
         m_insertCheck->Destroy();
         m_insertCheck = nullptr;
     }
+    ClearCastChecks();
     if (m_visEmptyLabel) m_visEmptyLabel->Show(true);
     if (m_visPanel) m_visPanel->Layout();
+}
+
+// ---------------------------------------------------------------------------
+// Drop just the cast-body checkboxes (bases / walls) from the visibility card,
+// leaving the half / shot / insert toggles in place. Paired with a canvas
+// TruncatePreviewHalves(m_castAnchorCount) so a cast re-generation starts clean.
+// ---------------------------------------------------------------------------
+void PreviewPanel::ClearCastChecks()
+{
+    auto* vSizer = m_visPanel ? m_visPanel->GetSizer() : nullptr;
+    for (wxCheckBox* cb : m_castChecks)
+    {
+        if (!cb) continue;
+        if (vSizer) vSizer->Detach(cb);
+        cb->Destroy();
+    }
+    m_castChecks.clear();
+}
+
+// ---------------------------------------------------------------------------
+// Append one cast body to the preview: upload its mesh to the canvas and add a
+// matching show/hide checkbox. Returns the preview-part index it loaded at.
+// ---------------------------------------------------------------------------
+int PreviewPanel::AddCastBody(const FileImporter::MeshData& mesh,
+    const wxString& label, const glm::vec3& color, const wxString& tip)
+{
+    if (!m_canvas) return -1;
+
+    const int partIndex = m_canvas->GetPreviewHalfCount();
+    m_canvas->AddPreviewHalf(mesh, label.ToStdString(), color);
+
+    if (m_visPanel)
+    {
+        auto* cb = new wxCheckBox(m_visPanel, kHalfToggleIdBase + partIndex, label);
+        cb->SetForegroundColour(Style::TextPrimary);
+        cb->SetBackgroundColour(Style::CardBg);
+        cb->SetValue(true);
+        cb->SetToolTip(tip);
+        cb->Bind(wxEVT_CHECKBOX,
+            [this, partIndex](wxCommandEvent& evt)
+            {
+                if (m_canvas) m_canvas->SetPreviewHalfVisible(partIndex, evt.IsChecked());
+            });
+        if (m_visEmptyLabel) m_visEmptyLabel->Show(false);
+        m_visPanel->GetSizer()->Add(cb, 0, wxEXPAND | wxALL, 6);
+        m_castChecks.push_back(cb);
+    }
+    return partIndex;
 }
 
 void PreviewPanel::LoadHalves()
