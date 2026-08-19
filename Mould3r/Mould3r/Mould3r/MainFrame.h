@@ -442,12 +442,13 @@ private:
     // on it; the widget just reports picks via wxEVT_CHOICE.
     SplitButton* m_btnExport = nullptr;
 
-    enum class ExportMode { Mould, ShotBody };
+    enum class ExportMode { Mould, ShotBody, MouldCasts };
     ExportMode m_exportMode = ExportMode::Mould;
 
     // Order MUST match the SplitButton's menu-item order (see CreateRibbon):
-    // index 0 = Mould, index 1 = Shot body. UpdateExportButtonLabel keeps the
-    // action-zone label in sync with m_exportMode.
+    // index 0 = Mould, index 1 = Shot body, index 2 = Mould casts.
+    // UpdateExportButtonLabel keeps the action-zone label in sync with
+    // m_exportMode.
     void UpdateExportButtonLabel();
 
     // Tri-state model for "is the Export button about to do something
@@ -500,6 +501,9 @@ private:
     // the tri-state MouldState gate + file-dialog flow for its own output.
     void DoExportMould();
     void DoExportShotBody();
+    // Export the generated mould casts (from the Preview perspective): the Top
+    // and Bottom bases plus one half of each wall, one binary STL per body.
+    void DoExportMouldCasts();
 
     wxPanel* CreateSidePanel(wxWindow* parent);
 

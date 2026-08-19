@@ -353,6 +353,38 @@ public:
     // a warning dialog if the last GenerateMould run didn't produce a shot.
     void ExportShotBody(const std::string& path);
 
+    // Write a display mesh (posNorm + indices, already in world space) to a
+    // binary STL. Public + static so callers outside the canvas (e.g. the
+    // cast-body export in MainFrame) reuse the exact writer the mould-half and
+    // shot-body STL exports use. Returns false on empty mesh or any file error.
+    static bool WriteMeshToStl(const std::string& path,
+        const FileImporter::MeshData& mesh);
+
+    // Write a single OCC solid to a STEP file (AsIs). Public + static so the
+    // cast-body export can emit STEP for BREP scenes, mirroring how the shot
+    // body / mould halves export. Returns false on a null shape or file error.
+    static bool WriteShapeToStep(const std::string& path,
+        const TopoDS_Shape& shape);
+
+    // Tessellate an OCC shape into a render-ready MeshData (vertices meshed,
+    // per-vertex normals computed, crease-split applied so the interleaved
+    // posNorm + indices upload cleanly), with orientation-aware winding.
+    // `mesh` is cleared first. When `faceIds` is non-null it is filled with one
+    // entry per output triangle: the 1-based index of that triangle's source
+    // face in a TopExp::MapShapes(shape, TopAbs_FACE) map (the crease split
+    // preserves triangle order, so the map stays aligned with mesh.indices).
+    // Static + public (uses no canvas state) so the cast-body BREP path can
+    // reuse it to build display meshes from its solids.
+    static void TessellateShapeToMesh(const TopoDS_Shape& shape,
+        FileImporter::MeshData& mesh,
+        std::vector<int>* faceIds = nullptr);
+
+    // The Cast Shot Body as a BREP solid from the most recent GenerateMould
+    // (the exact fused shape m_lastCastShotMesh is the tessellation of). Null in
+    // a mesh scene or when none was built. Consumed by the cast bases so they
+    // can be built as BREP for STEP export.
+    const TopoDS_Shape& GetLastCastShotShape() const { return m_lastCastShotShape; }
+
     // True once the scene holds at least one mesh-format body (STL/OBJ) among
     // the imported objects or inserts — i.e. the scene is on the mesh toolpath.
     // Maintained by RecomputeSceneMeshType at every add/remove/clear. Later
@@ -901,17 +933,6 @@ private:
     bool BuildInsertCutSolid(const InsertFeature& in, float scalePct,
         TopoDS_Shape& out) const;
 
-    // Tessellate an OCC shape into a render-ready MeshData (vertices meshed,
-    // per-vertex normals computed, crease-split applied so the interleaved
-    // posNorm + indices upload cleanly), with orientation-aware winding.
-    // `mesh` is cleared first. When `faceIds` is non-null it is filled with one
-    // entry per output triangle: the 1-based index of that triangle's source
-    // face in a TopExp::MapShapes(shape, TopAbs_FACE) map (the crease split
-    // preserves triangle order, so the map stays aligned with mesh.indices).
-    void TessellateShapeToMesh(const TopoDS_Shape& shape,
-        FileImporter::MeshData& mesh,
-        std::vector<int>* faceIds = nullptr);
-
     void InitGLOnce();
     void DestroyGL();
 
@@ -1432,7 +1453,10 @@ private:
     // The "Cast Shot Body": the standard shot fused with the features left out
     // of it — vents, inserts (grown by the Cut scale) and ejector pins. Built
     // at generation time for the cast-mould bases; not displayed on its own.
+    // The BREP solid is retained alongside its tessellation so the cast bases
+    // can be built as BREP (STEP-exportable) in a BREP scene.
     FileImporter::MeshData m_lastCastShotMesh;
+    TopoDS_Shape           m_lastCastShotShape;
     bool                   m_hasLastCastShotMesh = false;
 
     // The shot solid (BREP) and a per-display-triangle face-index map, kept so

@@ -1109,14 +1109,14 @@ wxPanel* MainFrame::CreateRibbon(wxWindow* parent)
 
     // Export split button. Action zone runs the current mode; dropdown zone
     // picks it. Menu-item order is fixed and mirrored by MainFrame::ExportMode:
-    //   index 0 -> Mould, index 1 -> Shot body.
+    //   index 0 -> Mould, index 1 -> Shot body, index 2 -> Mould casts.
     auto* btnExport = new SplitButton(panel, ID_Export, "Export Mould",
         wxDefaultPosition, wxSize(170, 32), wxBORDER_NONE);
     btnExport->SetBackgroundColour(Style::BtnGenerate);
     btnExport->SetForegroundColour(*wxWHITE);
     btnExport->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
-    btnExport->SetMenuItems({ "Mould", "Shot body" });
+    btnExport->SetMenuItems({ "Mould", "Shot body", "Mould casts" });
     btnExport->SetSelection(0);
     m_btnExport = btnExport;
     btnExport->Hide();   // Prepare is the initial perspective
@@ -3276,24 +3276,34 @@ void MainFrame::OnExport(wxCommandEvent&)
     // currently selects. Each DoExport* keeps its own gate + file dialog.
     switch (m_exportMode)
     {
-    case ExportMode::Mould:    DoExportMould();    break;
-    case ExportMode::ShotBody: DoExportShotBody(); break;
+    case ExportMode::Mould:      DoExportMould();      break;
+    case ExportMode::ShotBody:   DoExportShotBody();   break;
+    case ExportMode::MouldCasts: DoExportMouldCasts(); break;
     }
 }
 
 void MainFrame::OnExportModeChanged(wxCommandEvent& e)
 {
-    // Menu-item order is fixed in CreateRibbon: 0 = Mould, 1 = Shot body.
-    m_exportMode = (e.GetInt() == 1) ? ExportMode::ShotBody
-                                     : ExportMode::Mould;
+    // Menu-item order is fixed in CreateRibbon: 0 = Mould, 1 = Shot body,
+    // 2 = Mould casts.
+    switch (e.GetInt())
+    {
+    case 1:  m_exportMode = ExportMode::ShotBody;   break;
+    case 2:  m_exportMode = ExportMode::MouldCasts; break;
+    default: m_exportMode = ExportMode::Mould;      break;
+    }
     UpdateExportButtonLabel();
 }
 
 void MainFrame::UpdateExportButtonLabel()
 {
     if (!m_btnExport) return;
-    m_btnExport->SetLabel(m_exportMode == ExportMode::ShotBody
-        ? "Export Shot Body" : "Export Mould");
+    switch (m_exportMode)
+    {
+    case ExportMode::ShotBody:   m_btnExport->SetLabel("Export Shot Body");  break;
+    case ExportMode::MouldCasts: m_btnExport->SetLabel("Export Mould Casts"); break;
+    default:                     m_btnExport->SetLabel("Export Mould");       break;
+    }
 }
 
 void MainFrame::DoExportMould()
@@ -3486,6 +3496,123 @@ void MainFrame::DoExportShotBody()
     m_canvas->ExportShotBody(picked.GetFullPath().ToStdString());
 }
 
+void MainFrame::DoExportMouldCasts()
+{
+    // Casts are built in the Preview perspective after a mould generation, so
+    // the same tri-state gate applies; additionally the casts themselves must
+    // have been generated (they are not produced automatically by a mould run).
+    switch (m_mouldState)
+    {
+    case MouldState::NeverGenerated:
+        wxMessageBox("Mould must be generated before its casts can be exported.",
+            "Export Mould Casts", wxOK | wxICON_INFORMATION, this);
+        return;
+
+    case MouldState::Dirty:
+    {
+        const int ans = wxMessageBox(
+            "An edit has been made since the last Mould Generation, "
+            "some features may not be reflected. Would you like to continue?",
+            "Export Mould Casts", wxYES_NO | wxICON_WARNING, this);
+        if (ans != wxYES) return;
+        break;
+    }
+
+    case MouldState::Clean:
+        break;
+    }
+
+    if (!m_previewPanel || !m_previewPanel->HasCastBodies())
+    {
+        wxMessageBox("No mould casts are available to export.\n\nUse "
+            "\"Generate Mould Casts\" in the Preview perspective first.",
+            "Export Mould Casts", wxOK | wxICON_INFORMATION, this);
+        return;
+    }
+
+    const auto& bodies = m_previewPanel->GetCastExportBodies();
+
+    // Follow the same STEP/STL routing as the mould halves: a BREP scene writes
+    // STEP (from each body's solid), a mesh scene writes STL (from the mesh).
+    // Chosen per body from whether it carries a shape, so the file extension
+    // always matches its content. Like Export Mould, the picked path is a stem,
+    // not a real output file, so no wxFD_OVERWRITE_PROMPT — we check the real
+    // per-body paths manually.
+    const bool meshScene = m_canvas->IsSceneMeshType();
+    wxString suggestedDir, suggestedName;
+    if (!m_projectPath.empty())
+    {
+        wxFileName fn(m_projectPath);
+        suggestedDir = fn.GetPath();
+        suggestedName = fn.GetName() + "_cast";
+    }
+
+    const wxString wildcard = meshScene
+        ? "STL files (*.stl)|*.stl|All files (*.*)|*.*"
+        : "STEP files (*.step;*.stp)|*.step;*.stp|All files (*.*)|*.*";
+
+    wxFileDialog dlg(this, "Export Mould Casts",
+        suggestedDir, suggestedName, wildcard, wxFD_SAVE);
+    if (dlg.ShowModal() != wxID_OK)
+        return;
+
+    wxFileName picked(dlg.GetPath());
+    const wxString folder = picked.GetPath();
+    const wxString baseStem = picked.GetName();
+    if (baseStem.IsEmpty())
+    {
+        wxMessageBox("Please enter a filename for the export.",
+            "Export Mould Casts", wxOK | wxICON_INFORMATION, this);
+        return;
+    }
+
+    // Per-body: write STEP when the body has a solid, else STL. The extension
+    // tracks the content so a mixed case can't produce a mislabelled file.
+    const wxString sep = wxFileName::GetPathSeparator();
+    std::vector<wxString> paths;
+    paths.reserve(bodies.size());
+    for (const auto& b : bodies)
+    {
+        const wxString ext = b.hasShape ? ".step" : ".stl";
+        paths.push_back(folder + sep + baseStem + "_"
+            + wxString(b.suffix.c_str()) + ext);
+    }
+
+    // Manual overwrite check across all real output paths.
+    wxString existing;
+    for (const wxString& p : paths)
+        if (wxFileExists(p)) existing += p + "\n";
+    if (!existing.IsEmpty())
+    {
+        const int ans = wxMessageBox(
+            "The following file(s) already exist:\n\n" + existing + "\nOverwrite?",
+            "Export Mould Casts", wxYES_NO | wxICON_QUESTION, this);
+        if (ans != wxYES) return;
+    }
+
+    int okCount = 0;
+    wxString failed;
+    for (size_t i = 0; i < bodies.size(); ++i)
+    {
+        const bool ok = bodies[i].hasShape
+            ? GLCanvas::WriteShapeToStep(paths[i].ToStdString(), bodies[i].shape)
+            : GLCanvas::WriteMeshToStl(paths[i].ToStdString(), bodies[i].mesh);
+        if (ok) ++okCount;
+        else    failed += paths[i] + "\n";
+    }
+
+    if (failed.IsEmpty())
+    {
+        wxString done = wxString::Format("Exported %d cast ", okCount);
+        done += (okCount == 1) ? "body" : "bodies";
+        done += meshScene ? " (STL)." : " (STEP).";
+        wxMessageBox(done, "Export Complete", wxOK | wxICON_INFORMATION, this);
+    }
+    else
+        wxMessageBox("Some cast bodies could not be written:\n\n" + failed,
+            "Export Mould Casts", wxOK | wxICON_ERROR, this);
+}
+
 void MainFrame::OnGenerateMould(wxCommandEvent&)
 {
     if (!m_canvas) return;
@@ -3528,9 +3655,15 @@ void MainFrame::OnGenerateMould(wxCommandEvent&)
                 shot.volumeMm3 = m_canvas->GetLastShotVolumeMm3();
                 shot.halves = &m_canvas->GetLastHalfShapes();
                 // Augmented shot (vents + scaled inserts + ejectors) for the
-                // cast-mould bases; null-safe when none was built.
+                // cast-mould bases; null-safe when none was built. The BREP is
+                // passed too so the bases can be built as STEP-exportable solids
+                // in a BREP scene.
                 if (m_canvas->HasLastCastShotMesh())
+                {
                     shot.castMesh = &m_canvas->GetLastCastShotMesh();
+                    if (!m_canvas->GetLastCastShotShape().IsNull())
+                        shot.castShape = &m_canvas->GetLastCastShotShape();
+                }
             }
 
             // Inserts form their own preview category (one checkbox, yellow).

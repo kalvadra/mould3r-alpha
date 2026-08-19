@@ -2728,6 +2728,7 @@ bool GLCanvas::GenerateMould()
     m_lastHalfShapes.clear();
     m_lastInsertMeshes.clear();
     m_lastCastShotMesh = FileImporter::MeshData{};
+    m_lastCastShotShape = TopoDS_Shape();
     m_hasLastCastShotMesh = false;
 
     SetCurrent(*m_context);
@@ -3535,6 +3536,7 @@ bool GLCanvas::GenerateMould()
         if (BuildCastShotModel(castShape) && !castShape.IsNull())
         {
             TessellateShapeToMesh(castShape, m_lastCastShotMesh, nullptr);
+            m_lastCastShotShape = castShape;   // retained for the BREP cast bases
             m_hasLastCastShotMesh =
                 !m_lastCastShotMesh.posNorm.empty() && !m_lastCastShotMesh.indices.empty();
         }
@@ -8406,6 +8408,23 @@ static bool WriteBinaryStl(const std::string& path,
     }
 
     return static_cast<bool>(out);
+}
+
+// Public wrapper so non-canvas callers (cast-body export) reuse the writer.
+bool GLCanvas::WriteMeshToStl(const std::string& path,
+    const FileImporter::MeshData& mesh)
+{
+    return WriteBinaryStl(path, mesh);
+}
+
+// Write one OCC solid to STEP (AsIs), mirroring ExportShotBody's BREP path.
+bool GLCanvas::WriteShapeToStep(const std::string& path,
+    const TopoDS_Shape& shape)
+{
+    if (shape.IsNull()) return false;
+    STEPControl_Writer writer;
+    writer.Transfer(shape, STEPControl_AsIs);
+    return writer.Write(path.c_str()) == IFSelect_RetDone;
 }
 
 void GLCanvas::ExportFixtures(const std::string& pathA, const std::string& pathB)
