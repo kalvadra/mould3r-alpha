@@ -10,6 +10,7 @@
 #include <opencascade/BRepPrimAPI_MakeBox.hxx>
 #include <opencascade/BRepAlgoAPI_Common.hxx>
 #include <opencascade/BRepAlgoAPI_Fuse.hxx>
+#include <opencascade/BRepAlgoAPI_Cut.hxx>
 #include <opencascade/gp_Pnt.hxx>
 
 #include <wx/spinctrl.h>
@@ -273,6 +274,16 @@ static TopoDS_Shape FuseSolid(const TopoDS_Shape& a, const TopoDS_Shape& b)
     if (a.IsNull()) return b;
     if (b.IsNull()) return a;
     BRepAlgoAPI_Fuse op(a, b);
+    op.Build();
+    return (op.IsDone() && !op.Shape().IsNull()) ? op.Shape() : a;
+}
+
+// Boolean difference a − b (used to cut the tongue-and-groove groove). A null
+// operand leaves `a` unchanged; a failed cut also falls back to `a`.
+static TopoDS_Shape CutSolid(const TopoDS_Shape& a, const TopoDS_Shape& b)
+{
+    if (a.IsNull() || b.IsNull()) return a;
+    BRepAlgoAPI_Cut op(a, b);
     op.Build();
     return (op.IsDone() && !op.Shape().IsNull()) ? op.Shape() : a;
 }
@@ -1029,6 +1040,48 @@ void PreviewPanel::OnGenerateMouldCasts()
     // shows their tessellation; a mesh scene builds them as meshes (STL only).
     const bool brepScene = !m_sceneIsMesh;
 
+    // Axis-aligned box (min, max corners) used throughout the cast builders.
+    using Box = std::pair<glm::vec3, glm::vec3>;
+
+    // ---- Shared wall geometry --------------------------------------------
+    // Computed up front because the base needs it too: a base↔wall tongue is
+    // added to the base at each wall's y = 0 face midpoint (the matching groove
+    // is cut into the wall). Reuses the wall section's tongue fields.
+    const bool  wallsOn = v.walls.enabled && v.walls.ThicknessMm() > 0.0;
+    const float wThk = wallsOn ? (float)v.walls.ThicknessMm() : 0.0f;
+    const bool  wClover = (v.walls.type == "Clover");
+    const float wExtra = (wallsOn && wClover) ? (float)v.walls.ExtraDistanceMm() : 0.0f;
+    const float wE = (wallsOn && wClover) ? (wThk + wExtra) : 0.0f;   // clover overhang
+    const float jtw = (float)v.walls.TongueWidthMm();
+    const float jtt = (float)v.walls.TongueThicknessMm();
+    const float jtol = (float)v.walls.GrooveToleranceMm();
+    const bool  baseWallJoint = wallsOn && jtw > 1e-6f && jtt > 1e-6f;
+
+    // Midpoint of each wall's y = 0 face (-Z, +Z, +X, -X order), plus the XZ
+    // half-extents of the base↔wall tongue (tHalf) and groove (gHalf). The joint
+    // runs the FULL wall length (parallel to the perimeter, including the clover
+    // overhang), and is the tongue width ACROSS the wall (the groove adds the
+    // tolerance across that same width).
+    glm::vec2 wallMid[4] = {}, tHalf[4] = {}, gHalf[4] = {};
+    if (wallsOn)
+    {
+        const float X0 = mn.x, X1 = mx.x, Z0 = mn.z, Z1 = mx.z;
+        wallMid[0] = glm::vec2((X0 - wE + X1) * 0.5f, Z0 - wThk * 0.5f);   // -Z
+        wallMid[1] = glm::vec2((X0 + X1 + wE) * 0.5f, Z1 + wThk * 0.5f);   // +Z
+        wallMid[2] = glm::vec2(X1 + wThk * 0.5f, (Z0 - wE + Z1) * 0.5f);   // +X
+        wallMid[3] = glm::vec2(X0 - wThk * 0.5f, (Z0 + Z1 + wE) * 0.5f);   // -X
+
+        const float LhalfX = (X1 - X0 + wE) * 0.5f;  // -Z / +Z wall length / 2
+        const float LhalfZ = (Z1 - Z0 + wE) * 0.5f;  // +X / -X wall length / 2
+        const float hW  = jtw * 0.5f;                // half tongue width (across)
+        const float hWG = (jtw + jtol) * 0.5f;       // groove half-width (+ tol)
+        // -Z / +Z run along X (width across Z); +X / -X run along Z (width across X).
+        tHalf[0] = tHalf[1] = glm::vec2(LhalfX, hW);
+        tHalf[2] = tHalf[3] = glm::vec2(hW, LhalfZ);
+        gHalf[0] = gHalf[1] = glm::vec2(LhalfX, hWG);
+        gHalf[2] = gHalf[3] = glm::vec2(hWG, LhalfZ);
+    }
+
     wxString notes;
 
     // Cast bodies are grouped by which half-cast they belong to: the Top Cast
@@ -1162,6 +1215,54 @@ void PreviewPanel::OnGenerateMouldCasts()
             }
         }
 
+        // Base↔wall tongues: add a tongue at each wall's y = 0 face midpoint,
+        // standing proud toward the wall (the wall gets the matching groove).
+        // The tongue overlaps into the base so the fuse is robust.
+        if (baseWallJoint)
+        {
+            const float bov = 1.0f;           // overlap into the base for a clean fuse
+            std::vector<Box> topT, botT;
+            for (int i = 0; i < 4; ++i)
+            {
+                const glm::vec2 c = wallMid[i], h = tHalf[i];
+                // Top base sits below y=0, tongue stands UP into the top wall.
+                topT.push_back({ glm::vec3(c.x - h.x, -bov, c.y - h.y),
+                                 glm::vec3(c.x + h.x, jtt,  c.y + h.y) });
+                // Bottom base sits above y=0, tongue stands DOWN into the bottom wall.
+                botT.push_back({ glm::vec3(c.x - h.x, -jtt, c.y - h.y),
+                                 glm::vec3(c.x + h.x, bov,  c.y + h.y) });
+            }
+
+            if (haveShapes)
+            {
+                for (const Box& b : topT)
+                    topShape = FuseSolid(topShape, MakeBoxSolid(b.first, b.second));
+                for (const Box& b : botT)
+                    botShape = FuseSolid(botShape, MakeBoxSolid(b.first, b.second));
+                GLCanvas::TessellateShapeToMesh(topShape, topMeshD, nullptr);
+                GLCanvas::TessellateShapeToMesh(botShape, botMeshD, nullptr);
+            }
+            else
+            {
+                auto fuseMesh = [&](FileImporter::MeshData& md,
+                    const std::vector<Box>& tongues)
+                {
+                    std::vector<MeshBoolean::Mesh> parts;
+                    parts.push_back(ToBoolMesh(md));
+                    for (const Box& b : tongues)
+                        parts.push_back(MakeBoxBool(b.first, b.second));
+                    MeshBoolean::Mesh u; std::string err;
+                    if (MeshBoolean::Union(parts, u, err) && !u.empty())
+                    {
+                        FileImporter::MeshData nm = FlatDisplayMesh(u);
+                        if (!nm.posNorm.empty()) md = std::move(nm);
+                    }
+                };
+                fuseMesh(topMeshD, topT);
+                fuseMesh(botMeshD, botT);
+            }
+        }
+
         const glm::vec3 baseColor(0.40f, 0.55f, 0.68f);  // steel blue
         // Both bases are exported (they differ — each has its own shot half).
         m_castExports.push_back({ "top_base", topMeshD, topShape, haveShapes });
@@ -1199,6 +1300,29 @@ void PreviewPanel::OnGenerateMouldCasts()
         const float X0 = mn.x, X1 = mx.x, Z0 = mn.z, Z1 = mx.z;
         const float Y0 = mn.y, Y1 = mx.y;
 
+        // Tongue-and-groove joint between adjacent walls (aligns them). At each
+        // pinwheel corner one wall's clover overhang meets the neighbour's
+        // Flange 1; the TONGUE is added to the overhang's mould-facing face and
+        // the matching GROOVE is cut into the neighbour's Flange 1 leftmost face.
+        // Both are centred on the corner's mating region and run the full mould
+        // height (split per half). Built only when flanges exist and the tongue
+        // has positive size.
+        const bool  flanged = (ext > 1e-6f);   // clamp flanges present?
+        const float tw   = (float)v.walls.TongueWidthMm();      // along the face
+        const float tt   = (float)v.walls.TongueThicknessMm();  // stands proud by
+        const float tol  = (float)v.walls.GrooveToleranceMm();  // groove clearance
+        const bool  joint = flanged && tw > 1e-6f && tt > 1e-6f;
+        const float gw   = tw + tol;    // groove width  (= tongue width + tol)
+        const float gd   = tt + tol;    // groove depth  (= tongue thick + tol)
+        const float jeps = 0.1f;        // clean-cut / fuse overlap for the joint
+
+        // Centre of each corner's mating region (its Flange-1 footprint centre),
+        // shared by that corner's groove (one wall) and tongue (the neighbour).
+        const float Zc1 = Z0 - w - ext * 0.5f;  // corner (X1,Z0)
+        const float Xc2 = X1 + w + ext * 0.5f;  // corner (X1,Z1)
+        const float Zc3 = Z1 + w + ext * 0.5f;  // corner (X0,Z1)
+        const float Xc4 = X0 - w - ext * 0.5f;  // corner (X0,Z0)
+
         const glm::vec3 wallColor(0.62f, 0.55f, 0.42f);   // warm tan
 
         // Each wall as an XZ rectangle (the overhang assignment forms a
@@ -1224,39 +1348,63 @@ void PreviewPanel::OnGenerateMouldCasts()
             float xa, xb, za, zb;             // wall box XZ
             float f1xa, f1xb, f1za, f1zb;     // flange 1 (left tab) XZ
             float f2xa, f2xb, f2za, f2zb;     // flange 2 (bottom bar) XZ
+            float tgxa, tgxb, tgza, tgzb;     // tongue box XZ (added to overhang)
+            float grxa, grxb, grza, grzb;     // groove box XZ (cut from flange 1)
         };
         const WallRect rects[4] = {
             { "Wall -Z", "wall_zmin", X0 - e, X1,     Z0 - w, Z0,
               X1 - w,     X1,         Z0 - w - ext, Z0 - w + ov,
-              X0 - e,     X1,         Z0 - w - ext, Z0 - w + ov },
+              X0 - e,     X1,         Z0 - w - ext, Z0 - w + ov,
+              // tongue on the -X overhang (plane Z0, +Z), centred at Xc4
+              Xc4 - tw * 0.5f, Xc4 + tw * 0.5f, Z0 - jeps, Z0 + tt,
+              // groove in the +X flange (plane X1, -X), centred at Zc1
+              X1 - gd,     X1 + jeps,  Zc1 - gw * 0.5f, Zc1 + gw * 0.5f },
             { "Wall +Z", "wall_zmax", X0,     X1 + e, Z1,     Z1 + w,
               X0,         X0 + w,     Z1 + w - ov,  Z1 + w + ext,
-              X0,         X1 + e,     Z1 + w - ov,  Z1 + w + ext },
+              X0,         X1 + e,     Z1 + w - ov,  Z1 + w + ext,
+              // tongue on the +X overhang (plane Z1, -Z), centred at Xc2
+              Xc2 - tw * 0.5f, Xc2 + tw * 0.5f, Z1 - tt, Z1 + jeps,
+              // groove in the -X flange (plane X0, +X), centred at Zc3
+              X0 - jeps,   X0 + gd,    Zc3 - gw * 0.5f, Zc3 + gw * 0.5f },
             { "Wall +X", "wall_xmax", X1,     X1 + w, Z0 - e, Z1,
               X1 + w - ov, X1 + w + ext, Z1 - w,    Z1,
-              X1 + w - ov, X1 + w + ext, Z0 - e,    Z1 },
+              X1 + w - ov, X1 + w + ext, Z0 - e,    Z1,
+              // tongue on the -Z overhang (plane X1, -X), centred at Zc1
+              X1 - tt,     X1 + jeps,  Zc1 - tw * 0.5f, Zc1 + tw * 0.5f,
+              // groove in the +Z flange (plane Z1, -Z), centred at Xc2
+              Xc2 - gw * 0.5f, Xc2 + gw * 0.5f, Z1 - gd, Z1 + jeps },
             { "Wall -X", "wall_xmin", X0 - w, X0,     Z0,     Z1 + e,
               X0 - w - ext, X0 - w + ov, Z0,          Z0 + w,
-              X0 - w - ext, X0 - w + ov, Z0,          Z1 + e },
+              X0 - w - ext, X0 - w + ov, Z0,          Z1 + e,
+              // tongue on the +Z overhang (plane X0, +X), centred at Zc3
+              X0 - jeps,   X0 + tt,    Zc3 - tw * 0.5f, Zc3 + tw * 0.5f,
+              // groove in the -Z flange (plane Z0, +Z), centred at Xc4
+              Xc4 - gw * 0.5f, Xc4 + gw * 0.5f, Z0 - jeps, Z0 + gd },
         };
 
-        // Build one cast body from a set of boxes fused together: OCC solids +
-        // tessellation in a BREP scene (STEP-exportable), or a Manifold union of
+        // Build one cast body: fuse the `add` boxes together, then subtract the
+        // `sub` boxes (the tongue-and-groove groove). OCC solids + tessellation
+        // in a BREP scene (STEP-exportable), or a Manifold union/difference of
         // box meshes otherwise. Returns true when a shape is available.
-        auto makeFusedBody = [&](const std::vector<std::pair<glm::vec3, glm::vec3>>& boxes,
+        auto makeBody = [&](const std::vector<Box>& add, const std::vector<Box>& sub,
             FileImporter::MeshData& outMesh, TopoDS_Shape& outShape) -> bool
         {
             outMesh = FileImporter::MeshData();
             outShape = TopoDS_Shape();
-            if (boxes.empty()) return false;
+            if (add.empty()) return false;
 
             if (brepScene)
             {
                 TopoDS_Shape acc;
-                for (const auto& b : boxes)
+                for (const Box& b : add)
                 {
                     const TopoDS_Shape s = MakeBoxSolid(b.first, b.second);
                     if (!s.IsNull()) acc = FuseSolid(acc, s);
+                }
+                for (const Box& b : sub)
+                {
+                    const TopoDS_Shape s = MakeBoxSolid(b.first, b.second);
+                    if (!s.IsNull()) acc = CutSolid(acc, s);
                 }
                 if (!acc.IsNull())
                 {
@@ -1270,10 +1418,10 @@ void PreviewPanel::OnGenerateMouldCasts()
                 outShape = TopoDS_Shape();
             }
 
-            // Mesh path: union the box meshes.
+            // Mesh path: union the add boxes, then difference the sub boxes.
             std::vector<MeshBoolean::Mesh> parts;
-            parts.reserve(boxes.size());
-            for (const auto& b : boxes)
+            parts.reserve(add.size());
+            for (const Box& b : add)
                 parts.push_back(MakeBoxBool(b.first, b.second));
 
             MeshBoolean::Mesh u;
@@ -1281,9 +1429,17 @@ void PreviewPanel::OnGenerateMouldCasts()
             if (parts.size() == 1) u = parts[0];
             else if (!MeshBoolean::Union(parts, u, err) || u.empty()) u = parts[0];
 
+            for (const Box& b : sub)
+            {
+                MeshBoolean::Mesh res;
+                if (MeshBoolean::Difference(u, MakeBoxBool(b.first, b.second), res, err)
+                    && !res.empty())
+                    u = res;
+            }
+
             outMesh = FlatDisplayMesh(u);
             if (outMesh.posNorm.empty())
-                outMesh = MakeBoxMesh(boxes[0].first, boxes[0].second);
+                outMesh = MakeBoxMesh(add[0].first, add[0].second);
             return false;
         };
 
@@ -1293,31 +1449,44 @@ void PreviewPanel::OnGenerateMouldCasts()
         // flange 2 (bottom bar) along the half's y = 0 edge, i.e. the edge
         // nearest its base. Placing flange 2 on each half's parting-plane edge
         // keeps the two halves mirror-symmetric, so only one is exported per wall.
-        using Box = std::pair<glm::vec3, glm::vec3>;
         const float yMid = 0.0f;
-        const bool  flanged = (ext > 1e-6f);
-        for (const WallRect& r : rects)
+        for (int i = 0; i < 4; ++i)
         {
+            const WallRect& r = rects[i];
             const bool hasUpper = (Y1 > yMid + 1e-4f);
             const bool hasLower = (Y0 < yMid - 1e-4f);
 
             if (hasUpper)
             {
-                std::vector<Box> boxes;
-                boxes.push_back({ glm::vec3(r.xa, std::max(Y0, yMid), r.za),
-                                  glm::vec3(r.xb, Y1, r.zb) });
+                const float yLo = std::max(Y0, yMid), yHi = Y1;   // [0, Y1]
+                std::vector<Box> add, sub;
+                add.push_back({ glm::vec3(r.xa, yLo, r.za),
+                                glm::vec3(r.xb, yHi, r.zb) });
                 if (flanged)
                 {
                     // flange 1 (spans this half's height)
-                    boxes.push_back({ glm::vec3(r.f1xa, std::max(Y0, yMid), r.f1za),
-                                      glm::vec3(r.f1xb, Y1, r.f1zb) });
+                    add.push_back({ glm::vec3(r.f1xa, yLo, r.f1za),
+                                    glm::vec3(r.f1xb, yHi, r.f1zb) });
                     // flange 2 along the y = 0 edge (nearest the top base)
-                    boxes.push_back({ glm::vec3(r.f2xa, yMid, r.f2za),
-                                      glm::vec3(r.f2xb, std::min(yMid + w, Y1), r.f2zb) });
+                    add.push_back({ glm::vec3(r.f2xa, yMid, r.f2za),
+                                    glm::vec3(r.f2xb, std::min(yMid + w, Y1), r.f2zb) });
+                }
+                if (joint)   // wall↔wall tongue (add) + groove (cut), full height
+                {
+                    add.push_back({ glm::vec3(r.tgxa, yLo, r.tgza),
+                                    glm::vec3(r.tgxb, yHi, r.tgzb) });
+                    sub.push_back({ glm::vec3(r.grxa, yLo, r.grza),
+                                    glm::vec3(r.grxb, yHi, r.grzb) });
+                }
+                if (baseWallJoint)   // groove for the top base's tongue (up into wall)
+                {
+                    const glm::vec2 c = wallMid[i], hg = gHalf[i];
+                    sub.push_back({ glm::vec3(c.x - hg.x, -jeps, c.y - hg.y),
+                                    glm::vec3(c.x + hg.x, gd,    c.y + hg.y) });
                 }
 
                 FileImporter::MeshData m; TopoDS_Shape s;
-                const bool hs = makeFusedBody(boxes, m, s);
+                const bool hs = makeBody(add, sub, m, s);
                 m_castExports.push_back({ r.suffix, m, s, hs });   // halves symmetric
                 topChildren.push_back({ std::move(m),
                     wxString(r.name) + " (top)", wallColor,
@@ -1325,21 +1494,35 @@ void PreviewPanel::OnGenerateMouldCasts()
             }
             if (hasLower)
             {
-                std::vector<Box> boxes;
-                boxes.push_back({ glm::vec3(r.xa, Y0, r.za),
-                                  glm::vec3(r.xb, std::min(Y1, yMid), r.zb) });
+                const float yLo = Y0, yHi = std::min(Y1, yMid);   // [Y0, 0]
+                std::vector<Box> add, sub;
+                add.push_back({ glm::vec3(r.xa, yLo, r.za),
+                                glm::vec3(r.xb, yHi, r.zb) });
                 if (flanged)
                 {
                     // flange 1 (spans this half's height)
-                    boxes.push_back({ glm::vec3(r.f1xa, Y0, r.f1za),
-                                      glm::vec3(r.f1xb, std::min(Y1, yMid), r.f1zb) });
+                    add.push_back({ glm::vec3(r.f1xa, yLo, r.f1za),
+                                    glm::vec3(r.f1xb, yHi, r.f1zb) });
                     // flange 2 along the y = 0 edge (nearest the bottom base)
-                    boxes.push_back({ glm::vec3(r.f2xa, std::max(yMid - w, Y0), r.f2za),
-                                      glm::vec3(r.f2xb, yMid, r.f2zb) });
+                    add.push_back({ glm::vec3(r.f2xa, std::max(yMid - w, Y0), r.f2za),
+                                    glm::vec3(r.f2xb, yMid, r.f2zb) });
+                }
+                if (joint)
+                {
+                    add.push_back({ glm::vec3(r.tgxa, yLo, r.tgza),
+                                    glm::vec3(r.tgxb, yHi, r.tgzb) });
+                    sub.push_back({ glm::vec3(r.grxa, yLo, r.grza),
+                                    glm::vec3(r.grxb, yHi, r.grzb) });
+                }
+                if (baseWallJoint)   // groove for the bottom base's tongue (down into wall)
+                {
+                    const glm::vec2 c = wallMid[i], hg = gHalf[i];
+                    sub.push_back({ glm::vec3(c.x - hg.x, -gd,   c.y - hg.y),
+                                    glm::vec3(c.x + hg.x, jeps,  c.y + hg.y) });
                 }
 
                 FileImporter::MeshData m; TopoDS_Shape s;
-                const bool hs = makeFusedBody(boxes, m, s);
+                const bool hs = makeBody(add, sub, m, s);
                 if (!hasUpper)   // symmetric: export the lower only when there's no upper
                     m_castExports.push_back({ r.suffix, m, s, hs });
                 bottomChildren.push_back({ std::move(m),
@@ -1352,6 +1535,8 @@ void PreviewPanel::OnGenerateMouldCasts()
             wxString::FromUTF8(v.walls.type.c_str()), (double)w);
         if (clover && ext > 0.0f)
             notes << wxString::Format(", +%g mm overhang & clamp flanges", (double)ext);
+        if (joint)
+            notes << wxString::Format(", tongue %g\xC3\x97%g mm", (double)tw, (double)tt);
         notes << " (split at y=0)\n";
     }
 

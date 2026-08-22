@@ -38,6 +38,15 @@ struct MouldCastPart
     double      extraDistance = 0.0;
     bool        extraDistanceInches = false;
 
+    // Wall tongue-and-groove joint (walls only). The tongue is added to the
+    // clover-overhang face and the matching groove is cut into the neighbouring
+    // wall's Flange 1, so adjacent walls key together. Width runs along the
+    // mating face; thickness is how far the tongue stands proud; the groove is
+    // enlarged by `grooveTolerance` for fit clearance.
+    double      tongueWidth = 0.0;      bool tongueWidthInches = false;
+    double      tongueThickness = 0.0;  bool tongueThicknessInches = false;
+    double      grooveTolerance = 0.0;  bool grooveToleranceInches = false;
+
     // Thickness normalised to millimetres, regardless of the chosen unit, so
     // downstream geometry code has a single canonical value to build from.
     double ThicknessMm() const
@@ -49,6 +58,20 @@ struct MouldCastPart
     double ExtraDistanceMm() const
     {
         return extraDistanceInches ? extraDistance * 25.4 : extraDistance;
+    }
+
+    // Tongue / groove values normalised to millimetres.
+    double TongueWidthMm() const
+    {
+        return tongueWidthInches ? tongueWidth * 25.4 : tongueWidth;
+    }
+    double TongueThicknessMm() const
+    {
+        return tongueThicknessInches ? tongueThickness * 25.4 : tongueThickness;
+    }
+    double GrooveToleranceMm() const
+    {
+        return grooveToleranceInches ? grooveTolerance * 25.4 : grooveTolerance;
     }
 };
 
@@ -79,18 +102,25 @@ private:
         wxChoice*   unit = nullptr;
         wxTextCtrl* extra = nullptr;      // Extra distance value (flange / wall)
         wxChoice*   extraUnit = nullptr;  // mm / in for the extra distance
+
+        // Wall tongue-and-groove joint fields (walls only).
+        wxTextCtrl* tongueW = nullptr;    wxChoice* tongueWUnit = nullptr;
+        wxTextCtrl* tongueT = nullptr;    wxChoice* tongueTUnit = nullptr;
+        wxTextCtrl* grooveTol = nullptr;  wxChoice* grooveTolUnit = nullptr;
     };
 
     // Build a titled section ("Base" / "Walls") with the enable / type /
     // thickness rows. `typeChoices` seeds the type dropdown; `defThickness` is
     // the pre-filled thickness. When `withExtra` is true an extra-distance row
     // (labelled `extraLabel`) is added — "Extra Flange" for the base, "Extra
-    // Wall" for the walls. Returns the created controls.
+    // Wall" for the walls. When `withJoint` is true the tongue-and-groove rows
+    // are added (walls only). Returns the created controls.
     PartControls BuildPartSection(wxWindow* parent, wxSizer* into,
         const wxString& title, const wxArrayString& typeChoices,
         const MouldCastPart& initial, double defThickness,
         bool withExtra = false, double defExtra = 0.0,
-        const wxString& extraLabel = "Extra Flange:");
+        const wxString& extraLabel = "Extra Flange:",
+        bool withJoint = false);
 
     // Enable / disable a section's type + thickness rows to match its enable
     // checkbox, so a disabled part reads as inert.
