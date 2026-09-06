@@ -27,6 +27,8 @@ class InsertEditDialog;  // forward decl — modeless insert-transform editor,
                          // .vcxproj entry needed since only the frame uses it)
 class PreviewPanel;    // forward decl — m_previewPanel pointer; full def
 // is included from MainFrame.cpp where the panel is created.
+class CastingPanel;    // forward decl — m_castingPanel pointer; full def
+// is included from MainFrame.cpp where the panel is created.
 class wxSimplebook;    // forward decl — m_book pointer; the perspective pager.
 class PerspectiveButton; // forward decl — m_btnPrepare/m_btnPreview tabs.
 class VentEditToolbar;   // forward decl — m_ventEditToolbar overlay (Part 5).
@@ -38,7 +40,7 @@ class UpdateChecker;     // forward decl — background startup update check.
                          // defined entirely in MainFrame.cpp (same no-header
                          // arrangement as InsertEditDialog above)
 
-enum class TransformMode { Select, Translate, Rotate, Scale, Pattern, PlaceVent, PlaceRunner, PlaceGate, PlaceEjector, PlaceInsert, RemoveVent, RemoveRunner, RemoveGate, RemoveSprue, RemoveEjector, RemoveInsert, EditVent, EditRunner, EditGate, EditEjector, EditInsert, EditSprue, SelectInjectionPoint, AlignFace, AlignMidplane };
+enum class TransformMode { Select, Translate, Rotate, Scale, Pattern, PlaceVent, PlaceRunner, PlaceGate, PlaceEjector, PlaceInsert, PlaceIndexer, RemoveVent, RemoveRunner, RemoveGate, RemoveSprue, RemoveEjector, RemoveInsert, RemoveIndexer, EditVent, EditRunner, EditGate, EditEjector, EditInsert, EditIndexer, EditSprue, SelectInjectionPoint, AlignFace, AlignMidplane };
 
 // Sub-tool active while editing a Complex vent path (Part 5). Shared between
 // GLCanvas (which owns the authoring logic) and the floating VentEditToolbar
@@ -105,6 +107,12 @@ public:
 
     float GetEjectorDiameter() const;
     float GetEjectorLength() const;
+
+    // Indexer dimension accessors (mm regardless of unit system, same
+    // convention as the getters above). GetIndexerExtraTolerance may
+    // legitimately return 0 — see the .cpp comment.
+    float GetIndexerRadius() const;
+    float GetIndexerExtraTolerance() const;
 
     // Insert "Cut scale", as a fraction (the card takes percent; this returns
     // 1.0 for 100%). Unitless, so unlike every other feature getter it does
@@ -221,12 +229,25 @@ private:
     void OnPlaceInsert(wxCommandEvent& evt);
     void OnClearInserts(wxCommandEvent&);
 
+    // Indexers. Place toggles between Select and PlaceIndexer; the click is a
+    // simple plane pick (RayCastToPartingPlane) since an indexer always sits
+    // on y=0 — no multi-source snapping like the Ejector card. Clear wipes
+    // every indexer via the canvas helper. Remove / Edit toggle into their
+    // respective transient picking modes the same way the other point
+    // features do; Edit repositions by dragging the picked indexer, re-
+    // snapping to the plane every frame (mirrors EditEjector's re-snap-on-
+    // drag). The mould-half / cast-shot boolean fuse described for Generate
+    // is not implemented yet — see IndexerFeature in MouldFeature.h.
+    void OnPlaceIndexer(wxCommandEvent& evt);
+    void OnClearIndexers(wxCommandEvent&);
+
     void OnRemoveVent(wxCommandEvent&);
     void OnRemoveSprue(wxCommandEvent&);
     void OnRemoveRunner(wxCommandEvent&);
     void OnRemoveGate(wxCommandEvent&);
     void OnRemoveEjector(wxCommandEvent&);
     void OnRemoveInsert(wxCommandEvent&);
+    void OnRemoveIndexer(wxCommandEvent&);
 
     void OnEditVent(wxCommandEvent&);
     void OnEditRunner(wxCommandEvent&);
@@ -234,6 +255,7 @@ private:
     void OnEditSprue(wxCommandEvent&);
     void OnEditEjector(wxCommandEvent&);
     void OnEditInsert(wxCommandEvent&);
+    void OnEditIndexer(wxCommandEvent&);
 
     void OnSetMetric(wxCommandEvent&);
     void OnSetImperial(wxCommandEvent&);
@@ -248,30 +270,46 @@ private:
     void OnToggleAutoUpdateCheck(wxCommandEvent&);
 
     // ---- Workflow perspectives ---------------------------------------------
-    // The window hosts two stacked perspectives in a wxSimplebook: "Prepare"
-    // (the editing view — left panel + main canvas) and "Preview" (the post-cut
-    // mould review — PreviewPanel). The ribbon's Prepare / Preview buttons (and
-    // any future callers) switch between them via SetPerspective; each
+    // The window hosts three stacked perspectives in a wxSimplebook: "Prepare"
+    // (the editing view — left panel + main canvas), "Preview" (the post-cut
+    // mould review — PreviewPanel), and "Casting" (the mould-cast walls / base
+    // view — CastingPanel). The ribbon's Prepare / Preview / Casting buttons
+    // (and any future callers) switch between them via SetPerspective; each
     // perspective swaps in its own menu bar, while the ribbon stays shared.
-    enum class Perspective { Prepare, Preview };
+    enum class Perspective { Prepare, Preview, Casting };
     void SetPerspective(Perspective which);
     void OnPerspectivePrepare(wxCommandEvent&);
     void OnPerspectivePreview(wxCommandEvent&);
+    void OnPerspectiveCasting(wxCommandEvent&);
 
-    // Builds the two menu bars once at construction. Prepare carries the full
-    // File / Fixture / Units / Import set; Preview is minimal (File -> Exit)
-    // for now and grows as preview-specific actions are added.
+    // Builds the three menu bars once at construction. Prepare carries the full
+    // File / Fixture / Units / Import set; Preview and Casting are minimal
+    // (File -> Exit + Help) for now and grow as perspective-specific actions
+    // are added.
     wxMenuBar* BuildPrepareMenuBar();
     wxMenuBar* BuildPreviewMenuBar();
+    wxMenuBar* BuildCastingMenuBar();
 
     // Builds the Grid menu (Shape submenu + Change Size / Change Spacing),
     // reflecting the current m_gridSettings in the shape radio state.
     wxMenu* BuildGridMenu();
     wxMenu* BuildHelpMenu();
 
-    // Drive the two ribbon perspective tabs so the active one reads as
-    // selected. Safe to call before either tab exists (no-ops).
+    // Drive the ribbon perspective tabs so the active one reads as selected.
+    // Safe to call before the tabs exist (no-ops).
     void UpdatePerspectiveButtons();
+
+    // Cast generation (and therefore the Casting perspective) is reserved for
+    // procedural moulds — Parametric (fixed box) and Dynamic (adaptive box) —
+    // the same gate the "Generate Mould Casts" flow uses. Library moulds can't
+    // be cast.
+    bool IsCastableMould() const;
+
+    // Enable / grey the Casting tab to match IsCastableMould(), and — if the
+    // Casting perspective is showing when it becomes unavailable — fall back to
+    // Prepare so the user isn't stranded on an inert perspective. Called on
+    // every fixture-kind change (via LoadFixtureIntoScene) and once at startup.
+    void RefreshCastingAvailability();
 
     // Activates a tool button and deactivates the others (also called by GLCanvas on Escape)
 
@@ -288,6 +326,7 @@ private:
     wxPanel* CreateGatesContent(wxWindow* parent);
     wxPanel* CreateEjectorsContent(wxWindow* parent);
     wxPanel* CreateInsertsContent(wxWindow* parent);
+    wxPanel* CreateIndexersContent(wxWindow* parent);
 
     // Builds a "Place …" button with the standard side-panel styling (rounded
     // corners, BtnPlace fill — matching the Sprue feature button) and registers
@@ -342,6 +381,20 @@ private:
     // same convention the dimension fields use for every other feature.
     wxTextCtrl* m_insertCutScale = nullptr;
 
+    // Indexer field members (Aug 2026). Placement/Edit/Remove/Clear are wired
+    // up (see the TransformMode::*Indexer cases and GLCanvas's m_indexers),
+    // matching Ejector's maturity level — a preview-only sphere at the
+    // placement point. The generation-time split/scale/fuse into the A/B
+    // mould halves and the Cast Shot Body that Clayton specced is NOT
+    // implemented yet ("geometry TBD", same as Ejector's cut). Type dropdown
+    // drives which dimension panel is visible — same extensible pattern as
+    // the Ejector/Gate cards. Currently only "Spherical" is offered; new
+    // geometries plug in by appending to the wxChoice and adding a Show()
+    // branch in CreateIndexersContent.
+    wxChoice* m_indexerTypeChoice = nullptr;
+    wxTextCtrl* m_indexerRadius = nullptr;
+    wxTextCtrl* m_indexerExtraTolerance = nullptr;
+
     // The modeless insert-transform editor, or null when closed. Owned by
     // wxWidgets (parented to this frame); ~MainFrame destroys it explicitly so
     // it can't outlive the frame or fire a close-notify into a half-destroyed
@@ -384,24 +437,28 @@ private:
     void ShowUpdateBanner(const wxString& latestVersion, const wxString& targetUrl);
     void PositionUpdateBanner();
 
-    // The two stacked workflow perspectives and the pager that switches between
+    // The stacked workflow perspectives and the pager that switches between
     // them. m_preparePage wraps the left panel + main canvas; m_previewPanel is
-    // the embedded preview perspective (replaces the old breakout PreviewFrame).
+    // the embedded preview perspective (replaces the old breakout PreviewFrame);
+    // m_castingPanel is the embedded mould-cast perspective.
     wxSimplebook* m_book = nullptr;
     wxPanel* m_preparePage = nullptr;
     PreviewPanel* m_previewPanel = nullptr;
+    CastingPanel* m_castingPanel = nullptr;   // Casting perspective (page 2)
     Perspective m_perspective = Perspective::Prepare;
 
-    // Per-perspective menu bars, both built once in the constructor and swapped
+    // Per-perspective menu bars, all built once in the constructor and swapped
     // via SetMenuBar on perspective change. The frame only auto-destroys the
-    // currently-attached bar at teardown, so ~MainFrame deletes the detached one.
+    // currently-attached bar at teardown, so ~MainFrame deletes the detached ones.
     wxMenuBar* m_prepareMenuBar = nullptr;
     wxMenuBar* m_previewMenuBar = nullptr;
+    wxMenuBar* m_castingMenuBar = nullptr;
 
     // Ribbon perspective-switch tabs (shared top bar). Held so SetPerspective
     // can drive their selected styling.
     PerspectiveButton* m_btnPrepare = nullptr;
     PerspectiveButton* m_btnPreview = nullptr;
+    PerspectiveButton* m_btnCasting = nullptr;
 
     // Stored fixture definition (for project save/load)
     FixtureDefinition m_fixtureDef;
@@ -432,9 +489,17 @@ private:
     wxTextCtrl* m_exportPath = nullptr;
 
     // Top-ribbon primary-action buttons. Generate Mould shows in the Prepare
-    // perspective and Export in Preview; SetPerspective toggles their
-    // visibility so exactly one occupies the top-right slot at a time.
+    // perspective, Export in Preview, and Generate Mould Casts in Casting;
+    // SetPerspective toggles their visibility so the right one(s) occupy the
+    // top-right slot per perspective.
     RoundedButton* m_btnGenerate = nullptr;
+
+    // Casting perspective's actions — build the walls / base around the Cast
+    // Shot Body (GenerateCasts), and export the generated cast bodies
+    // (DoExportMouldCasts). Both share the top-right slot in the Casting
+    // perspective; SetPerspective shows them only there.
+    RoundedButton* m_btnGenerateCasts = nullptr;
+    RoundedButton* m_btnExportCasts = nullptr;
 
     // Export is a split button: its action zone runs the current export mode
     // and its dropdown zone picks the mode ("Mould" / "Shot body"). The mode
@@ -442,6 +507,8 @@ private:
     // on it; the widget just reports picks via wxEVT_CHOICE.
     SplitButton* m_btnExport = nullptr;
 
+    // Cast export moved to the Casting perspective's own "Export Casts" button,
+    // so the Preview Export split button offers only Mould / Shot body.
     enum class ExportMode { Mould, ShotBody };
     ExportMode m_exportMode = ExportMode::Mould;
 
@@ -500,6 +567,9 @@ private:
     // the tri-state MouldState gate + file-dialog flow for its own output.
     void DoExportMould();
     void DoExportShotBody();
+    // Export the generated mould casts (from the Preview perspective): the Top
+    // and Bottom bases plus one half of each wall, one binary STL per body.
+    void DoExportMouldCasts();
 
     wxPanel* CreateSidePanel(wxWindow* parent);
 
@@ -507,6 +577,7 @@ private:
         ID_Import = wxID_HIGHEST + 100,
         ID_PerspectivePrepare,
         ID_PerspectivePreview,
+        ID_PerspectiveCasting,
         ID_ToolSelect,
         ID_ToolTranslate,
         ID_ToolRotate,
@@ -520,6 +591,8 @@ private:
         ID_BrowseExport,
         ID_Export,
         ID_GenerateMould,
+        ID_GenerateCasts,
+        ID_ExportCasts,
         ID_CreateFixture,
         ID_ChangeFixture,
         ID_EditFixture,
@@ -534,18 +607,22 @@ private:
         ID_ClearEjectors,
         ID_PlaceInsert,
         ID_ClearInserts,
+        ID_PlaceIndexer,
+        ID_ClearIndexers,
         ID_RemoveVent,
         ID_RemoveSprue,
         ID_RemoveRunner,
         ID_RemoveGate,
         ID_RemoveEjector,
         ID_RemoveInsert,
+        ID_RemoveIndexer,
         ID_EditVent,
         ID_EditRunner,
         ID_EditGate,
         ID_EditSprue,
         ID_EditEjector,
         ID_EditInsert,
+        ID_EditIndexer,
         ID_SaveProject,
         ID_LoadProject,
         ID_NewProject,

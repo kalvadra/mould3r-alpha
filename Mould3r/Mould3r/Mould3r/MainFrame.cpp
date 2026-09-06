@@ -20,6 +20,7 @@
 #include "MainFrame.h"
 #include "GLCanvas.h"
 #include "PreviewPanel.h"    // embedded post-cut mould preview perspective
+#include "CastingPanel.h"    // embedded mould-cast (walls / base) perspective
 #include "FixtureEditor.h"
 #include "CreateFixtureDialog.h"
 #include "ProceduralFixtureDialog.h"   // re-open dims/clearances for Edit Fixture
@@ -527,6 +528,7 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
     // in the Prepare perspective below, so attach its bar now.
     m_prepareMenuBar = BuildPrepareMenuBar();
     m_previewMenuBar = BuildPreviewMenuBar();
+    m_castingMenuBar = BuildCastingMenuBar();
     SetMenuBar(m_prepareMenuBar);
 
     Bind(wxEVT_MENU, &MainFrame::OnExit, this, wxID_EXIT);
@@ -680,8 +682,12 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
     // ---- Preview page: the embedded preview perspective --------------------
     m_previewPanel = new PreviewPanel(m_book);
 
+    // ---- Casting page: the embedded mould-cast perspective -----------------
+    m_castingPanel = new CastingPanel(m_book);
+
     m_book->AddPage(m_preparePage, "Prepare");
     m_book->AddPage(m_previewPanel, "Preview");
+    m_book->AddPage(m_castingPanel, "Casting");
     m_book->SetSelection(0);
 
     vSizer->Add(ribbon, 0, wxEXPAND);
@@ -720,6 +726,11 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
         // pointers are populated.
         ApplyFixtureDefaults(fixture);
     }
+
+    // Set the Casting tab's initial enabled state. LoadFixtureIntoScene above
+    // already did this when a fixture loaded; this also covers the no-fixture
+    // first-launch case (tab greyed until a castable fixture is chosen).
+    RefreshCastingAvailability();
 
     // Win11 DWM corner rounding for the main frame — matches the rest
     // of the app's window family.
@@ -843,6 +854,8 @@ void MainFrame::OnToggleAutoUpdateCheck(wxCommandEvent& evt)
         m_prepareMenuBar->Check(ID_AutoUpdateCheck, enabled);
     if (m_previewMenuBar && m_previewMenuBar->FindItem(ID_AutoUpdateCheck))
         m_previewMenuBar->Check(ID_AutoUpdateCheck, enabled);
+    if (m_castingMenuBar && m_castingMenuBar->FindItem(ID_AutoUpdateCheck))
+        m_castingMenuBar->Check(ID_AutoUpdateCheck, enabled);
 }
 
 // ---------------------------------------------------------------------------
@@ -867,6 +880,11 @@ MainFrame::~MainFrame()
     {
         delete m_previewMenuBar;
         m_previewMenuBar = nullptr;
+    }
+    if (m_castingMenuBar && m_castingMenuBar != attached)
+    {
+        delete m_castingMenuBar;
+        m_castingMenuBar = nullptr;
     }
 }
 
@@ -952,8 +970,8 @@ wxMenu* MainFrame::BuildGridMenu()
 // ---------------------------------------------------------------------------
 // BuildHelpMenu — built fresh per call rather than shared, because a wxMenu
 // is owned by the wxMenuBar it's appended to; handing the same pointer to
-// both the Prepare and Preview bars would double-delete it on shutdown.
-// Both bars bind to the same wxID_ABOUT handler, so the two instances stay
+// the Prepare / Preview / Casting bars would double-delete it on shutdown.
+// All bars bind to the same wxID_ABOUT handler, so the instances stay
 // behaviourally identical.
 //
 // ---------------------------------------------------------------------------
@@ -990,6 +1008,21 @@ wxMenuBar* MainFrame::BuildPreviewMenuBar()
 }
 
 // ---------------------------------------------------------------------------
+// BuildCastingMenuBar — minimal (File -> Exit + Help), mirroring Preview.
+// Grows as casting-specific actions are added.
+// ---------------------------------------------------------------------------
+wxMenuBar* MainFrame::BuildCastingMenuBar()
+{
+    auto* fileMenu = new wxMenu();
+    fileMenu->Append(wxID_EXIT, "Exit\tAlt+F4");
+
+    auto* menuBar = new wxMenuBar();
+    menuBar->Append(fileMenu, "&File");
+    menuBar->Append(BuildHelpMenu(), "&Help");
+    return menuBar;
+}
+
+// ---------------------------------------------------------------------------
 // SetPerspective — switch the active workflow perspective: flip the book page,
 // swap in the matching menu bar, recolour the ribbon buttons, and (for Preview)
 // flush any pending GL upload now that the page is visible.
@@ -998,18 +1031,30 @@ void MainFrame::SetPerspective(Perspective which)
 {
     m_perspective = which;
 
+    // Book page index per perspective: Prepare = 0, Preview = 1, Casting = 2.
     if (m_book)
-        m_book->SetSelection(which == Perspective::Preview ? 1 : 0);
+    {
+        const int page = (which == Perspective::Casting) ? 2
+            : (which == Perspective::Preview) ? 1 : 0;
+        m_book->SetSelection(page);
+    }
 
-    SetMenuBar(which == Perspective::Preview ? m_previewMenuBar
+    SetMenuBar(which == Perspective::Casting ? m_castingMenuBar
+        : which == Perspective::Preview ? m_previewMenuBar
         : m_prepareMenuBar);
 
     // Primary action is perspective-specific: Generate Mould in Prepare,
-    // Export in Preview. They share the top-right slot, so show one and hide
-    // the other, then relayout the ribbon so the visible one sits flush right.
+    // Export in Preview, Generate Mould Casts in Casting. They share the
+    // top-right slot, so show the matching one(s) and hide the rest, then
+    // relayout the ribbon so the visible one sits flush right. (Casting's
+    // "Export Casts" action is added in a later step.)
+    const bool prepare = (which == Perspective::Prepare);
     const bool preview = (which == Perspective::Preview);
-    if (m_btnGenerate) m_btnGenerate->Show(!preview);
-    if (m_btnExport)   m_btnExport->Show(preview);
+    const bool casting = (which == Perspective::Casting);
+    if (m_btnGenerate)      m_btnGenerate->Show(prepare);
+    if (m_btnExport)        m_btnExport->Show(preview);
+    if (m_btnGenerateCasts) m_btnGenerateCasts->Show(casting);
+    if (m_btnExportCasts)   m_btnExportCasts->Show(casting);
     if (m_btnGenerate && m_btnGenerate->GetParent())
         m_btnGenerate->GetParent()->Layout();
 
@@ -1023,6 +1068,13 @@ void MainFrame::SetPerspective(Perspective which)
         m_previewPanel->SetGridSettings(m_gridSettings);
         m_previewPanel->FlushIfDirty();
     }
+    else if (which == Perspective::Casting && m_castingPanel)
+    {
+        // Same grid-sync + deferred-GL-upload deal as Preview: the casting
+        // canvas only has a valid drawable once its page is visible.
+        m_castingPanel->SetGridSettings(m_gridSettings);
+        m_castingPanel->FlushIfDirty();
+    }
 }
 
 void MainFrame::OnPerspectivePrepare(wxCommandEvent&)
@@ -1035,14 +1087,49 @@ void MainFrame::OnPerspectivePreview(wxCommandEvent&)
     SetPerspective(Perspective::Preview);
 }
 
+void MainFrame::OnPerspectiveCasting(wxCommandEvent&)
+{
+    // The tab is greyed for non-castable moulds; guard anyway so a stray
+    // activation (keyboard, programmatic) can't land on an inert perspective.
+    if (!IsCastableMould())
+        return;
+    SetPerspective(Perspective::Casting);
+}
+
+// ---------------------------------------------------------------------------
+// Casting availability — the Casting perspective is reserved for procedural
+// (Parametric / Dynamic) moulds, matching the "Generate Mould Casts" gate.
+// ---------------------------------------------------------------------------
+bool MainFrame::IsCastableMould() const
+{
+    return m_fixtureDef.kind == FixtureKind::Parametric
+        || m_fixtureDef.kind == FixtureKind::Dynamic;
+}
+
+void MainFrame::RefreshCastingAvailability()
+{
+    const bool castable = IsCastableMould();
+
+    if (m_btnCasting)
+    {
+        m_btnCasting->Enable(castable);
+        m_btnCasting->Refresh();   // custom control — repaint the greyed state
+    }
+
+    // If we're sitting on the Casting perspective when it becomes unavailable
+    // (e.g. the user swapped to a Library fixture), retreat to Prepare.
+    if (!castable && m_perspective == Perspective::Casting)
+        SetPerspective(Perspective::Prepare);
+}
+
 // ---------------------------------------------------------------------------
 // Recolour the ribbon perspective buttons so the active one reads as selected.
 // ---------------------------------------------------------------------------
 void MainFrame::UpdatePerspectiveButtons()
 {
-    const bool preview = (m_perspective == Perspective::Preview);
-    if (m_btnPrepare) m_btnPrepare->SetActive(!preview);
-    if (m_btnPreview) m_btnPreview->SetActive(preview);
+    if (m_btnPrepare) m_btnPrepare->SetActive(m_perspective == Perspective::Prepare);
+    if (m_btnPreview) m_btnPreview->SetActive(m_perspective == Perspective::Preview);
+    if (m_btnCasting) m_btnCasting->SetActive(m_perspective == Perspective::Casting);
 }
 
 
@@ -1086,8 +1173,10 @@ wxPanel* MainFrame::CreateRibbon(wxWindow* parent)
     };
     m_btnPrepare = makePerspectiveBtn(ID_PerspectivePrepare, "Prepare");
     m_btnPreview = makePerspectiveBtn(ID_PerspectivePreview, "Preview");
+    m_btnCasting = makePerspectiveBtn(ID_PerspectiveCasting, "Casting");
     hSizer->Add(m_btnPrepare, 0, wxEXPAND | wxLEFT, 8);
     hSizer->Add(m_btnPreview, 0, wxEXPAND);
+    hSizer->Add(m_btnCasting, 0, wxEXPAND);
 
     hSizer->AddStretchSpacer();
 
@@ -1109,7 +1198,8 @@ wxPanel* MainFrame::CreateRibbon(wxWindow* parent)
 
     // Export split button. Action zone runs the current mode; dropdown zone
     // picks it. Menu-item order is fixed and mirrored by MainFrame::ExportMode:
-    //   index 0 -> Mould, index 1 -> Shot body.
+    //   index 0 -> Mould, index 1 -> Shot body. (Cast export moved to the
+    //   Casting perspective's own "Export Casts" button.)
     auto* btnExport = new SplitButton(panel, ID_Export, "Export Mould",
         wxDefaultPosition, wxSize(170, 32), wxBORDER_NONE);
     btnExport->SetBackgroundColour(Style::BtnGenerate);
@@ -1122,12 +1212,45 @@ wxPanel* MainFrame::CreateRibbon(wxWindow* parent)
     btnExport->Hide();   // Prepare is the initial perspective
     hSizer->Add(btnExport, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 12);
 
+    // Generate Mould Casts — the Casting perspective's primary action. Same
+    // green pill as Generate Mould; shares the top-right slot (SetPerspective
+    // shows it only in Casting). The "Export Casts" action is added later.
+    auto* btnGenerateCasts = new RoundedButton(panel, ID_GenerateCasts,
+        "Generate Mould Casts", wxDefaultPosition, wxSize(170, 32), wxBORDER_NONE);
+    btnGenerateCasts->SetBackgroundColour(Style::BtnGenerate);
+    btnGenerateCasts->SetForegroundColour(*wxWHITE);
+    btnGenerateCasts->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
+    m_btnGenerateCasts = btnGenerateCasts;
+    btnGenerateCasts->Hide();   // Prepare is the initial perspective
+    hSizer->Add(btnGenerateCasts, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 12);
+
+    // Export Casts — the Casting perspective's export action. Plain green pill
+    // (casts are the only thing to export here, so no mode dropdown is needed).
+    // Shares the top-right slot with Generate Mould Casts; shown only in Casting.
+    auto* btnExportCasts = new RoundedButton(panel, ID_ExportCasts,
+        "Export Casts", wxDefaultPosition, wxSize(120, 32), wxBORDER_NONE);
+    btnExportCasts->SetBackgroundColour(Style::BtnGenerate);
+    btnExportCasts->SetForegroundColour(*wxWHITE);
+    btnExportCasts->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
+    m_btnExportCasts = btnExportCasts;
+    btnExportCasts->Hide();   // Prepare is the initial perspective
+    hSizer->Add(btnExportCasts, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 12);
+
     panel->SetSizer(hSizer);
 
     // ---- Bind events -------------------------------------------------------
     Bind(wxEVT_BUTTON, &MainFrame::OnImport, this, ID_Import);
     Bind(wxEVT_BUTTON, &MainFrame::OnPerspectivePrepare, this, ID_PerspectivePrepare);
     Bind(wxEVT_BUTTON, &MainFrame::OnPerspectivePreview, this, ID_PerspectivePreview);
+    Bind(wxEVT_BUTTON, &MainFrame::OnPerspectiveCasting, this, ID_PerspectiveCasting);
+    Bind(wxEVT_BUTTON,
+        [this](wxCommandEvent&) { if (m_castingPanel) m_castingPanel->GenerateCasts(); },
+        ID_GenerateCasts);
+    Bind(wxEVT_BUTTON,
+        [this](wxCommandEvent&) { DoExportMouldCasts(); },
+        ID_ExportCasts);
     Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolTranslate, this, ID_ToolTranslate);
     Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolRotate, this, ID_ToolRotate);
     Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolScale, this, ID_ToolScale);
@@ -1149,17 +1272,21 @@ wxPanel* MainFrame::CreateRibbon(wxWindow* parent)
     Bind(wxEVT_BUTTON, &MainFrame::OnClearEjectors, this, ID_ClearEjectors);
     Bind(wxEVT_BUTTON, &MainFrame::OnPlaceInsert, this, ID_PlaceInsert);
     Bind(wxEVT_BUTTON, &MainFrame::OnClearInserts, this, ID_ClearInserts);
+    Bind(wxEVT_BUTTON, &MainFrame::OnPlaceIndexer, this, ID_PlaceIndexer);
+    Bind(wxEVT_BUTTON, &MainFrame::OnClearIndexers, this, ID_ClearIndexers);
     Bind(wxEVT_BUTTON, &MainFrame::OnRemoveVent, this, ID_RemoveVent);
     Bind(wxEVT_BUTTON, &MainFrame::OnRemoveSprue, this, ID_RemoveSprue);
     Bind(wxEVT_BUTTON, &MainFrame::OnRemoveRunner, this, ID_RemoveRunner);
     Bind(wxEVT_BUTTON, &MainFrame::OnRemoveGate, this, ID_RemoveGate);
     Bind(wxEVT_BUTTON, &MainFrame::OnRemoveEjector, this, ID_RemoveEjector);
     Bind(wxEVT_BUTTON, &MainFrame::OnRemoveInsert, this, ID_RemoveInsert);
+    Bind(wxEVT_BUTTON, &MainFrame::OnRemoveIndexer, this, ID_RemoveIndexer);
     Bind(wxEVT_BUTTON, &MainFrame::OnEditVent, this, ID_EditVent);
     Bind(wxEVT_BUTTON, &MainFrame::OnEditRunner, this, ID_EditRunner);
     Bind(wxEVT_BUTTON, &MainFrame::OnEditGate, this, ID_EditGate);
     Bind(wxEVT_BUTTON, &MainFrame::OnEditEjector, this, ID_EditEjector);
     Bind(wxEVT_BUTTON, &MainFrame::OnEditInsert, this, ID_EditInsert);
+    Bind(wxEVT_BUTTON, &MainFrame::OnEditIndexer, this, ID_EditIndexer);
     Bind(wxEVT_BUTTON, &MainFrame::OnGenerateMould, this, ID_GenerateMould);
     Bind(wxEVT_BUTTON, &MainFrame::OnExport, this, ID_Export);
     Bind(wxEVT_CHOICE, &MainFrame::OnExportModeChanged, this, ID_Export);
@@ -1251,6 +1378,7 @@ void MainFrame::SetActiveTool(TransformMode mode)
     case TransformMode::PlaceGate:     activeId = ID_PlaceGate;         break;
     case TransformMode::PlaceEjector:  activeId = ID_PlaceEjector;      break;
     case TransformMode::PlaceInsert:   activeId = ID_PlaceInsert;       break;
+    case TransformMode::PlaceIndexer:  activeId = ID_PlaceIndexer;      break;
     case TransformMode::AlignFace:     activeId = ID_ToolAlignFace;     break;
     case TransformMode::AlignMidplane: activeId = ID_ToolAlignMidplane; break;
     default:                                                            break;
@@ -1733,6 +1861,42 @@ void MainFrame::OnEditEjector(wxCommandEvent&)
         SetActiveTool(TransformMode::Select);
     else
         SetActiveTool(TransformMode::EditEjector);
+}
+
+// ---------------------------------------------------------------------------
+// Indexer handlers — same toggle-into-mode shape as the Ejector handlers
+// above. The canvas-side placement/edit/remove/clear are real (see
+// GLCanvas.cpp); only the generation-time boolean fuse Clayton specced is
+// still pending.
+// ---------------------------------------------------------------------------
+void MainFrame::OnPlaceIndexer(wxCommandEvent&)
+{
+    if (m_canvas && m_canvas->GetTransformMode() == TransformMode::PlaceIndexer)
+        SetActiveTool(TransformMode::Select);
+    else
+        SetActiveTool(TransformMode::PlaceIndexer);
+}
+
+void MainFrame::OnClearIndexers(wxCommandEvent&)
+{
+    if (m_canvas)
+        m_canvas->ClearIndexers();
+}
+
+void MainFrame::OnRemoveIndexer(wxCommandEvent&)
+{
+    if (m_canvas && m_canvas->GetTransformMode() == TransformMode::RemoveIndexer)
+        SetActiveTool(TransformMode::Select);
+    else
+        SetActiveTool(TransformMode::RemoveIndexer);
+}
+
+void MainFrame::OnEditIndexer(wxCommandEvent&)
+{
+    if (m_canvas && m_canvas->GetTransformMode() == TransformMode::EditIndexer)
+        SetActiveTool(TransformMode::Select);
+    else
+        SetActiveTool(TransformMode::EditIndexer);
 }
 
 // ===========================================================================
@@ -2398,6 +2562,30 @@ float MainFrame::GetEjectorLength() const
     return static_cast<float>(v) * (m_imperial ? 25.4f : 1.0f);
 }
 
+// Indexer dimension accessors (Aug 2026). Same mm-regardless-of-unit-system
+// convention as the getters above.
+float MainFrame::GetIndexerRadius() const
+{
+    if (!m_indexerRadius) return 3.0f;
+    double v = 3.0;
+    if (!m_indexerRadius->GetValue().ToDouble(&v)) return 3.0f;
+    if (v <= 0.0) v = 3.0;
+    return static_cast<float>(v) * (m_imperial ? 25.4f : 1.0f);
+}
+
+// Extra Tolerance may legitimately be 0 (no enlargement on the B-half
+// hemisphere once the fuse step is implemented) — like the Cast card's
+// Groove Tolerance, a valid zero is not clamped back to the default; only a
+// negative or unparseable value is.
+float MainFrame::GetIndexerExtraTolerance() const
+{
+    if (!m_indexerExtraTolerance) return 0.1f;
+    double v = 0.1;
+    if (!m_indexerExtraTolerance->GetValue().ToDouble(&v)) return 0.1f;
+    if (v < 0.0) v = 0.0;
+    return static_cast<float>(v) * (m_imperial ? 25.4f : 1.0f);
+}
+
 // Insert "Cut scale": the card takes a percentage, callers want a multiplier,
 // so 100 -> 1.0. No unit conversion — a percentage is unitless, which is why
 // its "%" label is not registered in m_mmUnitLabels and doesn't flip with the
@@ -2498,6 +2686,11 @@ void MainFrame::LoadFixtureIntoScene(const FixtureDefinition& fixture)
         // ClearFixtures()/ClearAll() beforehand stay correct either way.
         m_canvas->CreateProceduralFixture(fixture);
     }
+
+    // Every fixture-kind change funnels through here (change / edit / new /
+    // startup prompt / project load), and each site sets m_fixtureDef before
+    // calling. Sync the Casting tab's enabled state to the new kind.
+    RefreshCastingAvailability();
 }
 
 void MainFrame::OnChangeFixture(wxCommandEvent&)
@@ -2734,6 +2927,8 @@ void MainFrame::OnSaveProject(wxCommandEvent&)
         p.subRunnerDiameter = GetSubRunnerDiameter();
         p.ejectorDiameter = GetEjectorDiameter();
         p.ejectorLength = GetEjectorLength();
+        p.indexerRadius = GetIndexerRadius();
+        p.indexerExtraTolerance = GetIndexerExtraTolerance();
     }
 
     // Sprue
@@ -2859,6 +3054,15 @@ void MainFrame::OnSaveProject(wxCommandEvent&)
         ProjectEjectorData pe;
         pe.point = ef.point;
         data.ejectors.push_back(pe);
+    }
+
+    // Indexers — just the world-space placement point (always y=0). Mirrors
+    // the ejector save loop above.
+    for (const auto& idf : m_canvas->GetIndexers())
+    {
+        ProjectIndexerData pidx;
+        pidx.point = idf.point;
+        data.indexers.push_back(pidx);
     }
 
     // Inserts — source body path + parent index + local transform. Cut scale is
@@ -3103,6 +3307,12 @@ void MainFrame::OnLoadProject(wxCommandEvent&)
     for (const auto& ej : data.ejectors)
         m_canvas->RestoreEjector(ej.point);
 
+    // ---- Restore indexers ---------------------------------------------------
+    // Radius / Extra Tolerance come from data.params and are applied by
+    // RebuildIndexerSolids (via RebuildAllFeatures below), same as ejectors.
+    for (const auto& idx : data.indexers)
+        m_canvas->RestoreIndexer(idx.point);
+
     // ---- Rebuild all derived GPU geometry -----------------------------------
     m_canvas->RebuildAllFeatures();
 
@@ -3150,6 +3360,8 @@ void MainFrame::SetParameterFields(const ProjectParameters& p)
     setField(m_subRunnerDiameter, p.subRunnerDiameter * conv);
     setField(m_ejectorDiameter, p.ejectorDiameter * conv);
     setField(m_ejectorLength, p.ejectorLength * conv);
+    setField(m_indexerRadius, p.indexerRadius * conv);
+    setField(m_indexerExtraTolerance, p.indexerExtraTolerance * conv);
 }
 
 // ---------------------------------------------------------------------------
@@ -3276,24 +3488,30 @@ void MainFrame::OnExport(wxCommandEvent&)
     // currently selects. Each DoExport* keeps its own gate + file dialog.
     switch (m_exportMode)
     {
-    case ExportMode::Mould:    DoExportMould();    break;
-    case ExportMode::ShotBody: DoExportShotBody(); break;
+    case ExportMode::Mould:      DoExportMould();      break;
+    case ExportMode::ShotBody:   DoExportShotBody();   break;
     }
 }
 
 void MainFrame::OnExportModeChanged(wxCommandEvent& e)
 {
     // Menu-item order is fixed in CreateRibbon: 0 = Mould, 1 = Shot body.
-    m_exportMode = (e.GetInt() == 1) ? ExportMode::ShotBody
-                                     : ExportMode::Mould;
+    switch (e.GetInt())
+    {
+    case 1:  m_exportMode = ExportMode::ShotBody;   break;
+    default: m_exportMode = ExportMode::Mould;      break;
+    }
     UpdateExportButtonLabel();
 }
 
 void MainFrame::UpdateExportButtonLabel()
 {
     if (!m_btnExport) return;
-    m_btnExport->SetLabel(m_exportMode == ExportMode::ShotBody
-        ? "Export Shot Body" : "Export Mould");
+    switch (m_exportMode)
+    {
+    case ExportMode::ShotBody:   m_btnExport->SetLabel("Export Shot Body");  break;
+    default:                     m_btnExport->SetLabel("Export Mould");       break;
+    }
 }
 
 void MainFrame::DoExportMould()
@@ -3486,6 +3704,123 @@ void MainFrame::DoExportShotBody()
     m_canvas->ExportShotBody(picked.GetFullPath().ToStdString());
 }
 
+void MainFrame::DoExportMouldCasts()
+{
+    // Casts are built in the Casting perspective after a mould generation, so
+    // the same tri-state gate applies; additionally the casts themselves must
+    // have been generated (they are not produced automatically by a mould run).
+    switch (m_mouldState)
+    {
+    case MouldState::NeverGenerated:
+        wxMessageBox("Mould must be generated before its casts can be exported.",
+            "Export Mould Casts", wxOK | wxICON_INFORMATION, this);
+        return;
+
+    case MouldState::Dirty:
+    {
+        const int ans = wxMessageBox(
+            "An edit has been made since the last Mould Generation, "
+            "some features may not be reflected. Would you like to continue?",
+            "Export Mould Casts", wxYES_NO | wxICON_WARNING, this);
+        if (ans != wxYES) return;
+        break;
+    }
+
+    case MouldState::Clean:
+        break;
+    }
+
+    if (!m_castingPanel || !m_castingPanel->HasCastBodies())
+    {
+        wxMessageBox("No mould casts are available to export.\n\nUse "
+            "\"Generate Mould Casts\" in the Casting perspective first.",
+            "Export Mould Casts", wxOK | wxICON_INFORMATION, this);
+        return;
+    }
+
+    const auto& bodies = m_castingPanel->GetCastExportBodies();
+
+    // Follow the same STEP/STL routing as the mould halves: a BREP scene writes
+    // STEP (from each body's solid), a mesh scene writes STL (from the mesh).
+    // Chosen per body from whether it carries a shape, so the file extension
+    // always matches its content. Like Export Mould, the picked path is a stem,
+    // not a real output file, so no wxFD_OVERWRITE_PROMPT — we check the real
+    // per-body paths manually.
+    const bool meshScene = m_canvas->IsSceneMeshType();
+    wxString suggestedDir, suggestedName;
+    if (!m_projectPath.empty())
+    {
+        wxFileName fn(m_projectPath);
+        suggestedDir = fn.GetPath();
+        suggestedName = fn.GetName() + "_cast";
+    }
+
+    const wxString wildcard = meshScene
+        ? "STL files (*.stl)|*.stl|All files (*.*)|*.*"
+        : "STEP files (*.step;*.stp)|*.step;*.stp|All files (*.*)|*.*";
+
+    wxFileDialog dlg(this, "Export Mould Casts",
+        suggestedDir, suggestedName, wildcard, wxFD_SAVE);
+    if (dlg.ShowModal() != wxID_OK)
+        return;
+
+    wxFileName picked(dlg.GetPath());
+    const wxString folder = picked.GetPath();
+    const wxString baseStem = picked.GetName();
+    if (baseStem.IsEmpty())
+    {
+        wxMessageBox("Please enter a filename for the export.",
+            "Export Mould Casts", wxOK | wxICON_INFORMATION, this);
+        return;
+    }
+
+    // Per-body: write STEP when the body has a solid, else STL. The extension
+    // tracks the content so a mixed case can't produce a mislabelled file.
+    const wxString sep = wxFileName::GetPathSeparator();
+    std::vector<wxString> paths;
+    paths.reserve(bodies.size());
+    for (const auto& b : bodies)
+    {
+        const wxString ext = b.hasShape ? ".step" : ".stl";
+        paths.push_back(folder + sep + baseStem + "_"
+            + wxString(b.suffix.c_str()) + ext);
+    }
+
+    // Manual overwrite check across all real output paths.
+    wxString existing;
+    for (const wxString& p : paths)
+        if (wxFileExists(p)) existing += p + "\n";
+    if (!existing.IsEmpty())
+    {
+        const int ans = wxMessageBox(
+            "The following file(s) already exist:\n\n" + existing + "\nOverwrite?",
+            "Export Mould Casts", wxYES_NO | wxICON_QUESTION, this);
+        if (ans != wxYES) return;
+    }
+
+    int okCount = 0;
+    wxString failed;
+    for (size_t i = 0; i < bodies.size(); ++i)
+    {
+        const bool ok = bodies[i].hasShape
+            ? GLCanvas::WriteShapeToStep(paths[i].ToStdString(), bodies[i].shape)
+            : GLCanvas::WriteMeshToStl(paths[i].ToStdString(), bodies[i].mesh);
+        if (ok) ++okCount;
+        else    failed += paths[i] + "\n";
+    }
+
+    if (failed.IsEmpty())
+    {
+        wxString done = wxString::Format("Exported %d cast ", okCount);
+        done += (okCount == 1) ? "body" : "bodies";
+        done += meshScene ? " (STL)." : " (STEP).";
+        wxMessageBox(done, "Export Complete", wxOK | wxICON_INFORMATION, this);
+    }
+    else
+        wxMessageBox("Some cast bodies could not be written:\n\n" + failed,
+            "Export Mould Casts", wxOK | wxICON_ERROR, this);
+}
+
 void MainFrame::OnGenerateMould(wxCommandEvent&)
 {
     if (!m_canvas) return;
@@ -3528,9 +3863,15 @@ void MainFrame::OnGenerateMould(wxCommandEvent&)
                 shot.volumeMm3 = m_canvas->GetLastShotVolumeMm3();
                 shot.halves = &m_canvas->GetLastHalfShapes();
                 // Augmented shot (vents + scaled inserts + ejectors) for the
-                // cast-mould bases; null-safe when none was built.
+                // cast-mould bases; null-safe when none was built. The BREP is
+                // passed too so the bases can be built as STEP-exportable solids
+                // in a BREP scene.
                 if (m_canvas->HasLastCastShotMesh())
+                {
                     shot.castMesh = &m_canvas->GetLastCastShotMesh();
+                    if (!m_canvas->GetLastCastShotShape().IsNull())
+                        shot.castShape = &m_canvas->GetLastCastShotShape();
+                }
             }
 
             // Inserts form their own preview category (one checkbox, yellow).
@@ -3538,6 +3879,44 @@ void MainFrame::OnGenerateMould(wxCommandEvent&)
             // insert checkbox", so a run without inserts is unaffected.
             m_previewPanel->SetData(halves, shot,
                 m_canvas->GetLastInsertMeshes());
+        }
+
+        // Seed the Casting perspective with the Cast Shot Body (the augmented
+        // shot used as the intermediate) so it shows by default there, plus the
+        // mould-half bounds the walls / base take as their perimeter. Prefer
+        // the augmented cast shot; fall back to the plain shot mesh when no
+        // cast shot was built, so the perspective still has something to show.
+        // The GL upload is deferred until the Casting page is visible.
+        if (m_castingPanel && !halves.empty())
+        {
+            CastPreviewInput ci;
+            ci.mouldKind = m_fixtureDef.kind;
+            ci.sceneIsMesh = m_canvas->IsSceneMeshType();
+            ci.halves = &halves;
+
+            // Snapshot the indexer placement points from the REAL mould canvas
+            // (m_canvas here is MainFrame's editing canvas). The casting panel
+            // has its own separate preview canvas and can't see these, so they
+            // must be carried across explicitly. Built in a local that outlives
+            // the SetData call (SetData copies what it keeps).
+            std::vector<glm::vec3> indexerPts;
+            for (const auto& idf : m_canvas->GetIndexers())
+                indexerPts.push_back(idf.point);
+            ci.indexerPoints = &indexerPts;
+
+            if (m_canvas->HasLastCastShotMesh())
+            {
+                ci.castMesh = &m_canvas->GetLastCastShotMesh();
+                if (!m_canvas->GetLastCastShotShape().IsNull())
+                    ci.castShape = &m_canvas->GetLastCastShotShape();
+            }
+            else if (m_canvas->HasLastShotMesh())
+            {
+                ci.castMesh = &m_canvas->GetLastShotMesh();
+                if (!m_canvas->GetLastShotShape().IsNull())
+                    ci.castShape = &m_canvas->GetLastShotShape();
+            }
+            m_castingPanel->SetData(ci);
         }
 
         // Jump to the Preview perspective so the freshly generated mould is
@@ -4577,6 +4956,168 @@ wxPanel* MainFrame::CreateInsertsContent(wxWindow* parent)
     return panel;
 }
 
+// ---------------------------------------------------------------------------
+// CreateIndexersContent — left-panel "Indexers" feature card (Aug 2026).
+//
+// Indexers let the two mould halves fit tightly into each other. Same layout
+// as CreateEjectorsContent (title, Place button, three small action buttons,
+// collapsible Settings with a type dropdown driving a dimension panel).
+// Place/Edit/Remove/Clear are wired to real TransformMode/canvas behaviour
+// (single-point placement locked to the parting plane, drag-to-reposition,
+// nearest-marker removal, clear-all) — see the TransformMode::*Indexer cases
+// and GLCanvas's m_indexers / RebuildIndexerSolids / RayCastToPartingPlane.
+// The generation-time split/scale/fuse into the A/B mould halves and the
+// Cast Shot Body is still TBD (matches where Ejector's own cut geometry
+// stands) — only the placement point and a preview sphere exist so far.
+//
+// Settings: a "Type" dropdown ("Spherical" the only entry for now) reveals a
+// dimension panel with Radius + Extra Tolerance (both mm) — same
+// extensible Show()-toggle-on-EVT_CHOICE pattern as the Ejector card, so a
+// second indexer geometry later just appends to the dropdown and adds a
+// parallel dimension panel + Show() branch.
+// ---------------------------------------------------------------------------
+wxPanel* MainFrame::CreateIndexersContent(wxWindow* parent)
+{
+    auto* panel = new wxPanel(parent, wxID_ANY);
+    panel->SetBackgroundColour(Style::CardBg);
+    auto* sizer = new wxBoxSizer(wxVERTICAL);
+
+    auto* titleLabel = new wxStaticText(panel, wxID_ANY, "Indexers");
+    titleLabel->SetForegroundColour(*wxWHITE);
+    titleLabel->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_BOLD, false, "Segoe UI"));
+    sizer->Add(titleLabel, 0, wxLEFT | wxTOP, 12);
+    sizer->AddSpacer(6);
+
+    auto* btnPlace = MakePlaceButton(panel, ID_PlaceIndexer, "Place Indexer");
+    sizer->Add(btnPlace, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
+    sizer->AddSpacer(6);
+
+    auto* actionGrid = new wxGridSizer(1, 3, 0, 4);
+    auto makeSmallBtn = [&](const wxString& label) -> RoundedButton* {
+        auto* btn = new RoundedButton(panel, wxID_ANY, label,
+            wxDefaultPosition, wxSize(-1, 26), wxBORDER_NONE);
+        btn->SetBackgroundColour(Style::BtnSmall);
+        btn->SetForegroundColour(Style::TextPrimary);
+        btn->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+        return btn;
+    };
+    auto* btnEdit = makeSmallBtn("Edit");
+    btnEdit->SetId(ID_EditIndexer);
+    auto* btnRemove = makeSmallBtn("Remove");
+    btnRemove->SetId(ID_RemoveIndexer);
+    auto* btnClearAll = makeSmallBtn("Clear all");
+    btnClearAll->SetId(ID_ClearIndexers);
+    actionGrid->Add(btnEdit, 0, wxEXPAND);
+    actionGrid->Add(btnRemove, 0, wxEXPAND);
+    actionGrid->Add(btnClearAll, 0, wxEXPAND);
+    sizer->Add(actionGrid, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
+    sizer->AddSpacer(8);
+
+    // Collapsible Settings — same chevron / debounce pattern as the other cards.
+    auto* settingsBtn = new wxToggleButton(panel, wxID_ANY,
+        "Settings",
+        wxDefaultPosition, wxSize(-1, 22), wxBU_LEFT | wxBORDER_NONE);
+    settingsBtn->SetValue(false);
+    settingsBtn->SetBackgroundColour(Style::CardBg);
+    settingsBtn->SetForegroundColour(Style::TextSubtle);
+    settingsBtn->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+    settingsBtn->SetBitmap(LoadSvgBundle(kChevronRightSvg, wxSize(12, 12), true));
+    settingsBtn->SetBitmapPosition(wxRIGHT);
+    sizer->Add(settingsBtn, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
+
+    auto* settingsPanel = new wxPanel(panel, wxID_ANY);
+    settingsPanel->SetBackgroundColour(Style::CardBg);
+    auto* settingsSizer = new wxBoxSizer(wxVERTICAL);
+
+    // Dimension-row helper — identical to the one used in CreateEjectorsContent.
+    auto addRow = [&](wxWindow* parent_, wxSizer* parentSz,
+        const wxString& label, wxTextCtrl*& ctrl,
+        const wxString& defVal, const wxString& unitStr, int /*lblW*/ = 60)
+    {
+        auto* row = new wxBoxSizer(wxHORIZONTAL);
+        auto* lbl = new wxStaticText(parent_, wxID_ANY, label);
+        lbl->SetForegroundColour(Style::TextMuted);
+        lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+        ctrl = new wxTextCtrl(parent_, wxID_ANY, defVal, wxDefaultPosition, wxSize(kFieldWidth, 22));
+        ctrl->SetBackgroundColour(Style::BtnSmall); ctrl->SetForegroundColour(kTextDefault);
+        auto* u = new wxStaticText(parent_, wxID_ANY, unitStr);
+        if (unitStr == "mm") m_mmUnitLabels.push_back(u);
+        u->SetForegroundColour(Style::TextSubtle);
+        u->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+        u->SetMinSize(wxSize(kUnitWidth, -1));
+        row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL);
+        row->AddStretchSpacer(1);
+        row->Add(ctrl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, kFieldGap);
+        row->Add(u, 0, wxALIGN_CENTER_VERTICAL);
+        parentSz->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
+    };
+
+    // ---- Indexer type dropdown (inline with label) ------------------------
+    auto* typeRow = new wxBoxSizer(wxHORIZONTAL);
+    auto* typeLabel = new wxStaticText(settingsPanel, wxID_ANY, "Type:");
+    typeLabel->SetForegroundColour(Style::TextMuted);
+    typeLabel->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+
+    m_indexerTypeChoice = new wxChoice(settingsPanel, wxID_ANY,
+        wxDefaultPosition, wxSize(kCtrlColWidth, -1));
+    m_indexerTypeChoice->SetBackgroundColour(Style::BtnSmall);
+    m_indexerTypeChoice->SetForegroundColour(Style::TextMuted);
+    m_indexerTypeChoice->Append("Spherical");
+    m_indexerTypeChoice->SetSelection(0);
+    typeRow->Add(typeLabel, 0, wxALIGN_CENTER_VERTICAL);
+    typeRow->AddStretchSpacer(1);
+    typeRow->Add(m_indexerTypeChoice, 0, wxALIGN_CENTER_VERTICAL);
+    settingsSizer->Add(typeRow, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
+
+    // Spherical dimensions. When a second geometry is added later, build a
+    // parallel dimension panel and toggle visibility in the EVT_CHOICE
+    // handler below — same structure as the Ejector card's Cylindrical branch.
+    auto* dimsPanel = new wxPanel(settingsPanel, wxID_ANY);
+    dimsPanel->SetBackgroundColour(Style::CardBg);
+    auto* dimsSizer = new wxBoxSizer(wxVERTICAL);
+    addRow(dimsPanel, dimsSizer, "Radius:", m_indexerRadius, "3.0", "mm");
+    addRow(dimsPanel, dimsSizer, "Extra Tolerance:", m_indexerExtraTolerance, "0.1", "mm");
+    dimsPanel->SetSizer(dimsSizer);
+    settingsSizer->Add(dimsPanel, 0, wxEXPAND | wxBOTTOM, 10);
+
+    settingsPanel->SetSizer(settingsSizer);
+    settingsPanel->Show(false);
+    sizer->Add(settingsPanel, 0, wxEXPAND);
+
+    m_indexerTypeChoice->Bind(wxEVT_CHOICE, [dimsPanel, this](wxCommandEvent&) {
+        // Currently only one type — left as a Show() toggle so additional
+        // types can be added by appending an else-if without restructuring.
+        dimsPanel->Show(m_indexerTypeChoice->GetStringSelection() == "Spherical");
+        dimsPanel->GetParent()->Layout();
+        dimsPanel->GetParent()->GetParent()->Layout();
+        dimsPanel->GetParent()->GetParent()->GetParent()->Layout();
+    });
+
+    settingsBtn->Bind(wxEVT_TOGGLEBUTTON, [settingsBtn, settingsPanel, panel](wxCommandEvent&) {
+        // Same 200ms debounce as the other settings togglers — mid-frame
+        // double-clicks (often from a touchpad tap) otherwise re-collapse
+        // the panel before the layout finishes.
+        static wxLongLong lastToggleMs = 0;
+        wxLongLong now = wxGetLocalTimeMillis();
+        if ((now - lastToggleMs).GetValue() < 200) { settingsBtn->SetValue(!settingsBtn->GetValue()); return; }
+        lastToggleMs = now;
+        const bool expanded = settingsBtn->GetValue();
+        settingsBtn->SetBitmap(LoadSvgBundle(
+            expanded ? kChevronDownSvg : kChevronRightSvg,
+            wxSize(12, 12), true));
+        settingsBtn->SetBitmapPosition(wxRIGHT);
+        settingsPanel->Show(expanded);
+        panel->Layout(); panel->GetParent()->Layout(); panel->GetParent()->GetParent()->Layout();
+    });
+
+    panel->SetSizer(sizer);
+    return panel;
+}
+
 wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
 {
     // Outer container: content column + right border
@@ -4943,6 +5484,9 @@ wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
 
     wxPanel* insertsContent = CreateInsertsContent(scrollWin);
     sizer->Add(insertsContent, 0, wxEXPAND | wxTOP, 8);
+
+    wxPanel* indexersContent = CreateIndexersContent(scrollWin);
+    sizer->Add(indexersContent, 0, wxEXPAND | wxTOP, 8);
 
     sizer->AddSpacer(12);
 

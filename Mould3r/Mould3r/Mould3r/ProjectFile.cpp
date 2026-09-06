@@ -137,6 +137,8 @@ bool ProjectFile::Save(const std::string& path,
     file << "subRunnerDiameter = " << data.params.subRunnerDiameter << "\n";
     file << "ejectorDiameter   = " << data.params.ejectorDiameter << "\n";
     file << "ejectorLength     = " << data.params.ejectorLength << "\n";
+    file << "indexerRadius     = " << data.params.indexerRadius << "\n";
+    file << "indexerExtraTolerance = " << data.params.indexerExtraTolerance << "\n";
 
     // -- [object.N] ----------------------------------------------------------
     for (int i = 0; i < (int)data.objects.size(); ++i)
@@ -321,6 +323,18 @@ bool ProjectFile::Save(const std::string& path,
         file << "posZ = " << ej.point.z << "\n";
     }
 
+    // -- [indexer.N] -----------------------------------------------------
+    // Just the world-space point (always y=0). Mirrors [ejector.N]. Older
+    // parsers ignore this section via the Section::None fallback.
+    for (int i = 0; i < (int)data.indexers.size(); ++i)
+    {
+        const auto& idx = data.indexers[i];
+        file << "\n[indexer." << i << "]\n";
+        file << "posX = " << idx.point.x << "\n";
+        file << "posY = " << idx.point.y << "\n";
+        file << "posZ = " << idx.point.z << "\n";
+    }
+
     // -- [insert.N] ----------------------------------------------------------
     // An imported body parented to object[parentIndex], with a local offset,
     // rotation and uniform scale. The body is re-imported from `path` on load,
@@ -364,7 +378,7 @@ bool ProjectFile::Load(const std::string& path,
     // Section tracking
     enum class Section {
         None, Project, Parameters, Object, Sprue, Runner, Gate, Vent, Ejector,
-        Insert
+        Indexer, Insert
     };
     Section currentSection = Section::None;
 
@@ -374,6 +388,7 @@ bool ProjectFile::Load(const std::string& path,
     ProjectGateData    pendingGate;    bool hasGate = false;
     ProjectVentData    pendingVent;    bool hasVent = false;
     ProjectEjectorData pendingEjector; bool hasEjector = false;
+    ProjectIndexerData pendingIndexer; bool hasIndexer = false;
     ProjectInsertData  pendingInsert;  bool hasInsert = false;
 
     auto commitPending = [&]()
@@ -383,6 +398,7 @@ bool ProjectFile::Load(const std::string& path,
             if (hasGate) { out.gates.push_back(pendingGate);       pendingGate = {};    hasGate = false; }
             if (hasVent) { out.vents.push_back(pendingVent);       pendingVent = {};    hasVent = false; }
             if (hasEjector) { out.ejectors.push_back(pendingEjector); pendingEjector = {}; hasEjector = false; }
+            if (hasIndexer) { out.indexers.push_back(pendingIndexer); pendingIndexer = {}; hasIndexer = false; }
             if (hasInsert) { out.inserts.push_back(pendingInsert);   pendingInsert = {};  hasInsert = false; }
         };
 
@@ -407,6 +423,7 @@ bool ProjectFile::Load(const std::string& path,
             else if (sec.rfind("gate.", 0) == 0) { currentSection = Section::Gate;   hasGate = true; }
             else if (sec.rfind("vent.", 0) == 0) { currentSection = Section::Vent;   hasVent = true; }
             else if (sec.rfind("ejector.", 0) == 0) { currentSection = Section::Ejector; hasEjector = true; }
+            else if (sec.rfind("indexer.", 0) == 0) { currentSection = Section::Indexer; hasIndexer = true; }
             else if (sec.rfind("insert.", 0) == 0) { currentSection = Section::Insert; hasInsert = true; }
             else                                       currentSection = Section::None;
 
@@ -458,6 +475,8 @@ bool ProjectFile::Load(const std::string& path,
             else if (key == "subRunnerDiameter") p.subRunnerDiameter = ParseFloat(val, p.subRunnerDiameter);
             else if (key == "ejectorDiameter")   p.ejectorDiameter = ParseFloat(val, p.ejectorDiameter);
             else if (key == "ejectorLength")     p.ejectorLength = ParseFloat(val, p.ejectorLength);
+            else if (key == "indexerRadius")     p.indexerRadius = ParseFloat(val, p.indexerRadius);
+            else if (key == "indexerExtraTolerance") p.indexerExtraTolerance = ParseFloat(val, p.indexerExtraTolerance);
             break;
         }
 
@@ -611,6 +630,13 @@ bool ProjectFile::Load(const std::string& path,
             if (key == "posX")    pendingEjector.point.x = ParseFloat(val, 0.0f);
             else if (key == "posY") pendingEjector.point.y = ParseFloat(val, 0.0f);
             else if (key == "posZ") pendingEjector.point.z = ParseFloat(val, 0.0f);
+            break;
+
+        case Section::Indexer:
+            // Just the world point (always y=0). Mirrors Section::Ejector.
+            if (key == "posX")    pendingIndexer.point.x = ParseFloat(val, 0.0f);
+            else if (key == "posY") pendingIndexer.point.y = ParseFloat(val, 0.0f);
+            else if (key == "posZ") pendingIndexer.point.z = ParseFloat(val, 0.0f);
             break;
 
         case Section::Insert:

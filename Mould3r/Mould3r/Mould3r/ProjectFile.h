@@ -123,6 +123,16 @@ struct ProjectEjectorData
     glm::vec3 point{ 0.0f };
 };
 
+// Indexers (Aug 2026) carry only a world-space point, always on y=0 — no
+// normal (the plane has one, but it's implicit and constant) and no parent
+// association, mirroring ProjectEjectorData. Radius and Extra Tolerance are
+// global UI parameters and live on ProjectParameters, same convention as
+// ejector diameter/length.
+struct ProjectIndexerData
+{
+    glm::vec3 point{ 0.0f };
+};
+
 // An imported insert body parented to a scene object (v6+). Stored as its
 // source path (re-imported on load, like an object) plus the local transform
 // relative to the parent: offset, rotation (deg, YXZ), and a UNIFORM scale.
@@ -162,6 +172,9 @@ struct ProjectParameters
 
     float ejectorDiameter = 3.0f;
     float ejectorLength = 25.0f;
+
+    float indexerRadius = 3.0f;
+    float indexerExtraTolerance = 0.1f;
 };
 
 struct ProjectData
@@ -187,6 +200,7 @@ struct ProjectData
     std::vector<ProjectGateData>    gates;
     std::vector<ProjectVentData>    vents;
     std::vector<ProjectEjectorData> ejectors;
+    std::vector<ProjectIndexerData> indexers;
     std::vector<ProjectInsertData>  inserts;
 };
 

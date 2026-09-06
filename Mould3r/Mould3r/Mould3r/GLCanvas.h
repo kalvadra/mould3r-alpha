@@ -353,6 +353,38 @@ public:
     // a warning dialog if the last GenerateMould run didn't produce a shot.
     void ExportShotBody(const std::string& path);
 
+    // Write a display mesh (posNorm + indices, already in world space) to a
+    // binary STL. Public + static so callers outside the canvas (e.g. the
+    // cast-body export in MainFrame) reuse the exact writer the mould-half and
+    // shot-body STL exports use. Returns false on empty mesh or any file error.
+    static bool WriteMeshToStl(const std::string& path,
+        const FileImporter::MeshData& mesh);
+
+    // Write a single OCC solid to a STEP file (AsIs). Public + static so the
+    // cast-body export can emit STEP for BREP scenes, mirroring how the shot
+    // body / mould halves export. Returns false on a null shape or file error.
+    static bool WriteShapeToStep(const std::string& path,
+        const TopoDS_Shape& shape);
+
+    // Tessellate an OCC shape into a render-ready MeshData (vertices meshed,
+    // per-vertex normals computed, crease-split applied so the interleaved
+    // posNorm + indices upload cleanly), with orientation-aware winding.
+    // `mesh` is cleared first. When `faceIds` is non-null it is filled with one
+    // entry per output triangle: the 1-based index of that triangle's source
+    // face in a TopExp::MapShapes(shape, TopAbs_FACE) map (the crease split
+    // preserves triangle order, so the map stays aligned with mesh.indices).
+    // Static + public (uses no canvas state) so the cast-body BREP path can
+    // reuse it to build display meshes from its solids.
+    static void TessellateShapeToMesh(const TopoDS_Shape& shape,
+        FileImporter::MeshData& mesh,
+        std::vector<int>* faceIds = nullptr);
+
+    // The Cast Shot Body as a BREP solid from the most recent GenerateMould
+    // (the exact fused shape m_lastCastShotMesh is the tessellation of). Null in
+    // a mesh scene or when none was built. Consumed by the cast bases so they
+    // can be built as BREP for STEP export.
+    const TopoDS_Shape& GetLastCastShotShape() const { return m_lastCastShotShape; }
+
     // True once the scene holds at least one mesh-format body (STL/OBJ) among
     // the imported objects or inserts — i.e. the scene is on the mesh toolpath.
     // Maintained by RecomputeSceneMeshType at every add/remove/clear. Later
@@ -711,6 +743,16 @@ public:
     // whatever dimensions they were built with.
     void RebuildEjectorSolids();
 
+    // Indexer placement (Aug 2026). Always on the parting plane (y=0), picked
+    // via RayCastToPartingPlane — no multi-source snapping like Ejector.
+    // Same "geometry TBD" maturity: a preview sphere only, no mould-half /
+    // cast-shot fuse yet. See IndexerFeature in MouldFeature.h.
+    const std::vector<IndexerFeature>& GetIndexers() const { return m_indexers; }
+    void ClearIndexers();
+    // Rebuild every indexer's preview sphere. Reads Radius from the
+    // MainFrame UI at call time, same convention as RebuildEjectorSolids.
+    void RebuildIndexerSolids();
+
     // ---- Insert placement ---------------------------------------------------
     // See InsertFeature above for the ownership / inheritance model.
     const std::vector<InsertFeature>& GetInserts() const { return m_inserts; }
@@ -756,6 +798,7 @@ public:
     void RemoveGateAtMouse(int mouseX, int mouseY);
     void RemoveSprueAtMouse(int mouseX, int mouseY);
     void RemoveEjectorAtMouse(int mouseX, int mouseY);
+    void RemoveIndexerAtMouse(int mouseX, int mouseY);
 
     // Unlike the other Remove*AtMouse helpers this hit-tests the insert's MESH
     // rather than a marker sphere — an insert is a body, so clicking anywhere
@@ -838,6 +881,10 @@ public:
     // feature in one pass.
     void RestoreEjector(const glm::vec3& point);
 
+    // Restore an indexer during project load. Same batching convention as
+    // RestoreEjector — no rebuild here, RebuildAllFeatures() at the end.
+    void RestoreIndexer(const glm::vec3& point);
+
     // Rebuild all derived geometry after a batch restore (call once at end)
     void RebuildAllFeatures();
 
@@ -893,6 +940,13 @@ private:
     // mesh scenes (the BREP shot has no mesh objects in it).
     bool BuildMeshShotModel(MeshBoolean::Mesh& outMesh, double& outVolumeMm3);
 
+    // Mesh-scene counterpart to BuildCastShotModel: the augmented shot (standard
+    // mesh shot + vents + enlarged inserts + ejector pins) as a single boolean
+    // mesh, for the cast-mould bases in a mesh (STL/OBJ) scene. BuildCastShotModel
+    // is BREP-only and yields nothing here, which is why a mesh scene's Cast Shot
+    // Body used to be empty. Returns false when there's nothing to build.
+    bool BuildMeshCastShotModel(MeshBoolean::Mesh& out);
+
     // Build the world-space solid one insert removes: its body scaled about the
     // local origin by `scalePct` (1.0 == exact body), then placed by the
     // insert's worldMatrix. GenerateMould passes the card's Cut scale for the
@@ -900,17 +954,6 @@ private:
     // false (leaving `out` untouched) on a missing BREP or degenerate scale.
     bool BuildInsertCutSolid(const InsertFeature& in, float scalePct,
         TopoDS_Shape& out) const;
-
-    // Tessellate an OCC shape into a render-ready MeshData (vertices meshed,
-    // per-vertex normals computed, crease-split applied so the interleaved
-    // posNorm + indices upload cleanly), with orientation-aware winding.
-    // `mesh` is cleared first. When `faceIds` is non-null it is filled with one
-    // entry per output triangle: the 1-based index of that triangle's source
-    // face in a TopExp::MapShapes(shape, TopAbs_FACE) map (the crease split
-    // preserves triangle order, so the map stays aligned with mesh.indices).
-    void TessellateShapeToMesh(const TopoDS_Shape& shape,
-        FileImporter::MeshData& mesh,
-        std::vector<int>* faceIds = nullptr);
 
     void InitGLOnce();
     void DestroyGL();
@@ -1432,7 +1475,10 @@ private:
     // The "Cast Shot Body": the standard shot fused with the features left out
     // of it — vents, inserts (grown by the Cut scale) and ejector pins. Built
     // at generation time for the cast-mould bases; not displayed on its own.
+    // The BREP solid is retained alongside its tessellation so the cast bases
+    // can be built as BREP (STEP-exportable) in a BREP scene.
     FileImporter::MeshData m_lastCastShotMesh;
+    TopoDS_Shape           m_lastCastShotShape;
     bool                   m_hasLastCastShotMesh = false;
 
     // The shot solid (BREP) and a per-display-triangle face-index map, kept so
@@ -1486,6 +1532,15 @@ private:
 
     // Ejector features (placement points only, geometry TBD)
     std::vector<EjectorFeature> m_ejectors;
+
+    // Indexer features (placement points only, geometry TBD — see
+    // IndexerFeature in MouldFeature.h). Always on y=0, so unlike the ejector
+    // ghost this one needs no separate "which surface did it snap to" state —
+    // RayCastToPartingPlane either hits the plane or it doesn't.
+    std::vector<IndexerFeature> m_indexers;
+    glm::vec3 m_indexerGhostPos{ 0.0f };
+    bool      m_indexerGhostActive = false;
+    wxPoint   m_indexerGhostMousePos;
 
     // Imported insert bodies. Separate from m_objects by design — see
     // InsertFeature. No ghost-preview flag: placement is parent-pick +

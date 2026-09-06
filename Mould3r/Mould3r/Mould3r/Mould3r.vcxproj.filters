@@ -108,6 +108,9 @@
     <ClCompile Include="PreviewPanel.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="CastingPanel.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="FixtureCanvas.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -228,6 +231,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="PreviewPanel.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="CastingPanel.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="FixtureCanvas.h">

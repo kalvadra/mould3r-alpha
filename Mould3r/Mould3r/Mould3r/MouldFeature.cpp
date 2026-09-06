@@ -145,6 +145,82 @@ SolidMesh BuildCylinderMesh(const glm::vec3& start, const glm::vec3& end,
 }
 
 // ---------------------------------------------------------------------------
+// BuildSphereMesh — UV sphere positioned at `center` with the given radius.
+// Same stack/slice/vertex-generation math as GLCanvas::BuildSphereGPU, but
+// baked to world position (that one is a shared unit sphere at the origin,
+// scaled per-instance for marker rendering) — see the header comment.
+//
+// Vertex layout: [px, py, pz, nx, ny, nz] — compatible with the vsLit shader,
+// matching BuildCylinderMesh.
+// ---------------------------------------------------------------------------
+SolidMesh BuildSphereMesh(const glm::vec3& center, float radius,
+    int stacks, int slices)
+{
+    SolidMesh solid;
+    solid.valid = false;
+
+    if (radius < 1e-6f || stacks < 2 || slices < 3) return solid;
+
+    std::vector<float>    verts;
+    std::vector<uint32_t> idx;
+
+    for (int i = 0; i <= stacks; ++i)
+    {
+        const float phi = glm::pi<float>() * float(i) / float(stacks);
+        const float sinPhi = std::sin(phi);
+        const float cosPhi = std::cos(phi);
+
+        for (int j = 0; j <= slices; ++j)
+        {
+            const float theta = 2.0f * glm::pi<float>() * float(j) / float(slices);
+            const glm::vec3 n(sinPhi * std::cos(theta), cosPhi, sinPhi * std::sin(theta));
+
+            verts.push_back(center.x + n.x * radius);
+            verts.push_back(center.y + n.y * radius);
+            verts.push_back(center.z + n.z * radius);
+            verts.push_back(n.x); verts.push_back(n.y); verts.push_back(n.z);
+        }
+    }
+
+    for (int i = 0; i < stacks; ++i)
+    {
+        for (int j = 0; j < slices; ++j)
+        {
+            const uint32_t a = uint32_t(i * (slices + 1) + j);
+            const uint32_t b = uint32_t(a + slices + 1);
+            idx.push_back(a);     idx.push_back(b);     idx.push_back(a + 1);
+            idx.push_back(b);     idx.push_back(b + 1); idx.push_back(a + 1);
+        }
+    }
+
+    glGenVertexArrays(1, &solid.vao);
+    glGenBuffers(1, &solid.vbo);
+    glGenBuffers(1, &solid.ebo);
+
+    glBindVertexArray(solid.vao);
+    glBindBuffer(GL_ARRAY_BUFFER, solid.vbo);
+    glBufferData(GL_ARRAY_BUFFER,
+        (GLsizeiptr)(verts.size() * sizeof(float)),
+        verts.data(), GL_STATIC_DRAW);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, solid.ebo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+        (GLsizeiptr)(idx.size() * sizeof(uint32_t)),
+        idx.data(), GL_STATIC_DRAW);
+
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float),
+        (void*)(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+
+    glBindVertexArray(0);
+
+    solid.indexCount = (GLsizei)idx.size();
+    solid.valid = true;
+    return solid;
+}
+
+// ---------------------------------------------------------------------------
 // SamplePath — turn a FeaturePath into an ordered list of cross-section frames
 // (stations). This is the single source of truth for a path's route: the
 // preview sweep below consumes it, and the OCC cut (Part 3) will consume the

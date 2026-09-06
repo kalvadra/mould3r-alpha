@@ -31,8 +31,11 @@ struct ShotPreviewInput
 
     // The "Cast Shot Body" (standard shot + vents + scaled inserts + ejector
     // pins), used only by cast-mould base generation. May be null (no cast shot
-    // was built); the base generation then falls back to `mesh`.
+    // was built); the base generation then falls back to `mesh`. `castShape` is
+    // the matching BREP solid (null in a mesh scene) so the bases can be built
+    // as STEP-exportable solids.
     const FileImporter::MeshData* castMesh = nullptr;
+    const TopoDS_Shape*           castShape = nullptr;
 
     // True when the last generation was a mesh-toolpath scene. The BREP design
     // checks can't run on it, so the panel refuses them (see OnStartSimulation).
@@ -93,6 +96,28 @@ public:
     // can't change while Preview is showing — syncing on entry is enough).
     void SetGridSettings(const GridSettings& s);
 
+    // One exportable cast body: a filename-safe suffix, the display mesh (always
+    // present, used for STL export), and — in a BREP scene — the exact OCC solid
+    // (used for STEP export). `hasShape` gates the STEP path.
+    struct CastExportBody
+    {
+        std::string            suffix;
+        FileImporter::MeshData mesh;
+        TopoDS_Shape           shape;
+        bool                   hasShape = false;
+    };
+
+    // Cast bodies retained for export (populated by Generate Mould Casts): the
+    // Top Base and Bottom Base, plus ONE half of each wall (the two halves are
+    // symmetric about y = 0, so only one need be saved). Empty until casts have
+    // been generated. MainFrame's "Export Mould Casts" writes one file per entry
+    // — STEP when the body carries a shape (BREP scene), else STL.
+    bool HasCastBodies() const { return !m_castExports.empty(); }
+    const std::vector<CastExportBody>& GetCastExportBodies() const
+    {
+        return m_castExports;
+    }
+
 private:
     // Build one visibility checkbox per part: a checkbox for each mould half,
     // then a "Shot" checkbox when a shot model is present, into m_visPanel (in
@@ -101,14 +126,27 @@ private:
     void BuildVisibilityChecks(int halfCount, bool hasShot, int insertCount);
     void ClearVisibilityChecks();
 
-    // Append one cast body (a generated base / wall) to the preview: upload its
-    // mesh to the canvas at the next free part index, and add a matching
-    // show/hide checkbox in the Preview Output Bodies card. The cast checkboxes
-    // are tracked separately (m_castChecks) so a re-generation can drop just
-    // them via ClearCastChecks without disturbing the half / shot / insert
-    // toggles. Returns the preview-part index the body was loaded at.
-    int  AddCastBody(const FileImporter::MeshData& mesh, const wxString& label,
-        const glm::vec3& color, const wxString& tip);
+    // One child body inside a cast group (Top Cast / Bottom Cast).
+    struct CastChild
+    {
+        FileImporter::MeshData mesh;
+        wxString               label;
+        glm::vec3              color{ 0.5f };
+        wxString               tip;
+    };
+
+    // Upload one cast body to the canvas at the next free preview-part index
+    // (no UI) and return that index. Used by AddCastGroup.
+    int  AddCastPart(const FileImporter::MeshData& mesh, const glm::vec3& color,
+        const wxString& label);
+
+    // Add a collapsible cast GROUP to the Preview Output Bodies card: a parent
+    // "master" checkbox that shows/hides the whole group, plus a chevron on the
+    // right that expands to per-child checkboxes. Uploads each child's mesh to
+    // the canvas. The group panels are tracked (m_castGroupPanels) so a cast
+    // re-generation can drop them via ClearCastChecks without disturbing the
+    // half / shot / insert toggles.
+    void AddCastGroup(const wxString& groupLabel, std::vector<CastChild>& children);
     void ClearCastChecks();
 
     // Left panel: a list of runnable simulations, each with its own Start
@@ -204,10 +242,18 @@ private:
     wxStaticText* m_visEmptyLabel = nullptr;
     std::vector<wxCheckBox*> m_halfChecks;
 
-    // Show/hide checkboxes for the generated cast bodies (bases, and later
-    // walls). Kept apart from m_halfChecks so a cast re-generation can drop and
-    // rebuild just these. Their preview-part indices start at m_castAnchorCount.
+    // Cast-body visibility widgets, kept apart from m_halfChecks so a cast
+    // re-generation can drop and rebuild just these (their preview-part indices
+    // start at m_castAnchorCount). Cast bodies are organised into collapsible
+    // "Top Cast" / "Bottom Cast" groups: m_castGroupPanels holds each group's
+    // container panel (destroying it frees the child checkboxes too), and
+    // m_castChecks references every child checkbox for convenience.
     std::vector<wxCheckBox*> m_castChecks;
+    std::vector<wxPanel*>    m_castGroupPanels;
+
+    // Exportable cast bodies (survive past the GPU upload). Rebuilt on each
+    // Generate Mould Casts; consumed by MainFrame's "Export Mould Casts".
+    std::vector<CastExportBody> m_castExports;
 
     // Insert preview bodies. Unlike halves and the shot, ALL inserts share a
     // SINGLE show/hide checkbox (m_insertCheck) rather than one each — the user
@@ -287,7 +333,9 @@ private:
     // standard shot plus vents, scaled inserts and ejector pins. Empty when the
     // last generation didn't build one — base generation then uses m_shotMesh.
     FileImporter::MeshData              m_castShotMesh;
+    TopoDS_Shape                        m_castShotShape;   // BREP (BREP scenes)
     bool                                m_hasCastShot = false;
+    bool                                m_hasCastShotShape = false;
 
     // Last generation was a mesh-toolpath scene — the BREP design checks refuse.
     bool                                m_sceneIsMesh = false;

@@ -38,6 +38,8 @@
 #include <opencascade/BRepPrimAPI_MakeCone.hxx>
 #include <opencascade/BRepPrimAPI_MakeSphere.hxx>
 #include <opencascade/BRepPrimAPI_MakeBox.hxx>
+#include <opencascade/Bnd_Box.hxx>
+#include <opencascade/BRepBndLib.hxx>
 #include <opencascade/gp_Circ.hxx>
 #include <opencascade/gp_Ax2.hxx>
 #include <opencascade/gp_Dir.hxx>
@@ -196,6 +198,17 @@ void GLCanvas::SetTransformMode(TransformMode mode)
         m_sprueEditTool = SprueEditTool::Move; // Edit Sprue: reset sub-tool
         m_sprueEndpointGrabbed = false;        // Edit Sprue: drop endpoint grab
         m_sprueInjectionGrabbed = false;       // Edit Sprue: drop injection grab
+
+        // Drop every placement-ghost preview on any mode change. The ghosts
+        // are recomputed in the paint pass for whichever place mode is active,
+        // so clearing here just guarantees none linger past a mode exit or a
+        // direct place-tool → place-tool switch (the ad-hoc mouse-move /
+        // Escape clears elsewhere only cover some of those paths).
+        m_ventGhostActive = false;
+        m_runnerGhostActive = false;
+        m_gateGhostActive = false;
+        m_ejectorGhostActive = false;
+        m_indexerGhostActive = false;
     }
 
     // Clear AlignFace hover state and highlight VBO when leaving AlignFace.
@@ -243,6 +256,8 @@ void GLCanvas::SetTransformMode(TransformMode mode)
         SetCursor(wxCursor(wxCURSOR_CROSS));    break;
     case TransformMode::PlaceEjector:
         SetCursor(wxCursor(wxCURSOR_CROSS));    break;
+    case TransformMode::PlaceIndexer:
+        SetCursor(wxCursor(wxCURSOR_CROSS));    break;
     case TransformMode::PlaceInsert:
         // Collecting a PARENT pick, not a position — the hand reads as
         // "click a thing" the way the Remove / Edit modes do, where the
@@ -255,12 +270,14 @@ void GLCanvas::SetTransformMode(TransformMode mode)
     case TransformMode::RemoveSprue:
     case TransformMode::RemoveEjector:
     case TransformMode::RemoveInsert:
+    case TransformMode::RemoveIndexer:
         SetCursor(wxCursor(wxCURSOR_HAND));     break;
     case TransformMode::EditVent:
     case TransformMode::EditRunner:
     case TransformMode::EditGate:
     case TransformMode::EditEjector:
     case TransformMode::EditInsert:
+    case TransformMode::EditIndexer:
         SetCursor(wxCursor(wxCURSOR_HAND));     break;
     case TransformMode::EditSprue:
         SetCursor(wxCursor(wxCURSOR_HAND));     break;
@@ -1569,6 +1586,30 @@ void GLCanvas::RebuildEjectorSolids()
         ef.solid = BuildCylinderMesh(start, end, ejectorRadius, 0.0f);
     }
 }
+
+// ---------------------------------------------------------------------------
+// RebuildIndexerSolids — builds a preview sphere for every placed indexer,
+// centred on the placement point (always y=0). Radius comes from the
+// MainFrame UI at call time, same convention as RebuildEjectorSolids.
+//
+// This is preview geometry only — the actual split-at-y=0 /
+// fuse-into-A-and-B / fuse-into-cast-shot behaviour Clayton specced is not
+// implemented yet, so the full sphere is shown rather than clipped halves.
+// ---------------------------------------------------------------------------
+void GLCanvas::RebuildIndexerSolids()
+{
+    for (auto& idf : m_indexers) idf.solid.Destroy();
+    if (m_indexers.empty()) return;
+
+    float indexerRadius = 3.0f;
+    if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+        indexerRadius = frame->GetIndexerRadius();
+
+    if (indexerRadius < 1e-4f) return;
+
+    for (IndexerFeature& idf : m_indexers)
+        idf.solid = BuildSphereMesh(idf.point, indexerRadius);
+}
 // feed-network segment (sprue parting point, or any point along a runner path)
 // in XZ, stores the result on the GateFeature, then uploads one GL_LINES pair
 // per gate.  Runner paths are treated as full segments (sprue parting pt →
@@ -2687,6 +2728,7 @@ static FileImporter::MeshData MakeDisplayMesh(std::vector<float> verts,
 // ---------------------------------------------------------------------------
 // Generate Mould Operation — Cuts objects, vents, runners, and sprues from blank mold halves
 // ---------------------------------------------------------------------------
+
 bool GLCanvas::GenerateMould()
 {
     if (m_fixtures.empty())
@@ -2728,6 +2770,7 @@ bool GLCanvas::GenerateMould()
     m_lastHalfShapes.clear();
     m_lastInsertMeshes.clear();
     m_lastCastShotMesh = FileImporter::MeshData{};
+    m_lastCastShotShape = TopoDS_Shape();
     m_hasLastCastShotMesh = false;
 
     SetCurrent(*m_context);
@@ -3241,6 +3284,13 @@ bool GLCanvas::GenerateMould()
             step += (int)m_ejectors.size();
         }
 
+        // NOTE: indexers are deliberately NOT fused into the mould halves.
+        // They're a CASTING feature only — the join/cut is applied to the
+        // top/bottom cast bases in CastingPanel::GenerateCasts. Baking them
+        // into the halves here would make them appear in the Preview
+        // perspective, which isn't wanted. (This is why the per-fixture
+        // fixture-side hemisphere fuse that used to live here was removed.)
+
         // Step: subtract sprue (frustum + cold slug)
         progress.Update(step++, fixLabel + ": cutting sprue...");
 
@@ -3530,13 +3580,31 @@ bool GLCanvas::GenerateMould()
     // vents, inserts (grown by the Cut scale), and ejector pins. Built here so
     // it rides the same generation as the shot; a failure just leaves
     // m_hasLastCastShotMesh false and the bases fall back to the plain shot.
+    // BREP scenes build an OCC solid (retained for STEP-exportable cast bases);
+    // mesh scenes build the equivalent boolean mesh (no BREP retained).
     {
-        TopoDS_Shape castShape;
-        if (BuildCastShotModel(castShape) && !castShape.IsNull())
+        if (m_sceneIsMesh)
         {
-            TessellateShapeToMesh(castShape, m_lastCastShotMesh, nullptr);
-            m_hasLastCastShotMesh =
-                !m_lastCastShotMesh.posNorm.empty() && !m_lastCastShotMesh.indices.empty();
+            MeshBoolean::Mesh castMesh;
+            if (BuildMeshCastShotModel(castMesh) && !castMesh.empty())
+            {
+                m_lastCastShotMesh = MakeDisplayMesh(
+                    std::move(castMesh.verts), std::move(castMesh.indices));
+                m_lastCastShotShape = TopoDS_Shape();   // no BREP shot in a mesh scene
+                m_hasLastCastShotMesh =
+                    !m_lastCastShotMesh.posNorm.empty() && !m_lastCastShotMesh.indices.empty();
+            }
+        }
+        else
+        {
+            TopoDS_Shape castShape;
+            if (BuildCastShotModel(castShape) && !castShape.IsNull())
+            {
+                TessellateShapeToMesh(castShape, m_lastCastShotMesh, nullptr);
+                m_lastCastShotShape = castShape;   // retained for the BREP cast bases
+                m_hasLastCastShotMesh =
+                    !m_lastCastShotMesh.posNorm.empty() && !m_lastCastShotMesh.indices.empty();
+            }
         }
     }
 
@@ -4328,6 +4396,8 @@ bool GLCanvas::BuildShotModel(TopoDS_Shape& out)
 // the cast-mould bases, never displayed on its own. All pieces are fused (union)
 // so the enlarged inserts overwrite the unscaled voids BuildShotModel left, the
 // vent channels are added back as solid, and the ejector pins are included.
+// Indexers are handled separately, directly on the top/bottom base solids —
+// see CastingPanel::GenerateCasts.
 // ---------------------------------------------------------------------------
 bool GLCanvas::BuildCastShotModel(TopoDS_Shape& out)
 {
@@ -4387,6 +4457,14 @@ bool GLCanvas::BuildCastShotModel(TopoDS_Shape& out)
             }
         }
     }
+
+    // Indexers are NOT included here (Aug 2026 revision). They used to be
+    // baked into the shot as positive material on both sides, but that can't
+    // express the corrected behaviour (join one side, cut the other with a
+    // different size) — a single "cast shot" body has no notion of which
+    // downstream base is which. That asymmetric join/cut is now applied
+    // directly to the top/bottom base solids in
+    // CastingPanel::GenerateCasts (see MakeIndexerSphereSolid there).
 
     if (pieces.empty()) return false;
 
@@ -4503,6 +4581,119 @@ bool GLCanvas::BuildMeshShotModel(MeshBoolean::Mesh& outMesh, double& outVolumeM
 
     outMesh = std::move(shot);
     outVolumeMm3 = MeshBoolean::Volume(outMesh);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// BuildMeshCastShotModel — the mesh-scene counterpart to BuildCastShotModel.
+// Produces the augmented shot (standard mesh shot + vents + enlarged inserts +
+// ejector pins) as one MeshBoolean::Mesh, for the cast-mould bases in a mesh
+// (STL/OBJ) scene. BuildCastShotModel is BREP-only and returns nothing here,
+// which is why a mesh scene's Cast Shot Body came up empty — the STL shot was
+// never fed into it.
+//
+// The feature primitives (vents, ejector cylinders, BREP inserts) are
+// procedural OCC solids even in a mesh scene, so they're built with the same
+// helpers the BREP path uses, then tessellated and unioned in mesh space. A
+// mesh insert (which BuildInsertCutSolid rejects, having no BREP) is enlarged
+// by scaling its local verts about the origin — matching BuildInsertCutSolid's
+// scale-about-local-origin — before the world placement.
+// ---------------------------------------------------------------------------
+bool GLCanvas::BuildMeshCastShotModel(MeshBoolean::Mesh& out)
+{
+    out = MeshBoolean::Mesh{};
+
+    std::vector<MeshBoolean::Mesh> parts;
+
+    // 1. Standard mesh shot (STL objects + feed system, unscaled inserts
+    //    subtracted) — the piece BuildCastShotModel can't supply in a mesh scene.
+    {
+        MeshBoolean::Mesh shot;
+        double vol = 0.0;
+        if (BuildMeshShotModel(shot, vol) && !shot.empty())
+            parts.push_back(std::move(shot));
+    }
+
+    // 2. Vents — positive material. BuildVentCutPieces yields BREP; tessellate.
+    for (const VentInstance& vent : m_vents)
+    {
+        std::vector<TopoDS_Shape> ventPieces;
+        if (!BuildVentCutPieces(vent, ventPieces)) continue;
+        for (const TopoDS_Shape& p : ventPieces)
+        {
+            if (p.IsNull()) continue;
+            FileImporter::MeshData md;
+            TessellateShapeToMesh(p, md, nullptr);
+            MeshBoolean::Mesh m = MeshFromPosNorm(md);
+            if (!m.empty()) parts.push_back(std::move(m));
+        }
+    }
+
+    // 3. Inserts — grown by the insert Cut scale, added as positive material
+    //    (mirrors BuildCastShotModel). BREP inserts go through BuildInsertCutSolid
+    //    + tessellate; mesh inserts scale their local verts about the origin then
+    //    place into world (BuildInsertCutSolid rejects mesh bodies).
+    float insertCutScale = 1.0f;
+    if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+        insertCutScale = frame->GetInsertCutScale();
+    for (const InsertFeature& in : m_inserts)
+    {
+        if (in.body.hasSourceShape && !in.body.sourceShape.IsNull())
+        {
+            TopoDS_Shape insertSolid;
+            if (BuildInsertCutSolid(in, insertCutScale, insertSolid) && !insertSolid.IsNull())
+            {
+                FileImporter::MeshData md;
+                TessellateShapeToMesh(insertSolid, md, nullptr);
+                MeshBoolean::Mesh m = MeshFromPosNorm(md);
+                if (!m.empty()) parts.push_back(std::move(m));
+            }
+        }
+        else if (in.body.format == SourceFormat::Mesh &&
+                 !in.body.cpuVerts.empty() && !in.body.cpuIndices.empty())
+        {
+            std::vector<float> scaled = in.body.cpuVerts;
+            if (std::abs(insertCutScale - 1.0f) > 1e-6f && insertCutScale > 1e-4f)
+                for (float& c : scaled) c *= insertCutScale;
+            MeshBoolean::Mesh m = WorldMeshFromLocal(scaled, in.body.cpuIndices,
+                                                     in.worldMatrix);
+            if (!m.empty()) parts.push_back(std::move(m));
+        }
+    }
+
+    // 4. Ejector pins — straight cylinders down -Y, same as BuildCastShotModel.
+    if (!m_ejectors.empty())
+    {
+        float ejectorRadius = 1.5f, ejectorLength = 25.0f;
+        if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+        {
+            ejectorRadius = frame->GetEjectorDiameter() * 0.5f;
+            ejectorLength = frame->GetEjectorLength();
+        }
+        if (ejectorRadius > 1e-4f && ejectorLength > 1e-4f)
+        {
+            for (const EjectorFeature& ef : m_ejectors)
+            {
+                const glm::vec3 s = ef.point;
+                gp_Ax2 ax(gp_Pnt(s.x, s.y, s.z), gp_Dir(0.0, -1.0, 0.0));
+                BRepPrimAPI_MakeCylinder cyl(ax, ejectorRadius, ejectorLength);
+                cyl.Build();
+                if (!cyl.IsDone() || cyl.Shape().IsNull()) continue;
+                FileImporter::MeshData md;
+                TessellateShapeToMesh(cyl.Shape(), md, nullptr);
+                MeshBoolean::Mesh m = MeshFromPosNorm(md);
+                if (!m.empty()) parts.push_back(std::move(m));
+            }
+        }
+    }
+
+    if (parts.empty()) return false;
+    if (parts.size() == 1) { out = std::move(parts[0]); return !out.empty(); }
+
+    std::string err;
+    MeshBoolean::Mesh acc;
+    if (!MeshBoolean::Union(parts, acc, err) || acc.empty()) return false;
+    out = std::move(acc);
     return true;
 }
 
@@ -5894,6 +6085,19 @@ void GLCanvas::ClearEjectors()
 }
 
 // ---------------------------------------------------------------------------
+// ClearIndexers — drop every indexer. Mirrors ClearEjectors: destroys GPU
+// resources, clears the vector, resets the ghost preview, refreshes.
+// ---------------------------------------------------------------------------
+void GLCanvas::ClearIndexers()
+{
+    for (auto& idf : m_indexers) idf.Destroy();
+    m_indexers.clear();
+    m_indexerGhostActive = false;
+    Refresh(false);
+    NotifySceneMutated();
+}
+
+// ---------------------------------------------------------------------------
 // ClearInserts — drop every insert. The reason inserts got their own list:
 // with the bodies pooled into m_objects this would have to tell insert bodies
 // apart from cavity bodies, and getting that wrong deletes the user's part.
@@ -6089,6 +6293,41 @@ void GLCanvas::RemoveEjectorAtMouse(int mouseX, int mouseY)
     m_ejectors.erase(m_ejectors.begin() + bestIdx);
 
     RebuildEjectorSolids();
+    Refresh(false);
+    NotifySceneMutated();
+}
+
+// ---------------------------------------------------------------------------
+// RemoveIndexerAtMouse — removes the indexer whose marker is closest to the
+// ray. Mirrors RemoveEjectorAtMouse.
+// ---------------------------------------------------------------------------
+void GLCanvas::RemoveIndexerAtMouse(int mouseX, int mouseY)
+{
+    if (m_indexers.empty()) return;
+
+    glm::vec3 rayOrig, rayDir;
+    BuildMouseRay(mouseX, mouseY, rayOrig, rayDir);
+
+    const float hitRadius = kVentMarkerRadius * 2.0f;
+    float bestDist = hitRadius;
+    int   bestIdx = -1;
+
+    for (int i = 0; i < (int)m_indexers.size(); ++i)
+    {
+        const float d = PointRayDistance(m_indexers[i].point, rayOrig, rayDir);
+        if (d < bestDist)
+        {
+            bestDist = d;
+            bestIdx = i;
+        }
+    }
+
+    if (bestIdx < 0) return;
+
+    m_indexers[bestIdx].Destroy();
+    m_indexers.erase(m_indexers.begin() + bestIdx);
+
+    RebuildIndexerSolids();
     Refresh(false);
     NotifySceneMutated();
 }
@@ -8408,6 +8647,23 @@ static bool WriteBinaryStl(const std::string& path,
     return static_cast<bool>(out);
 }
 
+// Public wrapper so non-canvas callers (cast-body export) reuse the writer.
+bool GLCanvas::WriteMeshToStl(const std::string& path,
+    const FileImporter::MeshData& mesh)
+{
+    return WriteBinaryStl(path, mesh);
+}
+
+// Write one OCC solid to STEP (AsIs), mirroring ExportShotBody's BREP path.
+bool GLCanvas::WriteShapeToStep(const std::string& path,
+    const TopoDS_Shape& shape)
+{
+    if (shape.IsNull()) return false;
+    STEPControl_Writer writer;
+    writer.Transfer(shape, STEPControl_AsIs);
+    return writer.Write(path.c_str()) == IFSelect_RetDone;
+}
+
 void GLCanvas::ExportFixtures(const std::string& pathA, const std::string& pathB)
 {
     if (m_fixtures.empty())
@@ -9747,6 +10003,26 @@ void GLCanvas::OnPaint(wxPaintEvent&)
                 RebuildEjectorSolids();
             }
         }
+        else if (m_transformMode == TransformMode::EditIndexer &&
+            m_editFeatureIndex >= 0 && m_editFeatureIndex < (int)m_indexers.size())
+        {
+            // Re-snap the dragged indexer with the same plane pick used at
+            // initial placement — it always stays on y=0. Ctrl = grid snap,
+            // read live since this runs from the deferred paint-pass update.
+            glm::vec3 hitPos;
+            if (RayCastToPartingPlane(m_editMousePos.x, m_editMousePos.y, hitPos))
+            {
+                if (wxGetKeyState(WXK_CONTROL))
+                {
+                    const glm::vec2 s = SnapToGrid(glm::vec2(hitPos.x, hitPos.z));
+                    hitPos.x = s.x;
+                    hitPos.z = s.y;
+                }
+                hitPos.y = 0.0f;
+                m_indexers[m_editFeatureIndex].point = hitPos;
+                RebuildIndexerSolids();
+            }
+        }
         else if (m_transformMode == TransformMode::EditSprue)
         {
             // Set on mouse-down (mutually exclusive): drag the perimeter
@@ -10206,6 +10482,105 @@ void GLCanvas::OnPaint(wxPaintEvent&)
             for (const EjectorFeature& ef : m_ejectors)
             {
                 glm::mat4 model = glm::translate(glm::mat4(1.0f), ef.point);
+                model = glm::scale(model, glm::vec3(kVentMarkerRadius));
+                glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &model[0][0]);
+                glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
+            }
+        }
+
+        glBindVertexArray(0);
+        glUseProgram(0);
+    }
+
+    // ---- Indexer point markers (magenta spheres) ----------------------------
+    // Mirrors the ejector marker block exactly, but with a plain plane pick
+    // (RayCastToPartingPlane) instead of the multi-source snap — an indexer
+    // always sits on y=0. Magenta so it reads distinctly against the cyan
+    // ejector markers when both are placed near each other.
+    if (m_transformMode == TransformMode::PlaceIndexer)
+    {
+        glm::vec3 hitPos;
+        m_indexerGhostActive = RayCastToPartingPlane(
+            m_indexerGhostMousePos.x, m_indexerGhostMousePos.y, hitPos);
+        if (m_indexerGhostActive)
+        {
+            // Ctrl = grid snap (live key state — this runs in the paint
+            // pass), same convention as PlaceEjector's ghost.
+            if (wxGetKeyState(WXK_CONTROL))
+            {
+                const glm::vec2 s = SnapToGrid(glm::vec2(hitPos.x, hitPos.z));
+                hitPos.x = s.x;
+                hitPos.z = s.y;
+            }
+            hitPos.y = 0.0f;
+        }
+        m_indexerGhostPos = hitPos;
+    }
+    if (m_program && m_sphereVAO && m_sphereIndexCount > 0 &&
+        (!m_indexers.empty() || m_indexerGhostActive))
+    {
+        glEnable(GL_DEPTH_TEST);
+        glUseProgram(m_program);
+
+        ApplyLitLighting(view, camPos);
+        glUniform1f(glGetUniformLocation(m_program, "uAmbient"), 0.35f);
+        glUniform1f(glGetUniformLocation(m_program, "uDiffuse"), 0.75f);
+        glUniform1f(glGetUniformLocation(m_program, "uSpecular"), 0.60f);
+        glUniform1f(glGetUniformLocation(m_program, "uShininess"), 48.0f);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uView"), 1, GL_FALSE, &view[0][0]);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uProj"), 1, GL_FALSE, &proj[0][0]);
+
+        glBindVertexArray(m_sphereVAO);
+
+        // Ghost preview — translucent magenta.
+        if (m_indexerGhostActive)
+        {
+            const glm::vec3 ghostColor(0.90f, 0.25f, 0.60f);   // magenta
+            glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &ghostColor[0]);
+            glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 0.45f);
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glDepthMask(GL_FALSE);
+
+            glm::mat4 model = glm::translate(glm::mat4(1.0f), m_indexerGhostPos);
+            model = glm::scale(model, glm::vec3(kVentMarkerRadius * 1.15f));
+            glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &model[0][0]);
+            glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
+
+            glDepthMask(GL_TRUE);
+            glDisable(GL_BLEND);
+        }
+
+        // Confirmed indexer points — halo pass (edit mode) then markers.
+        if (!m_indexers.empty())
+        {
+            if (m_transformMode == TransformMode::EditIndexer &&
+                m_editFeatureIndex >= 0 && m_editFeatureIndex < (int)m_indexers.size())
+            {
+                const glm::vec3 haloColor(1.0f, 0.55f, 0.0f);
+                glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &haloColor[0]);
+                glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 0.55f);
+                glEnable(GL_BLEND);
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                glDepthMask(GL_FALSE);
+
+                glm::mat4 model = glm::translate(glm::mat4(1.0f),
+                    m_indexers[m_editFeatureIndex].point);
+                model = glm::scale(model, glm::vec3(kVentMarkerRadius * 1.8f));
+                glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &model[0][0]);
+                glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
+
+                glDepthMask(GL_TRUE);
+                glDisable(GL_BLEND);
+            }
+
+            const glm::vec3 indexerColor(0.90f, 0.25f, 0.60f);
+            glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &indexerColor[0]);
+            glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 1.0f);
+
+            for (const IndexerFeature& idf : m_indexers)
+            {
+                glm::mat4 model = glm::translate(glm::mat4(1.0f), idf.point);
                 model = glm::scale(model, glm::vec3(kVentMarkerRadius));
                 glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &model[0][0]);
                 glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
@@ -11002,6 +11377,44 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         glDisable(GL_BLEND);
     }
 
+    // ---- Indexer solids (lit, semi-transparent magenta) ---------------------
+    // Mirrors the ejector-solid block exactly. This is the to-scale preview
+    // sphere from RebuildIndexerSolids (BuildSphereMesh) — the full sphere,
+    // not yet split/scaled/fused per Clayton's Generate-time spec.
+    if (m_program && !m_indexers.empty())
+    {
+        glEnable(GL_DEPTH_TEST);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glDepthMask(GL_FALSE);
+        glUseProgram(m_program);
+
+        const glm::mat4 identity(1.0f);
+        ApplyLitLighting(view, camPos);
+        glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 0.55f);
+        glUniform1f(glGetUniformLocation(m_program, "uAmbient"), 0.30f);
+        glUniform1f(glGetUniformLocation(m_program, "uDiffuse"), 0.80f);
+        glUniform1f(glGetUniformLocation(m_program, "uSpecular"), 0.40f);
+        glUniform1f(glGetUniformLocation(m_program, "uShininess"), 32.0f);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uView"), 1, GL_FALSE, &view[0][0]);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uProj"), 1, GL_FALSE, &proj[0][0]);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &identity[0][0]);
+
+        const glm::vec3 indexerColor(0.90f, 0.25f, 0.60f);   // magenta
+        glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &indexerColor[0]);
+        for (const IndexerFeature& idf : m_indexers)
+        {
+            if (!idf.solid.valid || idf.solid.vao == 0) continue;
+            glBindVertexArray(idf.solid.vao);
+            glDrawElements(GL_TRIANGLES, idf.solid.indexCount, GL_UNSIGNED_INT, 0);
+        }
+
+        glBindVertexArray(0);
+        glUseProgram(0);
+        glDepthMask(GL_TRUE);
+        glDisable(GL_BLEND);
+    }
+
     // ---- Sprue solid (lit, semi-transparent purple) ------------------------
     if (m_program && m_sprue.solid.valid && m_sprue.solid.vao != 0)
     {
@@ -11350,6 +11763,30 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
                 NotifySceneMutated();
             }
         }
+        else if (m_transformMode == TransformMode::PlaceIndexer)
+        {
+            // Simple plane pick — an indexer always sits exactly on y=0, so
+            // there's no snap-source ranking like PlaceEjector. Ctrl = grid
+            // snap, same convention as the free vent/runner node placement.
+            const wxPoint p = evt.GetPosition();
+            glm::vec3 hitPos;
+            if (RayCastToPartingPlane(p.x, p.y, hitPos))
+            {
+                if (wxGetKeyState(WXK_CONTROL))
+                {
+                    const glm::vec2 s = SnapToGrid(glm::vec2(hitPos.x, hitPos.z));
+                    hitPos.x = s.x;
+                    hitPos.z = s.y;
+                }
+                hitPos.y = 0.0f;   // exact — guard against float drift
+                IndexerFeature idf;
+                idf.point = hitPos;
+                m_indexers.push_back(std::move(idf));
+                RebuildIndexerSolids();
+                Refresh(false);
+                NotifySceneMutated();
+            }
+        }
         else if (m_transformMode == TransformMode::RemoveVent)
         {
             const wxPoint p = evt.GetPosition();
@@ -11374,6 +11811,11 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
         {
             const wxPoint p = evt.GetPosition();
             RemoveEjectorAtMouse(p.x, p.y);
+        }
+        else if (m_transformMode == TransformMode::RemoveIndexer)
+        {
+            const wxPoint p = evt.GetPosition();
+            RemoveIndexerAtMouse(p.x, p.y);
         }
         else if (m_transformMode == TransformMode::PlaceInsert)
         {
@@ -11839,6 +12281,24 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
             m_editFeatureIndex = bestIdx;
             Refresh(false);
         }
+        else if (m_transformMode == TransformMode::EditIndexer)
+        {
+            // Same pick pattern as EditEjector.
+            const wxPoint p = evt.GetPosition();
+            glm::vec3 rayOrig, rayDir;
+            BuildMouseRay(p.x, p.y, rayOrig, rayDir);
+
+            const float hitRadius = kVentMarkerRadius * 2.0f;
+            float bestDist = hitRadius;
+            int   bestIdx = -1;
+            for (int i = 0; i < (int)m_indexers.size(); ++i)
+            {
+                const float d = PointRayDistance(m_indexers[i].point, rayOrig, rayDir);
+                if (d < bestDist) { bestDist = d; bestIdx = i; }
+            }
+            m_editFeatureIndex = bestIdx;
+            Refresh(false);
+        }
     }
 
     // Node state persists past the release so it reads as a SELECTION, not just
@@ -11916,6 +12376,11 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
         if (m_transformMode == TransformMode::PlaceEjector)
         {
             m_ejectorGhostMousePos = pos;
+            Refresh(false);
+        }
+        if (m_transformMode == TransformMode::PlaceIndexer)
+        {
+            m_indexerGhostMousePos = pos;
             Refresh(false);
         }
         if (m_transformMode == TransformMode::AlignFace ||
@@ -12095,6 +12560,7 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
         m_transformMode == TransformMode::EditRunner ||
         m_transformMode == TransformMode::EditGate ||
         m_transformMode == TransformMode::EditEjector ||
+        m_transformMode == TransformMode::EditIndexer ||
         m_transformMode == TransformMode::EditSprue))
     {
         // For a Complex vent, dragging only does something when a node was
@@ -12195,6 +12661,11 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
         m_ejectorGhostMousePos = evt.GetPosition();
         Refresh(false);
     }
+    else if (m_transformMode == TransformMode::PlaceIndexer)
+    {
+        m_indexerGhostMousePos = evt.GetPosition();
+        Refresh(false);
+    }
     else if (m_transformMode == TransformMode::AlignFace ||
         m_transformMode == TransformMode::AlignMidplane)
     {
@@ -12211,12 +12682,13 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
         Refresh(false);
     }
     else if (m_ventGhostActive || m_runnerGhostActive || m_gateGhostActive ||
-        m_ejectorGhostActive)
+        m_ejectorGhostActive || m_indexerGhostActive)
     {
         m_ventGhostActive = false;
         m_runnerGhostActive = false;
         m_gateGhostActive = false;
         m_ejectorGhostActive = false;
+        m_indexerGhostActive = false;
         Refresh(false);
     }
 
@@ -12310,6 +12782,7 @@ void GLCanvas::OnKeyDown(wxKeyEvent& evt)
             m_runnerGhostActive = false;
             m_gateGhostActive = false;
             m_ejectorGhostActive = false;
+            m_indexerGhostActive = false;
             SetTransformMode(TransformMode::Select);
             if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
                 frame->SetActiveTool(TransformMode::Select);
@@ -12754,6 +13227,10 @@ void GLCanvas::ClearAll()
     for (auto& ef : m_ejectors) ef.Destroy();
     m_ejectors.clear();
 
+    // Indexers
+    for (auto& idf : m_indexers) idf.Destroy();
+    m_indexers.clear();
+
     // Inserts
     for (auto& in : m_inserts) in.Destroy();
     m_inserts.clear();
@@ -12770,6 +13247,7 @@ void GLCanvas::ClearAll()
     m_runnerGhostActive = false;
     m_gateGhostActive = false;
     m_ejectorGhostActive = false;
+    m_indexerGhostActive = false;
     m_editFeatureIndex = -1;
 
     // Rebuild all path/cross-section VBOs so stale highlights are cleared
@@ -13059,6 +13537,16 @@ void GLCanvas::RestoreEjector(const glm::vec3& point)
     m_ejectors.push_back(std::move(ef));
 }
 
+void GLCanvas::RestoreIndexer(const glm::vec3& point)
+{
+    // Programmatic placement during project load. Mirrors RestoreEjector —
+    // no rebuild here; the caller batches a single RebuildAllFeatures() at
+    // the end of the load.
+    IndexerFeature idf;
+    idf.point = point;
+    m_indexers.push_back(std::move(idf));
+}
+
 // ---------------------------------------------------------------------------
 // ReanchorVent / ReanchorGate — re-derive a parented feature's world-space
 // data from its parent object's current transform plus its stored local
@@ -13234,6 +13722,7 @@ void GLCanvas::RebuildAllFeatures()
     RebuildGatePathVBO();
     RebuildGateSolids();
     RebuildEjectorSolids();
+    RebuildIndexerSolids();
     for (auto& in : m_inserts) ReanchorInsert(in);
     Refresh(false);
 }
