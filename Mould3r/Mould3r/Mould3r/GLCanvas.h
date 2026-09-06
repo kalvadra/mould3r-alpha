@@ -743,6 +743,16 @@ public:
     // whatever dimensions they were built with.
     void RebuildEjectorSolids();
 
+    // Indexer placement (Aug 2026). Always on the parting plane (y=0), picked
+    // via RayCastToPartingPlane — no multi-source snapping like Ejector.
+    // Same "geometry TBD" maturity: a preview sphere only, no mould-half /
+    // cast-shot fuse yet. See IndexerFeature in MouldFeature.h.
+    const std::vector<IndexerFeature>& GetIndexers() const { return m_indexers; }
+    void ClearIndexers();
+    // Rebuild every indexer's preview sphere. Reads Radius from the
+    // MainFrame UI at call time, same convention as RebuildEjectorSolids.
+    void RebuildIndexerSolids();
+
     // ---- Insert placement ---------------------------------------------------
     // See InsertFeature above for the ownership / inheritance model.
     const std::vector<InsertFeature>& GetInserts() const { return m_inserts; }
@@ -788,6 +798,7 @@ public:
     void RemoveGateAtMouse(int mouseX, int mouseY);
     void RemoveSprueAtMouse(int mouseX, int mouseY);
     void RemoveEjectorAtMouse(int mouseX, int mouseY);
+    void RemoveIndexerAtMouse(int mouseX, int mouseY);
 
     // Unlike the other Remove*AtMouse helpers this hit-tests the insert's MESH
     // rather than a marker sphere — an insert is a body, so clicking anywhere
@@ -870,6 +881,10 @@ public:
     // feature in one pass.
     void RestoreEjector(const glm::vec3& point);
 
+    // Restore an indexer during project load. Same batching convention as
+    // RestoreEjector — no rebuild here, RebuildAllFeatures() at the end.
+    void RestoreIndexer(const glm::vec3& point);
+
     // Rebuild all derived geometry after a batch restore (call once at end)
     void RebuildAllFeatures();
 
@@ -924,6 +939,13 @@ private:
     // volume in mm^3. Returns false if there's nothing to build. Used only in
     // mesh scenes (the BREP shot has no mesh objects in it).
     bool BuildMeshShotModel(MeshBoolean::Mesh& outMesh, double& outVolumeMm3);
+
+    // Mesh-scene counterpart to BuildCastShotModel: the augmented shot (standard
+    // mesh shot + vents + enlarged inserts + ejector pins) as a single boolean
+    // mesh, for the cast-mould bases in a mesh (STL/OBJ) scene. BuildCastShotModel
+    // is BREP-only and yields nothing here, which is why a mesh scene's Cast Shot
+    // Body used to be empty. Returns false when there's nothing to build.
+    bool BuildMeshCastShotModel(MeshBoolean::Mesh& out);
 
     // Build the world-space solid one insert removes: its body scaled about the
     // local origin by `scalePct` (1.0 == exact body), then placed by the
@@ -1510,6 +1532,15 @@ private:
 
     // Ejector features (placement points only, geometry TBD)
     std::vector<EjectorFeature> m_ejectors;
+
+    // Indexer features (placement points only, geometry TBD — see
+    // IndexerFeature in MouldFeature.h). Always on y=0, so unlike the ejector
+    // ghost this one needs no separate "which surface did it snap to" state —
+    // RayCastToPartingPlane either hits the plane or it doesn't.
+    std::vector<IndexerFeature> m_indexers;
+    glm::vec3 m_indexerGhostPos{ 0.0f };
+    bool      m_indexerGhostActive = false;
+    wxPoint   m_indexerGhostMousePos;
 
     // Imported insert bodies. Separate from m_objects by design — see
     // InsertFeature. No ghost-preview flag: placement is parent-pick +

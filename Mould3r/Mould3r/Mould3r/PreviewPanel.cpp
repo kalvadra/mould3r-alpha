@@ -757,25 +757,12 @@ wxPanel* PreviewPanel::BuildSimPanel(wxWindow* parent)
     scrollWin->SetSizer(sizer);
     colSizer->Add(scrollWin, 1, wxEXPAND);
 
-    // ---- Generate Mould Casts --------------------------------------------
-    // Fixed action at the bottom of the column (always visible, below the
-    // scrollable simulations). Opens the wall/base cast dialog. Styled like
-    // the Prepare-side "Generate Mould" button (green RoundedButton).
-    auto* castDivider = new wxPanel(column, wxID_ANY,
-        wxDefaultPosition, wxSize(-1, 1));
-    castDivider->SetBackgroundColour(Style::Divider);
-    colSizer->Add(castDivider, 0, wxEXPAND | wxLEFT | wxRIGHT, 10);
-
-    auto* castBtn = new RoundedButton(column, wxID_ANY, "Generate Mould Casts",
-        wxDefaultPosition, wxSize(-1, 34), wxBORDER_NONE);
-    castBtn->SetBackgroundColour(Style::BtnGenerate);
-    castBtn->SetForegroundColour(*wxWHITE);
-    castBtn->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
-        wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
-    castBtn->SetToolTip("Generate the walls and base that hold the sand / silicone");
-    castBtn->Bind(wxEVT_BUTTON,
-        [this](wxCommandEvent&) { OnGenerateMouldCasts(); });
-    colSizer->Add(castBtn, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP | wxBOTTOM, 12);
+    // NOTE: the old "Generate Mould Casts" action button was removed from the
+    // Preview perspective — casting now lives entirely in the dedicated Casting
+    // perspective (CastingPanel), reached from the ribbon's Casting button.
+    // PreviewPanel::OnGenerateMouldCasts and its cast helpers remain in this
+    // file as (currently unreferenced) legacy code; they can be purged in a
+    // dedicated cleanup pass.
 
     column->SetSizer(colSizer);
     outerSizer->Add(column, 1, wxEXPAND);

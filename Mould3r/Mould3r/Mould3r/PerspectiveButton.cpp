@@ -14,6 +14,18 @@ namespace
             (unsigned char)std::min(255, c.Blue() + amt),
             c.Alpha());
     }
+
+    // Linear blend of two colours: t = 0 -> a, t = 1 -> b. Used to dim a
+    // disabled tab's label toward the surrounding bar so it reads as inert.
+    wxColour Blend(const wxColour& a, const wxColour& b, double t)
+    {
+        const double u = 1.0 - t;
+        return wxColour(
+            (unsigned char)(a.Red()   * u + b.Red()   * t),
+            (unsigned char)(a.Green() * u + b.Green() * t),
+            (unsigned char)(a.Blue()  * u + b.Blue()  * t),
+            a.Alpha());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -81,7 +93,13 @@ void PerspectiveButton::OnPaint(wxPaintEvent&)
     const wxColour parentBg = GetParent() ? GetParent()->GetBackgroundColour()
         : GetBackgroundColour();
     const wxColour activeBg = GetBackgroundColour();
-    const wxColour fg = GetForegroundColour();
+
+    // Label colour: full-strength when enabled, dimmed toward the bar when the
+    // tab is disabled (e.g. Casting for a non-castable mould) so it reads as
+    // inert rather than clickable.
+    wxColour fg = GetForegroundColour();
+    if (!IsEnabled())
+        fg = Blend(fg, parentBg, 0.6);
 
     const wxSize sz = GetClientSize();
 

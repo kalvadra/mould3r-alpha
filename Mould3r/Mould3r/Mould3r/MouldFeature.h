@@ -41,6 +41,15 @@ using VentSolid = SolidMesh;
 SolidMesh BuildCylinderMesh(const glm::vec3& start, const glm::vec3& end,
     float radius, float draftAngleDeg = 0.0f, int segments = 32);
 
+// UV sphere, positioned at `center` with the given `radius`. Unlike
+// GLCanvas::BuildSphereGPU (a shared UNIT sphere at the origin, scaled
+// per-instance for marker rendering), this bakes the position and true
+// radius into the vertex data — the same convention BuildCylinderMesh uses
+// — so it can stand in as an ordinary per-feature SolidMesh (see
+// IndexerFeature below).
+SolidMesh BuildSphereMesh(const glm::vec3& center, float radius,
+    int stacks = 16, int slices = 24);
+
 // ---------------------------------------------------------------------------
 // Path model — shared by features that extrude a cross-section along a route.
 //
@@ -344,6 +353,37 @@ struct GateFeature
 struct EjectorFeature
 {
     glm::vec3 point{ 0.0f };
+    SolidMesh solid;
+
+    void Destroy() { solid.Destroy(); }
+};
+
+// ---------------------------------------------------------------------------
+// IndexerFeature — placement point for an indexer (a spherical registration
+// feature that lets the two mould halves fit tightly together) plus its
+// preview geometry.
+//
+// Placement: a single point locked to the parting plane (y = 0), picked via
+// GLCanvas::RayCastToPartingPlane — the same simple ray/plane intersection
+// every other parting-plane point (runner nodes, gate sub-runner nodes, the
+// free sprue terminus) uses. Unlike EjectorFeature there is no multi-source
+// snapping; an indexer always sits exactly on the plane.
+//
+// Geometry: currently a preview sphere only (radius read from the MainFrame
+// UI at rebuild time, in GLCanvas::RebuildIndexerSolids — mirrors
+// RebuildEjectorSolids). The generation-time behaviour Clayton specced
+// (Aug 2026): split the sphere at y = 0; fuse the upper (A-side) hemisphere
+// into the A mould half as-is; scale the lower (B-side) hemisphere up about
+// its center by the Extra Tolerance and fuse it into the B mould half;
+// mirror both fuse operations into the Cast Shot Body so the casting bodies
+// (top/bottom base) pick up the same registration feature when generated.
+// That boolean step is NOT implemented yet — this struct only carries the
+// placement point and the preview sphere, matching where EjectorFeature's
+// cut geometry currently stands ("geometry TBD").
+// ---------------------------------------------------------------------------
+struct IndexerFeature
+{
+    glm::vec3 point{ 0.0f };   // always on y = 0 (the parting plane)
     SolidMesh solid;
 
     void Destroy() { solid.Destroy(); }
