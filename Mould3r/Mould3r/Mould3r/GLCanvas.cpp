@@ -24,6 +24,7 @@
 #include <opencascade/gp_XYZ.hxx>
 #include <opencascade/BRepAlgoAPI_Cut.hxx>
 #include <opencascade/BRepAlgoAPI_Fuse.hxx>
+#include <opencascade/BOPAlgo_Options.hxx>   // Tier 0: OCC intra-op parallel mode
 #include <opencascade/BRepGProp.hxx>
 #include <opencascade/GProp_GProps.hxx>
 #include <opencascade/BRepMesh_IncrementalMesh.hxx>
@@ -2775,6 +2776,16 @@ bool GLCanvas::GenerateMould()
 
     SetCurrent(*m_context);
     InitGLOnce();
+
+    // Tier 0 speed-up: turn on OpenCascade's intra-operation parallelism. Every
+    // BRepAlgoAPI_Cut / _Fuse / _Common reads this global default when it's
+    // constructed, so setting it here makes each boolean op below (and those in
+    // BuildShotModel / BuildCastShotModel, which run later in this call) split
+    // its internal work across OCC's default thread pool — no app-level
+    // threading, no GL/UI marshaling. Tessellation is already parallel
+    // (BRepMesh_IncrementalMesh isInParallel = true). Idempotent; cheap to set
+    // each run.
+    BOPAlgo_Options::SetParallelMode(Standard_True);
 
     for (int fi = 0; fi < (int)m_fixtures.size(); ++fi)
     {

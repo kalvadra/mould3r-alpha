@@ -11,6 +11,7 @@
 #include <opencascade/BRepAlgoAPI_Common.hxx>
 #include <opencascade/BRepAlgoAPI_Fuse.hxx>
 #include <opencascade/BRepAlgoAPI_Cut.hxx>
+#include <opencascade/BOPAlgo_Options.hxx>   // Tier 0: OCC intra-op parallel mode
 #include <opencascade/gp_Pnt.hxx>
 
 #include <wx/bmpbndl.h>
@@ -482,12 +483,12 @@ wxPanel* CastingPanel::BuildToolPanel(wxWindow* parent)
     {
         wxArrayString baseTypes;  baseTypes.Add("Flange");
         auto* baseCard = BuildPartCard(scroll, "Base", baseTypes,
-            /*defThickness*/ 5.0, "Extra Flange:", /*withJoint*/ false, m_baseUI);
+            /*defThickness*/ 5.0, "Extra Flange:", /*defExtra*/ 10.0, /*withJoint*/ false, m_baseUI);
         sSizer->Add(baseCard, 0, wxEXPAND | wxTOP, 8);
 
         wxArrayString wallTypes;  wallTypes.Add("Clover");
         auto* wallCard = BuildPartCard(scroll, "Walls", wallTypes,
-            /*defThickness*/ 5.0, "Extra Wall:", /*withJoint*/ true, m_wallsUI);
+            /*defThickness*/ 5.0, "Extra Wall:", /*defExtra*/ 5.0, /*withJoint*/ true, m_wallsUI);
         sSizer->Add(wallCard, 0, wxEXPAND | wxTOP, 8);
     }
 
@@ -552,7 +553,7 @@ wxPanel* CastingPanel::BuildToolPanel(wxWindow* parent)
 // ---------------------------------------------------------------------------
 wxPanel* CastingPanel::BuildPartCard(wxWindow* parent, const wxString& title,
     const wxArrayString& typeChoices, double defThickness,
-    const wxString& extraLabel, bool withJoint, PartUI& ui)
+    const wxString& extraLabel, double defExtra, bool withJoint, PartUI& ui)
 {
     auto* card = new wxPanel(parent, wxID_ANY);
     card->SetBackgroundColour(Style::CardBg);
@@ -619,13 +620,13 @@ wxPanel* CastingPanel::BuildPartCard(wxWindow* parent, const wxString& title,
 
     addValueRow("Thickness:", wxString::Format("%g", defThickness),
         ui.thickness, ui.unit);
-    addValueRow(extraLabel, "0", ui.extra, ui.extraUnit);
+    addValueRow(extraLabel, wxString::Format("%g", defExtra), ui.extra, ui.extraUnit);
 
     if (withJoint)
     {
         addValueRow("Tongue Width:", "2", ui.tongueW, ui.tongueWUnit);
         addValueRow("Tongue Thick:", "2", ui.tongueT, ui.tongueTUnit);
-        addValueRow("Groove Tol:",   "0", ui.grooveTol, ui.grooveTolUnit);
+        addValueRow("Groove Tol:",   "0.1", ui.grooveTol, ui.grooveTolUnit);
     }
 
     bs->AddSpacer(6);
@@ -962,6 +963,14 @@ void CastingPanel::GenerateCasts()
     // (and their toggles) once, up front, then rebuild whatever is enabled.
     m_canvas->TruncatePreviewHalves(m_castAnchorCount);
     ClearCastChecks();
+
+    // Tier 0 speed-up: enable OpenCascade's intra-operation parallelism for the
+    // cast booleans (base shot split / fuse, tongue joints, indexer fuse+cut).
+    // Each BRepAlgoAPI_Common / _Fuse / _Cut reads this global default at
+    // construction and splits its internal work across OCC's thread pool. The
+    // mesh-scene path runs through Manifold, which is already parallel. Set each
+    // run — cheap, idempotent, no app-level threading.
+    BOPAlgo_Options::SetParallelMode(Standard_True);
 
     // Progress dialog — the boolean ops (shot y=0 split, per-indexer fuse/cut,
     // wall interlock booleans) can take a noticeable moment on a dense mesh, so

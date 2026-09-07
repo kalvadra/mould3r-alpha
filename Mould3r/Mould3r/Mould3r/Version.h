@@ -26,8 +26,8 @@
 // PATCH fixes bugs. The update checker's comparison is a straight
 // major/minor/patch ordering, so these must only ever move forward.
 #define MOULD3R_VERSION_MAJOR   0
-#define MOULD3R_VERSION_MINOR   5
-#define MOULD3R_VERSION_PATCH   1
+#define MOULD3R_VERSION_MINOR   6
+#define MOULD3R_VERSION_PATCH   0
 
 // ---- Derived strings -------------------------------------------------------
 // Two-step stringification so the macro *values* get pasted, not the macro

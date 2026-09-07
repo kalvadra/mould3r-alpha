@@ -159,10 +159,11 @@ private:
     // Build one collapsible "Base" / "Walls" card into `parent`, populating
     // `ui`. `typeChoices` seeds the type dropdown; `defThickness` pre-fills the
     // thickness; `extraLabel` labels the extra-distance row ("Extra Flange:" /
-    // "Extra Wall:"); `withJoint` adds the tongue-and-groove rows (walls only).
+    // "Extra Wall:") and `defExtra` pre-fills it (mm); `withJoint` adds the
+    // tongue-and-groove rows (walls only).
     wxPanel* BuildPartCard(wxWindow* parent, const wxString& title,
         const wxArrayString& typeChoices, double defThickness,
-        const wxString& extraLabel, bool withJoint, PartUI& ui);
+        const wxString& extraLabel, double defExtra, bool withJoint, PartUI& ui);
 
     // Grey a card's rows to match its Enable checkbox, live.
     void SyncPartEnabled(const PartUI& ui);

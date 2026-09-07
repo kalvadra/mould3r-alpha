@@ -35,7 +35,7 @@ MouldCastDialog::MouldCastDialog(wxWindow* parent,
         baseTypes.Add("Flange");
         m_base = BuildPartSection(this, main, "Base", baseTypes,
             initial.base, /*defThickness*/ 5.0,
-            /*withExtra*/ true, /*defExtra*/ 0.0, "Extra Flange:");
+            /*withExtra*/ true, /*defExtra*/ 10.0, "Extra Flange:");
     }
 
     // ---- Walls section — the only type for now is "Clover" ----------------
@@ -44,7 +44,7 @@ MouldCastDialog::MouldCastDialog(wxWindow* parent,
         wallTypes.Add("Clover");
         m_walls = BuildPartSection(this, main, "Walls", wallTypes,
             initial.walls, /*defThickness*/ 5.0,
-            /*withExtra*/ true, /*defExtra*/ 0.0, "Extra Wall:",
+            /*withExtra*/ true, /*defExtra*/ 5.0, "Extra Wall:",
             /*withJoint*/ true);
     }
 
