@@ -70,6 +70,21 @@ bool Difference(const Mesh& minuend, const Mesh& subtrahend,
 // otherwise. Never throws.
 bool Union(const std::vector<Mesh>& parts, Mesh& out, std::string& error);
 
+// Boolean intersection: a ∩ b. Both operands are validated / welded internally
+// (best effort). Returns true and fills `out` when the intersection is a
+// non-empty solid; returns false (with `out` cleared and a reason in `error`)
+// when the operands don't overlap, an operand couldn't be made manifold, or
+// Manifold errors. A non-overlap is a normal false, not a fault — callers using
+// this as a contact test read the bool. Never throws.
+bool Intersection(const Mesh& a, const Mesh& b, Mesh& out, std::string& error);
+
+// Split a mesh into its connected components: maximal groups of triangles joined
+// through shared vertices. Assumes a welded mesh (shared corners share an index)
+// — the output of a Manifold boolean is welded, which is the intended input.
+// Returns true with one Mesh per component (a single entry for one connected
+// solid); false with a reason in `error` on empty/degenerate input. Never throws.
+bool Decompose(const Mesh& in, std::vector<Mesh>& out, std::string& error);
+
 // Volume of a closed triangle mesh, in the mesh's units cubed (mm^3 for
 // Mould3r geometry), via the divergence-theorem tetrahedron sum. Assumes a
 // closed surface (e.g. a Union / Difference result); returns the absolute

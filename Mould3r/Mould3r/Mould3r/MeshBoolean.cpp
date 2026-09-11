@@ -264,6 +264,144 @@ bool Union(const std::vector<Mesh>& parts, Mesh& out, std::string& error)
     return true;
 }
 
+bool Intersection(const Mesh& a, const Mesh& b, Mesh& out, std::string& error)
+{
+    out = Mesh{};
+    error.clear();
+
+    if (const char* why = BasicShapeReason(a))
+    {
+        error = std::string("First operand unusable: ") + why + ".";
+        return false;
+    }
+    if (const char* why = BasicShapeReason(b))
+    {
+        error = std::string("Second operand unusable: ") + why + ".";
+        return false;
+    }
+
+    bool ma = false, mb = false;
+    Manifold ha = BuildWelded(a, ma);
+    Manifold hb = BuildWelded(b, mb);
+
+    if (ha.Status() != Manifold::Error::NoError)
+    {
+        std::ostringstream os;
+        os << "First operand is not a watertight solid (error code "
+           << static_cast<int>(ha.Status()) << ").";
+        error = os.str();
+        return false;
+    }
+    if (hb.Status() != Manifold::Error::NoError)
+    {
+        std::ostringstream os;
+        os << "Second operand is not a watertight solid (error code "
+           << static_cast<int>(hb.Status()) << ").";
+        error = os.str();
+        return false;
+    }
+
+    Manifold result = ha ^ hb;          // Manifold boolean intersection
+
+    if (result.Status() != Manifold::Error::NoError)
+    {
+        std::ostringstream os;
+        os << "Boolean intersection failed (error code "
+           << static_cast<int>(result.Status()) << ").";
+        error = os.str();
+        return false;
+    }
+    if (result.IsEmpty())
+    {
+        error = "Intersection is empty (the operands do not overlap).";
+        return false;
+    }
+
+    out = FromMeshGL(result.GetMeshGL());
+    return true;
+}
+
+bool Decompose(const Mesh& in, std::vector<Mesh>& out, std::string& error)
+{
+    out.clear();
+    error.clear();
+
+    const size_t nTri  = in.indices.size() / 3;
+    const size_t nVert = in.verts.size()   / 3;
+    if (nTri == 0 || nVert == 0)
+    {
+        error = "Empty mesh.";
+        return false;
+    }
+
+    // Union-find over vertex indices: every triangle welds its three corners
+    // into one set, so a set ends up holding exactly one connected component's
+    // vertices. Path-halving find; union by leaving the second root as parent.
+    std::vector<uint32_t> parent(nVert);
+    for (uint32_t v = 0; v < static_cast<uint32_t>(nVert); ++v) parent[v] = v;
+
+    auto find = [&](uint32_t x) -> uint32_t {
+        while (parent[x] != x) { parent[x] = parent[parent[x]]; x = parent[x]; }
+        return x;
+    };
+    auto unite = [&](uint32_t x, uint32_t y) {
+        const uint32_t rx = find(x), ry = find(y);
+        if (rx != ry) parent[rx] = ry;
+    };
+
+    for (size_t t = 0; t < nTri; ++t)
+    {
+        const uint32_t a = in.indices[t * 3 + 0];
+        const uint32_t b = in.indices[t * 3 + 1];
+        const uint32_t c = in.indices[t * 3 + 2];
+        unite(a, b);
+        unite(b, c);
+    }
+
+    // Assign each component root a compact id in first-seen order.
+    std::vector<int32_t> compOfRoot(nVert, -1);
+    int nComp = 0;
+    for (size_t t = 0; t < nTri; ++t)
+    {
+        const uint32_t r = find(in.indices[t * 3 + 0]);
+        if (compOfRoot[r] < 0) compOfRoot[r] = nComp++;
+    }
+
+    // Single connected component: hand back the input unchanged (fast path).
+    if (nComp <= 1)
+    {
+        out.push_back(in);
+        return true;
+    }
+
+    // Rebuild one Mesh per component, remapping vertices lazily so each
+    // component carries only the vertices its triangles reference.
+    out.resize(nComp);
+    std::vector<std::vector<int32_t>> remap(
+        nComp, std::vector<int32_t>(nVert, -1));
+
+    for (size_t t = 0; t < nTri; ++t)
+    {
+        const int ci = compOfRoot[find(in.indices[t * 3 + 0])];
+        Mesh& comp = out[ci];
+        std::vector<int32_t>& rm = remap[ci];
+        for (int k = 0; k < 3; ++k)
+        {
+            const uint32_t vi = in.indices[t * 3 + k];
+            if (rm[vi] < 0)
+            {
+                rm[vi] = static_cast<int32_t>(comp.verts.size() / 3);
+                comp.verts.push_back(in.verts[vi * 3 + 0]);
+                comp.verts.push_back(in.verts[vi * 3 + 1]);
+                comp.verts.push_back(in.verts[vi * 3 + 2]);
+            }
+            comp.indices.push_back(static_cast<uint32_t>(rm[vi]));
+        }
+    }
+
+    return true;
+}
+
 double Volume(const Mesh& mesh)
 {
     if (mesh.indices.size() < 3 || mesh.verts.size() < 9) return 0.0;

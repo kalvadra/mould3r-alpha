@@ -955,6 +955,36 @@ private:
     bool BuildInsertCutSolid(const InsertFeature& in, float scalePct,
         TopoDS_Shape& out) const;
 
+    // Post-cut orphaned-volume resolution, run by GenerateMould between the
+    // cut phase and the tessellation phase (see the .cpp for the full
+    // contract). For each half it splits the fully-cut blank into connected
+    // solids and classifies them: a "parent" reaching the mould's OUTER face
+    // (the y-plane furthest from the origin), and "orphans" that don't. An
+    // orphan touching the OTHER half's parent is fused into that half (it
+    // demoulds with it); an orphan touching nothing is a true orphan. On any
+    // true orphan the user is prompted to reconfigure (abort) or delete the
+    // segments. Returns false only when the user chooses to reconfigure;
+    // otherwise mutates halfResults in place to the resolved half shapes and
+    // returns true. Two-part moulds only (halfResults / halfValid are indexed
+    // by fixture; "the other half" is the other valid entry).
+    bool ResolveOrphanVolumes(std::vector<TopoDS_Shape>& halfResults,
+        std::vector<bool>& halfValid);
+
+    // Mesh-scene counterpart to ResolveOrphanVolumes, run by GenerateMould after
+    // the Manifold carve (which can sever a lump the BREP-stage pass never saw,
+    // since that pass runs on the pre-carve BREP result). Same policy: each
+    // carved half mesh is split into connected components; the component
+    // reaching the mould's OUTER face is the parent, the rest are orphans. An
+    // orphan is fused into the OTHER half when translating it by the tolerance
+    // toward the parting plane makes it intersect that half's parent (the
+    // agreed mesh contact test); otherwise it is a true orphan. On any true
+    // orphan the user is prompted to reconfigure (abort) or delete the
+    // segments. Returns false only on reconfigure; otherwise mutates meshHalves
+    // in place to the resolved half meshes and returns true. Two-part moulds
+    // only (indexed by fixture; "the other half" is the other valid entry).
+    bool ResolveMeshOrphanVolumes(std::vector<MeshBoolean::Mesh>& meshHalves,
+        std::vector<bool>& meshValid);
+
     void InitGLOnce();
     void DestroyGL();
 
