@@ -41,6 +41,12 @@
 #include <opencascade/BRepPrimAPI_MakeBox.hxx>
 #include <opencascade/Bnd_Box.hxx>
 #include <opencascade/BRepBndLib.hxx>
+#include <opencascade/TopoDS.hxx>
+#include <opencascade/TopoDS_Solid.hxx>
+#include <opencascade/TopoDS_Compound.hxx>
+#include <opencascade/TopExp_Explorer.hxx>
+#include <opencascade/BRep_Builder.hxx>
+#include <opencascade/BRepExtrema_DistShapeShape.hxx>
 #include <opencascade/gp_Circ.hxx>
 #include <opencascade/gp_Ax2.hxx>
 #include <opencascade/gp_Dir.hxx>
@@ -2730,6 +2736,420 @@ static FileImporter::MeshData MakeDisplayMesh(std::vector<float> verts,
 // Generate Mould Operation — Cuts objects, vents, runners, and sprues from blank mold halves
 // ---------------------------------------------------------------------------
 
+// ===========================================================================
+// Orphaned mould-volume resolution
+//
+// A boolean cut can sever a chunk of a mould half from the main blank -- a
+// through-feature or an object wall can slice the blank into disconnected
+// lumps. Left alone those lumps tessellate and export as part of the half,
+// yielding unmanufacturable geometry. This pass runs once after every half is
+// cut but before any is tessellated. For each half it splits the fully-cut
+// blank into connected solids and classifies them:
+//
+//   * Parent -- the body (or bodies) reaching the half's OUTER face: the
+//               y-plane furthest from the origin (max-y for a top half, min-y
+//               for a bottom half). Several bodies reaching it are rejoined
+//               into one parent -- that only happens when a cut has pierced
+//               the mould skin, an invalid state we don't detect explicitly
+//               yet; treating them as one parent keeps this pass well-defined
+//               until that check exists.
+//   * Orphan -- any connected solid that does NOT reach the outer face.
+//
+// Each orphan is tested against the OTHER half's parent. Touching it (within
+// kOrphanTouchTol) means the orphan demoulds with that half, so it is fused
+// in. Touching nothing means it is a true orphan: floating material with no
+// half to join. Any true orphan prompts the user to reconfigure the mould
+// (abort) or delete the orphaned segments (finish without them).
+//
+// Two-part moulds only: halfResults / halfValid are indexed by fixture and
+// "the other half" is simply the other valid entry.
+// ===========================================================================
+namespace {
+
+// Contact tolerance (mm). A severed lump and the mating half share a
+// parting-plane face, so their gap is ~0; 0.01 mm absorbs boolean /
+// tessellation noise without letting a genuinely detached lump slip through.
+constexpr double kOrphanTouchTol = 0.01;
+
+// Outer-plane membership tolerance (mm). A solid whose extreme-y face sits
+// within this of the half's extreme-y face is anchored to the mould skin.
+constexpr double kOuterPlaneTol = 0.01;
+
+// The connected volumes of a shape, in document order.
+void CollectSolids(const TopoDS_Shape& s, std::vector<TopoDS_Shape>& out)
+{
+    for (TopExp_Explorer ex(s, TopAbs_SOLID); ex.More(); ex.Next())
+        out.push_back(ex.Current());
+}
+
+// Axis-aligned bounds of a shape.
+Bnd_Box ShapeBounds(const TopoDS_Shape& s)
+{
+    Bnd_Box b;
+    BRepBndLib::Add(s, b);
+    return b;
+}
+
+// Axis-aligned bounds of a flat mesh (min/max per axis into lo[3]/hi[3]). An
+// empty mesh leaves the sentinel +/-inf so callers can detect "no bounds".
+void MeshBounds(const MeshBoolean::Mesh& m, float lo[3], float hi[3])
+{
+    lo[0] = lo[1] = lo[2] =  std::numeric_limits<float>::max();
+    hi[0] = hi[1] = hi[2] = -std::numeric_limits<float>::max();
+    const size_t nv = m.verts.size() / 3;
+    for (size_t v = 0; v < nv; ++v)
+        for (int k = 0; k < 3; ++k)
+        {
+            const float c = m.verts[v * 3 + k];
+            lo[k] = std::min(lo[k], c);
+            hi[k] = std::max(hi[k], c);
+        }
+}
+
+// Minimum distance between two shapes (0 when they touch or overlap). Returns
+// +inf if the computation can't run, so a failed test never rescues an orphan
+// by accident.
+double ShapeGap(const TopoDS_Shape& a, const TopoDS_Shape& b)
+{
+    if (a.IsNull() || b.IsNull()) return std::numeric_limits<double>::max();
+    BRepExtrema_DistShapeShape dss(a, b);
+    if (!dss.IsDone()) return std::numeric_limits<double>::max();
+    return dss.Value();
+}
+
+// Fuse a set of shapes into one. A pairwise fuse that fails falls back to a
+// compound so geometry is never dropped -- the shapes are all still present
+// for tessellation / export, just not welded.
+TopoDS_Shape FuseShapes(const std::vector<TopoDS_Shape>& parts)
+{
+    if (parts.empty()) return TopoDS_Shape();
+    TopoDS_Shape acc = parts.front();
+    for (size_t i = 1; i < parts.size(); ++i)
+    {
+        if (parts[i].IsNull()) continue;
+        if (acc.IsNull()) { acc = parts[i]; continue; }
+        BRepAlgoAPI_Fuse fuse(acc, parts[i]);
+        fuse.Build();
+        if (fuse.IsDone() && !fuse.Shape().IsNull())
+        {
+            acc = fuse.Shape();
+        }
+        else
+        {
+            TopoDS_Compound comp;
+            BRep_Builder builder;
+            builder.MakeCompound(comp);
+            builder.Add(comp, acc);
+            builder.Add(comp, parts[i]);
+            acc = comp;
+        }
+    }
+    return acc;
+}
+
+} // namespace
+
+bool GLCanvas::ResolveOrphanVolumes(std::vector<TopoDS_Shape>& halfResults,
+    std::vector<bool>& halfValid)
+{
+    const int n = (int)halfResults.size();
+
+    struct HalfInfo
+    {
+        std::vector<TopoDS_Shape> orphans;   // severed, not on the outer face
+        TopoDS_Shape              parent;    // outer-face body/bodies, fused
+        bool                      analysed = false;
+    };
+    std::vector<HalfInfo> half(n);
+
+    // ---- classify each half's solids into parent vs orphan ----------------
+    for (int i = 0; i < n; ++i)
+    {
+        if (i >= (int)halfValid.size() || !halfValid[i]) continue;
+
+        std::vector<TopoDS_Shape> solids;
+        CollectSolids(halfResults[i], solids);
+
+        // 0 or 1 solids: nothing can be orphaned. Keep the shape as its own
+        // parent so the cross-half contact test still has something to hit.
+        if (solids.size() <= 1)
+        {
+            half[i].parent   = halfResults[i];
+            half[i].analysed = true;
+            continue;
+        }
+
+        // Outer face = the y-plane of the half furthest from the origin.
+        Bnd_Box bb = ShapeBounds(halfResults[i]);
+        if (bb.IsVoid())
+        {
+            half[i].parent   = halfResults[i];
+            half[i].analysed = true;
+            continue;
+        }
+        double xlo, ylo, zlo, xhi, yhi, zhi;
+        bb.Get(xlo, ylo, zlo, xhi, yhi, zhi);
+        const bool   outerIsMax = std::abs(yhi) >= std::abs(ylo);
+        const double outerY     = outerIsMax ? yhi : ylo;
+
+        std::vector<TopoDS_Shape> anchored;
+        for (const TopoDS_Shape& sld : solids)
+        {
+            Bnd_Box sb = ShapeBounds(sld);
+            if (sb.IsVoid()) continue;
+            double sxlo, sylo, szlo, sxhi, syhi, szhi;
+            sb.Get(sxlo, sylo, szlo, sxhi, syhi, szhi);
+            const double solidOuter = outerIsMax ? syhi : sylo;
+            if (std::abs(solidOuter - outerY) <= kOuterPlaneTol)
+                anchored.push_back(sld);      // reaches the mould skin
+            else
+                half[i].orphans.push_back(sld);
+        }
+
+        // Rejoin every outer-face body into a single parent.
+        half[i].parent   = anchored.empty() ? halfResults[i] : FuseShapes(anchored);
+        half[i].analysed = true;
+    }
+
+    // "The other half" of a two-part mould: the other valid, analysed entry.
+    auto otherOf = [&](int i) -> int {
+        for (int j = 0; j < n; ++j)
+            if (j != i && j < (int)halfValid.size() && halfValid[j] && half[j].analysed)
+                return j;
+        return -1;
+    };
+
+    // ---- route each orphan: fuse into the other half, or flag as true -----
+    std::vector<std::vector<TopoDS_Shape>> received(n);   // orphans joining half j
+    int trueOrphans = 0;
+
+    for (int i = 0; i < n; ++i)
+    {
+        if (!half[i].analysed) continue;
+        const int o = otherOf(i);
+        for (const TopoDS_Shape& orphan : half[i].orphans)
+        {
+            bool rescued = false;
+            if (o >= 0 && !half[o].parent.IsNull() &&
+                ShapeGap(orphan, half[o].parent) <= kOrphanTouchTol)
+            {
+                received[o].push_back(orphan);   // demoulds with the other half
+                rescued = true;
+            }
+            if (!rescued) ++trueOrphans;
+        }
+    }
+
+    // ---- true orphans: ask the user before finishing ----------------------
+    if (trueOrphans > 0)
+    {
+        wxString msg = wxString::Format(
+            "Mould generation produced %d orphaned segment(s): mould material "
+            "that ended up fully separated from both halves. A floating segment "
+            "cannot be demoulded and would make the mould unmanufacturable.\n\n"
+            "How would you like to proceed?",
+            trueOrphans);
+
+        wxMessageDialog dlg(this, msg, "Orphaned Mould Volume",
+            wxYES_NO | wxICON_WARNING);
+        dlg.SetYesNoLabels("Delete Segment(s)", "Reconfigure Mould");
+        if (dlg.ShowModal() != wxID_YES)
+            return false;   // Reconfigure (or dialog closed) -- abort generation
+        // Delete: fall through. True orphans are simply never re-added below.
+    }
+
+    // ---- rebuild each half from its parent + any received orphans ---------
+    for (int i = 0; i < n; ++i)
+    {
+        if (!half[i].analysed) continue;
+        std::vector<TopoDS_Shape> parts;
+        if (!half[i].parent.IsNull()) parts.push_back(half[i].parent);
+        for (const TopoDS_Shape& r : received[i]) parts.push_back(r);
+        if (!parts.empty())
+            halfResults[i] = FuseShapes(parts);
+    }
+
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Mesh-scene orphaned-volume resolution
+//
+// The mesh (Manifold) counterpart of ResolveOrphanVolumes, run after the carve
+// loop in a mesh scene. Same policy as the BREP pass; the domain-specific
+// pieces are: connected components via MeshBoolean::Decompose (union-find),
+// per-component bounds off the vertex buffer, and the agreed mesh contact test
+// -- translate the orphan by the tolerance TOWARD the parting plane (-Y for a
+// top half, +Y for a bottom half) and intersect it with the other half's
+// parent; a non-empty intersection means they were within tolerance across the
+// parting plane, so the orphan demoulds with that half and is unioned in.
+// ---------------------------------------------------------------------------
+bool GLCanvas::ResolveMeshOrphanVolumes(std::vector<MeshBoolean::Mesh>& meshHalves,
+    std::vector<bool>& meshValid)
+{
+    const int n = (int)meshHalves.size();
+
+    struct HalfInfo
+    {
+        std::vector<MeshBoolean::Mesh> orphans;    // severed, not on the outer face
+        MeshBoolean::Mesh              parent;     // outer-face component(s), unioned
+        bool                           outerIsMax = true;  // outer face is +Y vs -Y
+        bool                           analysed = false;
+    };
+    std::vector<HalfInfo> half(n);
+
+    // ---- classify each half's components into parent vs orphan ------------
+    for (int i = 0; i < n; ++i)
+    {
+        if (i >= (int)meshValid.size() || !meshValid[i]) continue;
+
+        std::vector<MeshBoolean::Mesh> comps;
+        std::string err;
+        if (!MeshBoolean::Decompose(meshHalves[i], comps, err) || comps.empty())
+        {
+            // Decompose failed (degenerate mesh) -- treat the whole half as its
+            // own parent so it survives untouched and can still be a fuse target.
+            half[i].parent   = meshHalves[i];
+            half[i].analysed = true;
+            continue;
+        }
+
+        // One connected component: nothing can be orphaned.
+        if (comps.size() == 1)
+        {
+            half[i].parent   = std::move(comps[0]);
+            half[i].analysed = true;
+            continue;
+        }
+
+        // Outer face = the y-plane of the half furthest from the origin.
+        float lo[3], hi[3];
+        MeshBounds(meshHalves[i], lo, hi);
+        const bool  outerIsMax = std::abs(hi[1]) >= std::abs(lo[1]);
+        const float outerY     = outerIsMax ? hi[1] : lo[1];
+        half[i].outerIsMax = outerIsMax;
+
+        std::vector<MeshBoolean::Mesh> anchored;
+        for (auto& c : comps)
+        {
+            float clo[3], chi[3];
+            MeshBounds(c, clo, chi);
+            const float compOuter = outerIsMax ? chi[1] : clo[1];
+            if (std::abs(compOuter - outerY) <= (float)kOuterPlaneTol)
+                anchored.push_back(std::move(c));   // reaches the mould skin
+            else
+                half[i].orphans.push_back(std::move(c));
+        }
+
+        // Rejoin every outer-face component into a single parent.
+        if (anchored.empty())
+        {
+            half[i].parent = meshHalves[i];
+        }
+        else if (anchored.size() == 1)
+        {
+            half[i].parent = std::move(anchored[0]);
+        }
+        else
+        {
+            MeshBoolean::Mesh fused;
+            std::string uerr;
+            if (MeshBoolean::Union(anchored, fused, uerr) && !fused.empty())
+                half[i].parent = std::move(fused);
+            else
+                half[i].parent = std::move(anchored[0]);  // fallback: keep one
+        }
+        half[i].analysed = true;
+    }
+
+    // "The other half" of a two-part mould: the other valid, analysed entry.
+    auto otherOf = [&](int i) -> int {
+        for (int j = 0; j < n; ++j)
+            if (j != i && j < (int)meshValid.size() && meshValid[j] && half[j].analysed)
+                return j;
+        return -1;
+    };
+
+    // ---- route each orphan: fuse into the other half, or flag as true -----
+    std::vector<std::vector<MeshBoolean::Mesh>> received(n);
+    int trueOrphans = 0;
+
+    for (int i = 0; i < n; ++i)
+    {
+        if (!half[i].analysed) continue;
+        const int o = otherOf(i);
+        for (auto& orphan : half[i].orphans)
+        {
+            bool rescued = false;
+            if (o >= 0 && !half[o].parent.empty())
+            {
+                // Shift the orphan by the tolerance toward the other half (i.e.
+                // toward the parting plane): -Y for a top half (outer face +Y),
+                // +Y for a bottom half. A face-touch across the plane becomes a
+                // thin real overlap the intersection can detect.
+                const float shift = half[i].outerIsMax ? -(float)kOrphanTouchTol
+                                                       : +(float)kOrphanTouchTol;
+                MeshBoolean::Mesh shifted = orphan;
+                for (size_t v = 1; v < shifted.verts.size(); v += 3)
+                    shifted.verts[v] += shift;
+
+                MeshBoolean::Mesh inter;
+                std::string ierr;
+                if (MeshBoolean::Intersection(shifted, half[o].parent, inter, ierr))
+                {
+                    received[o].push_back(std::move(orphan));   // demoulds with it
+                    rescued = true;
+                }
+            }
+            if (!rescued) ++trueOrphans;
+        }
+    }
+
+    // ---- true orphans: ask the user before finishing ----------------------
+    if (trueOrphans > 0)
+    {
+        wxString msg = wxString::Format(
+            "Mould generation produced %d orphaned segment(s): mould material "
+            "that ended up fully separated from both halves. A floating segment "
+            "cannot be demoulded and would make the mould unmanufacturable.\n\n"
+            "How would you like to proceed?",
+            trueOrphans);
+
+        wxMessageDialog dlg(this, msg, "Orphaned Mould Volume",
+            wxYES_NO | wxICON_WARNING);
+        dlg.SetYesNoLabels("Delete Segment(s)", "Reconfigure Mould");
+        if (dlg.ShowModal() != wxID_YES)
+            return false;   // Reconfigure (or dialog closed) -- abort generation
+    }
+
+    // ---- rebuild each half from its parent + any received orphans ---------
+    for (int i = 0; i < n; ++i)
+    {
+        if (!half[i].analysed) continue;
+        std::vector<MeshBoolean::Mesh> parts;
+        if (!half[i].parent.empty()) parts.push_back(std::move(half[i].parent));
+        for (auto& r : received[i]) parts.push_back(std::move(r));
+        if (parts.empty()) continue;
+
+        if (parts.size() == 1)
+        {
+            meshHalves[i] = std::move(parts[0]);
+        }
+        else
+        {
+            MeshBoolean::Mesh merged;
+            std::string uerr;
+            if (MeshBoolean::Union(parts, merged, uerr) && !merged.empty())
+                meshHalves[i] = std::move(merged);
+            else
+                meshHalves[i] = std::move(parts[0]);   // fallback: at least the parent
+        }
+    }
+
+    return true;
+}
+
+
 bool GLCanvas::GenerateMould()
 {
     if (m_fixtures.empty())
@@ -2786,6 +3206,21 @@ bool GLCanvas::GenerateMould()
     // (BRepMesh_IncrementalMesh isInParallel = true). Idempotent; cheap to set
     // each run.
     BOPAlgo_Options::SetParallelMode(Standard_True);
+
+    // Insert Cut scale is one global card field, identical for every fixture,
+    // and is needed in two phases (the BREP insert cut in phase 1 and the
+    // mesh-scene carve in phase 3), so read it once here.
+    float insertCutScale = 1.0f;
+    if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+        insertCutScale = frame->GetInsertCutScale();
+
+    // Per-fixture fully-cut half shapes. Phase 1 (the cut loop) fills these;
+    // phase 2 resolves orphaned volumes across halves; phase 3 tessellates and
+    // captures each. Indexed by fixture -- halfValid[fi] marks the fixtures
+    // that were actually cut (a skipped fixture leaves it false).
+    std::vector<TopoDS_Shape> halfResults(m_fixtures.size());
+    std::vector<bool>         halfValid(m_fixtures.size(), false);
+
 
     for (int fi = 0; fi < (int)m_fixtures.size(); ++fi)
     {
@@ -2901,10 +3336,7 @@ bool GLCanvas::GenerateMould()
         // leaves a half untouched (an insert seated entirely within the other
         // half) returns that half unchanged, so no per-half branching is
         // needed. A genuinely failed boolean is warned and skipped rather than
-        // dropping the rest.
-        float insertCutScale = 1.0f;
-        if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
-            insertCutScale = frame->GetInsertCutScale();
+        // dropping the rest. (insertCutScale is read once before the loop.)
 
         for (int ii = 0; ii < (int)m_inserts.size(); ++ii)
         {
@@ -3392,6 +3824,37 @@ bool GLCanvas::GenerateMould()
             }
         }
 
+        // Phase 1 keeps the fully-cut half; tessellation, orphan resolution
+        // and capture run once every half is cut (phases 2 and 3, below).
+        halfResults[fi] = result;
+        halfValid[fi]   = true;
+
+    }
+
+    // ---- Phase 2: resolve orphaned mould volumes --------------------------
+    // Every half's fully-cut blank is in halfResults now, so cross-half
+    // contact tests are possible. This may fuse a severed lump into the other
+    // half, drop true orphans, or -- if the user chooses to reconfigure --
+    // abort the whole generation.
+    progress.Update(step, "Checking for orphaned mould volumes...");
+    if (!ResolveOrphanVolumes(halfResults, halfValid))
+        return false;
+
+    // Mesh-scene carved halves are parked here through the loop below: a mesh
+    // (Manifold) cut can sever a lump the BREP-stage pass never saw, so mesh
+    // orphan resolution runs across BOTH halves after every one is carved
+    // (phases 3b/3c, after the loop). BREP scenes ignore these.
+    std::vector<MeshBoolean::Mesh> meshHalves(m_fixtures.size());
+    std::vector<bool>              meshValid(m_fixtures.size(), false);
+
+    // ---- Phase 3: tessellate + capture each resolved half -----------------
+    for (int fi = 0; fi < (int)m_fixtures.size(); ++fi)
+    {
+        if (!halfValid[fi]) continue;
+        SceneObject& fix    = m_fixtures[fi];
+        TopoDS_Shape result = halfResults[fi];
+        const std::string fixLabel = "Fixture " + std::to_string(fi + 1);
+
         // Step: tessellate + upload
         progress.Update(step++, fixLabel + ": tessellating result...");
 
@@ -3502,13 +3965,19 @@ bool GLCanvas::GenerateMould()
                       "insert " + std::to_string(ii + 1));
             }
 
-            meshData.vertices = std::move(half.verts);
-            meshData.indices  = std::move(half.indices);
-
-            if (meshData.vertices.empty() || meshData.indices.empty())
+            if (half.empty())
                 continue;   // fully carved away, or every cut failed
+
+            // Park the raw carved half; orphan resolution, normals and capture
+            // happen after every half is carved (phases 3b/3c, below) so the
+            // cross-half contact tests can see both halves. fix.mouldShape /
+            // hasMould were already set above for export.
+            meshHalves[fi] = std::move(half);
+            meshValid[fi]  = true;
+            continue;
         }
 
+        // ---- BREP scene: normals, crease split, capture -------------------
         ComputeVertexNormals_Pos3(meshData.vertices, meshData.indices, meshData.posNorm);
         auto split = SplitByCreaseAngle_Pos3(meshData.vertices, meshData.indices, 35.0f);
         meshData.posNorm = std::move(split.posNorm);
@@ -3522,21 +3991,51 @@ bool GLCanvas::GenerateMould()
         // mould halves after generation. The mesh captured here is already in
         // world space (the fixture transform was baked into `result` above),
         // so the preview renders it at an identity pose.
-        // In a mesh scene, keep this fixture's carved half for STL export.
-        // Stored per-fixture (like mouldShape) so export maps halves to fixtures
-        // even if some fixture was skipped, rather than positionally indexing
-        // m_lastMouldMeshes.
-        if (m_sceneIsMesh)
-        {
-            fix.mouldMesh = meshData;
-            fix.hasMouldMesh = true;
-        }
-
         m_lastMouldMeshes.push_back(meshData);
 
         // Retain the half solid (world space, post-cut) for the separation
         // demoldability check, kept in lockstep with m_lastMouldMeshes.
         m_lastHalfShapes.push_back(result);
+    }
+
+    // ---- Phase 3b/3c: mesh-scene orphan resolution + finalize -------------
+    // A mesh (Manifold) carve can sever a lump the BREP-stage pass never saw
+    // (that pass ran on the pre-carve BREP result). Resolve orphaned volumes
+    // across both carved halves, then finalize the resolved meshes exactly as
+    // the loop above finalized a BREP half: normals, crease split, and the
+    // per-fixture + preview captures. BREP scenes did all this in the loop.
+    if (m_sceneIsMesh)
+    {
+        progress.Update(step, "Checking for orphaned mould volumes...");
+        if (!ResolveMeshOrphanVolumes(meshHalves, meshValid))
+            return false;   // user chose to reconfigure -- abort generation
+
+        for (int fi = 0; fi < (int)m_fixtures.size(); ++fi)
+        {
+            if (!meshValid[fi]) continue;
+            SceneObject& fix = m_fixtures[fi];
+
+            FileImporter::MeshData meshData;
+            meshData.aabbMin = glm::vec3(std::numeric_limits<float>::infinity());
+            meshData.aabbMax = glm::vec3(-std::numeric_limits<float>::infinity());
+            meshData.vertices = std::move(meshHalves[fi].verts);
+            meshData.indices  = std::move(meshHalves[fi].indices);
+            if (meshData.vertices.empty() || meshData.indices.empty())
+                continue;
+
+            ComputeVertexNormals_Pos3(meshData.vertices, meshData.indices, meshData.posNorm);
+            auto split = SplitByCreaseAngle_Pos3(meshData.vertices, meshData.indices, 35.0f);
+            meshData.posNorm = std::move(split.posNorm);
+            meshData.indices = std::move(split.indices);
+
+            // Keep this fixture's carved half for STL export, and push to the
+            // preview / separation lists in lockstep (same order as a BREP scene
+            // would). fix.mouldShape holds the retained BREP result for this half.
+            fix.mouldMesh    = meshData;
+            fix.hasMouldMesh = true;
+            m_lastMouldMeshes.push_back(meshData);
+            m_lastHalfShapes.push_back(fix.mouldShape);
+        }
     }
 
     // ---- Shot model -------------------------------------------------------
