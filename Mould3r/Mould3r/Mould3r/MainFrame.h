@@ -119,6 +119,12 @@ public:
     // NOT convert for the imperial unit system.
     float GetInsertCutScale() const;
 
+    // Parting Behavior menu: whether Generate Mould should detect nearly-
+    // orphaned regions (cross-parting-plane cavities in a part) and offer to
+    // combine them into one half, instead of a plain y=0 split. Read by the
+    // canvas at generation time, like GetInsertCutScale above. Default on.
+    bool IsNearlyOrphanDetectionEnabled() const { return m_partingNearlyOrphan; }
+
     // Called by GLCanvas when the user picks a parent object in PlaceInsert
     // mode. Runs the import file dialog and hands the result to the canvas,
     // then drops back to Select. Public because the canvas drives it — the
@@ -268,6 +274,8 @@ private:
     void OnAbout(wxCommandEvent&);
     void OnCheckForUpdates(wxCommandEvent&);
     void OnToggleAutoUpdateCheck(wxCommandEvent&);
+    void OnPartingNearlyOrphan(wxCommandEvent&);
+    void OnPartingShowHull(wxCommandEvent&);
 
     // ---- Workflow perspectives ---------------------------------------------
     // The window hosts three stacked perspectives in a wxSimplebook: "Prepare"
@@ -454,6 +462,12 @@ private:
     wxMenuBar* m_previewMenuBar = nullptr;
     wxMenuBar* m_castingMenuBar = nullptr;
 
+    // Parting Behavior: detect nearly-orphaned (cross-parting-plane) part
+    // cavities on Generate Mould and offer to combine them into one half.
+    // Toggled from the Parting Behavior menu; read via
+    // IsNearlyOrphanDetectionEnabled(). Default on.
+    bool m_partingNearlyOrphan = true;
+
     // Ribbon perspective-switch tabs (shared top bar). Held so SetPerspective
     // can drive their selected styling.
     PerspectiveButton* m_btnPrepare = nullptr;
@@ -629,6 +643,8 @@ private:
         ID_UnitMetric,
         ID_UnitImperial,
         ID_GridSettings,
+        ID_PartingNearlyOrphan,
+        ID_PartingShowHull,
         ID_MeshQualityOff,
         ID_MeshQualityDraft,
         ID_MeshQualityNormal,

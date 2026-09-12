@@ -402,6 +402,35 @@ bool Decompose(const Mesh& in, std::vector<Mesh>& out, std::string& error)
     return true;
 }
 
+bool ConvexHull(const Mesh& in, Mesh& out, std::string& error)
+{
+    out = Mesh{};
+    error.clear();
+
+    if (const char* why = BasicShapeReason(in))
+    {
+        error = std::string("Hull input unusable: ") + why + ".";
+        return false;
+    }
+
+    // Manifold's convex hull works from the vertex cloud, so connectivity need
+    // not be watertight; but a part that can't be welded into a valid Manifold
+    // yields an errored/empty hull, which we report so the caller skips it
+    // rather than acting on a bad envelope.
+    bool merged = false;
+    Manifold m = BuildWelded(in, merged);
+    Manifold h = m.Hull();
+
+    if (h.Status() != Manifold::Error::NoError || h.IsEmpty())
+    {
+        error = "Convex hull could not be computed for this shape.";
+        return false;
+    }
+
+    out = FromMeshGL(h.GetMeshGL());
+    return true;
+}
+
 double Volume(const Mesh& mesh)
 {
     if (mesh.indices.size() < 3 || mesh.verts.size() < 9) return 0.0;

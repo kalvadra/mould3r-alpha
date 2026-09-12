@@ -47,6 +47,12 @@
 #include <opencascade/TopExp_Explorer.hxx>
 #include <opencascade/BRep_Builder.hxx>
 #include <opencascade/BRepExtrema_DistShapeShape.hxx>
+#include <opencascade/BRepAlgoAPI_Common.hxx>
+#include <opencascade/BRepBuilderAPI_Sewing.hxx>
+#include <opencascade/BRepBuilderAPI_MakeSolid.hxx>
+#include <opencascade/BRepBuilderAPI_MakePolygon.hxx>
+#include <opencascade/TopoDS_Shell.hxx>
+#include <wx/richmsgdlg.h>
 #include <opencascade/gp_Circ.hxx>
 #include <opencascade/gp_Ax2.hxx>
 #include <opencascade/gp_Dir.hxx>
@@ -3149,6 +3155,199 @@ bool GLCanvas::ResolveMeshOrphanVolumes(std::vector<MeshBoolean::Mesh>& meshHalv
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Nearly-orphaned region combine (Parting Behavior, BREP scenes)
+//
+// A part cavity that crosses the parting plane (a tunnel or pocket the part
+// encloses across y=0) gets divided by a flat split into a thin sliver on each
+// half. This pass offers to hand the whole region to one half instead, so the
+// parting surface locally follows the part. Per object: build the convex-hull
+// envelope, cut the part out of it, and any resulting cavity solid whose bounds
+// straddle the plane is a candidate. The candidate solid itself is the transfer
+// tool T: for "combine to the top half", cut T out of the bottom half and fuse
+// the removed piece into the top (mirror for the bottom). Runs before the
+// orphan resolver, which mops up any residue the transfer leaves.
+//
+// Builds the hull as an exact planar BREP solid so no mesh->BREP of arbitrary
+// geometry is needed. Two-part moulds only.
+// ---------------------------------------------------------------------------
+static bool HullSolidFromMesh(const MeshBoolean::Mesh& hull, TopoDS_Shape& out)
+{
+    out = TopoDS_Shape();
+    const size_t nTri = hull.indices.size() / 3;
+    if (nTri < 4 || hull.verts.empty()) return false;
+
+    // Each hull triangle is planar: sew them into a shell, then a solid. The
+    // hull is convex and closed, so this is well-behaved (unlike sewing an
+    // arbitrary mesh).
+    BRepBuilderAPI_Sewing sew(1.0e-6);
+    for (size_t t = 0; t < nTri; ++t)
+    {
+        const uint32_t ia = hull.indices[t * 3 + 0];
+        const uint32_t ib = hull.indices[t * 3 + 1];
+        const uint32_t ic = hull.indices[t * 3 + 2];
+        const gp_Pnt pa(hull.verts[ia * 3 + 0], hull.verts[ia * 3 + 1], hull.verts[ia * 3 + 2]);
+        const gp_Pnt pb(hull.verts[ib * 3 + 0], hull.verts[ib * 3 + 1], hull.verts[ib * 3 + 2]);
+        const gp_Pnt pc(hull.verts[ic * 3 + 0], hull.verts[ic * 3 + 1], hull.verts[ic * 3 + 2]);
+        BRepBuilderAPI_MakePolygon poly(pa, pb, pc, Standard_True);
+        if (!poly.IsDone()) continue;
+        BRepBuilderAPI_MakeFace face(poly.Wire(), /*onlyPlane=*/true);
+        if (!face.IsDone()) continue;
+        sew.Add(face.Face());
+    }
+    sew.Perform();
+    const TopoDS_Shape sewn = sew.SewedShape();
+    if (sewn.IsNull()) return false;
+
+    TopExp_Explorer ex(sewn, TopAbs_SHELL);
+    if (!ex.More()) return false;
+    const TopoDS_Shell shell = TopoDS::Shell(ex.Current());
+    BRepBuilderAPI_MakeSolid mkSolid(shell);
+    if (!mkSolid.IsDone()) return false;
+    out = mkSolid.Solid();
+    return !out.IsNull();
+}
+
+void GLCanvas::ResolveNearlyOrphanRegions(std::vector<TopoDS_Shape>& halfResults,
+    std::vector<bool>& halfValid)
+{
+    // Need the two halves and which is top (+y) vs bottom (-y).
+    int idxA = -1, idxB = -1;
+    for (int i = 0; i < (int)halfResults.size(); ++i)
+        if (i < (int)halfValid.size() && halfValid[i])
+        {
+            if (idxA < 0)      idxA = i;
+            else if (idxB < 0) idxB = i;
+        }
+    if (idxA < 0 || idxB < 0) return;   // need two halves to combine between
+
+    Bnd_Box ba = ShapeBounds(halfResults[idxA]);
+    Bnd_Box bb = ShapeBounds(halfResults[idxB]);
+    if (ba.IsVoid() || bb.IsVoid()) return;
+    double ax0, ay0, az0, ax1, ay1, az1;  ba.Get(ax0, ay0, az0, ax1, ay1, az1);
+    double bx0, by0, bz0, bx1, by1, bz1;  bb.Get(bx0, by0, bz0, bx1, by1, bz1);
+    const int topIdx = (ay1 >= by1) ? idxA : idxB;   // larger ymax = top half
+    const int botIdx = (topIdx == idxA) ? idxB : idxA;
+
+    // ---- collect straddling hull-cavity solids per object -----------------
+    struct Instance { TopoDS_Shape tool; std::string label; };
+    std::vector<Instance> instances;
+
+    for (int oi = 0; oi < (int)m_objects.size(); ++oi)
+    {
+        const SceneObject& obj = m_objects[oi];
+        if (obj.format == SourceFormat::Mesh) continue;      // BREP stage only
+        if (!obj.hasSourceShape || obj.sourceShape.IsNull()) continue;
+        if (obj.cpuVerts.empty() || obj.cpuIndices.empty()) continue;
+
+        // Envelope = convex hull of the object's world-space vertices, built as
+        // an exact planar BREP solid.
+        MeshBoolean::Mesh worldObj =
+            WorldMeshFromLocal(obj.cpuVerts, obj.cpuIndices, obj.BuildModelMatrix());
+        MeshBoolean::Mesh hullMesh;
+        std::string herr;
+        if (!MeshBoolean::ConvexHull(worldObj, hullMesh, herr)) continue;
+        TopoDS_Shape hullSolid;
+        if (!HullSolidFromMesh(hullMesh, hullSolid) || hullSolid.IsNull()) continue;
+
+        // World-space BREP part (same transform the cut loop uses).
+        gp_Trsf objTrsf;
+        glm::mat4 om = obj.BuildModelMatrix();
+        objTrsf.SetValues(
+            om[0][0], om[1][0], om[2][0], om[3][0],
+            om[0][1], om[1][1], om[2][1], om[3][1],
+            om[0][2], om[1][2], om[2][2], om[3][2]);
+        BRepBuilderAPI_Transform objXform(obj.sourceShape, objTrsf, true);
+        TopoDS_Shape objShape = objXform.Shape();
+        if (objShape.IsNull()) continue;
+
+        // Cavity = hull - part. Each connected solid that straddles the plane is
+        // a candidate; the solid is its own transfer tool.
+        BRepAlgoAPI_Cut cavCut(hullSolid, objShape);
+        cavCut.Build();
+        if (!cavCut.IsDone() || cavCut.Shape().IsNull()) continue;
+
+        std::vector<TopoDS_Shape> solids;
+        CollectSolids(cavCut.Shape(), solids);
+        int regionNo = 0;
+        for (const TopoDS_Shape& s : solids)
+        {
+            Bnd_Box sb = ShapeBounds(s);
+            if (sb.IsVoid()) continue;
+            double sx0, sy0, sz0, sx1, sy1, sz1;
+            sb.Get(sx0, sy0, sz0, sx1, sy1, sz1);
+            if (sy0 < -kOuterPlaneTol && sy1 > kOuterPlaneTol)   // straddles y=0
+            {
+                ++regionNo;
+                instances.push_back({ s,
+                    "object " + std::to_string(oi + 1) +
+                    ", region " + std::to_string(regionNo) });
+            }
+        }
+    }
+
+    if (instances.empty()) return;   // no cross-plane cavity -> plain y=0
+
+    // ---- prompt per instance (with apply-to-all), then transfer -----------
+    enum class Choice { KeepSplit, ToTop, ToBottom };
+    Choice remembered = Choice::KeepSplit;
+    bool   applyAll   = false;
+
+    for (size_t k = 0; k < instances.size(); ++k)
+    {
+        Choice choice;
+        if (applyAll)
+        {
+            choice = remembered;
+        }
+        else
+        {
+            wxString msg =
+                "A region of the part (" + wxString(instances[k].label) +
+                ") forms a cavity that crosses the parting plane. A flat y=0 "
+                "split would divide it into a thin sliver on each half. You can "
+                "combine the whole region into one half so the parting surface "
+                "follows the part there.\n\nHow would you like to handle it?";
+
+            wxRichMessageDialog dlg(this, msg, "Nearly-Orphaned Region",
+                wxYES_NO | wxCANCEL | wxICON_QUESTION);
+            dlg.SetYesNoCancelLabels("Combine to A (top)",
+                "Combine to B (bottom)", "Continue y=0 split");
+            dlg.ShowCheckBox("Apply this choice to all remaining regions");
+
+            const int rc = dlg.ShowModal();
+            choice = (rc == wxID_YES) ? Choice::ToTop
+                   : (rc == wxID_NO)  ? Choice::ToBottom
+                                      : Choice::KeepSplit;
+            if (dlg.IsCheckBoxChecked()) { applyAll = true; remembered = choice; }
+        }
+
+        if (choice == Choice::KeepSplit) continue;
+
+        const int dst = (choice == Choice::ToTop) ? topIdx : botIdx;
+        const int src = (choice == Choice::ToTop) ? botIdx : topIdx;
+        const TopoDS_Shape& T = instances[k].tool;
+
+        // piece = src-side material inside the region; move it dst-ward.
+        BRepAlgoAPI_Common common(halfResults[src], T);
+        common.Build();
+        TopoDS_Shape piece =
+            (common.IsDone() && !common.Shape().IsNull()) ? common.Shape()
+                                                          : TopoDS_Shape();
+
+        BRepAlgoAPI_Cut srcCut(halfResults[src], T);
+        srcCut.Build();
+        if (srcCut.IsDone() && !srcCut.Shape().IsNull())
+            halfResults[src] = srcCut.Shape();
+
+        if (!piece.IsNull())
+        {
+            std::vector<TopoDS_Shape> parts{ halfResults[dst], piece };
+            halfResults[dst] = FuseShapes(parts);
+        }
+    }
+}
+
 
 bool GLCanvas::GenerateMould()
 {
@@ -3836,6 +4035,23 @@ bool GLCanvas::GenerateMould()
     // contact tests are possible. This may fuse a severed lump into the other
     // half, drop true orphans, or -- if the user chooses to reconfigure --
     // abort the whole generation.
+    // ---- Parting Behavior: nearly-orphaned region combine (BREP scenes) ---
+    // Cross-parting-plane part cavities a flat y=0 split would divide awkwardly.
+    // Runs on the post-cut BREP halves, before the orphan resolver so any
+    // residue the transfer leaves is cleaned up there. Mesh scenes get the same
+    // pass in phase 3b (next stage). Gated by the Parting Behavior menu toggle.
+    if (!m_sceneIsMesh)
+    {
+        bool detect = true;
+        if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+            detect = frame->IsNearlyOrphanDetectionEnabled();
+        if (detect)
+        {
+            progress.Update(step, "Checking parting behavior...");
+            ResolveNearlyOrphanRegions(halfResults, halfValid);
+        }
+    }
+
     progress.Update(step, "Checking for orphaned mould volumes...");
     if (!ResolveOrphanVolumes(halfResults, halfValid))
         return false;
@@ -4374,6 +4590,59 @@ void GLCanvas::ClearShotDebugSolid()
 {
     m_showDebugSolid = false;
     m_debugSolidObj.mesh.Destroy();
+    Refresh(false);
+}
+
+// Parting Behavior diagnostic overlay: the convex-hull envelope of every part,
+// merged into one world-space mesh and shown translucent in the main canvas.
+// This is the exact envelope ResolveNearlyOrphanRegions cuts the part out of,
+// so it answers "why didn't this region flag?" — if the hull doesn't enclose
+// the cavity you expected, or the cavity doesn't cross y=0, that's visible here.
+// Rebuilt from the current objects on each switch-on (it's a snapshot; move a
+// part and toggle again to refresh).
+void GLCanvas::ShowConvexHullDebug(bool on)
+{
+    SetCurrent(*m_context);
+    InitGLOnce();
+
+    m_showHullDebug = on;
+    m_hullDebugObj.mesh.Destroy();
+
+    if (!on) { Refresh(false); return; }
+
+    FileImporter::MeshData combined;   // stride-6 posNorm, world space
+    for (const SceneObject& obj : m_objects)
+    {
+        if (obj.cpuVerts.empty() || obj.cpuIndices.empty()) continue;
+
+        MeshBoolean::Mesh worldObj =
+            WorldMeshFromLocal(obj.cpuVerts, obj.cpuIndices, obj.BuildModelMatrix());
+        MeshBoolean::Mesh hullMesh;
+        std::string herr;
+        if (!MeshBoolean::ConvexHull(worldObj, hullMesh, herr)) continue;
+
+        TopoDS_Shape hullSolid;
+        if (!HullSolidFromMesh(hullMesh, hullSolid) || hullSolid.IsNull()) continue;
+
+        FileImporter::MeshData md;
+        TessellateShapeToMesh(hullSolid, md);
+        if (md.posNorm.empty() || md.indices.empty()) continue;
+
+        const uint32_t base = (uint32_t)(combined.posNorm.size() / 6);
+        combined.posNorm.insert(combined.posNorm.end(),
+            md.posNorm.begin(), md.posNorm.end());
+        for (uint32_t idx : md.indices)
+            combined.indices.push_back(base + idx);
+    }
+
+    if (combined.posNorm.empty() || combined.indices.empty())
+    {
+        m_showHullDebug = false;   // nothing hull-able in the scene
+        Refresh(false);
+        return;
+    }
+
+    UploadMeshToGPU(combined, m_hullDebugObj);
     Refresh(false);
 }
 
@@ -10146,6 +10415,31 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         }
 
         glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &baseColor[0]);
+    }
+
+    // ---- Convex-hull debug overlay (Parting Behavior) ----------------------
+    // Each part's convex-hull envelope, merged into one world-space mesh, drawn
+    // translucent so the part shows through. Model matrix is identity (the mesh
+    // is already in world space). uBaseColor / uAlpha are restored afterwards
+    // since later passes share m_program.
+    if (m_showHullDebug && m_hullDebugObj.mesh.vao != 0 &&
+        m_hullDebugObj.mesh.indexCount > 0)
+    {
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+        const glm::mat4 identity(1.0f);
+        glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &identity[0][0]);
+        glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &m_hullDebugColor[0]);
+        glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 0.35f);
+
+        glBindVertexArray(m_hullDebugObj.mesh.vao);
+        glDrawElements(GL_TRIANGLES, m_hullDebugObj.mesh.indexCount, GL_UNSIGNED_INT, 0);
+        glBindVertexArray(0);
+
+        glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 1.0f);
+        glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &baseColor[0]);
+        glDisable(GL_BLEND);
     }
 
     // ---- AlignFace hover highlight -----------------------------------------

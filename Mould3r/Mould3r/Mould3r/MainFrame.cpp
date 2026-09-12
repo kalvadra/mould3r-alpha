@@ -548,6 +548,8 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
     Bind(wxEVT_MENU, &MainFrame::OnAbout, this, wxID_ABOUT);
     Bind(wxEVT_MENU, &MainFrame::OnCheckForUpdates, this, ID_CheckForUpdates);
     Bind(wxEVT_MENU, &MainFrame::OnToggleAutoUpdateCheck, this, ID_AutoUpdateCheck);
+    Bind(wxEVT_MENU, &MainFrame::OnPartingNearlyOrphan, this, ID_PartingNearlyOrphan);
+    Bind(wxEVT_MENU, &MainFrame::OnPartingShowHull, this, ID_PartingShowHull);
 
     // Mesh quality radio items just persist the chosen preset; the next
     // import picks it up via MeshImportSettings::GetQuality().
@@ -858,6 +860,22 @@ void MainFrame::OnToggleAutoUpdateCheck(wxCommandEvent& evt)
         m_castingMenuBar->Check(ID_AutoUpdateCheck, enabled);
 }
 
+// Parting Behavior toggle: records whether Generate Mould detects nearly-
+// orphaned regions. Only the Prepare menu bar carries this item (parting is a
+// Prepare-perspective concern), so there's nothing to re-sync across bars.
+void MainFrame::OnPartingNearlyOrphan(wxCommandEvent& evt)
+{
+    m_partingNearlyOrphan = evt.IsChecked();
+}
+
+// Parting Behavior diagnostic: overlay the convex-hull envelope of every part
+// in the main canvas so a missed detection can be eyeballed. The canvas holds
+// the toggle state and rebuilds the overlay when switched on.
+void MainFrame::OnPartingShowHull(wxCommandEvent& evt)
+{
+    if (m_canvas) m_canvas->ShowConvexHullDebug(evt.IsChecked());
+}
+
 // ---------------------------------------------------------------------------
 // Destructor — the frame auto-destroys whichever menu bar is currently
 // attached; the other (detached) one is ours to free.
@@ -916,6 +934,22 @@ wxMenuBar* MainFrame::BuildPrepareMenuBar()
 
     // Grid menu — edit the ground-plane grid's shape, size and spacing.
     menuBar->Append(BuildGridMenu(), "&Grid");
+
+    // Parting Behavior menu — how Generate Mould splits the mould. Home for
+    // non-y=0 parting methods as they arrive; for now, a single toggle for
+    // nearly-orphaned-region detection (cross-parting-plane part cavities that
+    // a flat y=0 split would divide awkwardly). Checked state mirrors
+    // m_partingNearlyOrphan, which the toggle handler keeps in sync.
+    auto* partingMenu = new wxMenu();
+    auto* nearlyOrphanItem = partingMenu->AppendCheckItem(ID_PartingNearlyOrphan,
+        "Detect Nearly-Orphaned Regions");
+    nearlyOrphanItem->Check(m_partingNearlyOrphan);
+    partingMenu->AppendSeparator();
+    // Diagnostic: overlay each part's convex-hull envelope (the shape the
+    // nearly-orphan detector cuts against) so a "why didn't this flag?" case
+    // can be inspected. Off by default; recomputed each time it's switched on.
+    partingMenu->AppendCheckItem(ID_PartingShowHull, "Show Convex Hull (Debug)");
+    menuBar->Append(partingMenu, "&Parting Behavior");
 
     auto* unitsMenu = new wxMenu();
     unitsMenu->AppendRadioItem(ID_UnitMetric, "Metric (mm)");

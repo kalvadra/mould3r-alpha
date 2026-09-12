@@ -485,6 +485,12 @@ public:
     void ShowShotDebugSolid(bool on);
     void ClearShotDebugSolid();
 
+    // Parting Behavior diagnostic: build (or clear) a translucent overlay of
+    // every part's convex-hull envelope in the main canvas, so a nearly-orphan
+    // case that didn't flag can be inspected against the actual envelope.
+    // Recomputed from the current objects each time it's switched on.
+    void ShowConvexHullDebug(bool on);
+
     // Read-only access to the meshes produced by the most recent successful
     // GenerateMould run, one per fixture, in fixture order. World-space,
     // interleaved position+normal with indices. PreviewPanel consumes these
@@ -985,6 +991,18 @@ private:
     bool ResolveMeshOrphanVolumes(std::vector<MeshBoolean::Mesh>& meshHalves,
         std::vector<bool>& meshValid);
 
+    // Parting Behavior: nearly-orphaned region combine (BREP scenes). For each
+    // BREP object, builds the convex-hull envelope, finds hull-cavity solids
+    // that straddle the parting plane (a flat y=0 split would divide them
+    // awkwardly), and for each one prompts the user to combine it wholly into
+    // the top or bottom half (or keep the y=0 split). "Combine" cuts the region
+    // out of one half and fuses it into the other. Runs on the post-cut BREP
+    // halves, before the orphan resolver. Gated by the Parting Behavior menu
+    // toggle at the call site. Two-part moulds only. Mutates halfResults in
+    // place; never aborts generation (worst case: every region kept at y=0).
+    void ResolveNearlyOrphanRegions(std::vector<TopoDS_Shape>& halfResults,
+        std::vector<bool>& halfValid);
+
     void InitGLOnce();
     void DestroyGL();
 
@@ -1482,6 +1500,12 @@ private:
     SceneObject m_debugSolidObj;
     bool        m_showDebugSolid = false;
     glm::vec3   m_debugSolidColor{ 0.90f, 0.15f, 0.15f };
+
+    // Parting Behavior hull-envelope debug overlay (main canvas). One merged,
+    // world-space mesh of every part's convex hull, drawn translucent.
+    SceneObject m_hullDebugObj;
+    bool        m_showHullDebug = false;
+    glm::vec3   m_hullDebugColor{ 0.15f, 0.90f, 0.45f };
 
     // Meshes from the most recent successful GenerateMould (one per fixture,
     // world-space, position+normal interleaved with indices). Populated in

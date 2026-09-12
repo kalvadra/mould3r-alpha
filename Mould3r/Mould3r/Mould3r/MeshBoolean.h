@@ -85,6 +85,13 @@ bool Intersection(const Mesh& a, const Mesh& b, Mesh& out, std::string& error);
 // solid); false with a reason in `error` on empty/degenerate input. Never throws.
 bool Decompose(const Mesh& in, std::vector<Mesh>& out, std::string& error);
 
+// Convex hull of a mesh's vertices, returned as a closed triangulated solid.
+// Only the vertex cloud is used (connectivity is ignored), so this doubles as a
+// tight "envelope" around a part regardless of how the part mesh is built.
+// Returns false (out cleared, reason in error) when the hull can't be formed.
+// Never throws.
+bool ConvexHull(const Mesh& in, Mesh& out, std::string& error);
+
 // Volume of a closed triangle mesh, in the mesh's units cubed (mm^3 for
 // Mould3r geometry), via the divergence-theorem tetrahedron sum. Assumes a
 // closed surface (e.g. a Union / Difference result); returns the absolute
