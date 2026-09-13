@@ -125,6 +125,21 @@ public:
     // canvas at generation time, like GetInsertCutScale above. Default on.
     bool IsNearlyOrphanDetectionEnabled() const { return m_partingNearlyOrphan; }
 
+    // Minimum region volume (mm^3) for nearly-orphan detection: straddling
+    // cavity regions below this are excluded, which drops the tiny silhouette
+    // slivers a loose convex hull produces. Read by the canvas at generation
+    // time. Default 0.01.
+    double GetPartingMinRegionVolume() const { return m_partingMinRegionVolume; }
+
+    // Nearly-orphan analysis: a straddling region is offered for combining only
+    // when it is lopsided about the parting plane — i.e. the surface area it
+    // shares with one half is below GetPartingSurfaceAreaThreshold (mm^2; 0
+    // disables this test), OR the smaller side's area is below
+    // GetPartingSignificanceRatio times the larger side's. Both read by the
+    // canvas at generation time.
+    double GetPartingSurfaceAreaThreshold() const { return m_partingSurfaceAreaThreshold; }
+    double GetPartingSignificanceRatio() const { return m_partingSignificanceRatio; }
+
     // Called by GLCanvas when the user picks a parent object in PlaceInsert
     // mode. Runs the import file dialog and hands the result to the canvas,
     // then drops back to Select. Public because the canvas drives it — the
@@ -276,6 +291,7 @@ private:
     void OnToggleAutoUpdateCheck(wxCommandEvent&);
     void OnPartingNearlyOrphan(wxCommandEvent&);
     void OnPartingShowHull(wxCommandEvent&);
+    void OnSetupNearOrphanChecks(wxCommandEvent&);
 
     // ---- Workflow perspectives ---------------------------------------------
     // The window hosts three stacked perspectives in a wxSimplebook: "Prepare"
@@ -468,6 +484,17 @@ private:
     // IsNearlyOrphanDetectionEnabled(). Default on.
     bool m_partingNearlyOrphan = true;
 
+    // Minimum region volume in mm^3 (see GetPartingMinRegionVolume). Default
+    // 0.01 (small enough for practically any part; excludes only sub-sliver
+    // noise). The Parting Behavior menu lets the user raise it.
+    double m_partingMinRegionVolume = 0.01;
+
+    // Nearly-orphan lopsidedness thresholds (see the accessors). Surface-area
+    // floor in mm^2 (default 0 = off); significance ratio in (0,1] (default
+    // 0.25 = smaller side under a quarter of the larger flags the region).
+    double m_partingSurfaceAreaThreshold = 0.0;
+    double m_partingSignificanceRatio = 0.25;
+
     // Ribbon perspective-switch tabs (shared top bar). Held so SetPerspective
     // can drive their selected styling.
     PerspectiveButton* m_btnPrepare = nullptr;
@@ -645,6 +672,7 @@ private:
         ID_GridSettings,
         ID_PartingNearlyOrphan,
         ID_PartingShowHull,
+        ID_PartingSetup,
         ID_MeshQualityOff,
         ID_MeshQualityDraft,
         ID_MeshQualityNormal,

@@ -10,6 +10,8 @@
 #include <wx/simplebook.h> // wxSimplebook — the Prepare/Preview perspective pager
 #include <wx/spinctrl.h>   // wxSpinCtrlDouble — fine-tune fields in the insert editor
 #include <wx/statline.h>   // wxStaticLine — section separators in the insert editor
+#include <wx/textdlg.h>    // wxTextEntryDialog — Set Minimum Region Volume popup
+#include <wx/radiobox.h>   // wxRadioBox — units toggle in the near-orphan setup
 #include <memory>
 
 #ifdef __WXMSW__
@@ -550,6 +552,7 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
     Bind(wxEVT_MENU, &MainFrame::OnToggleAutoUpdateCheck, this, ID_AutoUpdateCheck);
     Bind(wxEVT_MENU, &MainFrame::OnPartingNearlyOrphan, this, ID_PartingNearlyOrphan);
     Bind(wxEVT_MENU, &MainFrame::OnPartingShowHull, this, ID_PartingShowHull);
+    Bind(wxEVT_MENU, &MainFrame::OnSetupNearOrphanChecks, this, ID_PartingSetup);
 
     // Mesh quality radio items just persist the chosen preset; the next
     // import picks it up via MeshImportSettings::GetQuality().
@@ -877,6 +880,157 @@ void MainFrame::OnPartingShowHull(wxCommandEvent& evt)
 }
 
 // ---------------------------------------------------------------------------
+// Setup Near-Orphan Checks dialog
+//
+// One window for all the nearly-orphan tuning fields, with a mm/in unit toggle
+// (defaulting to the app's current unit) that live-converts the volume and area
+// fields. Values are held and returned in mm-based units (mm^3 / mm^2); the
+// significance ratio is unitless.
+// ---------------------------------------------------------------------------
+namespace {
+constexpr double kNearOrphanMMPerInch = 25.4;
+
+class NearOrphanSettingsDialog : public wxDialog
+{
+public:
+    NearOrphanSettingsDialog(wxWindow* parent, bool startImperial,
+        double minVolMM3, double surfAreaMM2, double sigRatio)
+        : wxDialog(parent, wxID_ANY, "Setup Near-Orphan Checks",
+              wxDefaultPosition, wxDefaultSize, wxDEFAULT_DIALOG_STYLE)
+        , m_displayImperial(startImperial)
+        , m_volMM3(minVolMM3), m_areaMM2(surfAreaMM2), m_ratio(sigRatio)
+    {
+        auto* main = new wxBoxSizer(wxVERTICAL);
+
+        auto* desc = new wxStaticText(this, wxID_ANY,
+            "These checks decide when a mould region that crosses the parting\n"
+            "plane is combined into one half instead of split at y=0. A region\n"
+            "is offered when it is small or lopsided about the plane:\n"
+            "  - Minimum region volume: regions below this are ignored.\n"
+            "  - Surface area threshold: flag if the area a region shares with\n"
+            "    one half is below this (0 disables this test).\n"
+            "  - Significance ratio: flag if the smaller side is below this\n"
+            "    fraction of the larger side.");
+        main->Add(desc, 0, wxALL, 12);
+
+        wxArrayString unitChoices;
+        unitChoices.Add("mm");
+        unitChoices.Add("in");
+        m_units = new wxRadioBox(this, wxID_ANY, "Units",
+            wxDefaultPosition, wxDefaultSize, unitChoices, 2, wxRA_SPECIFY_COLS);
+        m_units->SetSelection(startImperial ? 1 : 0);
+        m_units->Bind(wxEVT_RADIOBOX, &NearOrphanSettingsDialog::OnUnitChanged, this);
+        main->Add(m_units, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
+
+        auto* grid = new wxFlexGridSizer(3, 3, 6, 8);
+        const wxString u = startImperial ? "in" : "mm";
+        auto addRow = [&](const wxString& label, wxTextCtrl*& ctrl,
+                          double displayValue, const wxString& unitSuffix)
+        {
+            grid->Add(new wxStaticText(this, wxID_ANY, label), 0,
+                wxALIGN_CENTER_VERTICAL);
+            ctrl = new wxTextCtrl(this, wxID_ANY,
+                wxString::FromCDouble(displayValue, 4),
+                wxDefaultPosition, wxSize(120, -1));
+            grid->Add(ctrl, 0, wxALIGN_CENTER_VERTICAL);
+            auto* us = new wxStaticText(this, wxID_ANY, unitSuffix);
+            m_unitLabels.push_back(us);
+            grid->Add(us, 0, wxALIGN_CENTER_VERTICAL);
+        };
+        addRow("Minimum region volume:", m_ctrlVol,  m_volMM3 / VolFactor(),  u + "^3");
+        addRow("Surface area threshold:", m_ctrlArea, m_areaMM2 / AreaFactor(), u + "^2");
+        addRow("Significance ratio:",     m_ctrlRatio, m_ratio,                "(0-1)");
+        main->Add(grid, 0, wxLEFT | wxRIGHT | wxBOTTOM, 12);
+
+        main->Add(CreateButtonSizer(wxOK | wxCANCEL), 0, wxALIGN_RIGHT | wxALL, 10);
+        SetSizerAndFit(main);
+    }
+
+    double GetMinVolumeMM3() const   { return ParseVal(m_ctrlVol,  m_volMM3,  VolFactor()); }
+    double GetSurfaceAreaMM2() const { return ParseVal(m_ctrlArea, m_areaMM2, AreaFactor()); }
+    double GetSignificanceRatio() const
+    {
+        double v;
+        if (m_ctrlRatio->GetValue().ToCDouble(&v))
+        {
+            if (v < 0.0) v = 0.0;
+            if (v > 1.0) v = 1.0;
+            return v;
+        }
+        return m_ratio;
+    }
+
+private:
+    // Factor to turn a value shown in the current unit into mm-based units.
+    double VolFactor() const
+    {
+        return m_displayImperial
+            ? kNearOrphanMMPerInch * kNearOrphanMMPerInch * kNearOrphanMMPerInch
+            : 1.0;
+    }
+    double AreaFactor() const
+    {
+        return m_displayImperial ? kNearOrphanMMPerInch * kNearOrphanMMPerInch : 1.0;
+    }
+
+    double ParseVal(wxTextCtrl* ctrl, double fallbackMM, double factor) const
+    {
+        double v;
+        if (ctrl->GetValue().ToCDouble(&v))
+        {
+            if (v < 0.0) v = 0.0;
+            return v * factor;
+        }
+        return fallbackMM;
+    }
+
+    void OnUnitChanged(wxCommandEvent&)
+    {
+        const bool nowImperial = (m_units->GetSelection() == 1);
+        if (nowImperial == m_displayImperial) return;
+
+        // Read the current field values back to mm using the OLD unit, then
+        // rewrite them in the NEW unit.
+        const double volMM3  = ParseVal(m_ctrlVol,  m_volMM3,  VolFactor());
+        const double areaMM2 = ParseVal(m_ctrlArea, m_areaMM2, AreaFactor());
+        m_displayImperial = nowImperial;
+        m_ctrlVol->SetValue(wxString::FromCDouble(volMM3 / VolFactor(), 4));
+        m_ctrlArea->SetValue(wxString::FromCDouble(areaMM2 / AreaFactor(), 4));
+
+        const wxString u = nowImperial ? "in" : "mm";
+        if (m_unitLabels.size() >= 2)
+        {
+            m_unitLabels[0]->SetLabel(u + "^3");
+            m_unitLabels[1]->SetLabel(u + "^2");
+        }
+        Layout();
+    }
+
+    bool   m_displayImperial = false;
+    double m_volMM3 = 0.0, m_areaMM2 = 0.0, m_ratio = 0.0;
+    wxRadioBox* m_units = nullptr;
+    wxTextCtrl* m_ctrlVol = nullptr;
+    wxTextCtrl* m_ctrlArea = nullptr;
+    wxTextCtrl* m_ctrlRatio = nullptr;
+    std::vector<wxStaticText*> m_unitLabels;
+};
+} // namespace
+
+// Parting Behavior: open the consolidated near-orphan settings window and, on
+// OK, store the fields back (always in mm-based units).
+void MainFrame::OnSetupNearOrphanChecks(wxCommandEvent&)
+{
+    NearOrphanSettingsDialog dlg(this, m_imperial,
+        m_partingMinRegionVolume, m_partingSurfaceAreaThreshold,
+        m_partingSignificanceRatio);
+    if (dlg.ShowModal() != wxID_OK) return;
+
+    m_partingMinRegionVolume      = dlg.GetMinVolumeMM3();
+    m_partingSurfaceAreaThreshold = dlg.GetSurfaceAreaMM2();
+    m_partingSignificanceRatio    = dlg.GetSignificanceRatio();
+}
+
+// ---------------------------------------------------------------------------
 // Destructor — the frame auto-destroys whichever menu bar is currently
 // attached; the other (detached) one is ours to free.
 // ---------------------------------------------------------------------------
@@ -944,6 +1098,8 @@ wxMenuBar* MainFrame::BuildPrepareMenuBar()
     auto* nearlyOrphanItem = partingMenu->AppendCheckItem(ID_PartingNearlyOrphan,
         "Detect Nearly-Orphaned Regions");
     nearlyOrphanItem->Check(m_partingNearlyOrphan);
+    // Consolidated settings window for the nearly-orphan checks.
+    partingMenu->Append(ID_PartingSetup, "Setup Near-Orphan Checks...");
     partingMenu->AppendSeparator();
     // Diagnostic: overlay each part's convex-hull envelope (the shape the
     // nearly-orphan detector cuts against) so a "why didn't this flag?" case
@@ -3912,7 +4068,9 @@ void MainFrame::OnGenerateMould(wxCommandEvent&)
             // Passed even when empty — SetData treats an empty list as "no
             // insert checkbox", so a run without inserts is unaffected.
             m_previewPanel->SetData(halves, shot,
-                m_canvas->GetLastInsertMeshes());
+                m_canvas->GetLastInsertMeshes(),
+                m_canvas->GetLastNearlyOrphanRegions(),
+                m_canvas->GetLastNearlyOrphanRegionLabels());
         }
 
         // Seed the Casting perspective with the Cast Shot Body (the augmented

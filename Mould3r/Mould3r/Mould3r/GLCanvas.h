@@ -509,6 +509,24 @@ public:
         return m_lastInsertMeshes;
     }
 
+    // Straddling cavity regions the nearly-orphan detector found in the most
+    // recent Generate Mould (BREP scenes, when detection is enabled), one mesh
+    // per region, world-space. Surfaced by PreviewPanel as toggleable debug
+    // objects so an over-detection ("why 8 regions?") can be inspected.
+    const std::vector<FileImporter::MeshData>& GetLastNearlyOrphanRegions() const
+    {
+        return m_lastNearlyOrphanRegions;
+    }
+
+    // Per-region readout strings (parallel to GetLastNearlyOrphanRegions), e.g.
+    // "Region 1 | A 12.3 B 0.8 mm2" — the A/B shared surface areas the analysis
+    // computed. Shown by PreviewPanel as the region toggle labels so the values
+    // can be checked (useful for comparing STEP vs mesh results).
+    const std::vector<std::string>& GetLastNearlyOrphanRegionLabels() const
+    {
+        return m_lastNearlyOrphanRegionLabels;
+    }
+
     // The "shot" model from the most recent successful GenerateMould: the
     // boolean union of every imported object and the feed-system features
     // (sprue, runners, gates and their sub-parts) — i.e. all placed features
@@ -1002,6 +1020,16 @@ private:
     // place; never aborts generation (worst case: every region kept at y=0).
     void ResolveNearlyOrphanRegions(std::vector<TopoDS_Shape>& halfResults,
         std::vector<bool>& halfValid);
+
+    // Mesh-scene counterpart to ResolveNearlyOrphanRegions, run in phase 3b
+    // before the mesh orphan resolver. Same policy in the mesh (Manifold)
+    // domain: per mesh object, convex-hull envelope, hull-minus-part cavities,
+    // straddling components filtered by the minimum-region-volume setting, a
+    // per-region prompt, and transfer via Intersection / Difference / Union.
+    // Mutates meshHalves in place; gated by the Parting Behavior toggle at the
+    // call site. Two-part moulds only.
+    void ResolveMeshNearlyOrphanRegions(std::vector<MeshBoolean::Mesh>& meshHalves,
+        std::vector<bool>& meshValid);
 
     void InitGLOnce();
     void DestroyGL();
@@ -1553,6 +1581,17 @@ private:
     // as their own category, in the same yellow they use in the Prepare view.
     // Empty when there were no inserts.
     std::vector<FileImporter::MeshData> m_lastInsertMeshes;
+
+    // Straddling cavity regions from the last nearly-orphan detection pass, one
+    // world-space mesh per region. Captured in ResolveNearlyOrphanRegions and
+    // surfaced to PreviewPanel as toggleable debug objects. Empty when detection
+    // was off, the scene is mesh, or nothing straddled.
+    std::vector<FileImporter::MeshData> m_lastNearlyOrphanRegions;
+
+    // Readout strings parallel to m_lastNearlyOrphanRegions (the A/B shared
+    // surface areas per region), surfaced as the Preview region toggle labels.
+    std::vector<std::string> m_lastNearlyOrphanRegionLabels;
+
 
     // Vent features (consolidated: point + path + cross-section + solid)
     std::vector<VentInstance> m_vents;

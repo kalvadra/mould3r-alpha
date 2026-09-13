@@ -407,23 +407,30 @@ bool ConvexHull(const Mesh& in, Mesh& out, std::string& error)
     out = Mesh{};
     error.clear();
 
-    if (const char* why = BasicShapeReason(in))
+    if (in.verts.size() < 12)   // need at least 4 (non-coplanar) points
     {
-        error = std::string("Hull input unusable: ") + why + ".";
+        error = "Too few vertices to form a convex hull.";
         return false;
     }
 
-    // Manifold's convex hull works from the vertex cloud, so connectivity need
-    // not be watertight; but a part that can't be welded into a valid Manifold
-    // yields an errored/empty hull, which we report so the caller skips it
-    // rather than acting on a bad envelope.
-    bool merged = false;
-    Manifold m = BuildWelded(in, merged);
-    Manifold h = m.Hull();
+    // Hull the raw VERTEX CLOUD, not a solid. A part's display tessellation
+    // need not be watertight: TessellateShapeToMesh emits geometry per face, so
+    // a STEP body arrives with coincident-but-unshared vertices along every
+    // shared edge. Building a Manifold from that and calling the member Hull()
+    // drops it as non-manifold (the seams don't weld at the merge tolerance),
+    // which is why STEP parts produced an empty hull while welded STL imports
+    // did not. The static point-cloud hull only needs the positions, so it
+    // treats both identically.
+    std::vector<manifold::vec3> pts;
+    pts.reserve(in.verts.size() / 3);
+    for (size_t v = 0; v + 2 < in.verts.size(); v += 3)
+        pts.push_back(manifold::vec3(in.verts[v + 0], in.verts[v + 1], in.verts[v + 2]));
+
+    Manifold h = Manifold::Hull(pts);
 
     if (h.Status() != Manifold::Error::NoError || h.IsEmpty())
     {
-        error = "Convex hull could not be computed for this shape.";
+        error = "Convex hull could not be computed for this point set.";
         return false;
     }
 

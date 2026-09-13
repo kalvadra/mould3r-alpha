@@ -30,6 +30,9 @@
 #include <opencascade/BRepMesh_IncrementalMesh.hxx>
 #include <opencascade/TopExp.hxx>
 #include <opencascade/TopTools_IndexedMapOfShape.hxx>
+#include <opencascade/TopTools_ListOfShape.hxx>
+#include <opencascade/Standard_Failure.hxx>
+#include <opencascade/ShapeUpgrade_UnifySameDomain.hxx>
 #include <opencascade/BRepBuilderAPI_MakeEdge.hxx>
 #include <opencascade/BRepBuilderAPI_MakeWire.hxx>
 #include <opencascade/BRepBuilderAPI_MakeFace.hxx>
@@ -63,6 +66,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <cstdio>
 #include <fstream>
 #include <limits>
 #include <string>
@@ -2826,7 +2830,47 @@ double ShapeGap(const TopoDS_Shape& a, const TopoDS_Shape& b)
 // Fuse a set of shapes into one. A pairwise fuse that fails falls back to a
 // compound so geometry is never dropped -- the shapes are all still present
 // for tessellation / export, just not welded.
-TopoDS_Shape FuseShapes(const std::vector<TopoDS_Shape>& parts)
+// Run a two-operand boolean (Cut / Common / Fuse) with history filling turned
+// OFF, then return the result. OpenCASCADE's BRepTools_History builder asserts
+// ("a duplicated modification of a shape") on some coincident inputs -- notably
+// geometry sitting exactly on the origin -- and we never read the history, so
+// skipping it both avoids the assert and is a little cheaper. Uses the deferred
+// build (SetArguments/SetTools/Build) because the two-shape constructors build
+// immediately, before options can be set.
+// Two-operand boolean (Cut / Common / Fuse) guarded so an OCC failure returns
+// false instead of aborting Generate Mould. History is left ON (the default) so
+// coincident-face results are correct. An optional fuzzy value > 0 lets the
+// boolean resolve near/exactly-coincident faces cleanly (the convex-hull cavity
+// cut can share faces with the part) rather than tripping OCC's history
+// "duplicated modification" assert -- a backstop to unifying the hull faces.
+template <typename BoolOp>
+static bool BooleanSafe(const TopoDS_Shape& a, const TopoDS_Shape& b,
+    TopoDS_Shape& out, double fuzzy = 0.0)
+{
+    out = TopoDS_Shape();
+    if (a.IsNull() || b.IsNull()) return false;
+
+    try
+    {
+        BoolOp op;
+        TopTools_ListOfShape args;  args.Append(a);
+        TopTools_ListOfShape tools; tools.Append(b);
+        op.SetArguments(args);
+        op.SetTools(tools);
+        if (fuzzy > 0.0) op.SetFuzzyValue(fuzzy);
+        op.Build();
+        if (!op.IsDone() || op.Shape().IsNull()) return false;
+        out = op.Shape();
+        return true;
+    }
+    catch (const Standard_Failure&)
+    {
+        out = TopoDS_Shape();
+        return false;   // never let an OCC boolean failure abort Generate Mould
+    }
+}
+
+TopoDS_Shape FuseShapes(const std::vector<TopoDS_Shape>& parts, double fuzzy = 0.0)
 {
     if (parts.empty()) return TopoDS_Shape();
     TopoDS_Shape acc = parts.front();
@@ -2834,11 +2878,11 @@ TopoDS_Shape FuseShapes(const std::vector<TopoDS_Shape>& parts)
     {
         if (parts[i].IsNull()) continue;
         if (acc.IsNull()) { acc = parts[i]; continue; }
-        BRepAlgoAPI_Fuse fuse(acc, parts[i]);
-        fuse.Build();
-        if (fuse.IsDone() && !fuse.Shape().IsNull())
+
+        TopoDS_Shape fused;
+        if (BooleanSafe<BRepAlgoAPI_Fuse>(acc, parts[i], fused, fuzzy))
         {
-            acc = fuse.Shape();
+            acc = fused;
         }
         else
         {
@@ -3205,7 +3249,94 @@ static bool HullSolidFromMesh(const MeshBoolean::Mesh& hull, TopoDS_Shape& out)
     BRepBuilderAPI_MakeSolid mkSolid(shell);
     if (!mkSolid.IsDone()) return false;
     out = mkSolid.Solid();
+    if (out.IsNull()) return false;
+
+    // Merge the coplanar hull triangles into single faces. The hull is sewn from
+    // individual triangles, so a flat hull region is many faces; where that
+    // coincides with a flat part face, `hull - part` records the part face as
+    // "modified" once per coincident triangle and OCC's history asserts
+    // ("a duplicated modification of a shape"). Unifying to one face per plane
+    // makes the coincidence one-to-one and removes the trigger -- independent of
+    // where the part sits, unlike simply translating the finished hull.
+    try
+    {
+        ShapeUpgrade_UnifySameDomain unify(out,
+            /*unifyEdges=*/Standard_True,
+            /*unifyFaces=*/Standard_True,
+            /*concatBSplines=*/Standard_False);
+        unify.Build();
+        const TopoDS_Shape merged = unify.Shape();
+        if (!merged.IsNull()) out = merged;
+    }
+    catch (const Standard_Failure&)
+    {
+        // Keep the un-unified solid; the fuzzy cut below is the backstop.
+    }
+
     return !out.IsNull();
+}
+
+// Volume of a solid (mm^3). Used to exclude the tiny silhouette slivers a loose
+// convex hull produces from nearly-orphan detection: those read as many small
+// straddling solids, whereas a genuine cross-plane cavity has real volume. The
+// exclusion threshold is user-set from the Parting Behavior menu.
+static double RegionVolume(const TopoDS_Shape& s)
+{
+    GProp_GProps props;
+    BRepGProp::VolumeProperties(s, props);
+    return props.Mass();   // Mass() == volume for a unit-density solid
+}
+
+// Split a triangle mesh's surface area by the parting plane: sum triangle areas
+// whose centroid is above y=0 (the region's share of the top half) vs below.
+// This is the "surface a region shares with each half" used to judge whether it
+// is lopsided (nearly-orphaned) and which half it belongs with.
+static void RegionAreaSplitByPlane(const std::vector<float>& verts,
+    const std::vector<uint32_t>& indices, double& areaAbove, double& areaBelow)
+{
+    areaAbove = 0.0;
+    areaBelow = 0.0;
+    const size_t nTri = indices.size() / 3;
+    for (size_t t = 0; t < nTri; ++t)
+    {
+        const uint32_t ia = indices[t * 3 + 0];
+        const uint32_t ib = indices[t * 3 + 1];
+        const uint32_t ic = indices[t * 3 + 2];
+        if ((size_t)ia * 3 + 2 >= verts.size() ||
+            (size_t)ib * 3 + 2 >= verts.size() ||
+            (size_t)ic * 3 + 2 >= verts.size())
+            continue;
+
+        const double ax = verts[ia*3+0], ay = verts[ia*3+1], az = verts[ia*3+2];
+        const double bx = verts[ib*3+0], by = verts[ib*3+1], bz = verts[ib*3+2];
+        const double cx = verts[ic*3+0], cy = verts[ic*3+1], cz = verts[ic*3+2];
+
+        const double ux = bx-ax, uy = by-ay, uz = bz-az;   // (b-a) x (c-a)
+        const double vx = cx-ax, vy = cy-ay, vz = cz-az;
+        const double nx = uy*vz - uz*vy;
+        const double ny = uz*vx - ux*vz;
+        const double nz = ux*vy - uy*vx;
+        const double area = 0.5 * std::sqrt(nx*nx + ny*ny + nz*nz);
+
+        if ((ay + by + cy) / 3.0 >= 0.0) areaAbove += area;
+        else                             areaBelow += area;
+    }
+}
+
+// A straddling region is "nearly-orphaned" (worth offering to combine) only when
+// it is lopsided about the parting plane: the smaller shared side is below the
+// absolute area floor (when > 0), OR below sigRatio of the larger side. Balanced
+// cross-plane cavities are fine at a plain y=0 split. Also reports which half the
+// region shares more surface with (the side to suggest joining).
+static bool RegionIsNearlyOrphaned(double saAbove, double saBelow,
+    double areaThreshold, double sigRatio, bool& suggestTop)
+{
+    suggestTop = (saAbove >= saBelow);
+    const double smaller = std::min(saAbove, saBelow);
+    const double larger  = std::max(saAbove, saBelow);
+    const bool belowFloor = (areaThreshold > 0.0) && (smaller < areaThreshold);
+    const bool lopsided   = (larger > 0.0) && (smaller < sigRatio * larger);
+    return belowFloor || lopsided;
 }
 
 void GLCanvas::ResolveNearlyOrphanRegions(std::vector<TopoDS_Shape>& halfResults,
@@ -3229,8 +3360,34 @@ void GLCanvas::ResolveNearlyOrphanRegions(std::vector<TopoDS_Shape>& halfResults
     const int topIdx = (ay1 >= by1) ? idxA : idxB;   // larger ymax = top half
     const int botIdx = (topIdx == idxA) ? idxB : idxA;
 
+    // Minimum region volume (mm^3) from the Parting Behavior menu; a straddling
+    // region below this is excluded from detection. Default 0 excludes nothing.
+    double minRegionVolume = 0.0;
+    double surfThreshold   = 0.0;
+    double sigRatio        = 0.25;
+    if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+    {
+        minRegionVolume = frame->GetPartingMinRegionVolume();
+        surfThreshold   = frame->GetPartingSurfaceAreaThreshold();
+        sigRatio        = frame->GetPartingSignificanceRatio();
+    }
+
+    // OpenCASCADE booleans can fail on geometry sitting exactly at the origin
+    // (an assert / failure that moving the part away resolves). So every boolean
+    // below runs in a frame offset in X and Z -- Y is left alone so the parting
+    // analysis at y=0 is unaffected -- and results are moved back. `moved`
+    // applies a rigid transform, returning the shape unchanged on failure.
+    gp_Trsf nudge, unnudge;
+    nudge.SetTranslation(gp_Vec(1234.5, 0.0, 987.5));
+    unnudge = nudge.Inverted();
+    auto moved = [](const TopoDS_Shape& s, const gp_Trsf& t) -> TopoDS_Shape {
+        if (s.IsNull()) return s;
+        BRepBuilderAPI_Transform xf(s, t, true);
+        return xf.IsDone() ? xf.Shape() : s;
+    };
+
     // ---- collect straddling hull-cavity solids per object -----------------
-    struct Instance { TopoDS_Shape tool; std::string label; };
+    struct Instance { TopoDS_Shape tool; std::string label; bool suggestTop; };
     std::vector<Instance> instances;
 
     for (int oi = 0; oi < (int)m_objects.size(); ++oi)
@@ -3261,32 +3418,70 @@ void GLCanvas::ResolveNearlyOrphanRegions(std::vector<TopoDS_Shape>& halfResults
         TopoDS_Shape objShape = objXform.Shape();
         if (objShape.IsNull()) continue;
 
-        // Cavity = hull - part. Each connected solid that straddles the plane is
-        // a candidate; the solid is its own transfer tool.
-        BRepAlgoAPI_Cut cavCut(hullSolid, objShape);
-        cavCut.Build();
-        if (!cavCut.IsDone() || cavCut.Shape().IsNull()) continue;
+        // Cavity = hull - part, computed in the nudged frame; each connected
+        // solid that straddles the plane is a candidate, moved back to its real
+        // position before use. The solid is its own transfer tool.
+        TopoDS_Shape cavity;
+        if (!BooleanSafe<BRepAlgoAPI_Cut>(
+                moved(hullSolid, nudge), moved(objShape, nudge), cavity, 1.0e-3))
+            continue;
 
-        std::vector<TopoDS_Shape> solids;
-        CollectSolids(cavCut.Shape(), solids);
+        std::vector<TopoDS_Shape> solidsN;
+        CollectSolids(cavity, solidsN);
         int regionNo = 0;
-        for (const TopoDS_Shape& s : solids)
+        for (const TopoDS_Shape& sN : solidsN)
         {
+            const TopoDS_Shape s = moved(sN, unnudge);   // back to real position
             Bnd_Box sb = ShapeBounds(s);
             if (sb.IsVoid()) continue;
             double sx0, sy0, sz0, sx1, sy1, sz1;
             sb.Get(sx0, sy0, sz0, sx1, sy1, sz1);
             if (sy0 < -kOuterPlaneTol && sy1 > kOuterPlaneTol)   // straddles y=0
             {
+                // Filter: exclude regions below the user's minimum volume. A
+                // loose convex hull produces many tiny silhouette slivers that
+                // straddle the plane; a genuine cross-plane cavity has real
+                // volume. Default minimum (0) excludes nothing.
+                if (RegionVolume(s) < minRegionVolume)
+                    continue;
+
+                FileImporter::MeshData rmesh;
+                TessellateShapeToMesh(s, rmesh);
+                if (rmesh.vertices.empty() || rmesh.indices.empty())
+                    continue;
+
+                // Nearly-orphan analysis: compare the surface the region shares
+                // with each half. Only lopsided regions are offered; a balanced
+                // cross-plane cavity is fine at a plain y=0 split.
+                double saTop = 0.0, saBot = 0.0;
+                RegionAreaSplitByPlane(rmesh.vertices, rmesh.indices, saTop, saBot);
+                bool suggestTop = true;
+                if (!RegionIsNearlyOrphaned(saTop, saBot, surfThreshold, sigRatio, suggestTop))
+                    continue;
+
                 ++regionNo;
                 instances.push_back({ s,
                     "object " + std::to_string(oi + 1) +
-                    ", region " + std::to_string(regionNo) });
+                    ", region " + std::to_string(regionNo), suggestTop });
+
+                // Capture the region for the Preview debug overlay (toggleable
+                // per region). World space, so it loads with an identity pose.
+                // The label carries the A/B shared-surface areas so the values
+                // can be read off and compared (e.g. STEP vs mesh).
+                if (!rmesh.posNorm.empty())
+                {
+                    char buf[128];
+                    std::snprintf(buf, sizeof(buf),
+                        "Region %d   |   A %.4g   B %.4g mm2",
+                        (int)m_lastNearlyOrphanRegions.size() + 1, saTop, saBot);
+                    m_lastNearlyOrphanRegions.push_back(std::move(rmesh));
+                    m_lastNearlyOrphanRegionLabels.push_back(buf);
+                }
             }
         }
     }
 
-    if (instances.empty()) return;   // no cross-plane cavity -> plain y=0
+    if (instances.empty()) return;   // nothing nearly-orphaned -> plain y=0
 
     // ---- prompt per instance (with apply-to-all), then transfer -----------
     enum class Choice { KeepSplit, ToTop, ToBottom };
@@ -3302,15 +3497,23 @@ void GLCanvas::ResolveNearlyOrphanRegions(std::vector<TopoDS_Shape>& halfResults
         }
         else
         {
+            const bool sugTop = instances[k].suggestTop;
+            const wxString suggestion = sugTop
+                ? "Suggested: Combine to A (top) - it shares more surface with "
+                  "this region."
+                : "Suggested: Combine to B (bottom) - it shares more surface with "
+                  "this region.";
             wxString msg =
                 "A region of the part (" + wxString(instances[k].label) +
-                ") forms a cavity that crosses the parting plane. A flat y=0 "
-                "split would divide it into a thin sliver on each half. You can "
-                "combine the whole region into one half so the parting surface "
-                "follows the part there.\n\nHow would you like to handle it?";
+                ") is nearly orphaned: it crosses the parting plane but shares "
+                "little surface with one half, so a flat y=0 split would leave a "
+                "thin sliver there. You can combine the whole region into one "
+                "half instead.\n\n" + suggestion +
+                "\n\nHow would you like to handle it?";
 
-            wxRichMessageDialog dlg(this, msg, "Nearly-Orphaned Region",
-                wxYES_NO | wxCANCEL | wxICON_QUESTION);
+            long style = wxYES_NO | wxCANCEL | wxICON_QUESTION
+                       | (sugTop ? wxYES_DEFAULT : wxNO_DEFAULT);
+            wxRichMessageDialog dlg(this, msg, "Nearly-Orphaned Region", style);
             dlg.SetYesNoCancelLabels("Combine to A (top)",
                 "Combine to B (bottom)", "Continue y=0 split");
             dlg.ShowCheckBox("Apply this choice to all remaining regions");
@@ -3326,24 +3529,191 @@ void GLCanvas::ResolveNearlyOrphanRegions(std::vector<TopoDS_Shape>& halfResults
 
         const int dst = (choice == Choice::ToTop) ? topIdx : botIdx;
         const int src = (choice == Choice::ToTop) ? botIdx : topIdx;
-        const TopoDS_Shape& T = instances[k].tool;
 
-        // piece = src-side material inside the region; move it dst-ward.
-        BRepAlgoAPI_Common common(halfResults[src], T);
-        common.Build();
-        TopoDS_Shape piece =
-            (common.IsDone() && !common.Shape().IsNull()) ? common.Shape()
-                                                          : TopoDS_Shape();
+        // Transfer in the nudged frame too (the halves sit at the origin). piece
+        // = src-side material inside the region; remove it from src and fuse it
+        // into dst.
+        const TopoDS_Shape TN   = moved(instances[k].tool, nudge);
+        const TopoDS_Shape srcN = moved(halfResults[src],  nudge);
+        const TopoDS_Shape dstN = moved(halfResults[dst],  nudge);
 
-        BRepAlgoAPI_Cut srcCut(halfResults[src], T);
-        srcCut.Build();
-        if (srcCut.IsDone() && !srcCut.Shape().IsNull())
-            halfResults[src] = srcCut.Shape();
+        TopoDS_Shape pieceN;
+        BooleanSafe<BRepAlgoAPI_Common>(srcN, TN, pieceN, 1.0e-3);
 
-        if (!piece.IsNull())
+        TopoDS_Shape cutSrcN;
+        if (BooleanSafe<BRepAlgoAPI_Cut>(srcN, TN, cutSrcN, 1.0e-3))
+            halfResults[src] = moved(cutSrcN, unnudge);
+
+        if (!pieceN.IsNull())
         {
-            std::vector<TopoDS_Shape> parts{ halfResults[dst], piece };
-            halfResults[dst] = FuseShapes(parts);
+            std::vector<TopoDS_Shape> parts{ dstN, pieceN };
+            halfResults[dst] = moved(FuseShapes(parts, 1.0e-3), unnudge);
+        }
+    }
+}
+
+// Mesh-scene nearly-orphan region combine (Parting Behavior). The Manifold
+// counterpart of ResolveNearlyOrphanRegions: per mesh object, hull the world
+// vertices, cut the part out of the hull, and any resulting cavity component
+// that straddles the parting plane and clears the minimum-volume filter is a
+// candidate. The component mesh is the transfer tool T: "combine to the top"
+// intersects the bottom half with T (the piece), removes T from the bottom,
+// and unions the piece into the top (mirror for the bottom). Runs before the
+// mesh orphan resolver, which mops up any residue.
+void GLCanvas::ResolveMeshNearlyOrphanRegions(std::vector<MeshBoolean::Mesh>& meshHalves,
+    std::vector<bool>& meshValid)
+{
+    // Two halves and which is top (+y) vs bottom (-y).
+    int idxA = -1, idxB = -1;
+    for (int i = 0; i < (int)meshHalves.size(); ++i)
+        if (i < (int)meshValid.size() && meshValid[i])
+        {
+            if (idxA < 0)      idxA = i;
+            else if (idxB < 0) idxB = i;
+        }
+    if (idxA < 0 || idxB < 0) return;
+
+    float aLo[3], aHi[3], bLo[3], bHi[3];
+    MeshBounds(meshHalves[idxA], aLo, aHi);
+    MeshBounds(meshHalves[idxB], bLo, bHi);
+    const int topIdx = (aHi[1] >= bHi[1]) ? idxA : idxB;   // larger ymax = top
+    const int botIdx = (topIdx == idxA) ? idxB : idxA;
+
+    double minRegionVolume = 0.0;
+    double surfThreshold   = 0.0;
+    double sigRatio        = 0.25;
+    if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+    {
+        minRegionVolume = frame->GetPartingMinRegionVolume();
+        surfThreshold   = frame->GetPartingSurfaceAreaThreshold();
+        sigRatio        = frame->GetPartingSignificanceRatio();
+    }
+
+    // ---- collect straddling hull-cavity regions per mesh object -----------
+    struct MInstance { MeshBoolean::Mesh tool; bool suggestTop; };
+    std::vector<MInstance> instances;
+    for (int oi = 0; oi < (int)m_objects.size(); ++oi)
+    {
+        const SceneObject& obj = m_objects[oi];
+        if (obj.format != SourceFormat::Mesh) continue;   // mesh stage only
+        if (obj.cpuVerts.empty() || obj.cpuIndices.empty()) continue;
+
+        MeshBoolean::Mesh worldObj =
+            WorldMeshFromLocal(obj.cpuVerts, obj.cpuIndices, obj.BuildModelMatrix());
+        MeshBoolean::Mesh hull;
+        std::string e;
+        if (!MeshBoolean::ConvexHull(worldObj, hull, e)) continue;
+
+        MeshBoolean::Mesh cavity;
+        if (!MeshBoolean::Difference(hull, worldObj, cavity, e)) continue;  // hull - part
+
+        std::vector<MeshBoolean::Mesh> comps;
+        if (!MeshBoolean::Decompose(cavity, comps, e)) continue;
+
+        for (auto& c : comps)
+        {
+            float clo[3], chi[3];
+            MeshBounds(c, clo, chi);
+            if (!(clo[1] < -(float)kOuterPlaneTol && chi[1] > (float)kOuterPlaneTol))
+                continue;                                   // doesn't straddle y=0
+            if (MeshBoolean::Volume(c) < minRegionVolume)
+                continue;                                   // below the minimum
+
+            // Nearly-orphan analysis (same as BREP): only offer lopsided regions.
+            double saTop = 0.0, saBot = 0.0;
+            RegionAreaSplitByPlane(c.verts, c.indices, saTop, saBot);
+            bool suggestTop = true;
+            if (!RegionIsNearlyOrphaned(saTop, saBot, surfThreshold, sigRatio, suggestTop))
+                continue;
+
+            // Capture for the Preview debug overlay (same list as BREP).
+            FileImporter::MeshData rmesh;
+            rmesh.vertices = c.verts;
+            rmesh.indices  = c.indices;
+            ComputeVertexNormals_Pos3(rmesh.vertices, rmesh.indices, rmesh.posNorm);
+            if (!rmesh.posNorm.empty() && !rmesh.indices.empty())
+            {
+                char buf[128];
+                std::snprintf(buf, sizeof(buf),
+                    "Region %d   |   A %.4g   B %.4g mm2",
+                    (int)m_lastNearlyOrphanRegions.size() + 1, saTop, saBot);
+                m_lastNearlyOrphanRegions.push_back(rmesh);
+                m_lastNearlyOrphanRegionLabels.push_back(buf);
+            }
+
+            instances.push_back({ std::move(c), suggestTop });
+        }
+    }
+
+    if (instances.empty()) return;
+
+    // ---- prompt per instance (apply-to-all), then transfer ----------------
+    enum class Choice { KeepSplit, ToTop, ToBottom };
+    Choice remembered = Choice::KeepSplit;
+    bool   applyAll   = false;
+
+    for (size_t k = 0; k < instances.size(); ++k)
+    {
+        Choice choice;
+        if (applyAll)
+        {
+            choice = remembered;
+        }
+        else
+        {
+            const bool sugTop = instances[k].suggestTop;
+            const wxString suggestion = sugTop
+                ? "Suggested: Combine to A (top) - it shares more surface with "
+                  "this region."
+                : "Suggested: Combine to B (bottom) - it shares more surface with "
+                  "this region.";
+            wxString msg = wxString::Format(
+                "A region of the part (region %d) is nearly orphaned: it crosses "
+                "the parting plane but shares little surface with one half, so a "
+                "flat y=0 split would leave a thin sliver there. You can combine "
+                "the whole region into one half instead.\n\n%s\n\nHow would you "
+                "like to handle it?",
+                (int)(k + 1), suggestion);
+
+            long style = wxYES_NO | wxCANCEL | wxICON_QUESTION
+                       | (sugTop ? wxYES_DEFAULT : wxNO_DEFAULT);
+            wxRichMessageDialog dlg(this, msg, "Nearly-Orphaned Region", style);
+            dlg.SetYesNoCancelLabels("Combine to A (top)",
+                "Combine to B (bottom)", "Continue y=0 split");
+            dlg.ShowCheckBox("Apply this choice to all remaining regions");
+
+            const int rc = dlg.ShowModal();
+            choice = (rc == wxID_YES) ? Choice::ToTop
+                   : (rc == wxID_NO)  ? Choice::ToBottom
+                                      : Choice::KeepSplit;
+            if (dlg.IsCheckBoxChecked()) { applyAll = true; remembered = choice; }
+        }
+
+        if (choice == Choice::KeepSplit) continue;
+
+        const int dst = (choice == Choice::ToTop) ? topIdx : botIdx;
+        const int src = (choice == Choice::ToTop) ? botIdx : topIdx;
+        MeshBoolean::Mesh& T = instances[k].tool;
+
+        // piece = src-side material inside the region (computed before the
+        // Difference mutates the src half); move it dst-ward.
+        MeshBoolean::Mesh piece;
+        std::string pe;
+        const bool hasPiece =
+            MeshBoolean::Intersection(meshHalves[src], T, piece, pe) && !piece.empty();
+
+        MeshBoolean::Mesh cut;
+        std::string ce;
+        if (MeshBoolean::Difference(meshHalves[src], T, cut, ce) && !cut.empty())
+            meshHalves[src] = std::move(cut);
+
+        if (hasPiece)
+        {
+            std::vector<MeshBoolean::Mesh> parts{ meshHalves[dst], std::move(piece) };
+            MeshBoolean::Mesh merged;
+            std::string me;
+            if (MeshBoolean::Union(parts, merged, me) && !merged.empty())
+                meshHalves[dst] = std::move(merged);
         }
     }
 }
@@ -3389,6 +3759,8 @@ bool GLCanvas::GenerateMould()
     m_lastShotFaceIds.clear();
     m_lastHalfShapes.clear();
     m_lastInsertMeshes.clear();
+    m_lastNearlyOrphanRegions.clear();
+    m_lastNearlyOrphanRegionLabels.clear();
     m_lastCastShotMesh = FileImporter::MeshData{};
     m_lastCastShotShape = TopoDS_Shape();
     m_hasLastCastShotMesh = false;
@@ -4222,6 +4594,20 @@ bool GLCanvas::GenerateMould()
     // per-fixture + preview captures. BREP scenes did all this in the loop.
     if (m_sceneIsMesh)
     {
+        // Parting Behavior: nearly-orphaned region combine (mesh), gated by the
+        // menu toggle. Runs before the orphan resolver so any residue the
+        // transfer leaves is cleaned up there (mirrors the BREP ordering).
+        {
+            bool detect = true;
+            if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+                detect = frame->IsNearlyOrphanDetectionEnabled();
+            if (detect)
+            {
+                progress.Update(step, "Checking parting behavior...");
+                ResolveMeshNearlyOrphanRegions(meshHalves, meshValid);
+            }
+        }
+
         progress.Update(step, "Checking for orphaned mould volumes...");
         if (!ResolveMeshOrphanVolumes(meshHalves, meshValid))
             return false;   // user chose to reconfigure -- abort generation
@@ -5126,18 +5512,30 @@ bool GLCanvas::BuildShotModel(TopoDS_Shape& out)
 
     if (shapes.empty()) return false;
 
-    // ---- Fuse everything --------------------------------------------------
+    // OCC booleans can fail on geometry sitting exactly at the origin (the same
+    // degeneracy the nearly-orphan cut hits). Do the fuse/cut in a frame offset
+    // in X/Z -- Y preserved, and the shot volume is translation-invariant -- via
+    // BooleanSafe (guarded, history on), then move the result back.
+    gp_Trsf nudge, unnudge;
+    nudge.SetTranslation(gp_Vec(1234.5, 0.0, 987.5));
+    unnudge = nudge.Inverted();
+    auto moved = [](const TopoDS_Shape& s, const gp_Trsf& t) -> TopoDS_Shape {
+        if (s.IsNull()) return s;
+        BRepBuilderAPI_Transform xf(s, t, true);
+        return xf.IsDone() ? xf.Shape() : s;
+    };
+
+    // ---- Fuse everything (nudged frame) -----------------------------------
     // Pairwise fuse. Disjoint pieces fuse into a valid compound, so this stays
     // robust even when (say) a gate doesn't quite touch its feed point. A
     // failed individual fuse drops that one piece rather than aborting the
     // whole shot.
-    TopoDS_Shape acc = shapes[0];
+    TopoDS_Shape acc = moved(shapes[0], nudge);
     for (size_t i = 1; i < shapes.size(); ++i)
     {
-        BRepAlgoAPI_Fuse fuse(acc, shapes[i]);
-        fuse.Build();
-        if (fuse.IsDone() && !fuse.Shape().IsNull())
-            acc = fuse.Shape();
+        TopoDS_Shape fused;
+        if (BooleanSafe<BRepAlgoAPI_Fuse>(acc, moved(shapes[i], nudge), fused))
+            acc = fused;
         // else: keep acc, skip this piece.
     }
 
@@ -5157,15 +5555,14 @@ bool GLCanvas::BuildShotModel(TopoDS_Shape& out)
         if (!BuildInsertCutSolid(in, 1.0f, insertSolid) || insertSolid.IsNull())
             continue;
 
-        BRepAlgoAPI_Cut cut(acc, insertSolid);
-        cut.Build();
-        if (cut.IsDone() && !cut.Shape().IsNull())
-            acc = cut.Shape();
+        TopoDS_Shape cutRes;
+        if (BooleanSafe<BRepAlgoAPI_Cut>(acc, moved(insertSolid, nudge), cutRes))
+            acc = cutRes;
         // else: keep acc, skip this insert.
     }
 
     if (acc.IsNull()) return false;
-    out = acc;
+    out = moved(acc, unnudge);   // back to real position
     return true;
 }
 
