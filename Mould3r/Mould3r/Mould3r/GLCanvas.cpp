@@ -33,6 +33,7 @@
 #include <opencascade/TopTools_ListOfShape.hxx>
 #include <opencascade/Standard_Failure.hxx>
 #include <opencascade/ShapeUpgrade_UnifySameDomain.hxx>
+#include <opencascade/BRepAdaptor_Surface.hxx>
 #include <opencascade/BRepBuilderAPI_MakeEdge.hxx>
 #include <opencascade/BRepBuilderAPI_MakeWire.hxx>
 #include <opencascade/BRepBuilderAPI_MakeFace.hxx>
@@ -2995,8 +2996,9 @@ bool GLCanvas::ResolveOrphanVolumes(std::vector<TopoDS_Shape>& halfResults,
     {
         wxString msg = wxString::Format(
             "Mould generation produced %d orphaned segment(s): mould material "
-            "that ended up fully separated from both halves. A floating segment "
-            "cannot be demoulded and would make the mould unmanufacturable.\n\n"
+            "that ended up fully separated from both mould halves. A floating segment "
+            "cannot be demoulded and may impact manufacturability.\n\n"
+            "These may also be mesh artifacts that can be safely deleted."
             "How would you like to proceed?",
             trueOrphans);
 
@@ -3291,36 +3293,186 @@ static double RegionVolume(const TopoDS_Shape& s)
 // whose centroid is above y=0 (the region's share of the top half) vs below.
 // This is the "surface a region shares with each half" used to judge whether it
 // is lopsided (nearly-orphaned) and which half it belongs with.
-static void RegionAreaSplitByPlane(const std::vector<float>& verts,
-    const std::vector<uint32_t>& indices, double& areaAbove, double& areaBelow)
+// ---- attachment (hull-lid) area ---------------------------------------------
+// A region is hull - part, so its skin is two very different surfaces: the
+// part-facing walls (where the mould material molds the shot) and the convex-
+// hull "lid" that bridges the concavity opening. The lid is the surface where
+// this enclosed volume joins the bulk of its parent half -- it is what attaches
+// the region to a mould half -- while the part-facing walls attach it to
+// nothing. So the A/B nearly-orphan decision is driven ONLY by the lid area on
+// each side of y=0; the part-facing walls are ignored. Because the hull is
+// convex, a point's signed distance to it is exactly the max over its outward
+// face planes (<=0 inside, ~0 on the surface): lid geometry sits at ~0, part-
+// facing geometry sits deeper in. That single test tags lid vs wall.
+
+static glm::vec3 HullCentroid(const MeshBoolean::Mesh& hull)
 {
-    areaAbove = 0.0;
-    areaBelow = 0.0;
+    glm::dvec3 acc(0.0);
+    const size_t n = hull.verts.size() / 3;
+    for (size_t i = 0; i < n; ++i)
+        acc += glm::dvec3(hull.verts[i*3+0], hull.verts[i*3+1], hull.verts[i*3+2]);
+    return (n > 0) ? glm::vec3(acc / (double)n) : glm::vec3(0.0f);
+}
+
+// Signed distance from p to the convex hull surface: ~0 on the surface, negative
+// inside. Exact for a convex hull (max over its outward face planes).
+static double SignedDistToConvexHull(const glm::vec3& p,
+    const MeshBoolean::Mesh& hull, const glm::vec3& hullCtr)
+{
+    double best = -1.0e30;
+    const size_t nTri = hull.indices.size() / 3;
+    for (size_t t = 0; t < nTri; ++t)
+    {
+        const uint32_t ia = hull.indices[t*3+0];
+        const uint32_t ib = hull.indices[t*3+1];
+        const uint32_t ic = hull.indices[t*3+2];
+        const glm::vec3 a(hull.verts[ia*3+0], hull.verts[ia*3+1], hull.verts[ia*3+2]);
+        const glm::vec3 b(hull.verts[ib*3+0], hull.verts[ib*3+1], hull.verts[ib*3+2]);
+        const glm::vec3 c(hull.verts[ic*3+0], hull.verts[ic*3+1], hull.verts[ic*3+2]);
+        glm::vec3 n = glm::cross(b - a, c - a);
+        const float len = glm::length(n);
+        if (len < 1.0e-20f) continue;
+        n /= len;
+        if (glm::dot(n, (a + b + c) / 3.0f - hullCtr) < 0.0f) n = -n;   // outward
+        best = std::max(best, (double)glm::dot(n, p - a));
+    }
+    return best;
+}
+
+// True if a point lies on the hull lid (the attachment surface) rather than on
+// the part-facing wall.
+static bool OnHullLid(const glm::vec3& p, const MeshBoolean::Mesh& hull,
+    const glm::vec3& hullCtr)
+{
+    return SignedDistToConvexHull(p, hull, hullCtr) > -1.0e-3;   // within ~1um of hull
+}
+
+// Clip a triangle to the y>=0 (keepAbove) or y<=0 halfspace; returns the
+// resulting polygon (empty, or 3-4 points). Sutherland-Hodgman on one plane.
+static std::vector<glm::vec3> ClipTriByY(const glm::vec3 tri[3], bool keepAbove)
+{
+    std::vector<glm::vec3> out;
+    for (int i = 0; i < 3; ++i)
+    {
+        const glm::vec3& cur = tri[i];
+        const glm::vec3& nxt = tri[(i + 1) % 3];
+        const bool curIn = keepAbove ? (cur.y >= 0.0f) : (cur.y <= 0.0f);
+        const bool nxtIn = keepAbove ? (nxt.y >= 0.0f) : (nxt.y <= 0.0f);
+        if (curIn) out.push_back(cur);
+        if (curIn != nxtIn)
+        {
+            const float d = cur.y - nxt.y;
+            const float tt = (std::abs(d) > 1.0e-20f) ? (cur.y / d) : 0.0f;
+            out.push_back(cur + tt * (nxt - cur));
+        }
+    }
+    return out;
+}
+
+static double PolyArea(const std::vector<glm::vec3>& poly)
+{
+    if (poly.size() < 3) return 0.0;
+    glm::vec3 acc(0.0f);
+    for (size_t i = 1; i + 1 < poly.size(); ++i)
+        acc += glm::cross(poly[i] - poly[0], poly[i + 1] - poly[0]);
+    return 0.5 * (double)glm::length(acc);
+}
+
+// Area of triangle (a,b,c) above and below y=0, clipped (not by centroid) so a
+// triangle crossing the plane contributes to both sides correctly.
+static void TriAreaSplitByY(const glm::vec3& a, const glm::vec3& b,
+    const glm::vec3& c, double& areaUp, double& areaDown)
+{
+    const glm::vec3 tri[3] = { a, b, c };
+    areaUp   = PolyArea(ClipTriByY(tri, true));
+    areaDown = PolyArea(ClipTriByY(tri, false));
+}
+
+// Attachment-area split for a tessellated region: keep only lid triangles
+// (centroid on the hull), clip them at y=0. Used for the mesh path and the BREP
+// fallback.
+static void RegionAttachmentAreaSplitMesh(const std::vector<float>& verts,
+    const std::vector<uint32_t>& indices, const MeshBoolean::Mesh& hull,
+    const glm::vec3& hullCtr, double& saTop, double& saBot)
+{
+    saTop = 0.0; saBot = 0.0;
     const size_t nTri = indices.size() / 3;
     for (size_t t = 0; t < nTri; ++t)
     {
-        const uint32_t ia = indices[t * 3 + 0];
-        const uint32_t ib = indices[t * 3 + 1];
-        const uint32_t ic = indices[t * 3 + 2];
-        if ((size_t)ia * 3 + 2 >= verts.size() ||
-            (size_t)ib * 3 + 2 >= verts.size() ||
-            (size_t)ic * 3 + 2 >= verts.size())
-            continue;
-
-        const double ax = verts[ia*3+0], ay = verts[ia*3+1], az = verts[ia*3+2];
-        const double bx = verts[ib*3+0], by = verts[ib*3+1], bz = verts[ib*3+2];
-        const double cx = verts[ic*3+0], cy = verts[ic*3+1], cz = verts[ic*3+2];
-
-        const double ux = bx-ax, uy = by-ay, uz = bz-az;   // (b-a) x (c-a)
-        const double vx = cx-ax, vy = cy-ay, vz = cz-az;
-        const double nx = uy*vz - uz*vy;
-        const double ny = uz*vx - ux*vz;
-        const double nz = ux*vy - uy*vx;
-        const double area = 0.5 * std::sqrt(nx*nx + ny*ny + nz*nz);
-
-        if ((ay + by + cy) / 3.0 >= 0.0) areaAbove += area;
-        else                             areaBelow += area;
+        const uint32_t ia = indices[t*3+0], ib = indices[t*3+1], ic = indices[t*3+2];
+        if ((size_t)ia*3+2 >= verts.size() || (size_t)ib*3+2 >= verts.size() ||
+            (size_t)ic*3+2 >= verts.size()) continue;
+        const glm::vec3 a(verts[ia*3+0], verts[ia*3+1], verts[ia*3+2]);
+        const glm::vec3 b(verts[ib*3+0], verts[ib*3+1], verts[ib*3+2]);
+        const glm::vec3 c(verts[ic*3+0], verts[ic*3+1], verts[ic*3+2]);
+        if (!OnHullLid((a + b + c) / 3.0f, hull, hullCtr)) continue;   // wall, skip
+        double up = 0.0, dn = 0.0;
+        TriAreaSplitByY(a, b, c, up, dn);
+        saTop += up; saBot += dn;
     }
+}
+
+// Interior point of a face (parametric mid-point of its surface).
+static bool FaceMidPoint(const TopoDS_Face& f, gp_Pnt& p)
+{
+    BRepAdaptor_Surface surf(f);
+    const double u = 0.5 * (surf.FirstUParameter() + surf.LastUParameter());
+    const double v = 0.5 * (surf.FirstVParameter() + surf.LastVParameter());
+    p = surf.Value(u, v);
+    return true;
+}
+
+static double FaceArea(const TopoDS_Face& f)
+{
+    GProp_GProps g;
+    BRepGProp::SurfaceProperties(f, g);
+    return g.Mass();
+}
+
+// Exact hull-lid (attachment) area of a BREP cavity, split by y=0. The cavity is
+// cut at y=0 (so a lid face crossing the plane is divided exactly), then each
+// face lying on the hull lid -- the attachment to the parent half -- adds its
+// exact BRepGProp area. Part-facing walls and the y=0 cap (neither on the hull)
+// are ignored. Returns false if a split boolean fails, so the caller can fall
+// back to the tessellated estimate.
+static bool RegionAttachmentAreaSplitBREP(const TopoDS_Shape& cavity,
+    const MeshBoolean::Mesh& hull, const glm::vec3& hullCtr,
+    double& saTop, double& saBot)
+{
+    Bnd_Box bb = ShapeBounds(cavity);
+    if (bb.IsVoid()) return false;
+    double x0, y0, z0, x1, y1, z1; bb.Get(x0, y0, z0, x1, y1, z1);
+    const double pad = 1.0 + (x1 - x0) + (y1 - y0) + (z1 - z0);
+
+    double out[2] = { 0.0, 0.0 };
+    for (int half = 0; half < 2; ++half)
+    {
+        const bool top = (half == 0);
+        const gp_Pnt lo = top ? gp_Pnt(x0 - pad, 0.0,      z0 - pad)
+                              : gp_Pnt(x0 - pad, y0 - pad, z0 - pad);
+        const gp_Pnt hi = top ? gp_Pnt(x1 + pad, y1 + pad, z1 + pad)
+                              : gp_Pnt(x1 + pad, 0.0,      z1 + pad);
+        const TopoDS_Shape box = BRepPrimAPI_MakeBox(lo, hi).Shape();
+
+        TopoDS_Shape halfCav;
+        if (!BooleanSafe<BRepAlgoAPI_Common>(cavity, box, halfCav, 1.0e-3))
+            return false;
+
+        double area = 0.0;
+        for (TopExp_Explorer ex(halfCav, TopAbs_FACE); ex.More(); ex.Next())
+        {
+            const TopoDS_Face f = TopoDS::Face(ex.Current());
+            gp_Pnt p;
+            if (!FaceMidPoint(f, p)) continue;
+            const glm::vec3 pf((float)p.X(), (float)p.Y(), (float)p.Z());
+            if (!OnHullLid(pf, hull, hullCtr)) continue;     // keep only the hull lid
+            area += FaceArea(f);                             // (walls + y=0 cap excluded)
+        }
+        out[half] = area;
+    }
+    saTop = out[0];
+    saBot = out[1];
+    return true;
 }
 
 // A straddling region is "nearly-orphaned" (worth offering to combine) only when
@@ -3404,6 +3556,7 @@ void GLCanvas::ResolveNearlyOrphanRegions(std::vector<TopoDS_Shape>& halfResults
         MeshBoolean::Mesh hullMesh;
         std::string herr;
         if (!MeshBoolean::ConvexHull(worldObj, hullMesh, herr)) continue;
+        const glm::vec3 hullCtr = HullCentroid(hullMesh);
         TopoDS_Shape hullSolid;
         if (!HullSolidFromMesh(hullMesh, hullSolid) || hullSolid.IsNull()) continue;
 
@@ -3454,7 +3607,10 @@ void GLCanvas::ResolveNearlyOrphanRegions(std::vector<TopoDS_Shape>& halfResults
                 // with each half. Only lopsided regions are offered; a balanced
                 // cross-plane cavity is fine at a plain y=0 split.
                 double saTop = 0.0, saBot = 0.0;
-                RegionAreaSplitByPlane(rmesh.vertices, rmesh.indices, saTop, saBot);
+                if (!RegionAttachmentAreaSplitBREP(s, hullMesh, hullCtr, saTop, saBot)
+                    || (saTop + saBot) <= 0.0)
+                    RegionAttachmentAreaSplitMesh(rmesh.vertices, rmesh.indices,
+                                                 hullMesh, hullCtr, saTop, saBot);
                 bool suggestTop = true;
                 if (!RegionIsNearlyOrphaned(saTop, saBot, surfThreshold, sigRatio, suggestTop))
                     continue;
@@ -3463,20 +3619,6 @@ void GLCanvas::ResolveNearlyOrphanRegions(std::vector<TopoDS_Shape>& halfResults
                 instances.push_back({ s,
                     "object " + std::to_string(oi + 1) +
                     ", region " + std::to_string(regionNo), suggestTop });
-
-                // Capture the region for the Preview debug overlay (toggleable
-                // per region). World space, so it loads with an identity pose.
-                // The label carries the A/B shared-surface areas so the values
-                // can be read off and compared (e.g. STEP vs mesh).
-                if (!rmesh.posNorm.empty())
-                {
-                    char buf[128];
-                    std::snprintf(buf, sizeof(buf),
-                        "Region %d   |   A %.4g   B %.4g mm2",
-                        (int)m_lastNearlyOrphanRegions.size() + 1, saTop, saBot);
-                    m_lastNearlyOrphanRegions.push_back(std::move(rmesh));
-                    m_lastNearlyOrphanRegionLabels.push_back(buf);
-                }
             }
         }
     }
@@ -3505,17 +3647,16 @@ void GLCanvas::ResolveNearlyOrphanRegions(std::vector<TopoDS_Shape>& halfResults
                   "this region.";
             wxString msg =
                 "A region of the part (" + wxString(instances[k].label) +
-                ") is nearly orphaned: it crosses the parting plane but shares "
-                "little surface with one half, so a flat y=0 split would leave a "
-                "thin sliver there. You can combine the whole region into one "
-                "half instead.\n\n" + suggestion +
-                "\n\nHow would you like to handle it?";
+                ") has flagged as nearly-orphaned: it crosses the parting plane but shares "
+                "little surface with one of the mould halves. You can combine the whole region into the other "
+                "half instead, or keep a standard split.\n\n" + suggestion +
+                "\n\nHow would you like to proceed?";
 
             long style = wxYES_NO | wxCANCEL | wxICON_QUESTION
                        | (sugTop ? wxYES_DEFAULT : wxNO_DEFAULT);
             wxRichMessageDialog dlg(this, msg, "Nearly-Orphaned Region", style);
             dlg.SetYesNoCancelLabels("Combine to A (top)",
-                "Combine to B (bottom)", "Continue y=0 split");
+                "Combine to B (bottom)", "Continue midplane split");
             dlg.ShowCheckBox("Apply this choice to all remaining regions");
 
             const int rc = dlg.ShowModal();
@@ -3603,6 +3744,7 @@ void GLCanvas::ResolveMeshNearlyOrphanRegions(std::vector<MeshBoolean::Mesh>& me
         MeshBoolean::Mesh hull;
         std::string e;
         if (!MeshBoolean::ConvexHull(worldObj, hull, e)) continue;
+        const glm::vec3 hullCtr = HullCentroid(hull);
 
         MeshBoolean::Mesh cavity;
         if (!MeshBoolean::Difference(hull, worldObj, cavity, e)) continue;  // hull - part
@@ -3621,25 +3763,10 @@ void GLCanvas::ResolveMeshNearlyOrphanRegions(std::vector<MeshBoolean::Mesh>& me
 
             // Nearly-orphan analysis (same as BREP): only offer lopsided regions.
             double saTop = 0.0, saBot = 0.0;
-            RegionAreaSplitByPlane(c.verts, c.indices, saTop, saBot);
+            RegionAttachmentAreaSplitMesh(c.verts, c.indices, hull, hullCtr, saTop, saBot);
             bool suggestTop = true;
             if (!RegionIsNearlyOrphaned(saTop, saBot, surfThreshold, sigRatio, suggestTop))
                 continue;
-
-            // Capture for the Preview debug overlay (same list as BREP).
-            FileImporter::MeshData rmesh;
-            rmesh.vertices = c.verts;
-            rmesh.indices  = c.indices;
-            ComputeVertexNormals_Pos3(rmesh.vertices, rmesh.indices, rmesh.posNorm);
-            if (!rmesh.posNorm.empty() && !rmesh.indices.empty())
-            {
-                char buf[128];
-                std::snprintf(buf, sizeof(buf),
-                    "Region %d   |   A %.4g   B %.4g mm2",
-                    (int)m_lastNearlyOrphanRegions.size() + 1, saTop, saBot);
-                m_lastNearlyOrphanRegions.push_back(rmesh);
-                m_lastNearlyOrphanRegionLabels.push_back(buf);
-            }
 
             instances.push_back({ std::move(c), suggestTop });
         }
@@ -3668,11 +3795,11 @@ void GLCanvas::ResolveMeshNearlyOrphanRegions(std::vector<MeshBoolean::Mesh>& me
                 : "Suggested: Combine to B (bottom) - it shares more surface with "
                   "this region.";
             wxString msg = wxString::Format(
-                "A region of the part (region %d) is nearly orphaned: it crosses "
-                "the parting plane but shares little surface with one half, so a "
-                "flat y=0 split would leave a thin sliver there. You can combine "
-                "the whole region into one half instead.\n\n%s\n\nHow would you "
-                "like to handle it?",
+                "A region of the mould (region %d) has flagged as nearly-orphaned: it crosses "
+                "the parting plane but shares little surface with one of the mould halves. "
+                "You can combine "
+                "the whole region into the other half instead, or keep a standard split.\n\n%s\n\nHow would you "
+                "like to proceed?",
                 (int)(k + 1), suggestion);
 
             long style = wxYES_NO | wxCANCEL | wxICON_QUESTION
@@ -3759,8 +3886,6 @@ bool GLCanvas::GenerateMould()
     m_lastShotFaceIds.clear();
     m_lastHalfShapes.clear();
     m_lastInsertMeshes.clear();
-    m_lastNearlyOrphanRegions.clear();
-    m_lastNearlyOrphanRegionLabels.clear();
     m_lastCastShotMesh = FileImporter::MeshData{};
     m_lastCastShotShape = TopoDS_Shape();
     m_hasLastCastShotMesh = false;
@@ -4976,59 +5101,6 @@ void GLCanvas::ClearShotDebugSolid()
 {
     m_showDebugSolid = false;
     m_debugSolidObj.mesh.Destroy();
-    Refresh(false);
-}
-
-// Parting Behavior diagnostic overlay: the convex-hull envelope of every part,
-// merged into one world-space mesh and shown translucent in the main canvas.
-// This is the exact envelope ResolveNearlyOrphanRegions cuts the part out of,
-// so it answers "why didn't this region flag?" — if the hull doesn't enclose
-// the cavity you expected, or the cavity doesn't cross y=0, that's visible here.
-// Rebuilt from the current objects on each switch-on (it's a snapshot; move a
-// part and toggle again to refresh).
-void GLCanvas::ShowConvexHullDebug(bool on)
-{
-    SetCurrent(*m_context);
-    InitGLOnce();
-
-    m_showHullDebug = on;
-    m_hullDebugObj.mesh.Destroy();
-
-    if (!on) { Refresh(false); return; }
-
-    FileImporter::MeshData combined;   // stride-6 posNorm, world space
-    for (const SceneObject& obj : m_objects)
-    {
-        if (obj.cpuVerts.empty() || obj.cpuIndices.empty()) continue;
-
-        MeshBoolean::Mesh worldObj =
-            WorldMeshFromLocal(obj.cpuVerts, obj.cpuIndices, obj.BuildModelMatrix());
-        MeshBoolean::Mesh hullMesh;
-        std::string herr;
-        if (!MeshBoolean::ConvexHull(worldObj, hullMesh, herr)) continue;
-
-        TopoDS_Shape hullSolid;
-        if (!HullSolidFromMesh(hullMesh, hullSolid) || hullSolid.IsNull()) continue;
-
-        FileImporter::MeshData md;
-        TessellateShapeToMesh(hullSolid, md);
-        if (md.posNorm.empty() || md.indices.empty()) continue;
-
-        const uint32_t base = (uint32_t)(combined.posNorm.size() / 6);
-        combined.posNorm.insert(combined.posNorm.end(),
-            md.posNorm.begin(), md.posNorm.end());
-        for (uint32_t idx : md.indices)
-            combined.indices.push_back(base + idx);
-    }
-
-    if (combined.posNorm.empty() || combined.indices.empty())
-    {
-        m_showHullDebug = false;   // nothing hull-able in the scene
-        Refresh(false);
-        return;
-    }
-
-    UploadMeshToGPU(combined, m_hullDebugObj);
     Refresh(false);
 }
 
@@ -10812,31 +10884,6 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         }
 
         glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &baseColor[0]);
-    }
-
-    // ---- Convex-hull debug overlay (Parting Behavior) ----------------------
-    // Each part's convex-hull envelope, merged into one world-space mesh, drawn
-    // translucent so the part shows through. Model matrix is identity (the mesh
-    // is already in world space). uBaseColor / uAlpha are restored afterwards
-    // since later passes share m_program.
-    if (m_showHullDebug && m_hullDebugObj.mesh.vao != 0 &&
-        m_hullDebugObj.mesh.indexCount > 0)
-    {
-        glEnable(GL_BLEND);
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-
-        const glm::mat4 identity(1.0f);
-        glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &identity[0][0]);
-        glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &m_hullDebugColor[0]);
-        glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 0.35f);
-
-        glBindVertexArray(m_hullDebugObj.mesh.vao);
-        glDrawElements(GL_TRIANGLES, m_hullDebugObj.mesh.indexCount, GL_UNSIGNED_INT, 0);
-        glBindVertexArray(0);
-
-        glUniform1f(glGetUniformLocation(m_program, "uAlpha"), 1.0f);
-        glUniform3fv(glGetUniformLocation(m_program, "uBaseColor"), 1, &baseColor[0]);
-        glDisable(GL_BLEND);
     }
 
     // ---- AlignFace hover highlight -----------------------------------------

@@ -551,7 +551,6 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
     Bind(wxEVT_MENU, &MainFrame::OnCheckForUpdates, this, ID_CheckForUpdates);
     Bind(wxEVT_MENU, &MainFrame::OnToggleAutoUpdateCheck, this, ID_AutoUpdateCheck);
     Bind(wxEVT_MENU, &MainFrame::OnPartingNearlyOrphan, this, ID_PartingNearlyOrphan);
-    Bind(wxEVT_MENU, &MainFrame::OnPartingShowHull, this, ID_PartingShowHull);
     Bind(wxEVT_MENU, &MainFrame::OnSetupNearOrphanChecks, this, ID_PartingSetup);
 
     // Mesh quality radio items just persist the chosen preset; the next
@@ -871,14 +870,6 @@ void MainFrame::OnPartingNearlyOrphan(wxCommandEvent& evt)
     m_partingNearlyOrphan = evt.IsChecked();
 }
 
-// Parting Behavior diagnostic: overlay the convex-hull envelope of every part
-// in the main canvas so a missed detection can be eyeballed. The canvas holds
-// the toggle state and rebuilds the overlay when switched on.
-void MainFrame::OnPartingShowHull(wxCommandEvent& evt)
-{
-    if (m_canvas) m_canvas->ShowConvexHullDebug(evt.IsChecked());
-}
-
 // ---------------------------------------------------------------------------
 // Setup Near-Orphan Checks dialog
 //
@@ -1100,11 +1091,6 @@ wxMenuBar* MainFrame::BuildPrepareMenuBar()
     nearlyOrphanItem->Check(m_partingNearlyOrphan);
     // Consolidated settings window for the nearly-orphan checks.
     partingMenu->Append(ID_PartingSetup, "Setup Near-Orphan Checks...");
-    partingMenu->AppendSeparator();
-    // Diagnostic: overlay each part's convex-hull envelope (the shape the
-    // nearly-orphan detector cuts against) so a "why didn't this flag?" case
-    // can be inspected. Off by default; recomputed each time it's switched on.
-    partingMenu->AppendCheckItem(ID_PartingShowHull, "Show Convex Hull (Debug)");
     menuBar->Append(partingMenu, "&Parting Behavior");
 
     auto* unitsMenu = new wxMenu();
@@ -4068,9 +4054,7 @@ void MainFrame::OnGenerateMould(wxCommandEvent&)
             // Passed even when empty — SetData treats an empty list as "no
             // insert checkbox", so a run without inserts is unaffected.
             m_previewPanel->SetData(halves, shot,
-                m_canvas->GetLastInsertMeshes(),
-                m_canvas->GetLastNearlyOrphanRegions(),
-                m_canvas->GetLastNearlyOrphanRegionLabels());
+                m_canvas->GetLastInsertMeshes());
         }
 
         // Seed the Casting perspective with the Cast Shot Body (the augmented

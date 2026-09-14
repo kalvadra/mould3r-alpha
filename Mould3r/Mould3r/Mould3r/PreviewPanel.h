@@ -79,9 +79,7 @@ public:
     // distinct colour, and is analysable by the design checks.
     void SetData(const std::vector<FileImporter::MeshData>& halves,
         const ShotPreviewInput& shot = {},
-        const std::vector<FileImporter::MeshData>& inserts = {},
-        const std::vector<FileImporter::MeshData>& regions = {},
-        const std::vector<std::string>& regionLabels = {});
+        const std::vector<FileImporter::MeshData>& inserts = {});
 
     // Drop all loaded parts and reset the panel to its empty (grid-only) state.
     void ClearData();
@@ -125,8 +123,7 @@ private:
     // then a "Shot" checkbox when a shot model is present, into m_visPanel (in
     // the left column, above the Simulations section). Re-runnable: call
     // ClearVisibilityChecks first to drop the previous set.
-    void BuildVisibilityChecks(int halfCount, bool hasShot, int insertCount,
-        int regionCount);
+    void BuildVisibilityChecks(int halfCount, bool hasShot, int insertCount);
     void ClearVisibilityChecks();
 
     // One child body inside a cast group (Top Cast / Bottom Cast).
@@ -269,18 +266,6 @@ private:
     wxCheckBox* m_insertCheck = nullptr;
     int m_insertFirstIndex = -1;
     int m_insertCount = 0;
-
-    // Nearly-orphan debug regions. Each straddling cavity region the detector
-    // found becomes its own toggleable preview object (distinct colour), staged
-    // in m_pendingRegions until the panel is visible. Their checkboxes live in
-    // m_regionChecks — kept separate from m_halfChecks so the half/shot initial-
-    // hide loop (which indexes m_halfChecks positionally) never touches them.
-    // [m_regionFirstIndex, m_regionFirstIndex + m_regionCount) is their block.
-    std::vector<FileImporter::MeshData> m_pendingRegions;
-    std::vector<std::string> m_pendingRegionLabels;   // readout text per region
-    std::vector<wxCheckBox*> m_regionChecks;
-    int m_regionFirstIndex = -1;
-    int m_regionCount = 0;
 
     // Design-check parameter fields (left panel) and the verdict read-outs
     // (right panel). Plain text fields styled like the mould-feature inputs:

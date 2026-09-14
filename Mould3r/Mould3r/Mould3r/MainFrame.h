@@ -290,7 +290,6 @@ private:
     void OnCheckForUpdates(wxCommandEvent&);
     void OnToggleAutoUpdateCheck(wxCommandEvent&);
     void OnPartingNearlyOrphan(wxCommandEvent&);
-    void OnPartingShowHull(wxCommandEvent&);
     void OnSetupNearOrphanChecks(wxCommandEvent&);
 
     // ---- Workflow perspectives ---------------------------------------------
@@ -671,7 +670,6 @@ private:
         ID_UnitImperial,
         ID_GridSettings,
         ID_PartingNearlyOrphan,
-        ID_PartingShowHull,
         ID_PartingSetup,
         ID_MeshQualityOff,
         ID_MeshQualityDraft,

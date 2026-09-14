@@ -409,15 +409,11 @@ PreviewPanel::PreviewPanel(wxWindow* parent)
 // ---------------------------------------------------------------------------
 void PreviewPanel::SetData(const std::vector<FileImporter::MeshData>& halves,
     const ShotPreviewInput& shot,
-    const std::vector<FileImporter::MeshData>& inserts,
-    const std::vector<FileImporter::MeshData>& regions,
-    const std::vector<std::string>& regionLabels)
+    const std::vector<FileImporter::MeshData>& inserts)
 {
     // Stash the new data, replacing whatever the previous generation left.
     m_pendingHalves = halves;
     m_pendingInserts = inserts;
-    m_pendingRegions = regions;
-    m_pendingRegionLabels = regionLabels;
 
     // Cache the combined bounding box of the mould halves now, while we still
     // hold their meshes — LoadHalves drops the CPU copies afterwards. The cast
@@ -481,18 +477,9 @@ void PreviewPanel::SetData(const std::vector<FileImporter::MeshData>& halves,
         ? (int)halves.size() + (m_hasShot ? 1 : 0)
         : -1;
 
-    // Nearly-orphan debug regions load after the inserts, as their own
-    // contiguous block; each gets its own checkbox (unlike inserts).
-    m_regionCount = (int)regions.size();
-    m_regionFirstIndex = (m_regionCount > 0)
-        ? (int)halves.size() + (m_hasShot ? 1 : 0) + m_insertCount
-        : -1;
-
-    // Cast bodies (bases / walls) append after the halves, shot, inserts and
-    // debug regions. Record that boundary so a cast re-generation can truncate
-    // back to it.
-    m_castAnchorCount = (int)halves.size() + (m_hasShot ? 1 : 0)
-        + m_insertCount + m_regionCount;
+    // Cast bodies (bases / walls) append after the halves, shot and inserts.
+    // Record that boundary so a cast re-generation can truncate back to it.
+    m_castAnchorCount = (int)halves.size() + (m_hasShot ? 1 : 0) + m_insertCount;
 
     // Reset any debug overlay state carried over from the previous generation.
     m_hasResult = false;
@@ -516,7 +503,7 @@ void PreviewPanel::SetData(const std::vector<FileImporter::MeshData>& halves,
 
     // Rebuild the dynamic UI for the new part set.
     ClearVisibilityChecks();
-    BuildVisibilityChecks((int)halves.size(), m_hasShot, m_insertCount, m_regionCount);
+    BuildVisibilityChecks((int)halves.size(), m_hasShot, m_insertCount);
     UpdateInfoPanel();
 
     // The mesh upload waits until we're actually visible — a canvas on a hidden
@@ -535,11 +522,6 @@ void PreviewPanel::ClearData()
     m_insertCheck = nullptr;
     m_insertFirstIndex = -1;
     m_insertCount = 0;
-    m_pendingRegions.clear();
-    m_regionChecks.clear();
-    m_pendingRegionLabels.clear();
-    m_regionFirstIndex = -1;
-    m_regionCount = 0;
     m_shotMesh = FileImporter::MeshData();
     m_shotShape = TopoDS_Shape();
     m_shotFaceIds.clear();
@@ -1981,14 +1963,12 @@ void PreviewPanel::ToggleDebugContacts()
 // (Re)build the show/hide visibility checkboxes for the current part set, into
 // m_visPanel (left column). One per mould half, then "Shot" if present.
 // ---------------------------------------------------------------------------
-void PreviewPanel::BuildVisibilityChecks(int halfCount, bool hasShot, int insertCount,
-    int regionCount)
+void PreviewPanel::BuildVisibilityChecks(int halfCount, bool hasShot, int insertCount)
 {
     if (!m_visPanel) return;
     auto* vSizer = m_visPanel->GetSizer();
 
-    const bool anyParts = (halfCount > 0) || hasShot || (insertCount > 0)
-        || (regionCount > 0);
+    const bool anyParts = (halfCount > 0) || hasShot || (insertCount > 0);
     if (m_visEmptyLabel) m_visEmptyLabel->Show(!anyParts);
 
     auto addCheck = [&](int partIndex, const wxString& label, const wxString& tip,
@@ -2047,35 +2027,6 @@ void PreviewPanel::BuildVisibilityChecks(int halfCount, bool hasShot, int insert
         m_insertCheck = cb;
     }
 
-    // Nearly-orphan debug regions: ONE checkbox per region (unlike inserts), so
-    // individual over-detected regions can be isolated. They occupy the block
-    // [regionFirst, regionFirst + regionCount) after the inserts. Kept in
-    // m_regionChecks (not m_halfChecks) and default OFF — this is a debug layer.
-    if (regionCount > 0)
-    {
-        const int regionFirst = halfCount + (hasShot ? 1 : 0) + insertCount;
-        for (int r = 0; r < regionCount; ++r)
-        {
-            const int partIndex = regionFirst + r;
-            const wxString label = (r < (int)m_pendingRegionLabels.size())
-                ? wxString(m_pendingRegionLabels[r])
-                : wxString("Region " + std::to_string(r + 1));
-            auto* cb = new wxCheckBox(m_visPanel, kHalfToggleIdBase + partIndex, label);
-            cb->SetForegroundColour(Style::TextPrimary);
-            cb->SetBackgroundColour(Style::CardBg);
-            cb->SetValue(false);   // debug overlay starts hidden
-            cb->SetToolTip("Show / hide nearly-orphan debug region " +
-                std::to_string(r + 1));
-            cb->Bind(wxEVT_CHECKBOX,
-                [this, partIndex](wxCommandEvent& evt)
-                {
-                    if (m_canvas) m_canvas->SetPreviewHalfVisible(partIndex, evt.IsChecked());
-                });
-            vSizer->Add(cb, 0, wxEXPAND | wxALL, 6);
-            m_regionChecks.push_back(cb);
-        }
-    }
-
     m_visPanel->Layout();
     if (m_visPanel->GetParent()) m_visPanel->GetParent()->Layout();
 }
@@ -2099,13 +2050,6 @@ void PreviewPanel::ClearVisibilityChecks()
         m_insertCheck->Destroy();
         m_insertCheck = nullptr;
     }
-    for (wxCheckBox* cb : m_regionChecks)
-    {
-        if (!cb) continue;
-        if (vSizer) vSizer->Detach(cb);
-        cb->Destroy();
-    }
-    m_regionChecks.clear();
     ClearCastChecks();
     if (m_visEmptyLabel) m_visEmptyLabel->Show(true);
     if (m_visPanel) m_visPanel->Layout();
@@ -2269,34 +2213,12 @@ void PreviewPanel::LoadHalves()
             "Insert " + std::to_string(i + 1), insertColor);
     }
 
-    // Nearly-orphan debug regions, one preview part each (their own checkboxes),
-    // after the inserts. Distinct cycling colours so several regions stacked
-    // over one part can still be told apart. m_regionFirstIndex was recorded in
-    // SetData and matches the checkbox part indices.
-    static const glm::vec3 kRegionColors[] = {
-        { 0.20f, 0.85f, 0.45f }, { 0.90f, 0.35f, 0.85f }, { 0.30f, 0.65f, 0.95f },
-        { 0.95f, 0.75f, 0.20f }, { 0.95f, 0.35f, 0.35f }, { 0.55f, 0.85f, 0.25f },
-        { 0.25f, 0.80f, 0.80f }, { 0.70f, 0.50f, 0.95f },
-    };
-    for (size_t i = 0; i < m_pendingRegions.size(); ++i)
-    {
-        const glm::vec3 c = kRegionColors[i % (sizeof(kRegionColors) / sizeof(kRegionColors[0]))];
-        const std::string label = (i < m_pendingRegionLabels.size())
-            ? m_pendingRegionLabels[i]
-            : ("Region " + std::to_string(i + 1));
-        m_canvas->AddPreviewHalf(m_pendingRegions[i], label, c);
-    }
-
     // Half + insert meshes are now on the GPU; drop the CPU copies (the shot is
     // kept for the design checks).
     m_pendingHalves.clear();
     m_pendingHalves.shrink_to_fit();
     m_pendingInserts.clear();
     m_pendingInserts.shrink_to_fit();
-    m_pendingRegions.clear();
-    m_pendingRegions.shrink_to_fit();
-    m_pendingRegionLabels.clear();
-    m_pendingRegionLabels.shrink_to_fit();
 
     // Apply the initial checkbox states to the freshly loaded parts (parts are
     // added visible, so hide any whose checkbox starts unchecked — e.g. Half A).
@@ -2310,12 +2232,6 @@ void PreviewPanel::LoadHalves()
     if (m_insertCheck && !m_insertCheck->GetValue() && m_insertFirstIndex >= 0)
         for (int k = 0; k < m_insertCount; ++k)
             m_canvas->SetPreviewHalfVisible(m_insertFirstIndex + k, false);
-
-    // Debug regions load visible (AddPreviewHalf default) but their checkboxes
-    // start unchecked and aren't in m_halfChecks, so hide the whole block here.
-    if (m_regionFirstIndex >= 0)
-        for (int k = 0; k < m_regionCount; ++k)
-            m_canvas->SetPreviewHalfVisible(m_regionFirstIndex + k, false);
 
     m_canvas->Refresh(false);
 }

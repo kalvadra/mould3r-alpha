@@ -485,12 +485,6 @@ public:
     void ShowShotDebugSolid(bool on);
     void ClearShotDebugSolid();
 
-    // Parting Behavior diagnostic: build (or clear) a translucent overlay of
-    // every part's convex-hull envelope in the main canvas, so a nearly-orphan
-    // case that didn't flag can be inspected against the actual envelope.
-    // Recomputed from the current objects each time it's switched on.
-    void ShowConvexHullDebug(bool on);
-
     // Read-only access to the meshes produced by the most recent successful
     // GenerateMould run, one per fixture, in fixture order. World-space,
     // interleaved position+normal with indices. PreviewPanel consumes these
@@ -507,24 +501,6 @@ public:
     const std::vector<FileImporter::MeshData>& GetLastInsertMeshes() const
     {
         return m_lastInsertMeshes;
-    }
-
-    // Straddling cavity regions the nearly-orphan detector found in the most
-    // recent Generate Mould (BREP scenes, when detection is enabled), one mesh
-    // per region, world-space. Surfaced by PreviewPanel as toggleable debug
-    // objects so an over-detection ("why 8 regions?") can be inspected.
-    const std::vector<FileImporter::MeshData>& GetLastNearlyOrphanRegions() const
-    {
-        return m_lastNearlyOrphanRegions;
-    }
-
-    // Per-region readout strings (parallel to GetLastNearlyOrphanRegions), e.g.
-    // "Region 1 | A 12.3 B 0.8 mm2" — the A/B shared surface areas the analysis
-    // computed. Shown by PreviewPanel as the region toggle labels so the values
-    // can be checked (useful for comparing STEP vs mesh results).
-    const std::vector<std::string>& GetLastNearlyOrphanRegionLabels() const
-    {
-        return m_lastNearlyOrphanRegionLabels;
     }
 
     // The "shot" model from the most recent successful GenerateMould: the
@@ -1529,12 +1505,6 @@ private:
     bool        m_showDebugSolid = false;
     glm::vec3   m_debugSolidColor{ 0.90f, 0.15f, 0.15f };
 
-    // Parting Behavior hull-envelope debug overlay (main canvas). One merged,
-    // world-space mesh of every part's convex hull, drawn translucent.
-    SceneObject m_hullDebugObj;
-    bool        m_showHullDebug = false;
-    glm::vec3   m_hullDebugColor{ 0.15f, 0.90f, 0.45f };
-
     // Meshes from the most recent successful GenerateMould (one per fixture,
     // world-space, position+normal interleaved with indices). Populated in
     // GenerateMould and consumed by PreviewPanel via GetLastMouldMeshes().
@@ -1581,16 +1551,6 @@ private:
     // as their own category, in the same yellow they use in the Prepare view.
     // Empty when there were no inserts.
     std::vector<FileImporter::MeshData> m_lastInsertMeshes;
-
-    // Straddling cavity regions from the last nearly-orphan detection pass, one
-    // world-space mesh per region. Captured in ResolveNearlyOrphanRegions and
-    // surfaced to PreviewPanel as toggleable debug objects. Empty when detection
-    // was off, the scene is mesh, or nothing straddled.
-    std::vector<FileImporter::MeshData> m_lastNearlyOrphanRegions;
-
-    // Readout strings parallel to m_lastNearlyOrphanRegions (the A/B shared
-    // surface areas per region), surfaced as the Preview region toggle labels.
-    std::vector<std::string> m_lastNearlyOrphanRegionLabels;
 
 
     // Vent features (consolidated: point + path + cross-section + solid)
