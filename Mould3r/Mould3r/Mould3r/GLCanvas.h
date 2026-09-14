@@ -985,6 +985,28 @@ private:
     bool ResolveMeshOrphanVolumes(std::vector<MeshBoolean::Mesh>& meshHalves,
         std::vector<bool>& meshValid);
 
+    // Parting Behavior: nearly-orphaned region combine (BREP scenes). For each
+    // BREP object, builds the convex-hull envelope, finds hull-cavity solids
+    // that straddle the parting plane (a flat y=0 split would divide them
+    // awkwardly), and for each one prompts the user to combine it wholly into
+    // the top or bottom half (or keep the y=0 split). "Combine" cuts the region
+    // out of one half and fuses it into the other. Runs on the post-cut BREP
+    // halves, before the orphan resolver. Gated by the Parting Behavior menu
+    // toggle at the call site. Two-part moulds only. Mutates halfResults in
+    // place; never aborts generation (worst case: every region kept at y=0).
+    void ResolveNearlyOrphanRegions(std::vector<TopoDS_Shape>& halfResults,
+        std::vector<bool>& halfValid);
+
+    // Mesh-scene counterpart to ResolveNearlyOrphanRegions, run in phase 3b
+    // before the mesh orphan resolver. Same policy in the mesh (Manifold)
+    // domain: per mesh object, convex-hull envelope, hull-minus-part cavities,
+    // straddling components filtered by the minimum-region-volume setting, a
+    // per-region prompt, and transfer via Intersection / Difference / Union.
+    // Mutates meshHalves in place; gated by the Parting Behavior toggle at the
+    // call site. Two-part moulds only.
+    void ResolveMeshNearlyOrphanRegions(std::vector<MeshBoolean::Mesh>& meshHalves,
+        std::vector<bool>& meshValid);
+
     void InitGLOnce();
     void DestroyGL();
 
@@ -1529,6 +1551,7 @@ private:
     // as their own category, in the same yellow they use in the Prepare view.
     // Empty when there were no inserts.
     std::vector<FileImporter::MeshData> m_lastInsertMeshes;
+
 
     // Vent features (consolidated: point + path + cross-section + solid)
     std::vector<VentInstance> m_vents;
