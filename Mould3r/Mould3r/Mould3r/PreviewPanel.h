@@ -28,6 +28,7 @@ struct ShotPreviewInput
     const std::vector<int>*       faceIds = nullptr;  // per display tri -> face
     double                        volumeMm3 = 0.0;
     const std::vector<TopoDS_Shape>* halves = nullptr;  // half solids (separation)
+    const std::vector<DesignChecks::DraftSample>* draftSamples = nullptr; // area-weighted draft
 
     // The "Cast Shot Body" (standard shot + vents + scaled inserts + ejector
     // pins), used only by cast-mould base generation. May be null (no cast shot
@@ -182,6 +183,9 @@ private:
     // Compute (and cache) the demoldability result from the current thresholds,
     // without any UI. Returns false when there is no shot to analyse.
     bool ComputeDemoldability();
+    // Re-score the cached draft samples and update the verdict label only (no
+    // dialog). Used by the threshold fields / per-cavity toggle for live feedback.
+    void RefreshDraftVerdict();
 
     // Apply or clear the Draft Angle Checks mould overlay according to the
     // "Show mould overlay" checkbox on that card. When shown, the shot is
@@ -280,8 +284,10 @@ private:
     // whether the separation run has produced an interference solid to show.
     // The checkbox state itself is read from the controls; m_hasSepOverlay
     // gates the separation toggle so checking it before a run does nothing.
-    wxCheckBox* m_draftOverlayCheck = nullptr;
+    wxChoice*   m_debugModeChoice = nullptr;  // debug view: colour-by filter
+    wxCheckBox* m_debugWireCheck = nullptr;   // debug view: wireframe toggle
     wxCheckBox* m_sepOverlayCheck = nullptr;
+    wxCheckBox* m_perCavityCheck = nullptr;   // draft score: parts only vs whole shot
     bool        m_hasSepOverlay = false;
 
     // Right-hand information panel (outer), relaid out by UpdateInfoPanel, and
@@ -293,6 +299,12 @@ private:
     // Cached result of the last demoldability run, reused by the debug buttons.
     DesignChecks::DemoldabilityResult m_lastResult;
     bool m_hasResult = false;
+
+    // Area-weighted draft analysis: per-shot samples (built at generate time,
+    // copied in via SetData) and the last score reduction over them. Re-scored
+    // on every threshold edit / per-cavity toggle without re-sampling.
+    std::vector<DesignChecks::DraftSample> m_draftSamples;
+    DesignChecks::DraftScoreResult        m_lastDraftScore;
 
     // Triggering rays of the last run's undercut faces, for the ray overlay.
     std::vector<DesignChecks::UndercutRay> m_undercutRays;

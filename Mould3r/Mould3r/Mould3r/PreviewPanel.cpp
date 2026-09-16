@@ -433,6 +433,7 @@ void PreviewPanel::SetData(const std::vector<FileImporter::MeshData>& halves,
     m_shotShape = TopoDS_Shape();
     m_shotFaceIds.clear();
     m_halfShapes.clear();
+    m_draftSamples.clear();
     m_hasShot = false;
     m_shotVolumeMm3 = 0.0;
     m_castShotMesh = FileImporter::MeshData();
@@ -448,6 +449,7 @@ void PreviewPanel::SetData(const std::vector<FileImporter::MeshData>& halves,
         if (shot.shape)   m_shotShape = *shot.shape;
         if (shot.faceIds) m_shotFaceIds = *shot.faceIds;
         if (shot.halves)  m_halfShapes = *shot.halves;
+        if (shot.draftSamples) m_draftSamples = *shot.draftSamples;
         m_shotVolumeMm3 = shot.volumeMm3;
         m_hasShot = true;
     }
@@ -488,7 +490,8 @@ void PreviewPanel::SetData(const std::vector<FileImporter::MeshData>& halves,
     m_showContacts = false;
     m_undercutRays.clear();
     m_hasSepOverlay = false;
-    if (m_draftOverlayCheck) m_draftOverlayCheck->SetValue(false);
+    if (m_debugModeChoice)   m_debugModeChoice->SetSelection(0);
+    if (m_debugWireCheck)    m_debugWireCheck->SetValue(false);
     if (m_sepOverlayCheck)   m_sepOverlayCheck->SetValue(false);
 
     // Drop the previous generation's GPU parts now (clears its own context).
@@ -526,6 +529,7 @@ void PreviewPanel::ClearData()
     m_shotShape = TopoDS_Shape();
     m_shotFaceIds.clear();
     m_halfShapes.clear();
+    m_draftSamples.clear();
     m_hasShot = false;
     m_shotVolumeMm3 = 0.0;
     m_castShotMesh = FileImporter::MeshData();
@@ -545,7 +549,8 @@ void PreviewPanel::ClearData()
     m_showContacts = false;
     m_undercutRays.clear();
     m_hasSepOverlay = false;
-    if (m_draftOverlayCheck) m_draftOverlayCheck->SetValue(false);
+    if (m_debugModeChoice)   m_debugModeChoice->SetSelection(0);
+    if (m_debugWireCheck)    m_debugWireCheck->SetValue(false);
     if (m_sepOverlayCheck)   m_sepOverlayCheck->SetValue(false);
 
     if (m_canvas)
@@ -722,16 +727,18 @@ wxPanel* PreviewPanel::BuildSimPanel(wxWindow* parent)
         m_failDraftCtrl = AddFieldRow(body, bs, "Fail below:", "1.0", deg);
         m_warnDraftCtrl = AddFieldRow(body, bs, "Warn below:", "3.0", deg);
 
-        addStart(body, bs, "Draft Angle Checks");
+        m_perCavityCheck = new wxCheckBox(body, wxID_ANY, "Score cavity parts only");
+        m_perCavityCheck->SetForegroundColour(Style::TextPrimary);
+        m_perCavityCheck->SetBackgroundColour(Style::CardBg);
+        m_perCavityCheck->SetValue(true);
+        m_perCavityCheck->SetToolTip(
+            "On: score only the cavity (part) surfaces. Off: score the whole "
+            "shot, including the feed system.");
+        m_perCavityCheck->Bind(wxEVT_CHECKBOX,
+            [this](wxCommandEvent&) { RefreshDraftVerdict(); });
+        bs->Add(m_perCavityCheck, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
 
-        m_draftOverlayCheck = new wxCheckBox(body, wxID_ANY, "Show mould overlay");
-        m_draftOverlayCheck->SetForegroundColour(Style::TextPrimary);
-        m_draftOverlayCheck->SetBackgroundColour(Style::CardBg);
-        m_draftOverlayCheck->SetToolTip(
-            "Highlight fail faces (red) and warning faces (yellow) on the shot");
-        m_draftOverlayCheck->Bind(wxEVT_CHECKBOX,
-            [this](wxCommandEvent&) { UpdateDraftOverlay(); });
-        bs->Add(m_draftOverlayCheck, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
+        addStart(body, bs, "Draft Angle Checks");
     });
 
     // ---- Separation Test ----------------------------------------------------
@@ -751,6 +758,37 @@ wxPanel* PreviewPanel::BuildSimPanel(wxWindow* parent)
         m_sepOverlayCheck->Bind(wxEVT_CHECKBOX,
             [this](wxCommandEvent&) { UpdateSeparationOverlay(); });
         bs->Add(m_sepOverlayCheck, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
+    });
+
+    // ---- Debug View ---------------------------------------------------------
+    // Colour the shot's faces by an analysis filter and optionally draw it as
+    // a wireframe. Works on both BREP and mesh scenes (per-triangle on mesh).
+    makeCard("Debug View", [this](wxWindow* body, wxBoxSizer* bs)
+    {
+        auto* lbl = new wxStaticText(body, wxID_ANY, "Colour by:");
+        lbl->SetForegroundColour(Style::TextPrimary);
+        lbl->SetBackgroundColour(Style::CardBg);
+        bs->Add(lbl, 0, wxLEFT | wxRIGHT | wxTOP, 10);
+
+        wxArrayString modes;
+        modes.Add("None");
+        modes.Add("Draft angle");
+        modes.Add("Half ownership");
+        modes.Add("Trapped faces");
+        m_debugModeChoice = new wxChoice(body, wxID_ANY, wxDefaultPosition,
+            wxDefaultSize, modes);
+        m_debugModeChoice->SetSelection(0);
+        m_debugModeChoice->Bind(wxEVT_CHOICE,
+            [this](wxCommandEvent&) { UpdateDraftOverlay(); });
+        bs->Add(m_debugModeChoice, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
+
+        m_debugWireCheck = new wxCheckBox(body, wxID_ANY, "Wireframe");
+        m_debugWireCheck->SetForegroundColour(Style::TextPrimary);
+        m_debugWireCheck->SetBackgroundColour(Style::CardBg);
+        m_debugWireCheck->SetToolTip("Draw the shot as an edges-only wireframe");
+        m_debugWireCheck->Bind(wxEVT_CHECKBOX,
+            [this](wxCommandEvent&) { UpdateDraftOverlay(); });
+        bs->Add(m_debugWireCheck, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP | wxBOTTOM, 10);
     });
 
     sizer->AddSpacer(12);
@@ -945,12 +983,15 @@ void PreviewPanel::OnStartSimulation(const wxString& simName)
     // faces and half solids, which a mesh scene doesn't produce). Refuse every
     // simulation with a clear message rather than the generic "no shot model"
     // one. Mesh-native checks are a separate, later step.
-    if (m_sceneIsMesh)
+    // Mesh toolpath: Draft Angle Checks now runs on the mesh (facet-based).
+    // The Separation Test is still BREP-only (it needs the half solids), so
+    // refuse only that one on a mesh scene.
+    if (m_sceneIsMesh && simName != "Draft Angle Checks")
     {
         wxMessageBox(
             "This simulation can't be run on a mesh-type scene.\n\n"
-            "The design checks require a BREP (STEP) mould. Mesh-scene "
-            "simulations aren't available yet.",
+            "The Separation Test requires a BREP (STEP) mould. Mesh-scene "
+            "support for it is a later step.",
             simName, wxOK | wxICON_INFORMATION, this);
         return;
     }
@@ -1551,7 +1592,7 @@ void PreviewPanel::OnGenerateMouldCasts()
 // ---------------------------------------------------------------------------
 bool PreviewPanel::ComputeDemoldability()
 {
-    if (!m_hasShot || m_shotShape.IsNull())
+    if (!m_hasShot)
     {
         m_hasResult = false;
         return false;
@@ -1566,8 +1607,21 @@ bool PreviewPanel::ComputeDemoldability()
     if (params.warnDraftDeg < params.failDraftDeg)
         params.warnDraftDeg = params.failDraftDeg;
 
-    m_lastResult = DesignChecks::CheckDemoldability(m_shotShape, params, &m_undercutRays);
+    // BREP scene: the legacy per-face check still drives the undercut-ray
+    // debug viz. A mesh scene has no BREP shot, so skip it there; the
+    // area-weighted score below carries the mesh path.
+    if (!m_shotShape.IsNull())
+        m_lastResult = DesignChecks::CheckDemoldability(m_shotShape, params, &m_undercutRays);
     m_hasResult = true;
+
+    // Area-weighted score (signed draft + trapped-area) over the samples built
+    // at generate time. Cheap reduction — re-run on every threshold / toggle.
+    DesignChecks::DraftScoreParams sp;
+    sp.perCavity    = (!m_perCavityCheck || m_perCavityCheck->GetValue());
+    sp.failDraftDeg = params.failDraftDeg;
+    sp.warnDraftDeg = params.warnDraftDeg;
+    m_lastDraftScore = DesignChecks::ScoreDraft(m_draftSamples, sp);
+
     return true;
 }
 
@@ -1584,24 +1638,27 @@ void PreviewPanel::RunDemoldabilityCheck()
         return;
     }
 
-    const DesignChecks::DemoldabilityResult& res = m_lastResult;
+    const DesignChecks::DraftScoreResult& sc = m_lastDraftScore;
 
-    // ---- Verdict text + colour -------------------------------------------
-    wxString verdict;
-    wxColour verdictColour;
-    long icon = wxICON_INFORMATION;
-    switch (res.overall)
+    // Map a severity to verdict text / colour / message-box icon.
+    auto verdictOf = [](DesignChecks::Severity sev, wxString& text,
+                        wxColour& col, long& icon)
     {
-    case DesignChecks::Severity::Pass:
-        verdict = "PASS"; verdictColour = wxColour(0x26, 0xAB, 0x36);
-        icon = wxICON_INFORMATION; break;
-    case DesignChecks::Severity::Warning:
-        verdict = "WARNING"; verdictColour = wxColour(0xE0, 0x9B, 0x20);
-        icon = wxICON_WARNING; break;
-    case DesignChecks::Severity::Fail:
-        verdict = "FAIL"; verdictColour = wxColour(0xD0, 0x46, 0x46);
-        icon = wxICON_ERROR; break;
-    }
+        switch (sev)
+        {
+        case DesignChecks::Severity::Pass:
+            text = "PASS";    col = wxColour(0x26, 0xAB, 0x36); icon = wxICON_INFORMATION; break;
+        case DesignChecks::Severity::Warning:
+            text = "WARNING"; col = wxColour(0xE0, 0x9B, 0x20); icon = wxICON_WARNING;     break;
+        case DesignChecks::Severity::Fail:
+            text = "FAIL";    col = wxColour(0xD0, 0x46, 0x46); icon = wxICON_ERROR;       break;
+        }
+    };
+
+    // ---- Headline verdict = the Draft Index band (decision 2) ------------
+    wxString verdict; wxColour verdictColour; long icon = wxICON_INFORMATION;
+    verdictOf(sc.valid ? sc.overall : DesignChecks::Severity::Pass,
+              verdict, verdictColour, icon);
 
     if (m_draftStatus)
     {
@@ -1610,31 +1667,82 @@ void PreviewPanel::RunDemoldabilityCheck()
         if (m_infoPanel) m_infoPanel->Layout();
     }
 
-    // If the overlay is showing, refresh it against this run's faces/thresholds.
+    // Keep the (face-id) overlay in sync with this run. The signed-draft
+    // heatmap that will read this score directly is Stage 0b.
     UpdateDraftOverlay();
 
-    // ---- Detailed dialog --------------------------------------------------
-    const wxString deg = wxString::FromUTF8("\xC2\xB0");
+    const wxString deg  = wxString::FromUTF8("\xC2\xB0");
+    const wxString cm2  = wxString::FromUTF8("cm\xC2\xB2");
     wxString msg;
-    msg << "Draft Angle Checks: " << verdict << "\n\n";
-    if (res.issues.empty())
+
+    if (!sc.valid)
     {
-        msg << "No draft or undercut problems found.\n\n";
+        msg << "Draft Angle Checks: " << verdict << "\n\n"
+            << "No draft samples were available for this shot "
+            << "(mesh scenes are not yet supported here).";
+        wxMessageBox(msg, "Draft Angle Checks", wxOK | icon, this);
+        return;
     }
-    else
-    {
-        for (const DesignChecks::Issue& is : res.issues)
-            msg << wxString::FromUTF8(is.description.c_str()) << "\n";
-        msg << "\n";
-    }
-    msg << "Minimum draft: "
-        << wxString::Format("%.2f", res.minDraftDeg) << deg << "\n";
-    msg << "Undercut faces: " << res.undercutCount << "\n";
-    msg << "Below fail: " << res.failDraftCount << "\n";
-    msg << "Below warn: " << res.warnDraftCount << "\n";
-    msg << "Faces analysed: " << res.totalFaces;
+
+    const bool  perCavity = (!m_perCavityCheck || m_perCavityCheck->GetValue());
+    const float failDeg = (float)std::clamp(ParseField(m_failDraftCtrl, 1.0), 0.0, 45.0);
+    const float warnDeg = (float)std::clamp(ParseField(m_warnDraftCtrl, 3.0), 0.0, 45.0);
+
+    // Trapped-Area Fraction is its own axis (decision 4) with its own verdict.
+    wxString trapText; wxColour trapCol; long trapIcon = wxICON_INFORMATION;
+    verdictOf(sc.trappedSeverity, trapText, trapCol, trapIcon);
+
+    msg << "Draft Angle Checks: " << verdict << "\n";
+    msg << "Surface: " << (perCavity ? "cavity parts only" : "whole shot") << "\n\n";
+
+    msg << "Draft Index (area-weighted mean signed draft):\n    "
+        << wxString::Format("%.2f", sc.draftIndexDeg) << deg
+        << "   [fail < " << wxString::Format("%.1f", failDeg) << deg
+        << ", warn < "   << wxString::Format("%.1f", warnDeg) << deg << "]\n\n";
+
+    msg << "Trapped-Area Fraction (undercut): "
+        << wxString::Format("%.1f", sc.trappedAreaFraction * 100.0f) << "%   ("
+        << trapText << ")\n\n";
+
+    msg << "Area below fail: "
+        << wxString::Format("%.1f", sc.areaBelowFailFraction * 100.0f) << "%\n";
+    msg << "Area below warn: "
+        << wxString::Format("%.1f", sc.areaBelowWarnFraction * 100.0f) << "%\n";
+    msg << "    (localised \xe2\x80\x94 reported for context, not part of the verdict)\n\n";
+
+    msg << "Scored area: "
+        << wxString::Format("%.3f", sc.scoredAreaMm2 / 100.0f) << " " << cm2
+        << "    Samples: " << sc.sampleCount;
 
     wxMessageBox(msg, "Draft Angle Checks", wxOK | icon, this);
+}
+
+// ---------------------------------------------------------------------------
+// Re-score the cached draft samples and update only the verdict label (no
+// dialog) - used by the per-cavity toggle for live feedback once a run exists.
+// ---------------------------------------------------------------------------
+void PreviewPanel::RefreshDraftVerdict()
+{
+    // The Start button drives the first analysis (and the dialog); until then
+    // there is nothing to refresh.
+    if (!m_hasResult) return;
+    if (!ComputeDemoldability()) return;
+
+    wxString verdict; wxColour col(0x26, 0xAB, 0x36);
+    switch (m_lastDraftScore.valid ? m_lastDraftScore.overall
+                                   : DesignChecks::Severity::Pass)
+    {
+    case DesignChecks::Severity::Pass:    verdict = "PASS";    col = wxColour(0x26,0xAB,0x36); break;
+    case DesignChecks::Severity::Warning: verdict = "WARNING"; col = wxColour(0xE0,0x9B,0x20); break;
+    case DesignChecks::Severity::Fail:    verdict = "FAIL";    col = wxColour(0xD0,0x46,0x46); break;
+    }
+    if (m_draftStatus)
+    {
+        m_draftStatus->SetLabel(verdict);
+        m_draftStatus->SetForegroundColour(col);
+        if (m_infoPanel) m_infoPanel->Layout();
+    }
+    UpdateDraftOverlay();
 }
 
 // ---------------------------------------------------------------------------
@@ -1739,7 +1847,7 @@ void PreviewPanel::ApplyFaceGroups(const std::unordered_map<int, int>& groupOfFa
     const size_t numTris = I.size() / 3;
     for (size_t t = 0; t < numTris; ++t)
     {
-        const int fid = (t < m_shotFaceIds.size()) ? m_shotFaceIds[t] : 0;
+        const int fid = (t < m_shotFaceIds.size()) ? m_shotFaceIds[t] : (int)(t + 1);
         auto it = groupOfFace.find(fid);
         int g = (it != groupOfFace.end()) ? it->second : defaultGroup;
         if (g < 0 || g >= (int)colors.size()) g = defaultGroup;
@@ -1758,42 +1866,101 @@ void PreviewPanel::ApplyFaceGroups(const std::unordered_map<int, int>& groupOfFa
 // ---------------------------------------------------------------------------
 void PreviewPanel::UpdateDraftOverlay()
 {
+    // Debug view driver: colour the shot's faces by the selected analysis
+    // filter, optionally as a wireframe. Reads the area-weighted samples
+    // directly (no re-sampling) and works for both BREP and mesh scenes -
+    // ApplyFaceGroups keys on m_shotFaceIds (BREP) or the triangle index
+    // (mesh), which matches DraftSample::faceId on both paths.
     if (!m_canvas) return;
 
-    const bool show = m_draftOverlayCheck && m_draftOverlayCheck->GetValue();
-    if (!show)
+    const int  mode = m_debugModeChoice ? m_debugModeChoice->GetSelection() : 0;
+    const bool wire = m_debugWireCheck && m_debugWireCheck->GetValue();
+
+    if ((mode <= 0 && !wire) || m_shotHalfIndex < 0 || m_draftSamples.empty())
     {
         m_canvas->ClearShotDebugColoring();
+        m_canvas->SetShotDebugWireframe(false);
         m_activeDebugCategory = -1;
         return;
     }
 
-    if (m_shotHalfIndex < 0 || !ComputeDemoldability())
+    // One pass: aggregate the samples per display-face id. minDraft = worst
+    // (lowest) signed draft on the face; trapped = any trapped sample; area
+    // per half so a straddling BREP face colours by its dominant side.
+    struct Agg { float minDraft = 1.0e30f; bool trapped = false; float aHalf[2] = {0.0f, 0.0f}; };
+    std::unordered_map<int, Agg> agg;
+    for (const DesignChecks::DraftSample& s : m_draftSamples)
     {
-        // Nothing to analyse yet — leave the box checked, show nothing.
-        m_canvas->ClearShotDebugColoring();
-        return;
+        if (s.faceId <= 0) continue;
+        Agg& a = agg[s.faceId];
+        if (s.signedDraftDeg < a.minDraft) a.minDraft = s.signedDraftDeg;
+        if (s.trapped) a.trapped = true;
+        if (s.half == 0 || s.half == 1) a.aHalf[s.half] += s.area;
     }
 
-    // Group 0 = fails (red), 1 = warnings (yellow), 2 = everything else
-    // (default, neutral shot colour). The fail/warn face lists are disjoint
-    // (DesignChecks classifies each face into at most one bucket), so no
-    // precedence handling is needed.
+    const glm::vec3 kViolet (0.68f, 0.28f, 0.85f);
+    const glm::vec3 kRed    (0.92f, 0.16f, 0.16f);
+    const glm::vec3 kYellow (0.95f, 0.80f, 0.10f);
+    const glm::vec3 kNeutral(0.80f, 0.80f, 0.85f);
+    const glm::vec3 kHalfA  (0.30f, 0.55f, 0.95f);   // +drawAxis side
+    const glm::vec3 kHalfB  (0.95f, 0.60f, 0.20f);   // -drawAxis side
+
     std::unordered_map<int, int> groupOfFace;
-    for (int f : m_lastResult.failDraftFaces) if (f > 0) groupOfFace[f] = 0;
-    for (int f : m_lastResult.warnDraftFaces) if (f > 0) groupOfFace[f] = 1;
+    std::vector<glm::vec3>       colors;
+    std::vector<bool>           emissive;
+    int                         defaultGroup = 0;
 
-    const std::vector<glm::vec3> colors = {
-        glm::vec3(0.92f, 0.16f, 0.16f),   // red    — fail
-        glm::vec3(0.95f, 0.80f, 0.10f),   // yellow — warn
-        glm::vec3(0.80f, 0.80f, 0.85f),   // rest   — neutral (stays shaded)
-    };
-    // Highlight the flagged faces (groups 0 + 1) at full intensity; leave the
-    // rest shaded so the shot keeps its 3D form.
-    const std::vector<bool> emissive = { true, true, false };
+    if (mode == 1)          // Draft angle: back-draft / fail / warn / ok
+    {
+        const float failDeg = (float)std::clamp(ParseField(m_failDraftCtrl, 1.0), 0.0, 45.0);
+        float       warnDeg = (float)std::clamp(ParseField(m_warnDraftCtrl, 3.0), 0.0, 45.0);
+        if (warnDeg < failDeg) warnDeg = failDeg;
+        colors   = { kViolet, kRed, kYellow, kNeutral };
+        emissive = { true, true, true, false };
+        defaultGroup = 3;
+        for (const auto& kv : agg)
+        {
+            const float d = kv.second.minDraft;
+            int g;
+            if      (d < 0.0f)     g = 0;
+            else if (d < failDeg)  g = 1;
+            else if (d < warnDeg)  g = 2;
+            else                   continue;
+            groupOfFace[kv.first] = g;
+        }
+    }
+    else if (mode == 2)     // Half ownership: A (+) / B (-)
+    {
+        colors   = { kHalfA, kHalfB, kNeutral };
+        emissive = { false, false, false };
+        defaultGroup = 2;
+        for (const auto& kv : agg)
+        {
+            const Agg& a = kv.second;
+            int g = 2;
+            if (a.aHalf[0] > 0.0f || a.aHalf[1] > 0.0f)
+                g = (a.aHalf[0] >= a.aHalf[1]) ? 0 : 1;
+            groupOfFace[kv.first] = g;
+        }
+    }
+    else if (mode == 3)     // Trapped faces
+    {
+        colors   = { kRed, kNeutral };
+        emissive = { true, false };
+        defaultGroup = 1;
+        for (const auto& kv : agg)
+            if (kv.second.trapped) groupOfFace[kv.first] = 0;
+    }
+    else                    // None + wireframe: a single neutral body
+    {
+        colors   = { kNeutral };
+        emissive = { false };
+        defaultGroup = 0;
+    }
 
-    ApplyFaceGroups(groupOfFace, colors, /*defaultGroup*/ 2, emissive);
-    m_activeDebugCategory = -1;  // this combined view isn't one of the categories
+    ApplyFaceGroups(groupOfFace, colors, defaultGroup, emissive);
+    m_canvas->SetShotDebugWireframe(wire);
+    m_activeDebugCategory = -1;
 }
 
 // ---------------------------------------------------------------------------

@@ -4038,6 +4038,7 @@ void MainFrame::OnGenerateMould(wxCommandEvent&)
                 shot.faceIds = &m_canvas->GetLastShotFaceIds();
                 shot.volumeMm3 = m_canvas->GetLastShotVolumeMm3();
                 shot.halves = &m_canvas->GetLastHalfShapes();
+                shot.draftSamples = &m_canvas->GetLastDraftSamples();
                 // Augmented shot (vents + scaled inserts + ejectors) for the
                 // cast-mould bases; null-safe when none was built. The BREP is
                 // passed too so the bases can be built as STEP-exportable solids

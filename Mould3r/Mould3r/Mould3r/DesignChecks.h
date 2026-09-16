@@ -160,4 +160,108 @@ namespace DesignChecks
         const SeparationParams& params = SeparationParams{},
         TopoDS_Shape* outOverlap = nullptr);
 
+
+    // ======================================================================
+    // Area-weighted draft / demoldability scoring (Stage 0a - BREP scenes)
+    //
+    // A continuous alternative to the per-face pass/fail check above. The shot
+    // surface is sampled into small triangles; each contributes its SIGNED
+    // draft (positive = releases along its half's pull direction, negative =
+    // back-draft) weighted by its area. Two independent scalars fall out:
+    //   * Draft Index          - area-weighted mean signed draft, in degrees.
+    //   * Trapped-Area Fraction - fraction of scored area geometrically blocked
+    //                             along its pull axis (an undercut).
+    // The heavy geometry (BuildDraftSamplesBREP) runs once per generation; the
+    // cheap reduction (ScoreDraft) re-runs on every threshold / per-cavity
+    // toggle change without re-sampling.
+    // ======================================================================
+
+    // One surface sample. Carries everything the reduction needs; no geometry
+    // is retained, so the sample array is small and cheap to re-score.
+    struct DraftSample
+    {
+        float signedDraftDeg = 90.0f; // asin(n . pull) in deg; + releases, - back-draft
+        float area           = 0.0f;  // triangle area (mm^2) - the weight
+        int   objectId       = -1;    // >=0 imported-object index; -1 = feed system
+        int   faceId         = -1;    // 1-based shot face index (heatmap overlay)
+        int   half           = -1;    // mould half: 0 = +drawAxis side, 1 = -drawAxis
+        bool  trapped        = false; // inaccessible along its pull axis (undercut)
+    };
+
+    struct DraftSampleParams
+    {
+        glm::vec3 drawAxis         = glm::vec3(0.0f, 1.0f, 0.0f); // halves part +/-
+        bool      checkTrapped     = true;    // run the accessibility (undercut) ray
+        float     sampleDeflection = 0.25f;   // BREP sampling tessellation deflection
+        float     rayEpsilon       = 1.0e-3f; // ray start offset off the origin face
+        float     classifyOffset   = 0.02f;   // in/out offset for point classify (mm)
+        float     meshObjectTol    = 0.2f;    // mesh: max dist to call a facet "on" a part (mm)
+    };
+
+    // Inputs for the BREP sample build. `shot` is the fused shot to sample;
+    // `objectShapes` are the world-space imported objects (used to tag each
+    // face's objectId - feed faces match none and stay -1); `halves` are the
+    // post-cut half solids used to assign each sample's pull direction
+    // (decision 3: by the half the facet lands in). objectShapes/halves may be
+    // null or empty - the score then degrades gracefully (no per-cavity split;
+    // pull falls back to the parting-plane side of each sample).
+    struct DraftSampleInputBREP
+    {
+        const TopoDS_Shape*              shot         = nullptr;
+        const std::vector<TopoDS_Shape>* objectShapes = nullptr;
+        const std::vector<TopoDS_Shape>* halves       = nullptr;
+    };
+
+    // Build the per-sample array from a BREP shot. Runs the tessellation,
+    // analytic-normal, half-assignment and accessibility work once.
+    std::vector<DraftSample> BuildDraftSamplesBREP(
+        const DraftSampleInputBREP& in,
+        const DraftSampleParams& params = DraftSampleParams{});
+
+    // Build the per-sample array from a mesh shot (facet normals + areas from
+    // the interleaved posNorm buffer + index buffer). Half is assigned by the
+    // parting-plane side of each facet. objTriId tags each object triangle with
+    // its objectId (>=0); a shot facet within meshObjectTol of a part triangle
+    // takes that objectId, else -1 (feed). Trapped-area uses a ray any-hit
+    // against the shot. Pass empty object arrays to score the whole shot.
+    std::vector<DraftSample> BuildDraftSamplesMesh(
+        const std::vector<float>& posNorm,      // 6 floats/vertex: px,py,pz,nx,ny,nz
+        const std::vector<unsigned int>& indices,
+        const std::vector<float>& objVerts,     // part surfaces: xyz per vertex
+        const std::vector<unsigned int>& objIndices,
+        const std::vector<int>& objTriId,       // objectId per object triangle
+        const DraftSampleParams& params = DraftSampleParams{});
+
+    struct DraftScoreParams
+    {
+        bool  perCavity    = true;    // true: score part (object) surfaces only
+        float failDraftDeg = 1.0f;    // index below this => fail band
+        float warnDraftDeg = 3.0f;    // index below this (>= fail) => warning band
+        float trappedNoise = 1.0e-4f; // trapped fraction below this reads as clear
+    };
+
+    struct DraftScoreResult
+    {
+        bool     valid   = false;
+        Severity overall = Severity::Pass;      // by the Draft Index (decision 2)
+
+        float draftIndexDeg       = 90.0f;      // area-weighted mean signed draft
+        float trappedAreaFraction = 0.0f;       // 0..1 of scored area, blocked
+        Severity trappedSeverity  = Severity::Pass;
+
+        // Info-only localised-defect companions (decision 2: not verdict inputs).
+        float areaBelowFailFraction = 0.0f;
+        float areaBelowWarnFraction = 0.0f;
+
+        float scoredAreaMm2 = 0.0f;  // area actually scored (per the toggle)
+        float totalAreaMm2  = 0.0f;  // whole shot, for reference
+        int   sampleCount   = 0;
+    };
+
+    // Cheap reduction over a sample array - re-run on any threshold / toggle
+    // change. `perCavity` drops feed samples (objectId < 0).
+    DraftScoreResult ScoreDraft(
+        const std::vector<DraftSample>& samples,
+        const DraftScoreParams& params = DraftScoreParams{});
+
 }  // namespace DesignChecks

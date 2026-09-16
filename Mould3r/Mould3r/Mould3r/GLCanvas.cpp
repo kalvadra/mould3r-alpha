@@ -10,6 +10,7 @@
 #include <set>
 
 #include "GLCanvas.h"
+#include "DesignChecks.h"   // area-weighted draft scoring (BuildDraftSamplesBREP)
 #include <wx/dcclient.h>
 #include <wx/log.h>
 #include <wx/msgdlg.h>
@@ -3885,6 +3886,7 @@ bool GLCanvas::GenerateMould()
     m_lastShotShape = TopoDS_Shape();
     m_lastShotFaceIds.clear();
     m_lastHalfShapes.clear();
+    m_lastDraftSamples.clear();
     m_lastInsertMeshes.clear();
     m_lastCastShotMesh = FileImporter::MeshData{};
     m_lastCastShotShape = TopoDS_Shape();
@@ -4775,7 +4777,8 @@ bool GLCanvas::GenerateMould()
     if (!m_sceneIsMesh)
     {
         TopoDS_Shape shotShape;
-        if (BuildShotModel(shotShape))
+        std::vector<TopoDS_Shape> shotObjectShapes;
+        if (BuildShotModel(shotShape, &shotObjectShapes))
         {
             // Volume straight off the fused BREP (not the mesh) — accurate and
             // overlap-safe. Geometry is in mm, so this is cubic mm.
@@ -4789,6 +4792,22 @@ bool GLCanvas::GenerateMould()
             TessellateShapeToMesh(shotShape, m_lastShotMesh, &m_lastShotFaceIds);
             m_hasLastShotMesh =
                 !m_lastShotMesh.posNorm.empty() && !m_lastShotMesh.indices.empty();
+
+            // Area-weighted draft samples (signed draft + area + objectId +
+            // trapped), built once here and re-scored on demand in the preview.
+            // Never fatal: a failure just leaves the analysis empty.
+            try
+            {
+                DesignChecks::DraftSampleInputBREP dsi;
+                dsi.shot         = &m_lastShotShape;
+                dsi.objectShapes = &shotObjectShapes;
+                dsi.halves       = &m_lastHalfShapes;
+                m_lastDraftSamples = DesignChecks::BuildDraftSamplesBREP(dsi);
+            }
+            catch (const Standard_Failure&)
+            {
+                m_lastDraftSamples.clear();
+            }
         }
     }
     else
@@ -4809,6 +4828,33 @@ bool GLCanvas::GenerateMould()
             m_lastShotFaceIds.clear();
             m_hasLastShotMesh =
                 !m_lastShotMesh.posNorm.empty() && !m_lastShotMesh.indices.empty();
+
+            // Mesh draft samples: Draft Index + Trapped-Area + per-cavity.
+            // Gather every object's world-space triangles (uniform - each
+            // SceneObject carries a cpu mesh regardless of format), tagged by
+            // object index, so the analysis can separate cavity parts from the
+            // feed system.
+            {
+                std::vector<float>        objV;
+                std::vector<unsigned int> objI;
+                std::vector<int>          objTri;
+                for (size_t oi = 0; oi < m_objects.size(); ++oi)
+                {
+                    const SceneObject& obj = m_objects[oi];
+                    if (obj.cpuVerts.empty() || obj.cpuIndices.empty()) continue;
+                    MeshBoolean::Mesh w = WorldMeshFromLocal(
+                        obj.cpuVerts, obj.cpuIndices, obj.BuildModelMatrix());
+                    const unsigned int base = (unsigned int)(objV.size() / 3);
+                    objV.insert(objV.end(), w.verts.begin(), w.verts.end());
+                    for (uint32_t id : w.indices) objI.push_back(base + id);
+                    const size_t ntri = w.indices.size() / 3;
+                    for (size_t k = 0; k < ntri; ++k) objTri.push_back((int)oi);
+                }
+                DesignChecks::DraftSampleParams mp;   // checkTrapped defaults true
+                m_lastDraftSamples = DesignChecks::BuildDraftSamplesMesh(
+                    m_lastShotMesh.posNorm, m_lastShotMesh.indices,
+                    objV, objI, objTri, mp);
+            }
         }
     }
 
@@ -5021,6 +5067,13 @@ void GLCanvas::ClearShotDebugColoring()
     Refresh(false);
 }
 
+void GLCanvas::SetShotDebugWireframe(bool on)
+{
+    if (m_shotDebug.wireframe == on) return;
+    m_shotDebug.wireframe = on;
+    Refresh(false);
+}
+
 void GLCanvas::SetShotDebugRays(const std::vector<glm::vec3>& rayLineVerts,
     const std::vector<glm::vec3>& contactVerts)
 {
@@ -5196,6 +5249,14 @@ void GLCanvas::RenderPreview(const glm::mat4& view, const glm::mat4& proj,
             const GLint locEmis = glGetUniformLocation(m_program, "uEmissive");
 
             glBindVertexArray(m_shotDebug.vao);
+            const bool wf = m_shotDebug.wireframe;
+            GLboolean cullWas = GL_FALSE;
+            if (wf)
+            {
+                cullWas = glIsEnabled(GL_CULL_FACE);
+                if (cullWas) glDisable(GL_CULL_FACE);   // show back edges too
+                glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
+            }
             bool flattened = false;
             for (const DebugGroupGPU& g : m_shotDebug.groups)
             {
@@ -5226,6 +5287,11 @@ void GLCanvas::RenderPreview(const glm::mat4& view, const glm::mat4& proj,
                 glUniform3fv(locBase, 1, &g.color[0]);
                 glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g.ebo);
                 glDrawElements(GL_TRIANGLES, g.count, GL_UNSIGNED_INT, 0);
+            }
+            if (wf)
+            {
+                glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+                if (cullWas) glEnable(GL_CULL_FACE);
             }
             glBindVertexArray(0);
 
@@ -5367,7 +5433,8 @@ bool GLCanvas::BuildInsertCutSolid(const InsertFeature& in, float scalePct,
     return true;
 }
 
-bool GLCanvas::BuildShotModel(TopoDS_Shape& out)
+bool GLCanvas::BuildShotModel(TopoDS_Shape& out,
+    std::vector<TopoDS_Shape>* objectShapesOut)
 {
     std::vector<TopoDS_Shape> shapes;
 
@@ -5400,7 +5467,13 @@ bool GLCanvas::BuildShotModel(TopoDS_Shape& out)
         );
         BRepBuilderAPI_Transform objXform(objShape, objTrsf, true);
         if (!objXform.Shape().IsNull())
+        {
             shapes.push_back(objXform.Shape());
+            // Retain the world-space part surface so the draft analysis can tag
+            // each shot face as belonging to a cavity (objectId) vs the feed
+            // system. Feed primitives below are never added here.
+            if (objectShapesOut) objectShapesOut->push_back(objXform.Shape());
+        }
     }
 
     static constexpr float kCutEps = 0.1f;

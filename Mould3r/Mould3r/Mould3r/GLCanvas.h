@@ -22,6 +22,7 @@
 #include <opencascade/STEPControl_Writer.hxx>
 #include <opencascade/IFSelect_ReturnStatus.hxx>
 #include <opencascade/TopoDS_Shape.hxx>
+#include "DesignChecks.h"   // DesignChecks::DraftSample (area-weighted draft scoring)
 
 #include "camera.h"
 #include "FileImporter.h"
@@ -462,6 +463,10 @@ public:
     // Turn debug colouring off — the shot returns to its normal single colour.
     void ClearShotDebugColoring();
 
+    // Draw the active debug colouring as a wireframe (edges only) instead of
+    // filled triangles. Useful for inspecting the analysis mesh itself.
+    void SetShotDebugWireframe(bool on);
+
     // ---- Design-check debug rays -------------------------------------------
     // Upload accessibility-ray debug geometry for the preview: `rayLineVerts`
     // is GL_LINES vertex pairs (world space) for the ray segments, and
@@ -552,6 +557,14 @@ public:
     const std::vector<TopoDS_Shape>& GetLastHalfShapes() const
     {
         return m_lastHalfShapes;
+    }
+
+    // Area-weighted draft samples from the most recent GenerateMould (BREP
+    // scenes only for now). Empty in a mesh scene. Consumed by PreviewPanel's
+    // Draft Angle Checks via DesignChecks::ScoreDraft.
+    const std::vector<DesignChecks::DraftSample>& GetLastDraftSamples() const
+    {
+        return m_lastDraftSamples;
     }
 
     // Scene-mutation callback. MainFrame registers a callback that
@@ -923,7 +936,8 @@ private:
     // with the same geometry the cut loop uses, then fused pairwise. Returns
     // true and fills `out` when a non-null union results; returns false when
     // nothing contributed or the fuse failed outright. Read by GenerateMould.
-    bool BuildShotModel(TopoDS_Shape& out);
+    bool BuildShotModel(TopoDS_Shape& out,
+        std::vector<TopoDS_Shape>* objectShapesOut = nullptr);
 
     // Build the "Cast Shot Body": BuildShotModel's shot fused with the features
     // deliberately excluded from it — vents (their cut channels), inserts grown
@@ -1481,6 +1495,7 @@ private:
     struct ShotDebugView
     {
         bool    active = false;
+        bool    wireframe = false;
         int     halfIndex = -1;
         GLuint  vao = 0;
         std::vector<DebugGroupGPU> groups;
@@ -1543,6 +1558,10 @@ private:
     // The post-cut mould-half solids (BREP), in fixture order, retained for the
     // separation-based demoldability check.
     std::vector<TopoDS_Shape> m_lastHalfShapes;
+
+    // Area-weighted draft samples for the most recent shot (BREP scenes). Built
+    // once at generate time; PreviewPanel re-scores them per threshold / toggle.
+    std::vector<DesignChecks::DraftSample> m_lastDraftSamples;
 
     // Display meshes of the inserts as they stood at the most recent
     // GenerateMould (world-space, tessellated from each insert's UNSCALED body
