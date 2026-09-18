@@ -3847,6 +3847,24 @@ void GLCanvas::ResolveMeshNearlyOrphanRegions(std::vector<MeshBoolean::Mesh>& me
 }
 
 
+void GLCanvas::GatherObjectSoup(std::vector<float>& objV,
+    std::vector<unsigned int>& objI, std::vector<int>& objTri) const
+{
+    objV.clear(); objI.clear(); objTri.clear();
+    for (size_t oi = 0; oi < m_objects.size(); ++oi)
+    {
+        const SceneObject& obj = m_objects[oi];
+        if (obj.cpuVerts.empty() || obj.cpuIndices.empty()) continue;
+        MeshBoolean::Mesh w = WorldMeshFromLocal(
+            obj.cpuVerts, obj.cpuIndices, obj.BuildModelMatrix());
+        const unsigned int base = (unsigned int)(objV.size() / 3);
+        objV.insert(objV.end(), w.verts.begin(), w.verts.end());
+        for (uint32_t id : w.indices) objI.push_back(base + id);
+        const size_t ntri = w.indices.size() / 3;
+        for (size_t k = 0; k < ntri; ++k) objTri.push_back((int)oi);
+    }
+}
+
 bool GLCanvas::GenerateMould()
 {
     if (m_fixtures.empty())
@@ -3887,6 +3905,7 @@ bool GLCanvas::GenerateMould()
     m_lastShotFaceIds.clear();
     m_lastHalfShapes.clear();
     m_lastDraftSamples.clear();
+    m_lastObjV.clear(); m_lastObjI.clear(); m_lastObjTri.clear();
     m_lastInsertMeshes.clear();
     m_lastCastShotMesh = FileImporter::MeshData{};
     m_lastCastShotShape = TopoDS_Shape();
@@ -4796,18 +4815,12 @@ bool GLCanvas::GenerateMould()
             // Area-weighted draft samples (signed draft + area + objectId +
             // trapped), built once here and re-scored on demand in the preview.
             // Never fatal: a failure just leaves the analysis empty.
-            try
-            {
-                DesignChecks::DraftSampleInputBREP dsi;
-                dsi.shot         = &m_lastShotShape;
-                dsi.objectShapes = &shotObjectShapes;
-                dsi.halves       = &m_lastHalfShapes;
-                m_lastDraftSamples = DesignChecks::BuildDraftSamplesBREP(dsi);
-            }
-            catch (const Standard_Failure&)
-            {
-                m_lastDraftSamples.clear();
-            }
+            // BREP draft samples are built ON DEMAND in the preview (the
+            // remesh is heavy and depends on the target grid area). Here we
+            // only gather the object soup the preview needs; samples start
+            // empty and are filled when a draft check / debug view runs.
+            GatherObjectSoup(m_lastObjV, m_lastObjI, m_lastObjTri);
+            m_lastDraftSamples.clear();
         }
     }
     else
@@ -4835,25 +4848,11 @@ bool GLCanvas::GenerateMould()
             // object index, so the analysis can separate cavity parts from the
             // feed system.
             {
-                std::vector<float>        objV;
-                std::vector<unsigned int> objI;
-                std::vector<int>          objTri;
-                for (size_t oi = 0; oi < m_objects.size(); ++oi)
-                {
-                    const SceneObject& obj = m_objects[oi];
-                    if (obj.cpuVerts.empty() || obj.cpuIndices.empty()) continue;
-                    MeshBoolean::Mesh w = WorldMeshFromLocal(
-                        obj.cpuVerts, obj.cpuIndices, obj.BuildModelMatrix());
-                    const unsigned int base = (unsigned int)(objV.size() / 3);
-                    objV.insert(objV.end(), w.verts.begin(), w.verts.end());
-                    for (uint32_t id : w.indices) objI.push_back(base + id);
-                    const size_t ntri = w.indices.size() / 3;
-                    for (size_t k = 0; k < ntri; ++k) objTri.push_back((int)oi);
-                }
+                GatherObjectSoup(m_lastObjV, m_lastObjI, m_lastObjTri);
                 DesignChecks::DraftSampleParams mp;   // checkTrapped defaults true
                 m_lastDraftSamples = DesignChecks::BuildDraftSamplesMesh(
                     m_lastShotMesh.posNorm, m_lastShotMesh.indices,
-                    objV, objI, objTri, mp);
+                    m_lastObjV, m_lastObjI, m_lastObjTri, mp);
             }
         }
     }
@@ -5025,6 +5024,7 @@ void GLCanvas::SetShotDebugGroups(int halfIndex,
         if (g.ebo) { glDeleteBuffers(1, &g.ebo); g.ebo = 0; }
     m_shotDebug.groups.clear();
     if (m_shotDebug.vao) { glDeleteVertexArrays(1, &m_shotDebug.vao); m_shotDebug.vao = 0; }
+    if (m_shotDebug.ownVbo) { glDeleteBuffers(1, &m_shotDebug.ownVbo); m_shotDebug.ownVbo = 0; }
 
     // Debug VAO references the part's existing vertex buffer (pos + normal,
     // 6-float stride) so lighting matches the normal pass; only the element
@@ -5071,6 +5071,59 @@ void GLCanvas::SetShotDebugWireframe(bool on)
 {
     if (m_shotDebug.wireframe == on) return;
     m_shotDebug.wireframe = on;
+    Refresh(false);
+}
+
+void GLCanvas::SetShotDebugMesh(int halfIndex,
+    const std::vector<float>& posNorm,
+    const std::vector<ShotDebugGroup>& groups)
+{
+    if (halfIndex < 0 || halfIndex >= (int)m_previewHalves.size()) return;
+    if (posNorm.size() < 18) return;   // need at least one triangle
+
+    SetCurrent(*m_context);
+    InitGLOnce();
+
+    for (auto& g : m_shotDebug.groups)
+        if (g.ebo) { glDeleteBuffers(1, &g.ebo); g.ebo = 0; }
+    m_shotDebug.groups.clear();
+    if (m_shotDebug.vao) { glDeleteVertexArrays(1, &m_shotDebug.vao); m_shotDebug.vao = 0; }
+    if (m_shotDebug.ownVbo) { glDeleteBuffers(1, &m_shotDebug.ownVbo); m_shotDebug.ownVbo = 0; }
+
+    // The debug body is its OWN mesh (the area-grid remesh), uploaded here as
+    // a pos+normal (6-float stride) buffer; group EBOs index its triangles.
+    glGenBuffers(1, &m_shotDebug.ownVbo);
+    glBindBuffer(GL_ARRAY_BUFFER, m_shotDebug.ownVbo);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(posNorm.size() * sizeof(float)),
+        posNorm.data(), GL_STATIC_DRAW);
+
+    glGenVertexArrays(1, &m_shotDebug.vao);
+    glBindVertexArray(m_shotDebug.vao);
+    glBindBuffer(GL_ARRAY_BUFFER, m_shotDebug.ownVbo);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * (GLsizei)sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * (GLsizei)sizeof(float),
+        (void*)(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+
+    for (const ShotDebugGroup& grp : groups)
+    {
+        if (grp.indices.empty()) continue;
+        DebugGroupGPU gpu;
+        gpu.color = grp.color;
+        gpu.emissive = grp.emissive;
+        gpu.count = (GLsizei)grp.indices.size();
+        glGenBuffers(1, &gpu.ebo);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gpu.ebo);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+            (GLsizeiptr)(grp.indices.size() * sizeof(uint32_t)),
+            grp.indices.data(), GL_STATIC_DRAW);
+        m_shotDebug.groups.push_back(gpu);
+    }
+
+    glBindVertexArray(0);
+    m_shotDebug.halfIndex = halfIndex;
+    m_shotDebug.active = true;
     Refresh(false);
 }
 

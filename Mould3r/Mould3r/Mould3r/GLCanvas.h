@@ -467,6 +467,14 @@ public:
     // filled triangles. Useful for inspecting the analysis mesh itself.
     void SetShotDebugWireframe(bool on);
 
+    // Like SetShotDebugGroups, but the debug body is a supplied mesh (posNorm,
+    // 6 floats/vertex) rather than the shot's display mesh - used to draw the
+    // draft "area grid" remesh, whose triangles the group EBOs index. Rendered
+    // with the shot half's model matrix, so pass the shot half index.
+    void SetShotDebugMesh(int halfIndex,
+        const std::vector<float>& posNorm,
+        const std::vector<ShotDebugGroup>& groups);
+
     // ---- Design-check debug rays -------------------------------------------
     // Upload accessibility-ray debug geometry for the preview: `rayLineVerts`
     // is GL_LINES vertex pairs (world space) for the ray segments, and
@@ -566,6 +574,12 @@ public:
     {
         return m_lastDraftSamples;
     }
+
+    // World-space object soup (see members) for the preview's on-demand draft
+    // remesh (BREP), which separates cavity parts from the feed system.
+    const std::vector<float>&        GetLastObjV()   const { return m_lastObjV; }
+    const std::vector<unsigned int>& GetLastObjI()   const { return m_lastObjI; }
+    const std::vector<int>&          GetLastObjTri() const { return m_lastObjTri; }
 
     // Scene-mutation callback. MainFrame registers a callback that
     // invalidates the Export button when anything that would stale a
@@ -938,6 +952,12 @@ private:
     // nothing contributed or the fuse failed outright. Read by GenerateMould.
     bool BuildShotModel(TopoDS_Shape& out,
         std::vector<TopoDS_Shape>* objectShapesOut = nullptr);
+
+    // Gather every scene object's world-space triangles into one soup, each
+    // triangle tagged with its object index. Used by the draft analysis to
+    // separate cavity parts (objectId >= 0) from the feed system (-1).
+    void GatherObjectSoup(std::vector<float>& objV,
+        std::vector<unsigned int>& objI, std::vector<int>& objTri) const;
 
     // Build the "Cast Shot Body": BuildShotModel's shot fused with the features
     // deliberately excluded from it — vents (their cut channels), inserts grown
@@ -1498,6 +1518,7 @@ private:
         bool    wireframe = false;
         int     halfIndex = -1;
         GLuint  vao = 0;
+        GLuint  ownVbo = 0;   // non-zero when the debug body is its own mesh
         std::vector<DebugGroupGPU> groups;
     };
     ShotDebugView m_shotDebug;
@@ -1559,9 +1580,15 @@ private:
     // separation-based demoldability check.
     std::vector<TopoDS_Shape> m_lastHalfShapes;
 
-    // Area-weighted draft samples for the most recent shot (BREP scenes). Built
-    // once at generate time; PreviewPanel re-scores them per threshold / toggle.
+    // Area-weighted draft samples for the most recent shot (mesh scenes build
+    // these at generate; BREP scenes build them on demand in the preview).
     std::vector<DesignChecks::DraftSample> m_lastDraftSamples;
+
+    // World-space object triangle soup (parts, tagged by object index), gathered
+    // at generate for the draft analysis to separate cavities from the feed.
+    std::vector<float>        m_lastObjV;
+    std::vector<unsigned int> m_lastObjI;
+    std::vector<int>          m_lastObjTri;
 
     // Display meshes of the inserts as they stood at the most recent
     // GenerateMould (world-space, tessellated from each insert's UNSCALED body

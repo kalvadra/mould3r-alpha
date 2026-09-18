@@ -29,6 +29,9 @@ struct ShotPreviewInput
     double                        volumeMm3 = 0.0;
     const std::vector<TopoDS_Shape>* halves = nullptr;  // half solids (separation)
     const std::vector<DesignChecks::DraftSample>* draftSamples = nullptr; // area-weighted draft
+    const std::vector<float>*        objV = nullptr;   // world object soup (BREP on-demand remesh)
+    const std::vector<unsigned int>* objI = nullptr;
+    const std::vector<int>*          objTri = nullptr;
 
     // The "Cast Shot Body" (standard shot + vents + scaled inserts + ejector
     // pins), used only by cast-mould base generation. May be null (no cast shot
@@ -183,6 +186,10 @@ private:
     // Compute (and cache) the demoldability result from the current thresholds,
     // without any UI. Returns false when there is no shot to analyse.
     bool ComputeDemoldability();
+    // Build the BREP draft samples on demand: remesh the shot to the target
+    // grid area and facet-sample it, cached until the area or shot changes.
+    // No-op for mesh scenes (their samples are built at generate).
+    void EnsureDraftSamples();
     // Re-score the cached draft samples and update the verdict label only (no
     // dialog). Used by the threshold fields / per-cavity toggle for live feedback.
     void RefreshDraftVerdict();
@@ -276,6 +283,7 @@ private:
     // label + field + separate unit label.
     wxTextCtrl* m_failDraftCtrl = nullptr;   // draft fail threshold (deg)
     wxTextCtrl* m_warnDraftCtrl = nullptr;   // draft warn threshold (deg)
+    wxTextCtrl* m_gridAreaCtrl = nullptr;    // area-grid target per-polygon area (mm^2)
     wxTextCtrl* m_liftCtrl = nullptr;        // separation lift (mm)
     wxStaticText* m_draftStatus = nullptr;   // "Draft Angle Checks" verdict
     wxStaticText* m_demouldStatus = nullptr; // "Separation Test" verdict
@@ -305,6 +313,16 @@ private:
     // on every threshold edit / per-cavity toggle without re-sampling.
     std::vector<DesignChecks::DraftSample> m_draftSamples;
     DesignChecks::DraftScoreResult        m_lastDraftScore;
+
+    // BREP on-demand area grid: the object soup (from the canvas), the remesh
+    // itself (rendered as the debug body), and the target area last remeshed
+    // at (cache key). Mesh scenes use the passed samples and stay empty here.
+    std::vector<float>        m_objV;
+    std::vector<unsigned int> m_objI;
+    std::vector<int>          m_objTri;
+    std::vector<float>        m_remeshPosNorm;   // area grid, pos + normal
+    std::vector<unsigned int> m_remeshIdx;
+    float                     m_lastRemeshArea = -1.0f;
 
     // Triggering rays of the last run's undercut faces, for the ray overlay.
     std::vector<DesignChecks::UndercutRay> m_undercutRays;

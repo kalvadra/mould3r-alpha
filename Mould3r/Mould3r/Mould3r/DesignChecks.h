@@ -3,6 +3,7 @@
 #include <glm/glm.hpp>
 #include <string>
 #include <vector>
+#include <functional>
 
 class TopoDS_Shape;   // analysed at BREP level (see .cpp for OCC includes)
 
@@ -196,6 +197,7 @@ namespace DesignChecks
         float     rayEpsilon       = 1.0e-3f; // ray start offset off the origin face
         float     classifyOffset   = 0.02f;   // in/out offset for point classify (mm)
         float     meshObjectTol    = 0.2f;    // mesh: max dist to call a facet "on" a part (mm)
+        float     undercutEpsilonDeg = 0.1f;  // walls within this of vertical aren't undercuts
     };
 
     // Inputs for the BREP sample build. `shot` is the fused shot to sample;
@@ -260,6 +262,22 @@ namespace DesignChecks
 
     // Cheap reduction over a sample array - re-run on any threshold / toggle
     // change. `perCavity` drops feed samples (objectId < 0).
+    // Isotropic remesh (Botsch-Kobbelt) of a triangle soup toward a target
+    // per-triangle area (mm^2). Feature edges (dihedral > featureDeg, and
+    // boundaries) are preserved; new vertices are reprojected onto the input
+    // surface. outPosNorm is 6 floats/vertex (pos + outward normal sampled from
+    // the input). Returns false on empty/invalid input.
+    bool IsotropicRemesh(
+        const std::vector<float>& inVerts,
+        const std::vector<unsigned int>& inIndices,
+        float targetAreaMm2,
+        std::vector<float>& outPosNorm,
+        std::vector<unsigned int>& outIndices,
+        int iterations = 10,
+        float featureDeg = 40.0f,
+        // Optional progress callback: receives 0..1, returns false to cancel.
+        const std::function<bool(float)>& onProgress = {});
+
     DraftScoreResult ScoreDraft(
         const std::vector<DraftSample>& samples,
         const DraftScoreParams& params = DraftScoreParams{});

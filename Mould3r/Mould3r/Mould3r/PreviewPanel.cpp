@@ -1,5 +1,8 @@
 #include "PreviewPanel.h"
 #include "GLCanvas.h"
+#include <wx/progdlg.h>
+#include <thread>
+#include <atomic>
 #include "style.h"
 #include "DesignChecks.h"
 #include "RoundedButton.h"
@@ -434,6 +437,9 @@ void PreviewPanel::SetData(const std::vector<FileImporter::MeshData>& halves,
     m_shotFaceIds.clear();
     m_halfShapes.clear();
     m_draftSamples.clear();
+    m_objV.clear(); m_objI.clear(); m_objTri.clear();
+    m_remeshPosNorm.clear(); m_remeshIdx.clear();
+    m_lastRemeshArea = -1.0f;
     m_hasShot = false;
     m_shotVolumeMm3 = 0.0;
     m_castShotMesh = FileImporter::MeshData();
@@ -450,6 +456,11 @@ void PreviewPanel::SetData(const std::vector<FileImporter::MeshData>& halves,
         if (shot.faceIds) m_shotFaceIds = *shot.faceIds;
         if (shot.halves)  m_halfShapes = *shot.halves;
         if (shot.draftSamples) m_draftSamples = *shot.draftSamples;
+        if (shot.objV)   m_objV   = *shot.objV;
+        if (shot.objI)   m_objI   = *shot.objI;
+        if (shot.objTri) m_objTri = *shot.objTri;
+        m_lastRemeshArea = -1.0f;               // force a rebuild for the new shot
+        m_remeshPosNorm.clear(); m_remeshIdx.clear();
         m_shotVolumeMm3 = shot.volumeMm3;
         m_hasShot = true;
     }
@@ -530,6 +541,9 @@ void PreviewPanel::ClearData()
     m_shotFaceIds.clear();
     m_halfShapes.clear();
     m_draftSamples.clear();
+    m_objV.clear(); m_objI.clear(); m_objTri.clear();
+    m_remeshPosNorm.clear(); m_remeshIdx.clear();
+    m_lastRemeshArea = -1.0f;
     m_hasShot = false;
     m_shotVolumeMm3 = 0.0;
     m_castShotMesh = FileImporter::MeshData();
@@ -727,6 +741,12 @@ wxPanel* PreviewPanel::BuildSimPanel(wxWindow* parent)
         m_failDraftCtrl = AddFieldRow(body, bs, "Fail below:", "1.0", deg);
         m_warnDraftCtrl = AddFieldRow(body, bs, "Warn below:", "3.0", deg);
 
+        m_gridAreaCtrl = AddFieldRow(body, bs, "Grid area:", "1.0",
+            wxString::FromUTF8("mm\xC2\xB2"));
+        m_gridAreaCtrl->SetToolTip(
+            "Target per-polygon area for the analysis remesh (the area grid). "
+            "Applied when a draft check or debug view runs.");
+
         m_perCavityCheck = new wxCheckBox(body, wxID_ANY, "Score cavity parts only");
         m_perCavityCheck->SetForegroundColour(Style::TextPrimary);
         m_perCavityCheck->SetBackgroundColour(Style::CardBg);
@@ -785,7 +805,9 @@ wxPanel* PreviewPanel::BuildSimPanel(wxWindow* parent)
         m_debugWireCheck = new wxCheckBox(body, wxID_ANY, "Wireframe");
         m_debugWireCheck->SetForegroundColour(Style::TextPrimary);
         m_debugWireCheck->SetBackgroundColour(Style::CardBg);
-        m_debugWireCheck->SetToolTip("Draw the shot as an edges-only wireframe");
+        m_debugWireCheck->SetToolTip(
+            "With \"Colour by: None\", show the shot as a transparent "
+            "wireframe. Colour-by schemes always draw filled faces.");
         m_debugWireCheck->Bind(wxEVT_CHECKBOX,
             [this](wxCommandEvent&) { UpdateDraftOverlay(); });
         bs->Add(m_debugWireCheck, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP | wxBOTTOM, 10);
@@ -1590,6 +1612,85 @@ void PreviewPanel::OnGenerateMouldCasts()
 // ---------------------------------------------------------------------------
 // Compute (and cache) the demoldability result. No UI.
 // ---------------------------------------------------------------------------
+void PreviewPanel::EnsureDraftSamples()
+{
+    // Mesh scenes: samples were built at generate and passed in. BREP scenes:
+    // build the area-grid remesh + samples on demand, cached until the target
+    // area (or the shot) changes.
+    if (!m_hasShot || m_shotShape.IsNull()) return;
+    if (m_shotMesh.posNorm.empty() || m_shotMesh.indices.empty()) return;
+
+    const float targetArea = (float)std::max(0.1, ParseField(m_gridAreaCtrl, 1.0));
+    if (!m_draftSamples.empty() && targetArea == m_lastRemeshArea) return;   // cached
+
+    // Shot positions from the (outward-wound) display-mesh soup.
+    std::vector<float> shotPos;
+    const auto& pn = m_shotMesh.posNorm;
+    shotPos.reserve(pn.size() / 6 * 3);
+    for (size_t i = 0; i + 5 < pn.size(); i += 6)
+    { shotPos.push_back(pn[i]); shotPos.push_back(pn[i+1]); shotPos.push_back(pn[i+2]); }
+
+    // Safety clamp so a big part can't explode into millions of triangles.
+    float area = targetArea;
+    double surfA = 0.0;
+    const auto& idx = m_shotMesh.indices;
+    for (size_t t = 0; t + 2 < idx.size(); t += 3)
+    {
+        const uint32_t a = idx[t], b = idx[t+1], c = idx[t+2];
+        if (a*3+2 >= shotPos.size() || b*3+2 >= shotPos.size() || c*3+2 >= shotPos.size()) continue;
+        const float ux = shotPos[b*3]-shotPos[a*3], uy = shotPos[b*3+1]-shotPos[a*3+1], uz = shotPos[b*3+2]-shotPos[a*3+2];
+        const float vx = shotPos[c*3]-shotPos[a*3], vy = shotPos[c*3+1]-shotPos[a*3+1], vz = shotPos[c*3+2]-shotPos[a*3+2];
+        const float cx = uy*vz-uz*vy, cy = uz*vx-ux*vz, cz = ux*vy-uy*vx;
+        surfA += 0.5 * std::sqrt((double)(cx*cx+cy*cy+cz*cz));
+    }
+    const double kMaxTris = 300000.0;
+    if (surfA > 0.0 && surfA / area > kMaxTris) area = (float)(surfA / kMaxTris);
+
+    // Heavy job on a worker thread with a progress dialog polled from the UI
+    // thread. The worker touches only CPU data (DesignChecks + local buffers),
+    // never wx or GL, so this is safe.
+    std::atomic<float> progress{0.0f};
+    std::atomic<bool>  cancelled{false};
+    std::atomic<bool>  finished{false};
+    std::vector<float> rPosNorm; std::vector<unsigned int> rIdx;
+    std::vector<DesignChecks::DraftSample> samples;
+
+    std::thread worker([&]()
+    {
+        std::vector<float> rp; std::vector<unsigned int> ri;
+        const bool ok = DesignChecks::IsotropicRemesh(
+            shotPos, m_shotMesh.indices, area, rp, ri, 10, 40.0f,
+            [&](float p){ progress.store(p); return !cancelled.load(); });
+        if (ok && !ri.empty() && !cancelled.load())
+        {
+            DesignChecks::DraftSampleParams mp;
+            samples = DesignChecks::BuildDraftSamplesMesh(rp, ri, m_objV, m_objI, m_objTri, mp);
+            rPosNorm = std::move(rp);
+            rIdx     = std::move(ri);
+        }
+        finished.store(true);
+    });
+
+    wxProgressDialog dlg("Building area grid",
+        "Remeshing the shot surface to the target polygon area...",
+        100, this, wxPD_APP_MODAL | wxPD_CAN_ABORT | wxPD_AUTO_HIDE | wxPD_SMOOTH);
+    while (!finished.load())
+    {
+        const int pct = (int)(progress.load() * 100.0f);
+        if (!dlg.Update(pct < 99 ? pct : 99)) cancelled.store(true);
+        wxMilliSleep(25);
+    }
+    worker.join();
+
+    if (!cancelled.load() && !samples.empty())
+    {
+        m_draftSamples   = std::move(samples);
+        m_remeshPosNorm  = std::move(rPosNorm);
+        m_remeshIdx      = std::move(rIdx);
+        m_lastRemeshArea = targetArea;
+    }
+}
+
 bool PreviewPanel::ComputeDemoldability()
 {
     if (!m_hasShot)
@@ -1597,6 +1698,8 @@ bool PreviewPanel::ComputeDemoldability()
         m_hasResult = false;
         return false;
     }
+
+    EnsureDraftSamples();   // BREP: build the area-grid samples on demand
 
     DesignChecks::Params params;
     params.checkUndercuts = false;   // draft-angle assessment only — undercuts
@@ -1843,20 +1946,38 @@ void PreviewPanel::ApplyFaceGroups(const std::unordered_map<int, int>& groupOfFa
         groups[g].emissive = (g < emissive.size()) ? emissive[g] : false;
     }
 
-    const std::vector<uint32_t>& I = m_shotMesh.indices;
-    const size_t numTris = I.size() / 3;
-    for (size_t t = 0; t < numTris; ++t)
+    auto assign = [&](int fid, uint32_t i0, uint32_t i1, uint32_t i2)
     {
-        const int fid = (t < m_shotFaceIds.size()) ? m_shotFaceIds[t] : (int)(t + 1);
         auto it = groupOfFace.find(fid);
         int g = (it != groupOfFace.end()) ? it->second : defaultGroup;
         if (g < 0 || g >= (int)colors.size()) g = defaultGroup;
-        groups[(size_t)g].indices.push_back(I[t * 3 + 0]);
-        groups[(size_t)g].indices.push_back(I[t * 3 + 1]);
-        groups[(size_t)g].indices.push_back(I[t * 3 + 2]);
-    }
+        if (g < 0 || g >= (int)colors.size()) return;
+        groups[(size_t)g].indices.push_back(i0);
+        groups[(size_t)g].indices.push_back(i1);
+        groups[(size_t)g].indices.push_back(i2);
+    };
 
-    m_canvas->SetShotDebugGroups(m_shotHalfIndex, groups);
+    if (!m_remeshIdx.empty())
+    {
+        // BREP: the debug body is the area-grid remesh; sample i == triangle i,
+        // so faceId == remesh-triangle-index + 1.
+        const std::vector<uint32_t>& I = m_remeshIdx;
+        for (size_t t = 0; t + 2 < I.size(); t += 3)
+            assign((int)(t / 3) + 1, I[t], I[t + 1], I[t + 2]);
+        m_canvas->SetShotDebugMesh(m_shotHalfIndex, m_remeshPosNorm, groups);
+    }
+    else
+    {
+        // Mesh scene: colour the shot display mesh; fid = BREP face id or tri+1.
+        const std::vector<uint32_t>& I = m_shotMesh.indices;
+        const size_t numTris = I.size() / 3;
+        for (size_t t = 0; t < numTris; ++t)
+        {
+            const int fid = (t < m_shotFaceIds.size()) ? m_shotFaceIds[t] : (int)(t + 1);
+            assign(fid, I[t * 3 + 0], I[t * 3 + 1], I[t * 3 + 2]);
+        }
+        m_canvas->SetShotDebugGroups(m_shotHalfIndex, groups);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1876,7 +1997,17 @@ void PreviewPanel::UpdateDraftOverlay()
     const int  mode = m_debugModeChoice ? m_debugModeChoice->GetSelection() : 0;
     const bool wire = m_debugWireCheck && m_debugWireCheck->GetValue();
 
-    if ((mode <= 0 && !wire) || m_shotHalfIndex < 0 || m_draftSamples.empty())
+    if ((mode <= 0 && !wire) || m_shotHalfIndex < 0)
+    {
+        m_canvas->ClearShotDebugColoring();
+        m_canvas->SetShotDebugWireframe(false);
+        m_activeDebugCategory = -1;
+        return;
+    }
+
+    if (mode >= 1 || wire) EnsureDraftSamples();   // colour or wireframe needs the grid
+
+    if (mode >= 1 && m_draftSamples.empty())
     {
         m_canvas->ClearShotDebugColoring();
         m_canvas->SetShotDebugWireframe(false);
@@ -1959,7 +2090,9 @@ void PreviewPanel::UpdateDraftOverlay()
     }
 
     ApplyFaceGroups(groupOfFace, colors, defaultGroup, emissive);
-    m_canvas->SetShotDebugWireframe(wire);
+    // Wireframe (transparent faces) applies only in None; a colour-by scheme
+    // always draws filled faces so the colours read as solid regions.
+    m_canvas->SetShotDebugWireframe(mode <= 0 ? wire : false);
     m_activeDebugCategory = -1;
 }
 

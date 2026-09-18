@@ -36,6 +36,12 @@
 #include <algorithm>
 #include <cmath>
 #include <memory>
+#include <map>
+#include <set>
+#include <array>
+#include <vector>
+#include <cstdlib>
+#include <functional>
 
 namespace
 {
@@ -101,6 +107,30 @@ namespace
         const float vv = vb * den, ww = vc * den;
         const glm::vec3 r = p - (a + ab * vv + ac * ww);
         return glm::dot(r, r);
+    }
+
+    // Closest point on a triangle to p (Ericson's regions).
+    inline glm::vec3 ClosestPtOnTri(const glm::vec3& p, const glm::vec3& a,
+                                    const glm::vec3& b, const glm::vec3& c)
+    {
+        const glm::vec3 ab = b - a, ac = c - a, ap = p - a;
+        const float d1 = glm::dot(ab, ap), d2 = glm::dot(ac, ap);
+        if (d1 <= 0.0f && d2 <= 0.0f) return a;
+        const glm::vec3 bp = p - b;
+        const float d3 = glm::dot(ab, bp), d4 = glm::dot(ac, bp);
+        if (d3 >= 0.0f && d4 <= d3) return b;
+        const float vc = d1*d4 - d3*d2;
+        if (vc <= 0.0f && d1 >= 0.0f && d3 <= 0.0f) { const float t = d1/(d1-d3); return a + ab*t; }
+        const glm::vec3 cp = p - c;
+        const float d5 = glm::dot(ab, cp), d6 = glm::dot(ac, cp);
+        if (d6 >= 0.0f && d5 <= d6) return c;
+        const float vb = d5*d2 - d1*d6;
+        if (vb <= 0.0f && d2 >= 0.0f && d6 <= 0.0f) { const float t = d2/(d2-d6); return a + ac*t; }
+        const float va = d3*d6 - d5*d4;
+        if (va <= 0.0f && (d4-d3) >= 0.0f && (d5-d6) >= 0.0f)
+        { const float t = (d4-d3)/((d4-d3)+(d5-d6)); return b + (c-b)*t; }
+        const float den = 1.0f/(va+vb+vc), v = vb*den, w = vc*den;
+        return a + ab*v + ac*w;
     }
 
     // Uniform grid over a triangle soup (positions xyz + index buffer). Stores
@@ -216,8 +246,292 @@ namespace
                 }
             outD2 = bd2; return best;
         }
+
+        // Closest point on the whole mesh (expanding ring search; brute-force
+        // fallback). Query points during remeshing sit near the surface.
+        glm::vec3 ClosestPoint(const glm::vec3& p) const
+        {
+            if (Empty()) return p;
+            int x0, y0, z0; Cell(p, x0, y0, z0);
+            const int maxR = std::max(nx, std::max(ny, nz));
+            float bd2 = 1e30f; glm::vec3 best = p; bool found = false;
+            for (int rc = 1; rc <= maxR; rc = (rc < 2 ? 2 : rc*2))
+            {
+                for (int z = std::max(0,z0-rc); z <= std::min(nz-1,z0+rc); ++z)
+                for (int y = std::max(0,y0-rc); y <= std::min(ny-1,y0+rc); ++y)
+                for (int x = std::max(0,x0-rc); x <= std::min(nx-1,x0+rc); ++x)
+                    for (int tri : cells[Idx(x,y,z)])
+                    {
+                        const glm::vec3 a = Vert((*I)[tri*3]), b = Vert((*I)[tri*3+1]), c = Vert((*I)[tri*3+2]);
+                        const glm::vec3 q = ClosestPtOnTri(p, a, b, c);
+                        const glm::vec3 d = p - q; const float d2 = glm::dot(d, d);
+                        if (d2 < bd2) { bd2 = d2; best = q; found = true; }
+                    }
+                if (found && rc >= 2) break;
+            }
+            if (!found)
+                for (size_t t = 0; t < I->size()/3; ++t)
+                {
+                    const glm::vec3 a = Vert((*I)[t*3]), b = Vert((*I)[t*3+1]), c = Vert((*I)[t*3+2]);
+                    const glm::vec3 q = ClosestPtOnTri(p, a, b, c);
+                    const glm::vec3 d = p - q; const float d2 = glm::dot(d, d);
+                    if (d2 < bd2) { bd2 = d2; best = q; }
+                }
+            return best;
+        }
+
+        // Nearest triangle index to p (expanding ring search + brute fallback).
+        int NearestTriangle(const glm::vec3& p) const
+        {
+            if (Empty()) return -1;
+            int x0, y0, z0; Cell(p, x0, y0, z0);
+            const int maxR = std::max(nx, std::max(ny, nz));
+            float bd2 = 1e30f; int best = -1; bool found = false;
+            for (int rc = 1; rc <= maxR; rc = (rc < 2 ? 2 : rc*2))
+            {
+                for (int z = std::max(0,z0-rc); z <= std::min(nz-1,z0+rc); ++z)
+                for (int y = std::max(0,y0-rc); y <= std::min(ny-1,y0+rc); ++y)
+                for (int x = std::max(0,x0-rc); x <= std::min(nx-1,x0+rc); ++x)
+                    for (int tri : cells[Idx(x,y,z)])
+                    {
+                        const glm::vec3 a = Vert((*I)[tri*3]), b = Vert((*I)[tri*3+1]), c = Vert((*I)[tri*3+2]);
+                        const float d2 = DistPointTri2(p, a, b, c);
+                        if (d2 < bd2) { bd2 = d2; best = tri; found = true; }
+                    }
+                if (found && rc >= 2) break;
+            }
+            if (!found)
+                for (size_t t = 0; t < I->size()/3; ++t)
+                {
+                    const glm::vec3 a = Vert((*I)[t*3]), b = Vert((*I)[t*3+1]), c = Vert((*I)[t*3+2]);
+                    const float d2 = DistPointTri2(p, a, b, c);
+                    if (d2 < bd2) { bd2 = d2; best = (int)t; }
+                }
+            return best;
+        }
     };
 }
+
+// ===== Isotropic remesher (Botsch-Kobbelt), file-local ====================
+namespace   // reopened; uses TriGrid from the anonymous namespace above
+{
+namespace rmsh
+{
+    struct RV3 { double x, y, z; };
+    inline RV3 operator+(RV3 a, RV3 b){ return {a.x+b.x,a.y+b.y,a.z+b.z}; }
+    inline RV3 operator-(RV3 a, RV3 b){ return {a.x-b.x,a.y-b.y,a.z-b.z}; }
+    inline RV3 operator*(RV3 a, double s){ return {a.x*s,a.y*s,a.z*s}; }
+    inline double rdot(RV3 a, RV3 b){ return a.x*b.x+a.y*b.y+a.z*b.z; }
+    inline RV3 rcross(RV3 a, RV3 b){ return {a.y*b.z-a.z*b.y,a.z*b.x-a.x*b.z,a.x*b.y-a.y*b.x}; }
+    inline double rlen(RV3 a){ return std::sqrt(rdot(a,a)); }
+    inline RV3 rnorm(RV3 a){ double l=rlen(a); return l>1e-20?a*(1.0/l):RV3{0,0,0}; }
+
+    struct Mesh {
+        std::vector<RV3> V; std::vector<char> vAlive, vFeature;
+        std::vector<std::array<int,3>> F; std::vector<char> fAlive;
+    };
+    struct Ref {
+        const TriGrid* grid=nullptr;
+        RV3 closest(RV3 p) const {
+            if(!grid) return p;
+            glm::vec3 q=grid->ClosestPoint(glm::vec3((float)p.x,(float)p.y,(float)p.z));
+            return {(double)q.x,(double)q.y,(double)q.z};
+        }
+    };
+
+    typedef std::pair<int,int> Edge;
+    inline Edge ek(int a,int b){ return a<b?Edge(a,b):Edge(b,a); }
+    inline double triArea(const Mesh&m,int f){auto&t=m.F[f];return 0.5*rlen(rcross(m.V[t[1]]-m.V[t[0]],m.V[t[2]]-m.V[t[0]]));}
+    inline RV3 triNormal(const Mesh&m,int f){auto&t=m.F[f];return rnorm(rcross(m.V[t[1]]-m.V[t[0]],m.V[t[2]]-m.V[t[0]]));}
+
+    inline std::map<Edge,std::vector<int>> edgeFaces(const Mesh&m){
+        std::map<Edge,std::vector<int>> em;
+        for(int f=0;f<(int)m.F.size();++f){ if(!m.fAlive[f])continue; auto&t=m.F[f];
+            for(int e=0;e<3;++e) em[ek(t[e],t[(e+1)%3])].push_back(f); }
+        return em;
+    }
+    inline std::vector<std::vector<int>> vertFaces(const Mesh&m){
+        std::vector<std::vector<int>> vf(m.V.size());
+        for(int f=0;f<(int)m.F.size();++f){ if(!m.fAlive[f])continue; for(int k=0;k<3;++k) vf[m.F[f][k]].push_back(f); }
+        return vf;
+    }
+    inline void markFeatures(Mesh&m,double angleDeg){
+        auto em=edgeFaces(m);
+        std::fill(m.vFeature.begin(),m.vFeature.end(),(char)0);
+        double cthr=std::cos(angleDeg*3.14159265358979/180.0);
+        for(auto&kv:em){
+            if(kv.second.size()==1){ m.vFeature[kv.first.first]=1; m.vFeature[kv.first.second]=1; continue; }
+            if(kv.second.size()==2){ RV3 n0=triNormal(m,kv.second[0]),n1=triNormal(m,kv.second[1]);
+                if(rdot(n0,n1)<cthr){ m.vFeature[kv.first.first]=1; m.vFeature[kv.first.second]=1; } }
+        }
+    }
+    inline int addVertex(Mesh&m,RV3 p,char feat){m.V.push_back(p);m.vAlive.push_back(1);m.vFeature.push_back(feat);return (int)m.V.size()-1;}
+    inline int addFace(Mesh&m,int a,int b,int c){m.F.push_back({a,b,c});m.fAlive.push_back(1);return (int)m.F.size()-1;}
+    inline void compact(Mesh&m){
+        std::vector<int> remap(m.V.size(),-1); Mesh o;
+        for(int v=0;v<(int)m.V.size();++v) if(m.vAlive[v]){remap[v]=(int)o.V.size();o.V.push_back(m.V[v]);o.vAlive.push_back(1);o.vFeature.push_back(m.vFeature[v]);}
+        for(int f=0;f<(int)m.F.size();++f) if(m.fAlive[f]){auto&t=m.F[f]; if(remap[t[0]]<0||remap[t[1]]<0||remap[t[2]]<0)continue; o.F.push_back({remap[t[0]],remap[t[1]],remap[t[2]]});o.fAlive.push_back(1);}
+        m=o;
+    }
+    inline void splitLong(Mesh&m,const Ref&R,double high){
+      for(int sweep=0;sweep<8;++sweep){
+        auto em=edgeFaces(m);
+        std::vector<Edge> longE;
+        for(auto&kv:em) if(kv.second.size()==2){ RV3 a=m.V[kv.first.first],b=m.V[kv.first.second]; if(rlen(b-a)>high) longE.push_back(kv.first); }
+        if(longE.empty()) break;
+        std::vector<char> faceTouched(m.F.size(),0);
+        for(auto&e:longE){
+            auto it=em.find(e); if(it==em.end()||it->second.size()!=2) continue;
+            if(faceTouched[it->second[0]]||faceTouched[it->second[1]]) continue;
+            int a=e.first,b=e.second; if(!m.vAlive[a]||!m.vAlive[b]) continue;
+            RV3 mid=(m.V[a]+m.V[b])*0.5; char feat=(m.vFeature[a]&&m.vFeature[b])?1:0;
+            if(!feat) mid=R.closest(mid);
+            int mI=addVertex(m,mid,feat);
+            for(int f:it->second){ if(!m.fAlive[f])continue; auto t=m.F[f];
+                for(int k=0;k<3;++k){ int u=t[k],v=t[(k+1)%3],w=t[(k+2)%3];
+                    if((u==a&&v==b)||(u==b&&v==a)){ m.fAlive[f]=0; addFace(m,u,mI,w); addFace(m,mI,v,w); break; } } }
+            faceTouched[it->second[0]]=1; faceTouched[it->second[1]]=1; em.erase(it);
+        }
+        compact(m);
+      }
+    }
+    inline bool wouldFlip(const Mesh&m,const std::vector<std::vector<int>>&vf,int keep,int rem,RV3 np){
+        for(int f:vf[rem]){ if(!m.fAlive[f])continue; auto t=m.F[f];
+            int cnt=0; for(int k=0;k<3;++k) if(t[k]==keep) cnt++; if(cnt>0) continue;
+            RV3 p[3]; for(int k=0;k<3;++k) p[k]=(t[k]==rem)?np:m.V[t[k]];
+            RV3 nOld=triNormal(m,f); RV3 nNew=rnorm(rcross(p[1]-p[0],p[2]-p[0]));
+            if(rdot(nOld,nNew)<0.2) return true;
+            if(rlen(rcross(p[1]-p[0],p[2]-p[0]))<1e-14) return true; }
+        return false;
+    }
+    inline void collapseShort(Mesh&m,const Ref&R,double low,double high){
+        auto em=edgeFaces(m); auto vf=vertFaces(m);
+        std::vector<Edge> shortE;
+        for(auto&kv:em) if(kv.second.size()==2){ RV3 a=m.V[kv.first.first],b=m.V[kv.first.second]; if(rlen(b-a)<low) shortE.push_back(kv.first); }
+        std::vector<char> touched(m.V.size(),0);
+        for(auto&e:shortE){
+            int a=e.first,b=e.second;
+            if(!m.vAlive[a]||!m.vAlive[b]||touched[a]||touched[b]) continue;
+            if(m.vFeature[a]!=m.vFeature[b]) continue;
+            auto it=em.find(e); if(it==em.end()||it->second.size()!=2) continue;
+            std::set<int> na,nb;
+            for(int f:vf[a]){ if(!m.fAlive[f])continue; for(int k=0;k<3;++k) if(m.F[f][k]!=a) na.insert(m.F[f][k]); }
+            for(int f:vf[b]){ if(!m.fAlive[f])continue; for(int k=0;k<3;++k) if(m.F[f][k]!=b) nb.insert(m.F[f][k]); }
+            std::vector<int> inter; for(int x:na) if(nb.count(x)) inter.push_back(x);
+            std::set<int> opp; for(int f:it->second){auto t=m.F[f]; for(int k=0;k<3;++k) if(t[k]!=a&&t[k]!=b) opp.insert(t[k]);}
+            if(inter.size()!=opp.size()) continue;
+            bool ok=true; for(int x:inter) if(!opp.count(x)) ok=false; if(!ok) continue;
+            RV3 np=m.vFeature[a]?m.V[a]:(m.vFeature[b]?m.V[b]:(m.V[a]+m.V[b])*0.5);
+            if(!(m.vFeature[a]||m.vFeature[b])) np=R.closest(np);
+            bool tooLong=false; for(int x:na) if(x!=b&&rlen(m.V[x]-np)>high) tooLong=true; for(int x:nb) if(x!=a&&rlen(m.V[x]-np)>high) tooLong=true;
+            if(tooLong) continue;
+            if(wouldFlip(m,vf,a,b,np)||wouldFlip(m,vf,b,a,np)) continue;
+            m.V[a]=np; for(int f:it->second) m.fAlive[f]=0;
+            for(int f:vf[b]){ if(!m.fAlive[f])continue; for(int k=0;k<3;++k) if(m.F[f][k]==b) m.F[f][k]=a;
+                auto&t=m.F[f]; if(t[0]==t[1]||t[1]==t[2]||t[0]==t[2]) m.fAlive[f]=0; }
+            m.vAlive[b]=0; touched[a]=1; touched[b]=1; for(int x:inter) touched[x]=1;
+        }
+        compact(m);
+    }
+    inline void flipValence(Mesh&m){
+        auto em=edgeFaces(m);
+        std::vector<int> val(m.V.size(),0);
+        for(auto&kv:em){ val[kv.first.first]++; val[kv.first.second]++; }
+        for(auto&kv:em){ if(kv.second.size()!=2) continue; int a=kv.first.first,b=kv.first.second;
+            if(m.vFeature[a]&&m.vFeature[b]) continue;
+            int f0=kv.second[0],f1=kv.second[1]; if(!m.fAlive[f0]||!m.fAlive[f1])continue;
+            int c=-1,d=-1; for(int k=0;k<3;++k){ if(m.F[f0][k]!=a&&m.F[f0][k]!=b)c=m.F[f0][k]; if(m.F[f1][k]!=a&&m.F[f1][k]!=b)d=m.F[f1][k]; }
+            if(c<0||d<0||c==d) continue; if(em.count(ek(c,d))) continue;
+            int tgt=6;
+            int devOld=std::abs(val[a]-tgt)+std::abs(val[b]-tgt)+std::abs(val[c]-tgt)+std::abs(val[d]-tgt);
+            int devNew=std::abs(val[a]-1-tgt)+std::abs(val[b]-1-tgt)+std::abs(val[c]+1-tgt)+std::abs(val[d]+1-tgt);
+            if(devNew>=devOld) continue;
+            RV3 nc=rnorm(rcross(m.V[d]-m.V[c],m.V[a]-m.V[c]));
+            RV3 nd=rnorm(rcross(m.V[b]-m.V[c],m.V[d]-m.V[c]));
+            RV3 o0=triNormal(m,f0);
+            if(rdot(nc,o0)<0.2||rdot(nd,o0)<0.2) continue;
+            m.F[f0]={c,d,a}; m.F[f1]={d,c,b}; val[a]--; val[b]--; val[c]++; val[d]++; em[ek(c,d)]={f0,f1};
+        }
+        compact(m);
+    }
+    inline void relax(Mesh&m,const Ref&R){
+        auto vf=vertFaces(m);
+        std::vector<RV3> np(m.V.size());
+        for(int v=0;v<(int)m.V.size();++v){ np[v]=m.V[v];
+            if(!m.vAlive[v]||m.vFeature[v]) continue;
+            std::set<int> nb; for(int f:vf[v]){ if(!m.fAlive[f])continue; for(int k=0;k<3;++k) if(m.F[f][k]!=v) nb.insert(m.F[f][k]); }
+            if(nb.empty()) continue;
+            RV3 c{0,0,0}; for(int x:nb) c=c+m.V[x]; c=c*(1.0/nb.size());
+            RV3 vn{0,0,0}; for(int f:vf[v]){ if(!m.fAlive[f])continue; vn=vn+triNormal(m,f)*triArea(m,f); } vn=rnorm(vn);
+            RV3 d=c-m.V[v]; d=d-vn*rdot(d,vn);
+            np[v]=R.closest(m.V[v]+d);
+        }
+        m.V=np;
+    }
+    inline void killDegenerate(Mesh&m,double L){
+        for(int f=0;f<(int)m.F.size();++f){ if(!m.fAlive[f])continue; auto&t=m.F[f];
+            if(t[0]==t[1]||t[1]==t[2]||t[0]==t[2]){m.fAlive[f]=0;continue;}
+            if(triArea(m,f)<1e-10*L*L) m.fAlive[f]=0; }
+        compact(m);
+    }
+    inline int boundaryEdges(const Mesh&m){ auto em=edgeFaces(m); int b=0; for(auto&kv:em) if(kv.second.size()==1) b++; return b; }
+    inline void weld(Mesh&m,double eps){
+        auto key=[&](RV3 p){ return std::array<long,3>{ (long)std::llround(p.x/eps),(long)std::llround(p.y/eps),(long)std::llround(p.z/eps) }; };
+        std::map<std::array<long,3>,std::vector<int>> grid;
+        Mesh o; std::vector<int> remap(m.V.size(),-1);
+        for(int v=0;v<(int)m.V.size();++v){ if(!m.vAlive[v])continue;
+            RV3 p=m.V[v]; auto k=key(p); int found=-1;
+            for(long dz=-1;dz<=1&&found<0;++dz)for(long dy=-1;dy<=1&&found<0;++dy)for(long dx=-1;dx<=1&&found<0;++dx){
+                std::array<long,3> nk{k[0]+dx,k[1]+dy,k[2]+dz}; auto it=grid.find(nk); if(it==grid.end())continue;
+                for(int ov:it->second){ if(rlen(o.V[ov]-p)<=eps){found=ov;break;} } }
+            if(found>=0) remap[v]=found;
+            else{ int id=(int)o.V.size(); o.V.push_back(p);o.vAlive.push_back(1);o.vFeature.push_back(0); grid[k].push_back(id); remap[v]=id; } }
+        for(int f=0;f<(int)m.F.size();++f){ if(!m.fAlive[f])continue; auto&t=m.F[f];
+            int a=remap[t[0]],b=remap[t[1]],c=remap[t[2]]; if(a<0||b<0||c<0||a==b||b==c||a==c)continue;
+            o.F.push_back({a,b,c});o.fAlive.push_back(1); }
+        m=o;
+    }
+    inline void fillHoles(Mesh&m){
+        std::set<std::pair<int,int>> faceEdges;
+        for(int f=0;f<(int)m.F.size();++f){ if(!m.fAlive[f])continue; auto&t=m.F[f];
+            for(int k=0;k<3;++k) faceEdges.insert({t[k],t[(k+1)%3]}); }
+        std::multimap<int,int> holeEdges;
+        for(auto&e:faceEdges) if(!faceEdges.count({e.second,e.first})) holeEdges.insert({e.second,e.first});
+        while(!holeEdges.empty()){
+            int start=holeEdges.begin()->first;
+            std::vector<int> loop; int cur=start; bool closed=false; std::set<int> seen;
+            for(int guard=0; guard<200000; ++guard){
+                auto it=holeEdges.find(cur); if(it==holeEdges.end()) break;
+                int nxt=it->second; holeEdges.erase(it); loop.push_back(cur);
+                if(nxt==start){ closed=true; break; }
+                if(seen.count(nxt)) break; seen.insert(nxt); cur=nxt; }
+            if(closed && loop.size()>=3)
+                for(size_t i=1;i+1<loop.size();++i) addFace(m,loop[0],loop[(int)i],loop[(int)i+1]);
+        }
+    }
+
+    inline void run(Mesh&m,const Ref&R,double targetArea,int iters,double featDeg,
+                    const std::function<bool(float)>& onProgress){
+        double L=std::sqrt(4.0*targetArea/std::sqrt(3.0));
+        double high=4.0/3.0*L, low=4.0/5.0*L;
+        weld(m, L*1e-3);              // merge coincident seam verts (unwelded tess)
+        markFeatures(m,featDeg);
+        for(int i=0;i<iters;++i){
+            if(onProgress && !onProgress((float)i/(float)iters*0.9f)) return;  // cancelled
+            splitLong(m,R,high); killDegenerate(m,L);
+            collapseShort(m,R,low,high); killDegenerate(m,L);
+            flipValence(m); relax(m,R); markFeatures(m,featDeg);
+        }
+        int prevB=-1;                 // patch dropped faces so the grid is closed
+        for(int pass=0; pass<6; ++pass){
+            killDegenerate(m,L); fillHoles(m);
+            int b=boundaryEdges(m); if(b==0||b==prevB) break; prevB=b;
+        }
+        if(onProgress) onProgress(0.95f);
+    }
+} // namespace rmsh
+} // anonymous
+
 
 namespace DesignChecks
 {
@@ -769,7 +1083,8 @@ namespace DesignChecks
                 smp.faceId = fi;
                 smp.half = (pull.Dot(drawVec) > 0.0) ? 0 : 1;
 
-                if (params.checkTrapped && std::fabs(dp) > kVerticalEps)
+                if (params.checkTrapped &&
+                    std::fabs(dp) > std::sin(params.undercutEpsilonDeg * 0.01745329252))
                 {
                     const gp_Dir pullDir(pull);
                     const gp_Lin ray(c, pullDir);
@@ -882,7 +1197,8 @@ namespace DesignChecks
 
             // trapped: cast along pull from just outside the facet.
             smp.trapped = false;
-            if (params.checkTrapped && std::fabs(dp) > (float)kVerticalEps)
+            if (params.checkTrapped &&
+                std::fabs(dp) > std::sin(params.undercutEpsilonDeg * 0.01745329252f))
             {
                 const glm::vec3 o = ctr + pull * (float)params.rayEpsilon;
                 smp.trapped = shotGrid.RayAnyHit(o, pull, 0.0f);
@@ -893,6 +1209,56 @@ namespace DesignChecks
 
         return out;
     }
+    bool IsotropicRemesh(
+        const std::vector<float>& inVerts, const std::vector<unsigned int>& inIndices,
+        float targetAreaMm2, std::vector<float>& outPosNorm,
+        std::vector<unsigned int>& outIndices, int iterations, float featureDeg,
+        const std::function<bool(float)>& onProgress)
+    {
+        outPosNorm.clear(); outIndices.clear();
+        if (inVerts.size() < 9 || inIndices.size() < 3 || targetAreaMm2 <= 0.0f) return false;
+
+        TriGrid ref; ref.Build(inVerts, inIndices);   // reprojection reference
+
+        rmsh::Mesh m;
+        const size_t vc = inVerts.size() / 3;
+        m.V.reserve(vc); m.vAlive.assign(vc, 1); m.vFeature.assign(vc, 0);
+        for (size_t i = 0; i < vc; ++i)
+            m.V.push_back({ (double)inVerts[i*3], (double)inVerts[i*3+1], (double)inVerts[i*3+2] });
+        const size_t tc = inIndices.size() / 3;
+        m.F.reserve(tc); m.fAlive.assign(tc, 1);
+        for (size_t t = 0; t < tc; ++t)
+            m.F.push_back({ (int)inIndices[t*3], (int)inIndices[t*3+1], (int)inIndices[t*3+2] });
+
+        rmsh::Ref R; R.grid = &ref;
+        rmsh::run(m, R, (double)targetAreaMm2, iterations, (double)featureDeg, onProgress);
+
+        // Emit posNorm. Each vertex's normal is the outward facet normal of the
+        // nearest INPUT triangle (the input winding is outward), so downstream
+        // facet-normal orientation is correct regardless of remesh winding.
+        auto inPos = [&](unsigned i) {
+            return glm::vec3(inVerts[i*3], inVerts[i*3+1], inVerts[i*3+2]);
+        };
+        outPosNorm.reserve(m.V.size() * 6);
+        for (const auto& pd : m.V)
+        {
+            const glm::vec3 pos((float)pd.x, (float)pd.y, (float)pd.z);
+            glm::vec3 nrm(0.0f, 1.0f, 0.0f);
+            const int tri = ref.NearestTriangle(pos);
+            if (tri >= 0)
+            {
+                const glm::vec3 a = inPos(inIndices[tri*3]), b = inPos(inIndices[tri*3+1]), c = inPos(inIndices[tri*3+2]);
+                const glm::vec3 fn = glm::cross(b - a, c - a);
+                const float l = std::sqrt(fn.x*fn.x + fn.y*fn.y + fn.z*fn.z);
+                if (l > 1.0e-12f) nrm = fn / l;
+            }
+            outPosNorm.push_back(pos.x); outPosNorm.push_back(pos.y); outPosNorm.push_back(pos.z);
+            outPosNorm.push_back(nrm.x); outPosNorm.push_back(nrm.y); outPosNorm.push_back(nrm.z);
+        }
+        for (const auto& f : m.F) { outIndices.push_back((unsigned)f[0]); outIndices.push_back((unsigned)f[1]); outIndices.push_back((unsigned)f[2]); }
+        return !outIndices.empty();
+    }
+
     DraftScoreResult ScoreDraft(
         const std::vector<DraftSample>& samples, const DraftScoreParams& params)
     {
