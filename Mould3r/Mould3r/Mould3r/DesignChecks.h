@@ -234,6 +234,88 @@ namespace DesignChecks
         const std::vector<int>& objTriId,       // objectId per object triangle
         const DraftSampleParams& params = DraftSampleParams{});
 
+    // ======================================================================
+    // Face-by-face draft check (ray-assigned mould-half ownership)
+    //
+    // A lighter, remesh-free alternative to the area-weighted score above. It
+    // runs directly on the shot's display mesh and, per triangle:
+    //   1. Orients the facet normal outward (via the interpolated vertex normal).
+    //   2. Assigns the OWNING mould half by casting a ray from just outside the
+    //      facet along its outward normal into the supplied half meshes — the
+    //      nearest half hit is the half whose steel forms that facet. The half
+    //      meshes must already be the post-cut, orphan-resolved solids (the
+    //      generator's ResolveOrphanVolumes has run), so a facet formed by the
+    //      opposite half's steel (an overhang) is owned correctly rather than by
+    //      the crude "which side of y=0 the centroid sits on".
+    //   3. Measures signed draft relative to the OWNING half's pull direction.
+    // A facet whose ray hits no half falls back to the parting-plane side of its
+    // centroid. Trapped/undercut testing is intentionally omitted here.
+    // ======================================================================
+    struct FaceDraftParams
+    {
+        glm::vec3 drawAxis      = glm::vec3(0.0f, 1.0f, 0.0f); // halves part +/-
+        float     failDraftDeg  = 1.0f;   // signed draft below this => fail
+        float     warnDraftDeg  = 3.0f;   // ... below this (>= fail) => warning
+        float     rayEpsilon    = 1.0e-3f;// ray start offset off the origin facet
+        float     partingOffset = 0.0f;   // parting-plane position along drawAxis
+        // Facets within this of vertical read as zero-draft, not back-draft: a
+        // signed draft in [-backdraftEpsDeg, 0) is a near-vertical wall, not a
+        // true negative-draft (undercut) face. Only affects the back-draft tally
+        // and the back-draft overlay band, never the fail/warn thresholds.
+        float     backdraftEpsDeg = 0.1f;
+    };
+
+    // Split a shot mesh soup (posNorm, 6 floats/vertex + index buffer) by the
+    // parting plane dot(p, planeNormal) == planeOffset. Any triangle straddling
+    // the plane is cut so no output triangle crosses it; the new edge vertices
+    // land exactly on the plane, with linearly interpolated (renormalised)
+    // normals, and are welded so the parting line is a shared ring of vertices.
+    // Non-straddling triangles pass through unchanged. This is step 1 of the
+    // face-by-face draft method (clean per-half ownership at the parting line).
+    void SplitMeshByPlane(
+        const std::vector<float>& posNorm,
+        const std::vector<unsigned int>& indices,
+        const glm::vec3& planeNormal,
+        float planeOffset,
+        std::vector<float>& outPosNorm,
+        std::vector<unsigned int>& outIndices,
+        float onPlaneEps = 1.0e-5f);
+
+    struct FaceDraftStats
+    {
+        Severity overall = Severity::Pass; // per-face worst band
+        int  totalFaces    = 0;
+        int  passCount     = 0;
+        int  warnCount     = 0;            // >= fail, < warn
+        int  failCount     = 0;            // < fail (includes back-draft)
+        int  backdraftCount= 0;            // < 0 (subset of fail)
+        int  fallbackCount = 0;            // owner from parting-side fallback
+        float minDraftDeg  = 90.0f;        // smallest signed draft over the shot
+    };
+
+    // Build one sample per shot facet with ray-assigned half ownership. `posNorm`
+    // is the shot display mesh (6 floats/vertex). `halfVerts`/`halfIndices` are
+    // the per-half surface soups (xyz per vertex + index buffer) the ownership
+    // ray is cast against; each half's +/- side is inferred from its centroid.
+    // `triFaceId` (one entry per shot triangle) sets each sample's faceId key so
+    // the caller's overlay can map it back (BREP face id on a BREP scene); pass
+    // empty to key by 1-based triangle index. `outFallbackCount`, when non-null,
+    // receives the number of facets that fell back to the parting-plane side.
+    std::vector<DraftSample> BuildFaceDraftSamples(
+        const std::vector<float>& posNorm,
+        const std::vector<unsigned int>& indices,
+        const std::vector<std::vector<float>>& halfVerts,
+        const std::vector<std::vector<unsigned int>>& halfIndices,
+        const std::vector<int>& triFaceId = {},
+        const FaceDraftParams& params = FaceDraftParams{},
+        int* outFallbackCount = nullptr);
+
+    // Per-face reduction: tally each sample against the fail/warn thresholds.
+    // (One sample == one facet, so these are true per-face counts.)
+    FaceDraftStats ClassifyFaceDraft(
+        const std::vector<DraftSample>& samples,
+        const FaceDraftParams& params = FaceDraftParams{});
+
     struct DraftScoreParams
     {
         bool  perCavity    = true;    // true: score part (object) surfaces only
@@ -276,7 +358,22 @@ namespace DesignChecks
         int iterations = 10,
         float featureDeg = 40.0f,
         // Optional progress callback: receives 0..1, returns false to cancel.
-        const std::function<bool(float)>& onProgress = {});
+        const std::function<bool(float)>& onProgress = {},
+        // Optional per-input-vertex feature flags (1 = pinned sharp-edge vertex).
+        // When sized to the input, these REPLACE dihedral feature detection,
+        // so sharp edges from the BREP are preserved exactly.
+        const std::vector<unsigned char>& inFeatureVerts = {},
+        // Optional: filled with a 0/1 flag per OUTPUT vertex (1 = pinned), so
+        // callers can visualise which pinned verts survived the remesh.
+        std::vector<unsigned char>* outFeature = nullptr);
+
+    // Mark which of `verts` (xyz per vertex) lie on a BREP edge of `shot`, using
+    // the shared edge tessellation. Returns a per-vertex 0/1 flag for feeding
+    // IsotropicRemesh's inFeatureVerts. `tol` is the position match tolerance.
+    std::vector<unsigned char> MarkFeatureVertsOnEdges(
+        const TopoDS_Shape& shot,
+        const std::vector<float>& verts,
+        float tol = 1.0e-3f);
 
     DraftScoreResult ScoreDraft(
         const std::vector<DraftSample>& samples,

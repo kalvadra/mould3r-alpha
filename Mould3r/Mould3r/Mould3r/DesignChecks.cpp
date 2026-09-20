@@ -18,6 +18,9 @@
 #include <opencascade/TopAbs_State.hxx>
 #include <opencascade/Bnd_Box.hxx>
 #include <opencascade/BRepBndLib.hxx>
+#include <opencascade/Poly_PolygonOnTriangulation.hxx>
+#include <opencascade/Poly_Triangulation.hxx>
+#include <opencascade/TColStd_Array1OfInteger.hxx>
 #include <opencascade/BRepAlgoAPI_Common.hxx>
 #include <opencascade/BRepBuilderAPI_Transform.hxx>
 #include <opencascade/BRepGProp.hxx>
@@ -227,6 +230,54 @@ namespace
             return false;
         }
 
+        // Amanatides-Woo DDA nearest-hit: the smallest t > tmin at which the ray
+        // strikes any triangle. Marches cells front-to-back and returns as soon
+        // as the best hit so far lies within the current cell (no closer hit can
+        // follow). Used to pick the mould half a facet's outward normal enters.
+        bool RayNearestHit(const glm::vec3& o, const glm::vec3& dir,
+                           float tmin, float& tHit) const
+        {
+            tHit = 1e30f;
+            if (Empty()) return false;
+            float t0 = tmin, t1 = 1e30f;
+            for (int a = 0; a < 3; ++a)
+            {
+                const float od = Comp(o,a), dd = Comp(dir,a), lo = Comp(bmin,a), hi = Comp(bmax,a);
+                if (std::fabs(dd) < 1.0e-20f) { if (od < lo || od > hi) return false; }
+                else { float ta = (lo-od)/dd, tb = (hi-od)/dd; if (ta>tb) std::swap(ta,tb);
+                       t0 = std::max(t0,ta); t1 = std::min(t1,tb); if (t0>t1) return false; }
+            }
+            const glm::vec3 start = o + dir * (t0 + 1.0e-6f);
+            int x,y,z; Cell(start,x,y,z);
+            const int sx = dir.x > 0 ? 1 : -1, sy = dir.y > 0 ? 1 : -1, sz = dir.z > 0 ? 1 : -1;
+            auto edgeT = [&](int cc, int s, int a, float od, float dd)->float {
+                const float cell = (a==0?cx:a==1?cy:cz);
+                const float edge = Comp(bmin,a) + (cc + (s>0?1:0)) * cell;
+                return std::fabs(dd) < 1.0e-20f ? 1e30f : (edge - od) / dd;
+            };
+            float tMaxX = edgeT(x,sx,0,o.x,dir.x), tMaxY = edgeT(y,sy,1,o.y,dir.y), tMaxZ = edgeT(z,sz,2,o.z,dir.z);
+            const float tDx = std::fabs(dir.x) < 1.0e-20f ? 1e30f : std::fabs(cx/dir.x);
+            const float tDy = std::fabs(dir.y) < 1.0e-20f ? 1e30f : std::fabs(cy/dir.y);
+            const float tDz = std::fabs(dir.z) < 1.0e-20f ? 1e30f : std::fabs(cz/dir.z);
+            const int maxg = (nx+ny+nz)*3 + 10;
+            float best = 1e30f;
+            for (int guard = 0; guard < maxg; ++guard)
+            {
+                const float tExit = std::min(tMaxX, std::min(tMaxY, tMaxZ));
+                for (int tri : cells[Idx(x,y,z)])
+                {
+                    const glm::vec3 a = Vert((*I)[tri*3]), b = Vert((*I)[tri*3+1]), c = Vert((*I)[tri*3+2]);
+                    float tt; if (RayTri(o,dir,a,b,c,tmin,tt) && tt < best) best = tt;
+                }
+                if (best <= tExit) { tHit = best; return true; }
+                if (tMaxX < tMaxY && tMaxX < tMaxZ) { x += sx; if (x<0||x>=nx) break; tMaxX += tDx; }
+                else if (tMaxY < tMaxZ)             { y += sy; if (y<0||y>=ny) break; tMaxY += tDy; }
+                else                                { z += sz; if (z<0||z>=nz) break; tMaxZ += tDz; }
+            }
+            if (best < 1e30f) { tHit = best; return true; }
+            return false;
+        }
+
         // Nearest triangle within radius r; returns tri index (or -1) + dist^2.
         int Nearest(const glm::vec3& p, float r, float& outD2) const
         {
@@ -412,7 +463,7 @@ namespace rmsh
         for(auto&e:shortE){
             int a=e.first,b=e.second;
             if(!m.vAlive[a]||!m.vAlive[b]||touched[a]||touched[b]) continue;
-            if(m.vFeature[a]!=m.vFeature[b]) continue;
+            if(m.vFeature[a]||m.vFeature[b]) continue;   // never collapse at a pinned vert
             auto it=em.find(e); if(it==em.end()||it->second.size()!=2) continue;
             std::set<int> na,nb;
             for(int f:vf[a]){ if(!m.fAlive[f])continue; for(int k=0;k<3;++k) if(m.F[f][k]!=a) na.insert(m.F[f][k]); }
@@ -484,8 +535,8 @@ namespace rmsh
             for(long dz=-1;dz<=1&&found<0;++dz)for(long dy=-1;dy<=1&&found<0;++dy)for(long dx=-1;dx<=1&&found<0;++dx){
                 std::array<long,3> nk{k[0]+dx,k[1]+dy,k[2]+dz}; auto it=grid.find(nk); if(it==grid.end())continue;
                 for(int ov:it->second){ if(rlen(o.V[ov]-p)<=eps){found=ov;break;} } }
-            if(found>=0) remap[v]=found;
-            else{ int id=(int)o.V.size(); o.V.push_back(p);o.vAlive.push_back(1);o.vFeature.push_back(0); grid[k].push_back(id); remap[v]=id; } }
+            if(found>=0){ remap[v]=found; if(m.vFeature[v]) o.vFeature[found]=1; }
+            else{ int id=(int)o.V.size(); o.V.push_back(p);o.vAlive.push_back(1);o.vFeature.push_back(m.vFeature[v]); grid[k].push_back(id); remap[v]=id; } }
         for(int f=0;f<(int)m.F.size();++f){ if(!m.fAlive[f])continue; auto&t=m.F[f];
             int a=remap[t[0]],b=remap[t[1]],c=remap[t[2]]; if(a<0||b<0||c<0||a==b||b==c||a==c)continue;
             o.F.push_back({a,b,c});o.fAlive.push_back(1); }
@@ -511,16 +562,18 @@ namespace rmsh
     }
 
     inline void run(Mesh&m,const Ref&R,double targetArea,int iters,double featDeg,
-                    const std::function<bool(float)>& onProgress){
+                    const std::function<bool(float)>& onProgress,
+                    bool useProvidedFeatures){
         double L=std::sqrt(4.0*targetArea/std::sqrt(3.0));
         double high=4.0/3.0*L, low=4.0/5.0*L;
-        weld(m, L*1e-3);              // merge coincident seam verts (unwelded tess)
-        markFeatures(m,featDeg);
+        weld(m, L*1e-3);              // merge coincident seam verts; keeps features
+        if(!useProvidedFeatures) markFeatures(m,featDeg);
         for(int i=0;i<iters;++i){
             if(onProgress && !onProgress((float)i/(float)iters*0.9f)) return;  // cancelled
             splitLong(m,R,high); killDegenerate(m,L);
             collapseShort(m,R,low,high); killDegenerate(m,L);
-            flipValence(m); relax(m,R); markFeatures(m,featDeg);
+            flipValence(m); relax(m,R);
+            if(!useProvidedFeatures) markFeatures(m,featDeg);
         }
         int prevB=-1;                 // patch dropped faces so the grid is closed
         for(int pass=0; pass<6; ++pass){
@@ -1209,13 +1262,338 @@ namespace DesignChecks
 
         return out;
     }
+
+    // ======================================================================
+    // Parting-plane mesh split (step 1 of the face-by-face draft method).
+    // Original vertices pass through untouched; a triangle straddling the plane
+    // is clipped into its + and - parts, and the new edge vertices (snapped
+    // exactly onto the plane, normals interpolated) are welded so the parting
+    // line is one shared ring of vertices.
+    // ======================================================================
+    void SplitMeshByPlane(
+        const std::vector<float>& posNorm,
+        const std::vector<unsigned int>& indices,
+        const glm::vec3& planeNormal,
+        float planeOffset,
+        std::vector<float>& outPosNorm,
+        std::vector<unsigned int>& outIndices,
+        float onPlaneEps)
+    {
+        outPosNorm.clear(); outIndices.clear();
+        const size_t stride = 6;
+        if (posNorm.size() < stride || indices.size() < 3)
+        { outPosNorm = posNorm; outIndices = indices; return; }
+        const size_t vcount = posNorm.size() / stride;
+
+        glm::vec3 n = planeNormal;
+        {
+            const float L = std::sqrt(n.x*n.x + n.y*n.y + n.z*n.z);
+            if (L > 1.0e-12f) n /= L;
+            else { outPosNorm = posNorm; outIndices = indices; return; }
+        }
+
+        outPosNorm = posNorm;                 // keep all original verts; append new
+        outIndices.reserve(indices.size());
+
+        auto P = [&](unsigned int i) {
+            return glm::vec3(posNorm[i*stride+0], posNorm[i*stride+1], posNorm[i*stride+2]);
+        };
+        auto N = [&](unsigned int i) {
+            return glm::vec3(posNorm[i*stride+3], posNorm[i*stride+4], posNorm[i*stride+5]);
+        };
+        auto dist = [&](const glm::vec3& p) { return glm::dot(p, n) - planeOffset; };
+
+        // Weld only the newly created plane vertices (shared parting ring).
+        const float q = 1.0e-4f;
+        std::map<std::array<long,3>, unsigned int> planeVerts;
+        auto addPlaneVert = [&](glm::vec3 p, glm::vec3 nn)->unsigned int
+        {
+            p -= n * (glm::dot(p, n) - planeOffset);   // snap exactly onto plane
+            const std::array<long,3> k{ (long)std::llround(p.x/q),
+                (long)std::llround(p.y/q), (long)std::llround(p.z/q) };
+            auto it = planeVerts.find(k);
+            if (it != planeVerts.end()) return it->second;
+            const float L = std::sqrt(nn.x*nn.x + nn.y*nn.y + nn.z*nn.z);
+            if (L > 1.0e-12f) nn /= L; else nn = n;
+            const unsigned int idx = (unsigned int)(outPosNorm.size() / stride);
+            outPosNorm.push_back(p.x);  outPosNorm.push_back(p.y);  outPosNorm.push_back(p.z);
+            outPosNorm.push_back(nn.x); outPosNorm.push_back(nn.y); outPosNorm.push_back(nn.z);
+            planeVerts.emplace(k, idx);
+            return idx;
+        };
+
+        // A clipped-polygon vertex: an existing vertex (orig >= 0) or a new
+        // plane-intersection vertex (orig < 0, carrying interpolated attributes).
+        struct CV { int orig; glm::vec3 p; glm::vec3 nrm; };
+        auto emitPoly = [&](const std::vector<CV>& poly)
+        {
+            auto resolve = [&](const CV& v)->unsigned int {
+                return (v.orig >= 0) ? (unsigned int)v.orig : addPlaneVert(v.p, v.nrm);
+            };
+            for (size_t i = 1; i + 1 < poly.size(); ++i)   // fan triangulation
+            {
+                const unsigned int ia = resolve(poly[0]);
+                const unsigned int ib = resolve(poly[i]);
+                const unsigned int ic = resolve(poly[i+1]);
+                if (ia == ib || ib == ic || ia == ic) continue;   // degenerate
+                outIndices.push_back(ia); outIndices.push_back(ib); outIndices.push_back(ic);
+            }
+        };
+
+        for (size_t t = 0; t + 2 < indices.size(); t += 3)
+        {
+            const unsigned int a = indices[t], b = indices[t+1], c = indices[t+2];
+            if (a >= vcount || b >= vcount || c >= vcount) continue;
+
+            const glm::vec3 pa = P(a), pb = P(b), pc = P(c);
+            const float dd[3] = { dist(pa), dist(pb), dist(pc) };
+            const bool anyPos = (dd[0] > onPlaneEps) || (dd[1] > onPlaneEps) || (dd[2] > onPlaneEps);
+            const bool anyNeg = (dd[0] < -onPlaneEps) || (dd[1] < -onPlaneEps) || (dd[2] < -onPlaneEps);
+
+            if (!(anyPos && anyNeg))   // wholly on one side (or just touching)
+            {
+                outIndices.push_back(a); outIndices.push_back(b); outIndices.push_back(c);
+                continue;
+            }
+
+            const CV tri[3] = { { (int)a, pa, N(a) },
+                                { (int)b, pb, N(b) },
+                                { (int)c, pc, N(c) } };
+            auto clip = [&](bool keepPos)->std::vector<CV>
+            {
+                std::vector<CV> out;
+                for (int i = 0; i < 3; ++i)
+                {
+                    const float dcur = dd[i], dnxt = dd[(i+1)%3];
+                    const bool curIn = keepPos ? (dcur >= -onPlaneEps) : (dcur <= onPlaneEps);
+                    if (curIn) out.push_back(tri[i]);
+                    const bool strictCross =
+                        (dcur > onPlaneEps && dnxt < -onPlaneEps) ||
+                        (dcur < -onPlaneEps && dnxt > onPlaneEps);
+                    if (strictCross)
+                    {
+                        const float u = dcur / (dcur - dnxt);
+                        const CV& cur = tri[i]; const CV& nxt = tri[(i+1)%3];
+                        CV I; I.orig = -1;
+                        I.p   = cur.p + (nxt.p - cur.p) * u;
+                        I.nrm = cur.nrm + (nxt.nrm - cur.nrm) * u;
+                        out.push_back(I);
+                    }
+                }
+                return out;
+            };
+            emitPoly(clip(true));
+            emitPoly(clip(false));
+        }
+    }
+
+    // ======================================================================
+    // Face-by-face draft check with ray-assigned mould-half ownership.
+    // Runs on the shot display mesh directly (no remesh). See the header.
+    // ======================================================================
+    std::vector<DraftSample> BuildFaceDraftSamples(
+        const std::vector<float>& posNorm,
+        const std::vector<unsigned int>& indices,
+        const std::vector<std::vector<float>>& halfVerts,
+        const std::vector<std::vector<unsigned int>>& halfIndices,
+        const std::vector<int>& triFaceId,
+        const FaceDraftParams& params,
+        int* outFallbackCount)
+    {
+        std::vector<DraftSample> out;
+        if (outFallbackCount) *outFallbackCount = 0;
+        const size_t stride = 6;
+        if (posNorm.size() < stride || indices.size() < 3) return out;
+        const size_t vcount = posNorm.size() / stride;
+
+        glm::vec3 draw = params.drawAxis;
+        {
+            const float L = std::sqrt(draw.x*draw.x + draw.y*draw.y + draw.z*draw.z);
+            if (L > 1.0e-12f) draw /= L; else draw = glm::vec3(0.0f, 1.0f, 0.0f);
+        }
+
+        auto Pos = [&](unsigned int i) {
+            return glm::vec3(posNorm[i*stride+0], posNorm[i*stride+1], posNorm[i*stride+2]);
+        };
+        auto Nrm = [&](unsigned int i) {
+            return glm::vec3(posNorm[i*stride+3], posNorm[i*stride+4], posNorm[i*stride+5]);
+        };
+
+        // One grid per half + each half's pull side (0 = +draw, 1 = -draw),
+        // inferred from the half's centroid relative to the parting plane.
+        const size_t H = std::min(halfVerts.size(), halfIndices.size());
+        std::vector<TriGrid> grids(H);
+        std::vector<int>     halfSide(H, 0);
+        for (size_t h = 0; h < H; ++h)
+        {
+            grids[h].Build(halfVerts[h], halfIndices[h]);
+            const size_t n = halfVerts[h].size() / 3;
+            glm::dvec3 c(0.0);
+            for (size_t i = 0; i < n; ++i)
+                c += glm::dvec3(halfVerts[h][i*3], halfVerts[h][i*3+1], halfVerts[h][i*3+2]);
+            if (n > 0) c /= (double)n;
+            const double s = c.x*draw.x + c.y*draw.y + c.z*draw.z - (double)params.partingOffset;
+            halfSide[h] = (s >= 0.0) ? 0 : 1;
+        }
+
+        out.reserve(indices.size() / 3);
+        for (size_t t = 0; t + 2 < indices.size(); t += 3)
+        {
+            const unsigned int a = indices[t], b = indices[t+1], c = indices[t+2];
+            if (a >= vcount || b >= vcount || c >= vcount) continue;
+
+            const glm::vec3 p0 = Pos(a), p1 = Pos(b), p2 = Pos(c);
+            const glm::vec3 cr = glm::cross(p1 - p0, p2 - p0);
+            const float len = std::sqrt(cr.x*cr.x + cr.y*cr.y + cr.z*cr.z);
+            if (len <= 1.0e-12f) continue;                  // degenerate triangle
+
+            glm::vec3 nrm = cr / len;                        // geometric facet normal
+            const glm::vec3 vn = Nrm(a) + Nrm(b) + Nrm(c);   // orient outward
+            if ((nrm.x*vn.x + nrm.y*vn.y + nrm.z*vn.z) < 0.0f) nrm = -nrm;
+
+            const float area = 0.5f * len;
+            const glm::vec3 ctr = (p0 + p1 + p2) / 3.0f;
+
+            // Ownership: cast along +normal; the nearest half hit owns the facet.
+            const glm::vec3 o = ctr + nrm * (float)params.rayEpsilon;
+            int   owner = -1;
+            float bestT = 1e30f;
+            for (size_t h = 0; h < H; ++h)
+            {
+                float tt;
+                if (grids[h].RayNearestHit(o, nrm, 0.0f, tt) && tt < bestT)
+                { bestT = tt; owner = (int)h; }
+            }
+
+            int side;
+            if (owner >= 0)
+                side = halfSide[owner];
+            else
+            {
+                // Fallback: parting-plane side of the centroid (normal tie-break).
+                float sd = ctr.x*draw.x + ctr.y*draw.y + ctr.z*draw.z - params.partingOffset;
+                if (std::fabs(sd) < 1.0e-9f) sd = nrm.x*draw.x + nrm.y*draw.y + nrm.z*draw.z;
+                side = (sd >= 0.0f) ? 0 : 1;
+                if (outFallbackCount) ++(*outFallbackCount);
+            }
+
+            const glm::vec3 pull = (side == 0) ? draw : -draw;
+            float dp = nrm.x*pull.x + nrm.y*pull.y + nrm.z*pull.z;
+            if (dp < -1.0f) dp = -1.0f; else if (dp > 1.0f) dp = 1.0f;
+
+            const int triIdx = (int)(t / 3);
+
+            DraftSample smp;
+            smp.signedDraftDeg = Deg(std::asin(dp));
+            smp.area     = area;
+            smp.faceId   = (triIdx < (int)triFaceId.size()) ? triFaceId[triIdx]
+                                                            : triIdx + 1;
+            smp.half     = side;
+            smp.objectId = -1;      // per-cavity split not used by this check
+            smp.trapped  = false;   // trapped/undercut intentionally omitted
+            out.push_back(smp);
+        }
+
+        return out;
+    }
+
+    FaceDraftStats ClassifyFaceDraft(
+        const std::vector<DraftSample>& samples, const FaceDraftParams& params)
+    {
+        FaceDraftStats r;
+        r.totalFaces = (int)samples.size();
+
+        float failDeg = params.failDraftDeg;
+        float warnDeg = params.warnDraftDeg;
+        if (warnDeg < failDeg) warnDeg = failDeg;   // keep the bands ordered
+        const float bdEps = params.backdraftEpsDeg; // near-vertical isn't back-draft
+
+        float minD = 90.0f;
+        for (const DraftSample& s : samples)
+        {
+            if (s.signedDraftDeg < minD) minD = s.signedDraftDeg;
+            if (s.signedDraftDeg < -bdEps)        ++r.backdraftCount;
+            if (s.signedDraftDeg < failDeg)       ++r.failCount;
+            else if (s.signedDraftDeg < warnDeg)  ++r.warnCount;
+            else                                  ++r.passCount;
+        }
+        if (!samples.empty()) r.minDraftDeg = minD;
+
+        if      (r.failCount > 0) r.overall = Severity::Fail;
+        else if (r.warnCount > 0) r.overall = Severity::Warning;
+        else                      r.overall = Severity::Pass;
+
+        return r;
+    }
+
+    std::vector<unsigned char> MarkFeatureVertsOnEdges(
+        const TopoDS_Shape& shot, const std::vector<float>& verts, float tol)
+    {
+        const size_t vc = verts.size() / 3;
+        std::vector<unsigned char> feat(vc, 0);
+        if (vc == 0 || tol <= 0.0f) return feat;
+
+        // A hash grid of cells (at `tol`) touched by any BREP-edge tessellation
+        // point, expanded by one ring so boundary rounding can't miss a match.
+        auto key = [&](float x, float y, float z) {
+            return std::array<long,3>{ (long)std::llround(x/tol),
+                (long)std::llround(y/tol), (long)std::llround(z/tol) };
+        };
+        // Edge tessellation via each face's triangulation (BRepMesh always
+        // creates PolygonOnTriangulation; standalone Polygon3D is optional).
+        std::set<std::array<long,3>> edgeCells;
+        auto addPoint = [&](const gp_Pnt& p) {
+            const std::array<long,3> k = key((float)p.X(), (float)p.Y(), (float)p.Z());
+            for (long dz=-1; dz<=1; ++dz) for (long dy=-1; dy<=1; ++dy) for (long dx=-1; dx<=1; ++dx)
+                edgeCells.insert({ k[0]+dx, k[1]+dy, k[2]+dz });
+        };
+        for (TopExp_Explorer fx(shot, TopAbs_FACE); fx.More(); fx.Next())
+        {
+            const TopoDS_Face face = TopoDS::Face(fx.Current());
+            TopLoc_Location loc;
+            Handle(Poly_Triangulation) tri = BRep_Tool::Triangulation(face, loc);
+            if (tri.IsNull()) continue;
+            const gp_Trsf trsf = loc.Transformation();
+            // const args force the (edge, triangulation, location) lookup
+            // overload rather than the out-parameter one.
+            const Handle(Poly_Triangulation) triC = tri;
+            const TopLoc_Location            locC = loc;
+            for (TopExp_Explorer ex(face, TopAbs_EDGE); ex.More(); ex.Next())
+            {
+                const TopoDS_Edge e = TopoDS::Edge(ex.Current());
+                Handle(Poly_PolygonOnTriangulation) pot =
+                    BRep_Tool::PolygonOnTriangulation(e, triC, locC);
+                if (pot.IsNull()) continue;
+                const TColStd_Array1OfInteger& ni = pot->Nodes();
+                for (int i = ni.Lower(); i <= ni.Upper(); ++i)
+                {
+                    gp_Pnt p = tri->Node(ni(i)); p.Transform(trsf);
+                    addPoint(p);
+                }
+            }
+        }
+        if (edgeCells.empty()) return {};   // no edge tess -> caller uses dihedral
+
+        size_t marked = 0;
+        for (size_t v = 0; v < vc; ++v)
+        {
+            const std::array<long,3> k = key(verts[v*3], verts[v*3+1], verts[v*3+2]);
+            if (edgeCells.count(k)) { feat[v] = 1; ++marked; }
+        }
+        if (marked == 0) return {};         // nothing matched -> dihedral fallback
+        return feat;
+    }
+
     bool IsotropicRemesh(
         const std::vector<float>& inVerts, const std::vector<unsigned int>& inIndices,
         float targetAreaMm2, std::vector<float>& outPosNorm,
         std::vector<unsigned int>& outIndices, int iterations, float featureDeg,
-        const std::function<bool(float)>& onProgress)
+        const std::function<bool(float)>& onProgress,
+        const std::vector<unsigned char>& inFeatureVerts,
+        std::vector<unsigned char>* outFeature)
     {
         outPosNorm.clear(); outIndices.clear();
+        if (outFeature) outFeature->clear();
         if (inVerts.size() < 9 || inIndices.size() < 3 || targetAreaMm2 <= 0.0f) return false;
 
         TriGrid ref; ref.Build(inVerts, inIndices);   // reprojection reference
@@ -1230,8 +1608,13 @@ namespace DesignChecks
         for (size_t t = 0; t < tc; ++t)
             m.F.push_back({ (int)inIndices[t*3], (int)inIndices[t*3+1], (int)inIndices[t*3+2] });
 
+        // Provided (BREP-edge) features: pin them and skip dihedral detection.
+        const bool useProvided = (inFeatureVerts.size() == vc);
+        if (useProvided)
+            for (size_t i = 0; i < vc; ++i) m.vFeature[i] = inFeatureVerts[i] ? 1 : 0;
+
         rmsh::Ref R; R.grid = &ref;
-        rmsh::run(m, R, (double)targetAreaMm2, iterations, (double)featureDeg, onProgress);
+        rmsh::run(m, R, (double)targetAreaMm2, iterations, (double)featureDeg, onProgress, useProvided);
 
         // Emit posNorm. Each vertex's normal is the outward facet normal of the
         // nearest INPUT triangle (the input winding is outward), so downstream
@@ -1256,6 +1639,11 @@ namespace DesignChecks
             outPosNorm.push_back(nrm.x); outPosNorm.push_back(nrm.y); outPosNorm.push_back(nrm.z);
         }
         for (const auto& f : m.F) { outIndices.push_back((unsigned)f[0]); outIndices.push_back((unsigned)f[1]); outIndices.push_back((unsigned)f[2]); }
+        if (outFeature)
+        {
+            outFeature->reserve(m.V.size());
+            for (size_t i = 0; i < m.V.size(); ++i) outFeature->push_back(m.vFeature[i] ? 1 : 0);
+        }
         return !outIndices.empty();
     }
 

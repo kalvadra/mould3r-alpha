@@ -183,6 +183,13 @@ private:
     // the analytic undercut faces.
     void RunSeparationCheck();
 
+    // Run the face-by-face draft check: per shot facet, assign the owning mould
+    // half by casting a ray along the facet's outward normal into the generated
+    // half meshes, then measure signed draft against that half's pull. Reports
+    // per-face pass/warn/fail counts and drives the "Face draft (ray)" overlay.
+    // Remesh-free; runs on the shot display mesh, on BREP and mesh scenes alike.
+    void RunFaceDraftCheck();
+
     // Compute (and cache) the demoldability result from the current thresholds,
     // without any UI. Returns false when there is no shot to analyse.
     bool ComputeDemoldability();
@@ -190,6 +197,11 @@ private:
     // grid area and facet-sample it, cached until the area or shot changes.
     // No-op for mesh scenes (their samples are built at generate).
     void EnsureDraftSamples();
+    // Compute which display verts sit on a BREP edge (cached per shot). Cheap;
+    // does not remesh. Feeds both the remesh and the Pinned-edges debug view.
+    void EnsureFeatureFlags();
+    // Inspect-face: report the values of the picked area-grid triangle.
+    void OnInspectHit(int tri);
     // Re-score the cached draft samples and update the verdict label only (no
     // dialog). Used by the threshold fields / per-cavity toggle for live feedback.
     void RefreshDraftVerdict();
@@ -286,6 +298,7 @@ private:
     wxTextCtrl* m_gridAreaCtrl = nullptr;    // area-grid target per-polygon area (mm^2)
     wxTextCtrl* m_liftCtrl = nullptr;        // separation lift (mm)
     wxStaticText* m_draftStatus = nullptr;   // "Draft Angle Checks" verdict
+    wxStaticText* m_faceDraftStatus = nullptr; // "Face Draft Check" verdict
     wxStaticText* m_demouldStatus = nullptr; // "Separation Test" verdict
 
     // "Show mould overlay" checkboxes under each simulation's Start button, and
@@ -294,6 +307,7 @@ private:
     // gates the separation toggle so checking it before a run does nothing.
     wxChoice*   m_debugModeChoice = nullptr;  // debug view: colour-by filter
     wxCheckBox* m_debugWireCheck = nullptr;   // debug view: wireframe toggle
+    wxStaticText* m_inspectText = nullptr;    // inspect-face readout
     wxCheckBox* m_sepOverlayCheck = nullptr;
     wxCheckBox* m_perCavityCheck = nullptr;   // draft score: parts only vs whole shot
     bool        m_hasSepOverlay = false;
@@ -314,6 +328,16 @@ private:
     std::vector<DesignChecks::DraftSample> m_draftSamples;
     DesignChecks::DraftScoreResult        m_lastDraftScore;
 
+    // Face Draft Check (ray-assigned half ownership) — its own sample buffer and
+    // stats, kept separate from the area-weighted pipeline above so the two
+    // checks don't clobber each other and can be compared via the debug view.
+    std::vector<DesignChecks::DraftSample> m_faceDraftSamples;
+    DesignChecks::FaceDraftStats           m_lastFaceDraftStats;
+    // The parting-plane-split analysis mesh the face check runs on and the
+    // "Face draft (ray)" overlay renders (6 floats/vertex + its own indices).
+    std::vector<float>        m_faceDraftPosNorm;
+    std::vector<unsigned int> m_faceDraftIdx;
+
     // BREP on-demand area grid: the object soup (from the canvas), the remesh
     // itself (rendered as the debug body), and the target area last remeshed
     // at (cache key). Mesh scenes use the passed samples and stay empty here.
@@ -323,6 +347,8 @@ private:
     std::vector<float>        m_remeshPosNorm;   // area grid, pos + normal
     std::vector<unsigned int> m_remeshIdx;
     float                     m_lastRemeshArea = -1.0f;
+    std::vector<unsigned char> m_featFlags;   // per display vertex: on a BREP edge
+    std::vector<unsigned char> m_remeshFeat;  // per remesh vertex: pinned (post-remesh)
 
     // Triggering rays of the last run's undercut faces, for the ray overlay.
     std::vector<DesignChecks::UndercutRay> m_undercutRays;
@@ -356,6 +382,13 @@ private:
     TopoDS_Shape                        m_shotShape;
     std::vector<int>                    m_shotFaceIds;
     std::vector<TopoDS_Shape>           m_halfShapes;   // for the separation test
+
+    // Mould-half surface soups (xyz positions + indices, one entry per half),
+    // retained from the half display meshes in SetData for the Face Draft Check
+    // ownership ray. The half MeshData themselves are uploaded then dropped, so
+    // these lightweight copies are kept explicitly.
+    std::vector<std::vector<float>>        m_halfMeshPos;
+    std::vector<std::vector<unsigned int>> m_halfMeshIdx;
     bool                                m_hasShot = false;
     double                              m_shotVolumeMm3 = 0.0;
 

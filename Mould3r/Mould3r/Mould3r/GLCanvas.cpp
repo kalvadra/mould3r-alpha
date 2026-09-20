@@ -7488,6 +7488,36 @@ void GLCanvas::ClearInserts()
 }
 
 // ---------------------------------------------------------------------------
+// InspectPickAt — ray-cast the inspect mesh (in its half's local space) and
+// report the hit triangle index (-1 on miss) to the inspect callback.
+void GLCanvas::InspectPickAt(int mouseX, int mouseY)
+{
+    if (!m_onInspectHit) return;
+    if (m_inspectHalf < 0 || m_inspectHalf >= (int)m_previewHalves.size()) return;
+    if (m_inspectVerts.size() < 9 || m_inspectIdx.size() < 3) { m_onInspectHit(-1); return; }
+
+    glm::vec3 rayOrig, rayDir;
+    BuildMouseRay(mouseX, mouseY, rayOrig, rayDir);
+
+    const glm::mat4 inv = glm::inverse(m_previewHalves[m_inspectHalf].obj.BuildModelMatrix());
+    const glm::vec3 lo = glm::vec3(inv * glm::vec4(rayOrig, 1.0f));
+    const glm::vec3 ld = glm::normalize(glm::vec3(inv * glm::vec4(rayDir, 0.0f)));
+
+    int bestTri = -1; float bestT = 1.0e30f;
+    const size_t nt = m_inspectIdx.size() / 3;
+    for (size_t t = 0; t < nt; ++t)
+    {
+        const unsigned int a = m_inspectIdx[t*3], b = m_inspectIdx[t*3+1], c = m_inspectIdx[t*3+2];
+        if (a*3+2 >= m_inspectVerts.size() || b*3+2 >= m_inspectVerts.size() || c*3+2 >= m_inspectVerts.size()) continue;
+        const glm::vec3 v0(m_inspectVerts[a*3], m_inspectVerts[a*3+1], m_inspectVerts[a*3+2]);
+        const glm::vec3 v1(m_inspectVerts[b*3], m_inspectVerts[b*3+1], m_inspectVerts[b*3+2]);
+        const glm::vec3 v2(m_inspectVerts[c*3], m_inspectVerts[c*3+1], m_inspectVerts[c*3+2]);
+        float tt;
+        if (RayTriangle(lo, ld, v0, v1, v2, tt) && tt > 0.0f && tt < bestT) { bestT = tt; bestTri = (int)t; }
+    }
+    m_onInspectHit(bestTri);
+}
+
 // BuildMouseRay — unprojects mouse coordinates into a world-space ray.
 // ---------------------------------------------------------------------------
 void GLCanvas::BuildMouseRay(int mouseX, int mouseY,
@@ -12912,8 +12942,23 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
     // selection, transform, or feature placement.
     if (m_previewMode)
     {
-        if (evt.LeftDown()) { m_lmb = true;  m_hasLast = false; }
-        if (evt.LeftUp()) { m_lmb = false; if (HasCapture()) ReleaseMouse(); }
+        // Inspect-face: dragging still orbits; a click (no drag) picks a face.
+        if (evt.LeftDown())
+        {
+            m_lmb = true; m_hasLast = false;
+            if (m_inspectMode) m_inspectDownPos = evt.GetPosition();
+        }
+        if (evt.LeftUp())
+        {
+            m_lmb = false; if (HasCapture()) ReleaseMouse();
+            if (m_inspectMode)
+            {
+                const wxPoint up = evt.GetPosition();
+                int ddx = up.x - m_inspectDownPos.x; if (ddx < 0) ddx = -ddx;
+                int ddy = up.y - m_inspectDownPos.y; if (ddy < 0) ddy = -ddy;
+                if (ddx <= 3 && ddy <= 3) InspectPickAt(up.x, up.y);   // a click, not a drag
+            }
+        }
         if (evt.MiddleDown()) { m_mmb = true;  m_hasLast = false; CaptureMouse(); }
         if (evt.MiddleUp()) { m_mmb = false; if (HasCapture()) ReleaseMouse(); }
         if (evt.RightDown()) { m_rmb = true;  m_hasLast = false; CaptureMouse(); }

@@ -475,6 +475,15 @@ public:
         const std::vector<float>& posNorm,
         const std::vector<ShotDebugGroup>& groups);
 
+    // Inspect-face (preview): when on, a left click picks a triangle of the
+    // supplied CPU mesh (xyz per vertex, in halfIndex's local space) and
+    // reports its index (or -1 on a miss) via the callback, instead of orbiting.
+    void SetInspectMode(bool on) { m_inspectMode = on; }
+    void SetInspectMesh(int halfIndex, const std::vector<float>& verts,
+        const std::vector<unsigned int>& indices)
+    { m_inspectHalf = halfIndex; m_inspectVerts = verts; m_inspectIdx = indices; }
+    void SetOnInspectHit(std::function<void(int)> cb) { m_onInspectHit = std::move(cb); }
+
     // ---- Design-check debug rays -------------------------------------------
     // Upload accessibility-ray debug geometry for the preview: `rayLineVerts`
     // is GL_LINES vertex pairs (world space) for the ray segments, and
@@ -1522,6 +1531,15 @@ private:
         std::vector<DebugGroupGPU> groups;
     };
     ShotDebugView m_shotDebug;
+
+    // Inspect-face picking (preview).
+    bool m_inspectMode = false;
+    int  m_inspectHalf = -1;
+    wxPoint m_inspectDownPos;
+    std::vector<float>        m_inspectVerts;
+    std::vector<unsigned int> m_inspectIdx;
+    std::function<void(int)>  m_onInspectHit;
+    void InspectPickAt(int mouseX, int mouseY);
 
     // Accessibility-ray debug overlay (preview): ray segments drawn as GL_LINES
     // and contact points as GL_POINTS via the flat shader. Geometry is world
