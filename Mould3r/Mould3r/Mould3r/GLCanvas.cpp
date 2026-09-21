@@ -10,7 +10,7 @@
 #include <set>
 
 #include "GLCanvas.h"
-#include "DesignChecks.h"   // area-weighted draft scoring (BuildDraftSamplesBREP)
+#include "DesignChecks.h"   // Severity / Separation types shared with the preview
 #include <wx/dcclient.h>
 #include <wx/log.h>
 #include <wx/msgdlg.h>
@@ -3847,24 +3847,6 @@ void GLCanvas::ResolveMeshNearlyOrphanRegions(std::vector<MeshBoolean::Mesh>& me
 }
 
 
-void GLCanvas::GatherObjectSoup(std::vector<float>& objV,
-    std::vector<unsigned int>& objI, std::vector<int>& objTri) const
-{
-    objV.clear(); objI.clear(); objTri.clear();
-    for (size_t oi = 0; oi < m_objects.size(); ++oi)
-    {
-        const SceneObject& obj = m_objects[oi];
-        if (obj.cpuVerts.empty() || obj.cpuIndices.empty()) continue;
-        MeshBoolean::Mesh w = WorldMeshFromLocal(
-            obj.cpuVerts, obj.cpuIndices, obj.BuildModelMatrix());
-        const unsigned int base = (unsigned int)(objV.size() / 3);
-        objV.insert(objV.end(), w.verts.begin(), w.verts.end());
-        for (uint32_t id : w.indices) objI.push_back(base + id);
-        const size_t ntri = w.indices.size() / 3;
-        for (size_t k = 0; k < ntri; ++k) objTri.push_back((int)oi);
-    }
-}
-
 bool GLCanvas::GenerateMould()
 {
     if (m_fixtures.empty())
@@ -3903,9 +3885,6 @@ bool GLCanvas::GenerateMould()
     m_lastShotVolumeMm3 = 0.0;
     m_lastShotShape = TopoDS_Shape();
     m_lastShotFaceIds.clear();
-    m_lastHalfShapes.clear();
-    m_lastDraftSamples.clear();
-    m_lastObjV.clear(); m_lastObjI.clear(); m_lastObjTri.clear();
     m_lastInsertMeshes.clear();
     m_lastCastShotMesh = FileImporter::MeshData{};
     m_lastCastShotShape = TopoDS_Shape();
@@ -4726,10 +4705,6 @@ bool GLCanvas::GenerateMould()
         // world space (the fixture transform was baked into `result` above),
         // so the preview renders it at an identity pose.
         m_lastMouldMeshes.push_back(meshData);
-
-        // Retain the half solid (world space, post-cut) for the separation
-        // demoldability check, kept in lockstep with m_lastMouldMeshes.
-        m_lastHalfShapes.push_back(result);
     }
 
     // ---- Phase 3b/3c: mesh-scene orphan resolution + finalize -------------
@@ -4776,13 +4751,11 @@ bool GLCanvas::GenerateMould()
             meshData.posNorm = std::move(split.posNorm);
             meshData.indices = std::move(split.indices);
 
-            // Keep this fixture's carved half for STL export, and push to the
-            // preview / separation lists in lockstep (same order as a BREP scene
-            // would). fix.mouldShape holds the retained BREP result for this half.
+            // Keep this fixture's carved half for STL export and push it to the
+            // preview list (same order a BREP scene would).
             fix.mouldMesh    = meshData;
             fix.hasMouldMesh = true;
             m_lastMouldMeshes.push_back(meshData);
-            m_lastHalfShapes.push_back(fix.mouldShape);
         }
     }
 
@@ -4812,15 +4785,8 @@ bool GLCanvas::GenerateMould()
             m_hasLastShotMesh =
                 !m_lastShotMesh.posNorm.empty() && !m_lastShotMesh.indices.empty();
 
-            // Area-weighted draft samples (signed draft + area + objectId +
-            // trapped), built once here and re-scored on demand in the preview.
-            // Never fatal: a failure just leaves the analysis empty.
-            // BREP draft samples are built ON DEMAND in the preview (the
-            // remesh is heavy and depends on the target grid area). Here we
-            // only gather the object soup the preview needs; samples start
-            // empty and are filled when a draft check / debug view runs.
-            GatherObjectSoup(m_lastObjV, m_lastObjI, m_lastObjTri);
-            m_lastDraftSamples.clear();
+            // The Draft Angle Checks run in the preview from the shot mesh and
+            // the generated mould halves; nothing to precompute here.
         }
     }
     else
@@ -4842,18 +4808,8 @@ bool GLCanvas::GenerateMould()
             m_hasLastShotMesh =
                 !m_lastShotMesh.posNorm.empty() && !m_lastShotMesh.indices.empty();
 
-            // Mesh draft samples: Draft Index + Trapped-Area + per-cavity.
-            // Gather every object's world-space triangles (uniform - each
-            // SceneObject carries a cpu mesh regardless of format), tagged by
-            // object index, so the analysis can separate cavity parts from the
-            // feed system.
-            {
-                GatherObjectSoup(m_lastObjV, m_lastObjI, m_lastObjTri);
-                DesignChecks::DraftSampleParams mp;   // checkTrapped defaults true
-                m_lastDraftSamples = DesignChecks::BuildDraftSamplesMesh(
-                    m_lastShotMesh.posNorm, m_lastShotMesh.indices,
-                    m_lastObjV, m_lastObjI, m_lastObjTri, mp);
-            }
+            // The Draft Angle Checks run in the preview from the shot mesh and
+            // the generated mould halves; nothing to precompute here.
         }
     }
 

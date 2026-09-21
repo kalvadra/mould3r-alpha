@@ -22,7 +22,7 @@
 #include <opencascade/STEPControl_Writer.hxx>
 #include <opencascade/IFSelect_ReturnStatus.hxx>
 #include <opencascade/TopoDS_Shape.hxx>
-#include "DesignChecks.h"   // DesignChecks::DraftSample (area-weighted draft scoring)
+#include "DesignChecks.h"   // DesignChecks types shared with the preview
 
 #include "camera.h"
 #include "FileImporter.h"
@@ -567,28 +567,6 @@ public:
     // mapped back to the shot's display triangles for colouring.
     const std::vector<int>& GetLastShotFaceIds() const { return m_lastShotFaceIds; }
 
-    // The post-cut mould-half solids (BREP) from the most recent successful
-    // GenerateMould, in fixture order. Used by the separation-based
-    // demoldability check (translate each half off the shot and test for
-    // interference). Empty when no mould was generated.
-    const std::vector<TopoDS_Shape>& GetLastHalfShapes() const
-    {
-        return m_lastHalfShapes;
-    }
-
-    // Area-weighted draft samples from the most recent GenerateMould (BREP
-    // scenes only for now). Empty in a mesh scene. Consumed by PreviewPanel's
-    // Draft Angle Checks via DesignChecks::ScoreDraft.
-    const std::vector<DesignChecks::DraftSample>& GetLastDraftSamples() const
-    {
-        return m_lastDraftSamples;
-    }
-
-    // World-space object soup (see members) for the preview's on-demand draft
-    // remesh (BREP), which separates cavity parts from the feed system.
-    const std::vector<float>&        GetLastObjV()   const { return m_lastObjV; }
-    const std::vector<unsigned int>& GetLastObjI()   const { return m_lastObjI; }
-    const std::vector<int>&          GetLastObjTri() const { return m_lastObjTri; }
 
     // Scene-mutation callback. MainFrame registers a callback that
     // invalidates the Export button when anything that would stale a
@@ -961,12 +939,6 @@ private:
     // nothing contributed or the fuse failed outright. Read by GenerateMould.
     bool BuildShotModel(TopoDS_Shape& out,
         std::vector<TopoDS_Shape>* objectShapesOut = nullptr);
-
-    // Gather every scene object's world-space triangles into one soup, each
-    // triangle tagged with its object index. Used by the draft analysis to
-    // separate cavity parts (objectId >= 0) from the feed system (-1).
-    void GatherObjectSoup(std::vector<float>& objV,
-        std::vector<unsigned int>& objI, std::vector<int>& objTri) const;
 
     // Build the "Cast Shot Body": BuildShotModel's shot fused with the features
     // deliberately excluded from it — vents (their cut channels), inserts grown
@@ -1593,20 +1565,6 @@ private:
     // face map of m_lastShotShape, matching what DesignChecks rebuilds.
     TopoDS_Shape           m_lastShotShape;
     std::vector<int>       m_lastShotFaceIds;
-
-    // The post-cut mould-half solids (BREP), in fixture order, retained for the
-    // separation-based demoldability check.
-    std::vector<TopoDS_Shape> m_lastHalfShapes;
-
-    // Area-weighted draft samples for the most recent shot (mesh scenes build
-    // these at generate; BREP scenes build them on demand in the preview).
-    std::vector<DesignChecks::DraftSample> m_lastDraftSamples;
-
-    // World-space object triangle soup (parts, tagged by object index), gathered
-    // at generate for the draft analysis to separate cavities from the feed.
-    std::vector<float>        m_lastObjV;
-    std::vector<unsigned int> m_lastObjI;
-    std::vector<int>          m_lastObjTri;
 
     // Display meshes of the inserts as they stood at the most recent
     // GenerateMould (world-space, tessellated from each insert's UNSCALED body
