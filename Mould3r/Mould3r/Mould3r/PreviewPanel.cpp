@@ -7,6 +7,7 @@
 #include "DesignChecks.h"
 #include "TestMaterial.h"   // material data for the Hele-Shaw flow scaffold
 #include "RoundedButton.h"
+#include "FlowResultsBar.h"
 #include "MouldCastDialog.h"
 #include "MeshBoolean.h"   // split the shot at y=0 and fuse a half into each base
 
@@ -31,6 +32,7 @@
 #include <algorithm>
 #include <cmath>
 #include <functional>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -528,6 +530,66 @@ PreviewPanel::PreviewPanel(wxWindow* parent)
     m_canvas = new GLCanvas(this);
     m_canvas->SetPreviewMode(true);
     centre->Add(m_canvas, 1, wxEXPAND);
+
+    // Results bar under the canvas, always shown: Sim Viewer Select (what the
+    // canvas shows) + wireframe at the left; the fill timeline and the legend
+    // appear when the selected view uses them.
+    m_resultsBar = new FlowResultsBar(this);
+    m_resultsBar->onFrameChanged = [this](int pos)
+    {
+        m_fillFrame = (pos >= m_resultsBar->GetEndPosition()) ? -1 : pos;
+        UpdateDraftOverlay();
+    };
+    centre->Add(m_resultsBar, 0, wxEXPAND);
+    {
+        wxWindow* host = m_resultsBar->ControlsParent();
+        auto* lbl = new wxStaticText(host, wxID_ANY, "Sim Viewer Select:");
+        lbl->SetForegroundColour(Style::TextMuted);
+        lbl->SetBackgroundColour(Style::CardBg);
+        lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+        m_resultsBar->AddControl(lbl, wxALIGN_CENTER_VERTICAL | wxRIGHT, 6);
+
+        wxArrayString modes;
+        modes.Add("None");
+        modes.Add("Draft (ray)");
+        modes.Add("Travel volume A (+draw)");
+        modes.Add("Travel volume B (-draw)");
+        modes.Add("Flow (thickness)");
+        modes.Add("Flow network");
+        modes.Add("Flow midplane");
+        modes.Add("Flow fill time");
+        modes.Add("Flow pressure");
+        modes.Add("Flow front temp");
+        modes.Add("Flow frozen layer");
+        modes.Add("Flow melt temp");
+        modes.Add("Flow welds & air traps");
+        modes.Add("Pack: shrinkage");
+        modes.Add("Cooling: time to eject");
+        modes.Add("Warp: deflection");
+        modes.Add("Warp: shape change");
+        m_debugModeChoice = new wxChoice(host, wxID_ANY, wxDefaultPosition,
+            wxDefaultSize, modes);
+        m_debugModeChoice->SetSelection(0);
+        m_debugModeChoice->SetToolTip(
+            "What the view shows: the analysis overlays (draft, travel volumes, "
+            "wall thickness) and the flow results. Flow views need a Hele-Shaw "
+            "2.5D Flow run; the fill views play back with the timeline.");
+        m_debugModeChoice->Bind(wxEVT_CHOICE,
+            [this](wxCommandEvent&) { UpdateDraftOverlay(); });
+        m_resultsBar->AddControl(m_debugModeChoice, wxALIGN_CENTER_VERTICAL | wxRIGHT, 10);
+
+        m_debugWireCheck = new wxCheckBox(host, wxID_ANY, "Wireframe");
+        m_debugWireCheck->SetForegroundColour(Style::TextPrimary);
+        m_debugWireCheck->SetBackgroundColour(Style::CardBg);
+        m_debugWireCheck->SetToolTip(
+            "With \"None\" selected, show the shot as a transparent wireframe. "
+            "For the other views it draws their mesh as a wireframe (e.g. reveals "
+            "the parting ring, a travel volume's interior, or the midplane mesh).");
+        m_debugWireCheck->Bind(wxEVT_CHECKBOX,
+            [this](wxCommandEvent&) { UpdateDraftOverlay(); });
+        m_resultsBar->AddControl(m_debugWireCheck, wxALIGN_CENTER_VERTICAL, 0);
+    }
     middle->Add(centre, 1, wxEXPAND);
 
     wxPanel* infoPanel = BuildInfoPanel(this);
@@ -644,6 +706,7 @@ void PreviewPanel::SetData(const std::vector<FileImporter::MeshData>& halves,
     m_midplaneAreaMm2 = -1.0f;
     m_fill = Flow::CoupledFillResult{};
     m_hasFill = false;
+    OnFillChanged();
     m_hasShot = false;
     m_shotVolumeMm3 = 0.0;
     m_castShotMesh = FileImporter::MeshData();
@@ -714,10 +777,11 @@ void PreviewPanel::SetData(const std::vector<FileImporter::MeshData>& halves,
     // Record that boundary so a cast re-generation can truncate back to it.
     m_castAnchorCount = (int)halves.size() + (m_hasShot ? 1 : 0) + m_insertCount;
 
-    // Reset any debug overlay state carried over from the previous generation.
+    // Reset the overlay state carried over from the previous generation. The
+    // Sim Viewer selection and wireframe toggle are sticky: they persist across
+    // generations and analyses (a view whose data isn't there yet shows nothing
+    // until the analysis runs).
     m_hasSepOverlay = false;
-    if (m_debugModeChoice)   m_debugModeChoice->SetSelection(0);
-    if (m_debugWireCheck)    m_debugWireCheck->SetValue(false);
     if (m_sepOverlayCheck)   m_sepOverlayCheck->SetValue(false);
 
     // Drop the previous generation's GPU parts now (clears its own context).
@@ -771,6 +835,7 @@ void PreviewPanel::ClearData()
     m_midplaneAreaMm2 = -1.0f;
     m_fill = Flow::CoupledFillResult{};
     m_hasFill = false;
+    OnFillChanged();
     m_hasShot = false;
     m_shotVolumeMm3 = 0.0;
     m_castShotMesh = FileImporter::MeshData();
@@ -957,7 +1022,7 @@ wxPanel* PreviewPanel::BuildSimPanel(wxWindow* parent)
     // at the parting plane first). Fields: fail/warn thresholds, the back-draft
     // epsilon (near-vertical isn't back-draft), and a minimum-significant-area
     // filter (dropdown: % of surface area or absolute mm²) that quiets isolated
-    // mesh-artifact facets. Visualise via Debug View -> "Draft (ray)". Undercuts
+    // mesh-artifact facets. Visualise via Sim Viewer Select -> "Draft (ray)". Undercuts
     // are NOT assessed here — see the Separation Test.
     makeCard("Draft Angle Checks", [this, &addStart](wxWindow* body, wxBoxSizer* bs)
     {
@@ -1090,10 +1155,34 @@ wxPanel* PreviewPanel::BuildSimPanel(wxWindow* parent)
             "temperature everywhere; faster but optimistic).");
         bs->Add(m_flowThermalCheck, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
 
+        m_flowPackCheck = new wxCheckBox(body, wxID_ANY, "Pack and cool");
+        m_flowPackCheck->SetValue(true);
+        m_flowPackCheck->SetForegroundColour(Style::TextPrimary);
+        m_flowPackCheck->SetBackgroundColour(Style::CardBg);
+        m_flowPackCheck->SetToolTip(
+            "After the fill, hold the pack pressure until the gates freeze, then cool "
+            "to the ejection temperature: gate freeze, cooling time, part mass and "
+            "volumetric shrinkage. Needs Thermal.");
+        bs->Add(m_flowPackCheck, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
+        m_flowPackPressureCtrl = AddFieldRow(body, bs, "Pack pressure:", "80", "%");
+        m_flowPackPressureCtrl->SetToolTip(
+            "Pack / hold pressure as a percentage of the fill's injection pressure "
+            "(typically 50-80%). More packing = less shrinkage, but more flash risk "
+            "and stress.");
+        m_flowHoldTimeCtrl = AddFieldRow(body, bs, "Hold time:", "0", "s");
+        m_flowHoldTimeCtrl->SetToolTip(
+            "How long the pack pressure is held after the fill. 0 = until every gate "
+            "has frozen (holding longer changes nothing once they have).");
+        m_flowShrinkRatioCtrl = AddFieldRow(body, bs, "Flow/cross shrink:", "1.0", "");
+        m_flowShrinkRatioCtrl->SetToolTip(
+            "Warpage: in-plane shrinkage along the flow divided by shrinkage across it "
+            "(same total). 1 = isotropic. Oriented polymers usually shrink more along "
+            "the flow (e.g. 1.1-1.3 for unfilled PP); glass-filled grades less.");
+
         auto* note = new wxStaticText(body, wxID_ANY,
             "Materials come from the Physical Setup bar.\n"
             "Run fills the feed system and every part's\n"
-            "midplane together (Debug View: Flow fill time).");
+            "midplane together (Sim Viewer: Flow fill time).");
         note->SetForegroundColour(Style::TextMuted);
         note->SetBackgroundColour(Style::CardBg);
         note->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
@@ -1101,51 +1190,6 @@ wxPanel* PreviewPanel::BuildSimPanel(wxWindow* parent)
         bs->Add(note, 0, wxLEFT | wxRIGHT | wxTOP, 10);
 
         addStart(body, bs, "Hele-Shaw 2.5D Flow");
-    });
-
-    // ---- Debug View ---------------------------------------------------------
-    // Colour the shot by the ownership analysis, or draw it as a wireframe.
-    // "Draft (ray)" renders the parting-split mesh coloured by per-facet signed
-    // draft (wireframe reveals the parting ring). "Travel volume A / B" show each
-    // mould half's swept travel volume (the Separation Test's sweep) as a solid.
-    // Any of these builds the analysis on demand if a check hasn't been run.
-    makeCard("Debug View", [this](wxWindow* body, wxBoxSizer* bs)
-    {
-        auto* lbl = new wxStaticText(body, wxID_ANY, "Colour by:");
-        lbl->SetForegroundColour(Style::TextPrimary);
-        lbl->SetBackgroundColour(Style::CardBg);
-        bs->Add(lbl, 0, wxLEFT | wxRIGHT | wxTOP, 10);
-
-        wxArrayString modes;
-        modes.Add("None");
-        modes.Add("Draft (ray)");
-        modes.Add("Travel volume A (+draw)");
-        modes.Add("Travel volume B (-draw)");
-        modes.Add("Flow (thickness)");
-        modes.Add("Flow network");
-        modes.Add("Flow midplane");
-        modes.Add("Flow fill time");
-        modes.Add("Flow pressure");
-        modes.Add("Flow front temp");
-        modes.Add("Flow frozen layer");
-        m_debugModeChoice = new wxChoice(body, wxID_ANY, wxDefaultPosition,
-            wxDefaultSize, modes);
-        m_debugModeChoice->SetSelection(0);
-        m_debugModeChoice->Bind(wxEVT_CHOICE,
-            [this](wxCommandEvent&) { UpdateDraftOverlay(); });
-        bs->Add(m_debugModeChoice, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
-
-        m_debugWireCheck = new wxCheckBox(body, wxID_ANY, "Wireframe");
-        m_debugWireCheck->SetForegroundColour(Style::TextPrimary);
-        m_debugWireCheck->SetBackgroundColour(Style::CardBg);
-        m_debugWireCheck->SetToolTip(
-            "With \"Colour by: None\", show the shot as a transparent "
-            "wireframe. For the analysis modes it draws the debug mesh as a "
-            "wireframe (e.g. reveals the parting ring, or a travel volume's "
-            "interior).");
-        m_debugWireCheck->Bind(wxEVT_CHECKBOX,
-            [this](wxCommandEvent&) { UpdateDraftOverlay(); });
-        bs->Add(m_debugWireCheck, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP | wxBOTTOM, 10);
     });
 
     sizer->AddSpacer(12);
@@ -2016,6 +2060,7 @@ bool PreviewPanel::EnsureMidplanes()
     wxBusyCursor busy;
     m_fill = Flow::CoupledFillResult{};      // indexes the old midplanes
     m_hasFill = false;
+    OnFillChanged();
     Flow::MidplaneParams params;
     params.targetAreaMm2 = area;
     m_midplanes.clear();
@@ -2140,8 +2185,9 @@ void PreviewPanel::RunFaceDraftCheck()
         if (m_infoPanel) m_infoPanel->Layout();
     }
 
-    // Show the result immediately: switch the debug view to the ray overlay.
-    if (m_debugModeChoice) m_debugModeChoice->SetSelection(1);
+    // Show the result: the Sim Viewer selection is sticky, so only pick the ray
+    // overlay when nothing is selected; otherwise refresh the chosen view.
+    if (m_debugModeChoice && m_debugModeChoice->GetSelection() <= 0) m_debugModeChoice->SetSelection(1);
     UpdateDraftOverlay();
 
     const wxString deg = wxString::FromUTF8("\xC2\xB0");
@@ -2407,6 +2453,9 @@ void PreviewPanel::RunFlowCheck()
     const double eta0     = poly.viscosity.eta0(meltK);   // Pa·s
     const double maxInjMPa = std::clamp(ParseField(m_flowMaxPressureCtrl, 150.0), 1.0, 1000.0);
     const bool   thermalOn = !m_flowThermalCheck || m_flowThermalCheck->GetValue();
+    const bool   packOn = thermalOn && (!m_flowPackCheck || m_flowPackCheck->GetValue());
+    const double packPct = std::clamp(ParseField(m_flowPackPressureCtrl, 80.0), 5.0, 150.0);
+    const double holdS = std::clamp(ParseField(m_flowHoldTimeCtrl, 0.0), 0.0, 120.0);
     // Wall temperature the melt sees: contact temperature of melt and mould
     // from their effusivities sqrt(k rho c) (the fill solver uses the same).
     const double eMelt = std::sqrt(poly.thermalConductivity * poly.densityMelt * poly.specificHeat);
@@ -2614,6 +2663,7 @@ void PreviewPanel::RunFlowCheck()
     // temperature), behind a cancellable progress dialog.
     m_fill = Flow::CoupledFillResult{};
     m_hasFill = false;
+    OnFillChanged();
     bool fillRan = false;
     if (haveMidplanes && net.inletNode >= 0)
     {
@@ -2634,14 +2684,29 @@ void PreviewPanel::RunFlowCheck()
             th.meltSpecificHeat = poly.specificHeat;
             th.meltConductivity = poly.thermalConductivity;
             th.mouldEffusivity = eMould;
+            th.pvt = poly.pvt;
+            th.ejectionTempC = poly.ejectionTempC;
+            fp.pack.enabled = packOn;
+            fp.pack.packFraction = packPct / 100.0;
+            fp.pack.holdTimeS = holdS;
         }
-        wxProgressDialog prog("Hele-Shaw 2.5D Flow", "Filling the feed system and cavities...", 100, this,
+        wxProgressDialog prog("Hele-Shaw 2.5D Flow",
+                              packOn ? "Filling, packing and cooling..." : "Filling the feed system and cavities...", 100, this,
                               wxPD_APP_MODAL | wxPD_CAN_ABORT | wxPD_AUTO_HIDE | wxPD_ELAPSED_TIME);
         fp.progress = [&prog](double f)
         { return prog.Update((int)std::lround(99.0 * std::clamp(f, 0.0, 1.0))); };
         m_fill = Flow::SolveCoupledFill(net, m_midplanes, fp);
         m_hasFill = m_fill.ok && !m_fill.cancelled;
+        OnFillChanged();
         fillRan = true;
+        if (m_hasFill && m_fill.pack.ran)
+        {
+            Flow::WarpParams wp;
+            wp.elasticModulusMPa = poly.elasticModulusMPa;
+            wp.poissonRatio = poly.poissonRatio;
+            wp.flowShrinkRatio = std::clamp(ParseField(m_flowShrinkRatioCtrl, 1.0), 0.5, 2.0);
+            m_warp = Flow::SolveWarpage(m_midplanes, m_fill, wp);
+        }
     }
     const Flow::CoupledFillResult& fr = m_fill;
     int fillCautions = 0;
@@ -2738,6 +2803,139 @@ void PreviewPanel::RunFlowCheck()
                 cautions.push_back(wxString::Format(
                     "Cavity wall shear reaches %.0f/s, over the ~%.0f/s guideline.",
                     fr.maxCavityShearRate, poly.maxShearRate));
+            // Weld / meld lines, air traps and where the cavity fills last.
+            {
+                const Flow::FillDefects& fd = m_defects;
+                auto partName = [&](int k) {
+                    return (k >= 0 && (size_t)k < fr.parts.size()) ? wxString::FromUTF8(fr.parts[(size_t)k].label.c_str()) : wxString("?"); };
+                auto at = [](const glm::vec3& p) { return wxString::Format("(x %.1f, z %.1f)", p.x, p.z); };
+                msg << "  weld lines: " << fd.weldCount << ", meld lines: " << fd.meldCount
+                    << ", air traps: " << (int)fd.traps.size() << "\n";
+                int shown = 0;
+                for (const Flow::WeldLine& L : fd.lines)
+                {
+                    if (shown++ >= 8) { msg << U("    \xe2\x80\xa6 and ") << (int)(fd.lines.size() - 8) << " more\n"; break; }
+                    msg << "    " << partName(L.part) << ": " << (L.weld ? "weld" : "meld") << " line "
+                        << wxString::Format("%.0f", L.lengthMm) << " mm near " << at(L.anchor) << ", fronts met at "
+                        << wxString::Format("%.3f", L.formedS) << " s (up to " << wxString::Format("%.0f", L.maxAngleDeg)
+                        << U("\xc2\xb0 apart)");
+                    if (L.hasFrontTemp) msg << ", front " << wxString::Format("%.0f", L.minFrontTempC) << deg;
+                    msg << "\n";
+                    if (L.weld && L.hasFrontTemp && L.minFrontTempC < meltC - 20.0)
+                        cautions.push_back(partName(L.part) + ": weak weld line near " + at(L.anchor) +
+                            U(" \xe2\x80\x94 ") + wxString::Format("the fronts met at %.0f", L.minFrontTempC) + deg +
+                            wxString::Format(", more than 20%s below the melt; fill faster, run hotter or move the gate.", deg));
+                }
+                for (const Flow::AirTrap& a : fd.traps)
+                {
+                    msg << "    " << partName(a.part) << ": air trap, " << wxString::Format("%.1f", a.volumeMm3)
+                        << U(" mm\xc2\xb3 of air cut off at ") << wxString::Format("%.3f", a.sealedS)
+                        << " s, squeezed to " << at(a.pos) << "\n";
+                    cautions.push_back(partName(a.part) + ": air trap at " + at(a.pos) +
+                        U(" \xe2\x80\x94 burn marks / voids / short fill there; vent it (e.g. an ejector-pin vent) or move the gate."));
+                }
+                int needVent = 0;
+                for (const Flow::LastFillPoint& p : fd.lastFill)
+                {
+                    msg << "    " << partName(p.part) << ": fills last at " << at(p.pos) << " ("
+                        << wxString::Format("%.3f", p.timeS) << " s) " << U("\xe2\x80\x94 ")
+                        << (p.vented ? wxString("vented")
+                                     : (p.ventDistMm >= 0.0f ? wxString::Format("no vent within reach (nearest %.0f mm)", p.ventDistMm)
+                                                             : wxString("add a vent here")))
+                        << "\n";
+                    needVent += p.vented ? 0 : 1;
+                }
+                if (needVent > 0)
+                    msg << "    (air leaves last where the cavity fills last: vents belong at the unvented points above)\n";
+                if (!fd.lines.empty())
+                    msg << "    note: lines are traced where fronts meet; the meld line trailing downstream of an "
+                           "obstacle after the streams merge is not followed yet.\n";
+            }
+            // Packing, holding and cooling.
+            if (fr.pack.ran)
+            {
+                const Flow::PackResult& K = fr.pack;
+                msg << "  packing: " << wxString::Format("%.1f", K.packPressureMPa) << " MPa ("
+                    << wxString::Format("%.0f", packPct) << "% of the fill's), held "
+                    << wxString::Format("%.2f", K.holdTimeS) << " s"
+                    << (holdS <= 0.0 ? wxString(" (until the gates froze)") : wxString()) << "\n";
+                for (size_t i = 0; i < net.edges.size() && i < fr.feedEdges.size(); ++i)
+                {
+                    const Flow::FeedEdge& e = net.edges[i];
+                    if (!fr.feedEdges[i].modelled || (e.kind != EK::Gate && e.kind != EK::SubRunner)) continue;
+                    msg << "    " << wxString::FromUTF8(e.label.c_str()) << ": "
+                        << (fr.feedEdges[i].freezeS >= 0.0f
+                            ? wxString::Format("frozen shut at %.2f s", fr.feedEdges[i].freezeS)
+                            : wxString("still open when packing ended")) << "\n";
+                }
+                if (K.ejectReached)
+                    msg << "  cooling: ejectable at " << wxString::Format("%.1f", K.ejectS) << " s from the start of injection "
+                        << "(whole section below " << wxString::Format("%.0f", poly.ejectionTempC) << deg
+                        << "); cycle ~" << wxString::Format("%.0f", K.ejectS) << " s + mould open / eject / close\n";
+                else
+                {
+                    msg << "  cooling: not every part reached " << wxString::Format("%.0f", poly.ejectionTempC) << deg
+                        << " within " << wxString::Format("%.0f", K.endS) << " s\n";
+                    cautions.push_back(wxString::Format("Cooling did not reach the ejection temperature within %.0f s.", K.endS));
+                }
+                msg << "  part mass " << wxString::Format("%.2f", K.partsMassG) << " g ("
+                    << wxString::Format("%.2f", K.packedMassG) << " g of it packed in after the fill)\n";
+                for (size_t k = 0; k < fr.parts.size(); ++k)
+                {
+                    const Flow::PartFillResult& pr = fr.parts[k];
+                    if (!pr.fed || pr.shrinkPct.empty()) continue;
+                    msg << "    " << wxString::FromUTF8(pr.label.c_str()) << ": volumetric shrinkage "
+                        << wxString::Format("%.1f", pr.meanShrinkPct) << "% (" << wxString::Format("%.1f", pr.minShrinkPct)
+                        << U("\xe2\x80\x93") << wxString::Format("%.1f", pr.maxShrinkPct) << "%), ~"
+                        << wxString::Format("%.1f", pr.meanShrinkPct / 3.0f) << "% linear; "
+                        << wxString::Format("%.2f", pr.massG) << " g; ejectable at "
+                        << (pr.ejectS >= 0.0f ? wxString::Format("%.1f s", pr.ejectS) : wxString("-")) << "\n";
+                    // Where it shrinks most (sink / void risk) and how uneven it is (warpage).
+                    size_t imax = 0;
+                    for (size_t i = 1; i < pr.shrinkPct.size(); ++i) if (pr.shrinkPct[i] > pr.shrinkPct[imax]) imax = i;
+                    const glm::vec3 pmax = m_midplanes[k].nodes[imax];
+                    if (pr.maxShrinkPct > 8.0f)
+                        cautions.push_back(wxString::FromUTF8(pr.label.c_str()) + wxString::Format(
+                            ": %.1f%% volumetric shrinkage near (x %.1f, z %.1f)", pr.maxShrinkPct, pmax.x, pmax.z) +
+                            U(" \xe2\x80\x94 sink mark / void risk; pack harder or longer, or gate closer to that thick area."));
+                    if (pr.maxShrinkPct - pr.minShrinkPct > 3.0f)
+                        cautions.push_back(wxString::FromUTF8(pr.label.c_str()) + wxString::Format(
+                            ": shrinkage varies by %.1f points across the part", pr.maxShrinkPct - pr.minShrinkPct) +
+                            U(" \xe2\x80\x94 uneven shrinkage warps parts; balance the packing (gate position, pack pressure)."));
+                }
+                msg << "    (shrinkage from the mass each region holds vs its volume at room temperature; "
+                       "PP's real shrinkage is anisotropic, so ~1/3 volumetric is only a rough linear figure)\n";
+            }
+            // Warpage from the packing shrinkage.
+            if (m_warp.ok)
+            {
+                msg << "  warpage (linear-elastic shell, room temperature):\n";
+                for (const Flow::PartWarp& W : m_warp.parts)
+                {
+                    if (!W.ok || W.part < 0 || (size_t)W.part >= fr.parts.size()) continue;
+                    const wxString name = wxString::FromUTF8(fr.parts[(size_t)W.part].label.c_str());
+                    const float size = std::max({ W.sizeBefore.x, W.sizeBefore.y, W.sizeBefore.z, 1e-3f });
+                    // Sizes of the midplane (the wall thickness isn't in it): in plan for a
+                    // flat part, with the height along the pull axis otherwise.
+                    const bool flatPart = W.sizeBefore.y < 0.01f;
+                    msg << "    " << name << ": "
+                        << (flatPart ? wxString::Format("%.2f x %.2f", W.sizeBefore.x, W.sizeBefore.z)
+                                     : wxString::Format("%.2f x %.2f x %.2f", W.sizeBefore.x, W.sizeBefore.z, W.sizeBefore.y))
+                        << U(" mm \xe2\x86\x92 ")
+                        << (flatPart ? wxString::Format("%.2f x %.2f mm", W.sizeAfter.x, W.sizeAfter.z)
+                                     : wxString::Format("%.2f x %.2f x %.2f mm", W.sizeAfter.x, W.sizeAfter.z, W.sizeAfter.y))
+                        << (flatPart ? " (x by z, in plan; " : " (x, z, height; ")
+                        << wxString::Format("%.2f", W.uniformShrinkPct) << "% average linear shrink)\n";
+                    msg << "      deflection up to " << wxString::Format("%.3f", W.maxDispMm) << " mm; shape change (warp) up to "
+                        << wxString::Format("%.3f", W.maxWarpMm) << wxString::Format(" mm near (x %.1f, z %.1f)", W.maxWarpPos.x, W.maxWarpPos.z)
+                        << ", out of the parting plane " << wxString::Format("%.3f", W.flatnessMm) << " mm\n";
+                    if (W.maxWarpMm > 0.003f * size)
+                        cautions.push_back(name + wxString::Format(": warps %.2f mm (%.1f%% of its size)", W.maxWarpMm, 100.0f * W.maxWarpMm / size) +
+                            U(" \xe2\x80\x94 even out the shrinkage (packing, gate position, wall thickness)."));
+                }
+                msg << "    (shrinkage is uniform through the thickness here, so a flat part only distorts in its plane; "
+                       "bending from unequal mould-half temperatures and buckling aren't modelled yet)\n";
+            }
             fillCautions = (int)cautions.size();
             for (const wxString& c : cautions)
                 msg << U("  \xe2\x9a\xa0 ") << c << "\n";
@@ -2762,7 +2960,9 @@ void PreviewPanel::RunFlowCheck()
             for (const Flow::PartFillResult& pr : fr.parts)
                 if (pr.fed && pr.fillEndS >= 0.0f) { tFirst = std::min(tFirst, pr.fillEndS); tLast = std::max(tLast, pr.fillEndS); }
             if (tLast >= 0.0f && tLast - tFirst > 0.05f * fr.fillTimeS) spreadOK = false;
-            m_flowStatus->SetLabel(wxString::Format("FILL %.2f s  %.1f MPa", fr.fillTimeS, fr.peakInletPressureMPa));
+            wxString verdict = wxString::Format("FILL %.2f s  %.1f MPa", fr.fillTimeS, fr.peakInletPressureMPa);
+            if (fr.pack.ran && fr.pack.ejectReached) verdict << wxString::Format("  EJECT %.1f s", fr.pack.ejectS);
+            m_flowStatus->SetLabel(verdict);
             const bool clean = spreadOK && fr.warnings.empty() && net.warnings.empty() && !fr.pressureLimited &&
                                fillCautions == 0;
             m_flowStatus->SetForegroundColour(clean ? wxColour(0x26, 0xAB, 0x36) : wxColour(0xE0, 0x9B, 0x20));
@@ -2806,20 +3006,30 @@ void PreviewPanel::RunFlowCheck()
         msg << "\n";
     }
 
-    msg << U("\xe2\x86\x92 Debug View: \"Flow fill time\" and \"Flow pressure\" colour each part's "
+    msg << U("\xe2\x86\x92 Sim Viewer Select (bar under the view): \"Flow fill time\" and \"Flow pressure\" colour each part's "
            "midplane by when it filled and by pressure at switchover (blue low \xe2\x86\x92 red high, "
            "unfilled grey); on thermal runs \"Flow front temp\" shows the melt temperature as the "
            "front arrived and \"Flow frozen layer\" the frozen share of the wall at end of fill; "
+           "\"Flow melt temp\" the melt temperature averaged through the wall (frozen skin included); "
+           "\"Flow welds & air traps\" marks weld / meld lines, trapped air and where the cavity fills "
+           "last (vent there); after packing, \"Pack: shrinkage\" and \"Cooling: time to eject\" map the "
+           "volumetric shrinkage and when each area can be ejected, \"Warp: deflection\" / \"Warp: shape "
+           "change\" show the shrunk part (exaggerated) over the original outline, and the timeline runs on through "
+           "packing and cooling. The bar also holds the colour legend and a timeline: press Play or drag "
+           "it to watch the fill advance. "
            "\"Flow midplane\" colours it by gap; \"Flow network\" shows the "
            "network alone. Network colours: sprue orange, "
            "runners blue, sub-runners cyan, gates magenta, vents green, part links "
            "grey; part nodes yellow, sprue inlet white. Edges the melt can't reach "
            "show red.");
 
-    // Auto-select the most informative view available.
+    // The Sim Viewer selection is sticky: keep the user's view (refreshed with
+    // the new results); only when nothing is selected pick the most
+    // informative flow view available.
     if (m_debugModeChoice)
     {
-        m_debugModeChoice->SetSelection(m_hasFill ? 7 : (haveMidplanes ? 6 : 5));   // fill time / midplane / network
+        if (m_debugModeChoice->GetSelection() <= 0)
+            m_debugModeChoice->SetSelection(m_hasFill ? 7 : (haveMidplanes ? 6 : 5));   // fill time / midplane / network
         UpdateDraftOverlay();
     }
 
@@ -2909,12 +3119,15 @@ static std::vector<GLCanvas::DebugOverlayBatch> NetworkOverlayBatches(
 // are left out of the ramp's range. Shared by the midplane / fill / pressure
 // debug views.
 // ---------------------------------------------------------------------------
-static void DrawMidplaneField(GLCanvas* canvas, int halfIndex, bool wire,
+static std::pair<float, float> DrawMidplaneField(GLCanvas* canvas, int halfIndex, bool wire,
     const std::vector<Flow::MidplaneMesh>& parts,
     const std::function<const std::vector<float>*(size_t)>& field,
     const std::function<bool(size_t, size_t)>& valid,
     const std::function<bool(size_t, size_t)>& ranged,
-    bool muteWalls)
+    bool muteWalls,
+    const std::pair<float, float>* fixedRange = nullptr,
+    const glm::vec3* flatColour = nullptr,
+    const std::vector<std::vector<glm::vec3>>* positions = nullptr)
 {
     std::vector<float>         posNorm;
     std::vector<glm::ivec3>    tris;
@@ -2929,11 +3142,14 @@ static void DrawMidplaneField(GLCanvas* canvas, int halfIndex, bool wire,
         const std::vector<float>* f = field(k);
         const bool hasField = f && f->size() == m.nodes.size();
         const int base = (int)(posNorm.size() / 6);
+        // Drawn at the given (e.g. deformed) positions when supplied.
+        const std::vector<glm::vec3>& P = (positions && k < positions->size() && (*positions)[k].size() == m.nodes.size())
+                                          ? (*positions)[k] : m.nodes;
         std::vector<glm::vec3> nrm(m.nodes.size(), glm::vec3(0.0f));
         for (const glm::ivec3& t : m.tris)
         {
-            const glm::vec3 fn = glm::cross(m.nodes[(size_t)t.y] - m.nodes[(size_t)t.x],
-                                            m.nodes[(size_t)t.z] - m.nodes[(size_t)t.x]);
+            const glm::vec3 fn = glm::cross(P[(size_t)t.y] - P[(size_t)t.x],
+                                            P[(size_t)t.z] - P[(size_t)t.x]);
             nrm[(size_t)t.x] += fn; nrm[(size_t)t.y] += fn; nrm[(size_t)t.z] += fn;
         }
         for (size_t i = 0; i < m.nodes.size(); ++i)
@@ -2942,7 +3158,7 @@ static void DrawMidplaneField(GLCanvas* canvas, int halfIndex, bool wire,
             const float L = std::sqrt(glm::dot(n, n));
             n = (L > 1e-12f) ? n / L : glm::vec3(0.0f, 1.0f, 0.0f);
             if (n.y < 0.0f) n = -n;                          // face the pull axis
-            posNorm.insert(posNorm.end(), { m.nodes[i].x, m.nodes[i].y, m.nodes[i].z, n.x, n.y, n.z });
+            posNorm.insert(posNorm.end(), { P[i].x, P[i].y, P[i].z, n.x, n.y, n.z });
             const bool v = hasField && valid(k, i);
             val.push_back(hasField ? (*f)[i] : 0.0f);
             ok.push_back(v ? 1 : 0);
@@ -2954,40 +3170,34 @@ static void DrawMidplaneField(GLCanvas* canvas, int halfIndex, bool wire,
             triSteep.push_back(m.triSteep[t]);
         }
     }
+    if (fixedRange) { lo = fixedRange->first; hi = fixedRange->second; }
     if (!(hi >= lo)) { lo = 0.0f; hi = 1.0f; }
     if (hi - lo < 1e-6f * std::max(1.0f, std::fabs(hi))) { lo -= 0.5f; hi += 0.5f; }  // uniform: mid colour
     const float span = hi - lo;
 
-    auto ramp = [](float v) -> glm::vec3
-    {
-        v = std::clamp(v, 0.0f, 1.0f);
-        const glm::vec3 stops[5] = {
-            glm::vec3(0.20f, 0.32f, 0.90f), glm::vec3(0.20f, 0.80f, 0.90f),
-            glm::vec3(0.30f, 0.85f, 0.35f), glm::vec3(0.95f, 0.85f, 0.20f),
-            glm::vec3(0.92f, 0.26f, 0.18f) };
-        const float sc = v * 4.0f;
-        const int i = std::clamp((int)std::floor(sc), 0, 3);
-        const float f = sc - (float)i;
-        return stops[i] * (1.0f - f) + stops[i + 1] * f;
-    };
-    const int nBands = 12;
+    // Bands share Heatmap:: with the results-bar legend, so the two always agree.
+    const int nBands = Heatmap::kBands;
     const size_t gWall = (size_t)nBands, gNone = (size_t)nBands + 1;
     std::vector<GLCanvas::ShotDebugGroup> groups((size_t)nBands + 2);
     for (int b = 0; b < nBands; ++b)
     {
-        groups[(size_t)b].color = ramp(((float)b + 0.5f) / (float)nBands);
+        float r, g, bl;
+        Heatmap::Band(b, r, g, bl);
+        groups[(size_t)b].color = glm::vec3(r, g, bl);
         groups[(size_t)b].emissive = true;
     }
-    groups[gWall].color = glm::vec3(0.55f, 0.30f, 0.30f);    // wall-flagged
+    groups[gWall].color = glm::vec3(Heatmap::kWall[0], Heatmap::kWall[1], Heatmap::kWall[2]);          // wall-flagged
     groups[gWall].emissive = false;
-    groups[gNone].color = glm::vec3(0.55f, 0.55f, 0.58f);    // no value (unfilled / unfed)
+    groups[gNone].color = glm::vec3(Heatmap::kNoValue[0], Heatmap::kNoValue[1], Heatmap::kNoValue[2]); // no value (unfilled / unfed)
     groups[gNone].emissive = false;
+    if (flatColour) { groups[0].color = *flatColour; groups[0].emissive = false; }
     for (size_t k = 0; k < tris.size(); ++k)
     {
         const glm::ivec3& t = tris[k];
         size_t g;
         if (muteWalls && triSteep[k]) g = gWall;
         else if (!ok[(size_t)t.x] || !ok[(size_t)t.y] || !ok[(size_t)t.z]) g = gNone;
+        else if (flatColour) g = 0;
         else
         {
             const float v = ((val[(size_t)t.x] + val[(size_t)t.y] + val[(size_t)t.z]) / 3.0f - lo) / span;
@@ -2999,6 +3209,44 @@ static void DrawMidplaneField(GLCanvas* canvas, int halfIndex, bool wire,
     }
     canvas->SetShotDebugMesh(halfIndex, posNorm, groups);
     canvas->SetShotDebugWireframe(wire);
+    return { lo, hi };
+}
+
+// ---------------------------------------------------------------------------
+// Weld / meld lines, air traps and last-to-fill points as on-top lines and
+// points, up to time tF (infinity: everything): lines once their fronts met,
+// traps once sealed, last-to-fill points once filled.
+// ---------------------------------------------------------------------------
+static const glm::vec3 kWeldColour(0.08f, 0.08f, 0.10f);
+static const glm::vec3 kMeldColour(0.45f, 0.22f, 0.70f);
+static const glm::vec3 kTrapColour(1.00f, 0.15f, 0.15f);
+static const glm::vec3 kNeedVentColour(1.00f, 0.72f, 0.10f);
+static const glm::vec3 kVentedColour(0.30f, 0.90f, 0.40f);
+
+static std::vector<GLCanvas::DebugOverlayBatch> DefectOverlayBatches(
+    const Flow::FillDefects& d, const std::vector<Flow::MidplaneMesh>& parts, float tF)
+{
+    GLCanvas::DebugOverlayBatch weld, meld, trap, need, vented;
+    weld.points = false; weld.color = kWeldColour; weld.size = 4.0f;
+    meld.points = false; meld.color = kMeldColour; meld.size = 3.0f;
+    trap.points = true;  trap.color = kTrapColour; trap.size = 16.0f;
+    need.points = true;  need.color = kNeedVentColour; need.size = 12.0f;
+    vented.points = true; vented.color = kVentedColour; vented.size = 12.0f;
+    for (const Flow::WeldLine& L : d.lines)
+    {
+        if (L.part < 0 || (size_t)L.part >= parts.size() || L.formedS > tF) continue;
+        const Flow::MidplaneMesh& m = parts[(size_t)L.part];
+        GLCanvas::DebugOverlayBatch& b = L.weld ? weld : meld;
+        for (const auto& e : L.edges) { b.verts.push_back(m.nodes[(size_t)e.first]); b.verts.push_back(m.nodes[(size_t)e.second]); }
+    }
+    for (const Flow::AirTrap& a : d.traps)
+        if (a.sealedS <= tF) trap.verts.push_back(a.pos);
+    for (const Flow::LastFillPoint& p : d.lastFill)
+        if (p.timeS <= tF) (p.vented ? vented : need).verts.push_back(p.pos);
+    std::vector<GLCanvas::DebugOverlayBatch> out;
+    for (GLCanvas::DebugOverlayBatch* b : { &meld, &weld, &need, &vented, &trap })
+        if (!b->verts.empty()) out.push_back(*b);
+    return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -3011,8 +3259,10 @@ static void DrawMidplaneField(GLCanvas* canvas, int halfIndex, bool wire,
 // planform midplane coloured by gap (wall-flagged facets muted red) with the
 // network on top; Flow fill time / Flow pressure — the last coupled fill's
 // fill-time and switchover-pressure fields on the midplanes (unfilled grey);
-// Flow front temp / Flow frozen layer — a thermal fill's melt-front
-// temperature and end-of-fill frozen share on the midplanes.
+// Flow front temp / Flow frozen layer / Flow melt temp — a thermal fill's
+// melt-front temperature, frozen share and gap-mean melt temperature. The
+// heat-map views show a legend in the results bar under the canvas; the fill
+// views also get its timeline (m_fillFrame picks the animation frame).
 // Reads cached analysis / solve state; the midplane is built on first use at
 // the card's target triangle area.
 // ---------------------------------------------------------------------------
@@ -3024,7 +3274,9 @@ void PreviewPanel::UpdateDraftOverlay()
     const bool wire = m_debugWireCheck && m_debugWireCheck->GetValue();
 
     // The on-top line/point overlay (the feed network) belongs to the flow views.
-    if (mode < 5 || mode > 10) m_canvas->ClearDebugOverlay();
+    if (mode < 5 || mode > 16) m_canvas->ClearDebugOverlay();
+    // The legend and the fill timeline belong to the heat-map / flow views.
+    if (!(mode == 4 || (mode >= 6 && mode <= 16))) ShowResultsBar(false);
 
     if (mode <= 0)
     {
@@ -3040,32 +3292,21 @@ void PreviewPanel::UpdateDraftOverlay()
         {
             m_canvas->ClearShotDebugColoring();
             m_canvas->SetShotDebugWireframe(false);
+            ShowResultsBar(false);
             return;
         }
 
         // Thin -> cool (blue), thick -> warm (red), unpaired -> grey (last band).
-        auto ramp = [](float v) -> glm::vec3
-        {
-            v = std::clamp(v, 0.0f, 1.0f);
-            const glm::vec3 stops[5] = {
-                glm::vec3(0.20f, 0.32f, 0.90f), glm::vec3(0.20f, 0.80f, 0.90f),
-                glm::vec3(0.30f, 0.85f, 0.35f), glm::vec3(0.95f, 0.85f, 0.20f),
-                glm::vec3(0.92f, 0.26f, 0.18f) };
-            const float s = v * 4.0f;
-            int i = (int)std::floor(s);
-            if (i < 0) i = 0; if (i > 3) i = 3;
-            const float f = s - (float)i;
-            return stops[i] * (1.0f - f) + stops[i + 1] * f;
-        };
-
-        const int nBands = 12;
+        const int nBands = Heatmap::kBands;
         std::vector<GLCanvas::ShotDebugGroup> groups((size_t)nBands + 1);
         for (int b = 0; b < nBands; ++b)
         {
-            groups[(size_t)b].color = ramp(((float)b + 0.5f) / (float)nBands);
+            float r, g, bl;
+            Heatmap::Band(b, r, g, bl);
+            groups[(size_t)b].color = glm::vec3(r, g, bl);
             groups[(size_t)b].emissive = true;
         }
-        groups[(size_t)nBands].color = glm::vec3(0.55f, 0.55f, 0.58f);  // unpaired
+        groups[(size_t)nBands].color = glm::vec3(Heatmap::kNoValue[0], Heatmap::kNoValue[1], Heatmap::kNoValue[2]);  // unpaired
         groups[(size_t)nBands].emissive = false;
 
         const float lo = m_flowMeshStats.minThicknessMm;
@@ -3090,6 +3331,14 @@ void PreviewPanel::UpdateDraftOverlay()
         }
         m_canvas->SetShotDebugMesh(m_shotHalfIndex, m_flowMesh.posNorm, groups);
         m_canvas->SetShotDebugWireframe(wire);
+
+        FlowResultsBar::Legend L;
+        L.valid = true;
+        L.title = "Wall thickness"; L.unit = "mm";
+        L.lo = lo; L.hi = (span > 0.0f) ? hi : lo + 1.0f;
+        L.swatches.push_back({ "Unpaired", Heatmap::ToColour(Heatmap::kNoValue[0], Heatmap::kNoValue[1], Heatmap::kNoValue[2]) });
+        m_resultsBar->SetLegend(L);
+        ShowResultsBar(true, false);
         return;
     }
 
@@ -3110,70 +3359,237 @@ void PreviewPanel::UpdateDraftOverlay()
         return;
     }
 
-    if (mode >= 6 && mode <= 10)  // Flow midplane / fill time / pressure / front temp / frozen, on the midplanes
+    if (mode >= 6 && mode <= 16)  // midplane / fill / pressure / temps / frozen / welds / shrinkage / eject / warp
     {
         const bool haveMid = m_shotHalfIndex >= 0 && EnsureMidplanes();
-        if (!haveMid || (mode != 6 && !m_hasFill) || (mode >= 9 && !m_fill.thermal))
+        if (!haveMid || (mode != 6 && !m_hasFill) || (mode >= 9 && mode <= 11 && !m_fill.thermal) ||
+            (mode >= 13 && !m_fill.pack.ran) || (mode >= 15 && !m_warp.ok))
         {
             m_canvas->ClearShotDebugColoring();
             m_canvas->SetShotDebugWireframe(false);
             m_canvas->ClearDebugOverlay();
+            ShowResultsBar(false);
             return;
         }
+        const wxString degC = wxString::FromUTF8("\xC2\xB0""C");
+        const wxColour greyC = Heatmap::ToColour(Heatmap::kNoValue[0], Heatmap::kNoValue[1], Heatmap::kNoValue[2]);
+        float overlayT = std::numeric_limits<float>::infinity();   // defect markers up to this time
+        bool outlineOverlay = false;                                 // warp views: the as-moulded outline
+        FlowResultsBar::Legend L;
+        L.valid = true;
         if (mode == 6)          // gap (thin blue -> thick red); wall-flagged facets muted
         {
-            DrawMidplaneField(m_canvas, m_shotHalfIndex, wire, m_midplanes,
+            const auto r = DrawMidplaneField(m_canvas, m_shotHalfIndex, wire, m_midplanes,
                 [&](size_t k) -> const std::vector<float>* { return &m_midplanes[k].thicknessMm; },
                 [](size_t, size_t) { return true; },
                 [&](size_t k, size_t i) { return !(m_midplanes[k].nodeFlags[i] & Flow::MidNodeFilled); },
                 /*muteWalls=*/true);
+            L.title = "Midplane gap"; L.unit = "mm"; L.lo = r.first; L.hi = r.second;
+            L.swatches.push_back({ "Wall (steep)", Heatmap::ToColour(Heatmap::kWall[0], Heatmap::kWall[1], Heatmap::kWall[2]) });
+            m_resultsBar->SetLegend(L);
+            ShowResultsBar(true, false);
         }
-        else if (mode == 7)     // fill time (early blue -> late red); unfilled / unfed grey
+        else
         {
-            DrawMidplaneField(m_canvas, m_shotHalfIndex, wire, m_midplanes,
-                [&](size_t k) -> const std::vector<float>* {
-                    return (k < m_fill.parts.size() && m_fill.parts[k].fed) ? &m_fill.parts[k].fillTimeS : nullptr; },
-                [&](size_t k, size_t i) { return m_fill.parts[k].fillTimeS[i] >= 0.0f; },
-                [&](size_t k, size_t i) { return m_fill.parts[k].fillTimeS[i] >= 0.0f; },
-                /*muteWalls=*/false);
-        }
-        else if (mode == 8)     // pressure at V/P switchover (low blue -> high red)
-        {
-            DrawMidplaneField(m_canvas, m_shotHalfIndex, wire, m_midplanes,
-                [&](size_t k) -> const std::vector<float>* {
-                    return (k < m_fill.parts.size() && m_fill.parts[k].fed) ? &m_fill.parts[k].pressureMPa : nullptr; },
-                [](size_t, size_t) { return true; },
-                [](size_t, size_t) { return true; },
-                /*muteWalls=*/false);
-        }
-        else if (mode == 9)     // melt temperature as the front arrived (cold blue -> hot red)
-        {
-            DrawMidplaneField(m_canvas, m_shotHalfIndex, wire, m_midplanes,
-                [&](size_t k) -> const std::vector<float>* {
-                    return (k < m_fill.parts.size() && m_fill.parts[k].fed && !m_fill.parts[k].frontTempC.empty())
-                        ? &m_fill.parts[k].frontTempC : nullptr; },
-                [&](size_t k, size_t i) { return m_fill.parts[k].fillTimeS[i] >= 0.0f; },
-                [&](size_t k, size_t i) { return m_fill.parts[k].fillTimeS[i] >= 0.0f; },
-                /*muteWalls=*/false);
-        }
-        else                    // frozen share of the wall at end of fill (none blue -> most red)
-        {
-            DrawMidplaneField(m_canvas, m_shotHalfIndex, wire, m_midplanes,
-                [&](size_t k) -> const std::vector<float>* {
-                    return (k < m_fill.parts.size() && m_fill.parts[k].fed && !m_fill.parts[k].frozenPct.empty())
-                        ? &m_fill.parts[k].frozenPct : nullptr; },
-                [&](size_t k, size_t i) { return m_fill.parts[k].frozenPct[i] >= 0.0f; },
-                [&](size_t k, size_t i) { return m_fill.parts[k].frozenPct[i] >= 0.0f; },
-                /*muteWalls=*/false);
+            // The animation frame on screen (-1: the end-of-fill state). A node
+            // is filled at the frame when its fill time is at or before it.
+            const int nFrames = (int)m_fill.frames.size();
+            const int f = (m_fillFrame >= 0 && m_fillFrame < nFrames) ? m_fillFrame : -1;
+            const float tF = (f >= 0) ? m_fill.frames[(size_t)f].timeS : std::numeric_limits<float>::infinity();
+            overlayT = tF;
+            auto part = [&](size_t k) -> const Flow::PartFillResult* {
+                return (k < m_fill.parts.size() && m_fill.parts[k].fed) ? &m_fill.parts[k] : nullptr; };
+            auto filled = [&](size_t k, size_t i) {
+                const float t = m_fill.parts[k].fillTimeS[i];
+                return t >= 0.0f && t <= tF; };
+            // After packing, the end state is the last frame (ejection); without it,
+            // the end-of-fill fields.
+            const bool packed = m_fill.pack.ran && nFrames > 0;
+            auto frameOf = [&](size_t k, const std::vector<std::vector<float>>& frames,
+                               const std::vector<float>& end) -> const std::vector<float>* {
+                const Flow::PartFillResult* pr = part(k);
+                if (!pr) return nullptr;
+                if (f < 0 && packed) return frames.empty() ? nullptr : &frames.back();
+                if (f < 0) return end.empty() ? nullptr : &end;
+                return ((size_t)f < frames.size()) ? &frames[(size_t)f] : nullptr; };
+            const wxString endWhen = packed ? "at ejection" : "at end of fill";
+            const int ri = std::min(mode, 11) - 7;
+            const std::pair<float, float> range(m_fillRangeLo[ri], m_fillRangeHi[ri]);
+            std::pair<float, float> used;
+            wxString endNote;
+            if (mode == 7)          // fill time (early blue -> late red); the front advances with the timeline
+            {
+                used = DrawMidplaneField(m_canvas, m_shotHalfIndex, wire, m_midplanes,
+                    [&](size_t k) -> const std::vector<float>* { const auto* pr = part(k); return pr ? &pr->fillTimeS : nullptr; },
+                    filled, filled, /*muteWalls=*/false, &range);
+                L.title = "Fill time"; L.unit = "s";
+            }
+            else if (mode == 8)     // pressure (low blue -> high red): the frame's field, or at V/P switchover
+            {
+                used = DrawMidplaneField(m_canvas, m_shotHalfIndex, wire, m_midplanes,
+                    [&](size_t k) -> const std::vector<float>* {
+                        const auto* pr = part(k); return pr ? frameOf(k, pr->framePressureMPa, pr->pressureMPa) : nullptr; },
+                    filled, filled, /*muteWalls=*/false, &range);
+                L.title = (f < 0) ? (packed ? "Pressure at ejection" : "Pressure at V/P switchover") : "Pressure"; L.unit = "MPa";
+                endNote = packed ? "residual cavity pressure" : "pressure at V/P switchover";
+            }
+            else if (mode == 9)     // melt temperature as the front arrived (cold blue -> hot red)
+            {
+                used = DrawMidplaneField(m_canvas, m_shotHalfIndex, wire, m_midplanes,
+                    [&](size_t k) -> const std::vector<float>* {
+                        const auto* pr = part(k); return (pr && !pr->frontTempC.empty()) ? &pr->frontTempC : nullptr; },
+                    filled, filled, /*muteWalls=*/false, &range);
+                L.title = "Melt-front temperature"; L.unit = degC;
+            }
+            else if (mode == 10)    // frozen share of the wall (none blue -> most red)
+            {
+                used = DrawMidplaneField(m_canvas, m_shotHalfIndex, wire, m_midplanes,
+                    [&](size_t k) -> const std::vector<float>* {
+                        const auto* pr = part(k); return pr ? frameOf(k, pr->frameFrozenPct, pr->frozenPct) : nullptr; },
+                    filled, filled, /*muteWalls=*/false, &range);
+                L.title = "Frozen layer"; L.unit = "% of wall";
+                endNote = "frozen layer " + endWhen;
+            }
+            else if (mode == 11)    // melt temperature, through-wall average (cold blue -> hot red)
+            {
+                used = DrawMidplaneField(m_canvas, m_shotHalfIndex, wire, m_midplanes,
+                    [&](size_t k) -> const std::vector<float>* {
+                        const auto* pr = part(k); return pr ? frameOf(k, pr->frameBulkTempC, pr->bulkTempC) : nullptr; },
+                    filled, filled, /*muteWalls=*/false, &range);
+                L.title = "Melt temperature, through-wall average"; L.unit = degC;
+                endNote = "melt temperature " + endWhen;
+            }
+            else if (mode == 12)    // weld / meld lines, air traps, last to fill (markers over the filled part)
+            {
+                const glm::vec3 base(0.72f, 0.76f, 0.82f);
+                used = DrawMidplaneField(m_canvas, m_shotHalfIndex, wire, m_midplanes,
+                    [&](size_t k) -> const std::vector<float>* { const auto* pr = part(k); return pr ? &pr->fillTimeS : nullptr; },
+                    filled, filled, /*muteWalls=*/false, &range, &base);
+                L.title = "Weld lines & air traps";
+                L.showRamp = false;
+                auto col = [](const glm::vec3& c) { return Heatmap::ToColour(c.r, c.g, c.b); };
+                L.swatches.push_back({ "Weld line", col(kWeldColour) });
+                L.swatches.push_back({ "Meld line", col(kMeldColour) });
+                L.swatches.push_back({ "Air trap", col(kTrapColour) });
+                L.swatches.push_back({ "Fills last: vent", col(kNeedVentColour) });
+                L.swatches.push_back({ "Vented", col(kVentedColour) });
+            }
+            else if (mode == 13)    // volumetric shrinkage after packing (least blue -> most red)
+            {
+                used = DrawMidplaneField(m_canvas, m_shotHalfIndex, wire, m_midplanes,
+                    [&](size_t k) -> const std::vector<float>* {
+                        const auto* pr = part(k); return (pr && !pr->shrinkPct.empty()) ? &pr->shrinkPct : nullptr; },
+                    [](size_t, size_t) { return true; }, [](size_t, size_t) { return true; }, /*muteWalls=*/false);
+                L.title = "Volumetric shrinkage, cooled to room temp"; L.unit = "%";
+            }
+            else if (mode == 15 || mode == 16)   // warpage on the deformed shape (exaggerated)
+            {
+                // Exaggeration: the largest movement shows as ~6% of the part size,
+                // rounded to 1 / 2 / 5 x 10^n.
+                const bool shape = (mode == 16);
+                float maxV = 0.0f, size = 1.0f;
+                for (const Flow::PartWarp& W : m_warp.parts)
+                    if (W.ok)
+                    {
+                        maxV = std::max(maxV, shape ? W.maxWarpMm : W.maxDispMm);
+                        size = std::max({ size, W.sizeBefore.x, W.sizeBefore.y, W.sizeBefore.z });
+                    }
+                double scale = (maxV > 1e-9f) ? 0.06 * size / maxV : 1.0;
+                {
+                    const double e = std::pow(10.0, std::floor(std::log10(scale)));
+                    const double m = scale / e;
+                    scale = (m >= 5.0 ? 5.0 : (m >= 2.0 ? 2.0 : 1.0)) * e;
+                    scale = std::max(1.0, scale);
+                }
+                std::vector<std::vector<glm::vec3>> pos(m_midplanes.size());
+                for (size_t k = 0; k < m_midplanes.size() && k < m_warp.parts.size(); ++k)
+                {
+                    const Flow::PartWarp& W = m_warp.parts[k];
+                    if (!W.ok) continue;
+                    const std::vector<glm::vec3>& d = shape ? W.warp : W.disp;
+                    pos[k].resize(m_midplanes[k].nodes.size());
+                    for (size_t i = 0; i < pos[k].size(); ++i) pos[k][i] = m_midplanes[k].nodes[i] + (float)scale * d[i];
+                }
+                auto okW = [&](size_t k, size_t) { return k < m_warp.parts.size() && m_warp.parts[k].ok; };
+                used = DrawMidplaneField(m_canvas, m_shotHalfIndex, wire, m_midplanes,
+                    [&](size_t k) -> const std::vector<float>* {
+                        if (k >= m_warp.parts.size() || !m_warp.parts[k].ok) return nullptr;
+                        return shape ? &m_warp.parts[k].warpMm : &m_warp.parts[k].dispMm; },
+                    okW, okW, /*muteWalls=*/false, nullptr, nullptr, &pos);
+                L.title = wxString(shape ? "Warp (shape change)" : "Deflection (rigid motion removed)") +
+                          wxString::Format(", drawn x%.0f", scale);
+                L.unit = "mm";
+                // The as-moulded outline for reference.
+                outlineOverlay = true;
+            }
+            else                    // time to reach the ejection temperature (soonest blue -> last red)
+            {
+                auto ok = [&](size_t k, size_t i) { return !m_fill.parts[k].ejectTimeS.empty() && m_fill.parts[k].ejectTimeS[i] >= 0.0f; };
+                used = DrawMidplaneField(m_canvas, m_shotHalfIndex, wire, m_midplanes,
+                    [&](size_t k) -> const std::vector<float>* {
+                        const auto* pr = part(k); return (pr && !pr->ejectTimeS.empty()) ? &pr->ejectTimeS : nullptr; },
+                    ok, ok, /*muteWalls=*/false);
+                L.title = "Time to ejection temperature (from injection start)"; L.unit = "s";
+            }
+            L.lo = used.first; L.hi = used.second;
+            if (mode == 15 || mode == 16) L.swatches.push_back({ "As moulded", wxColour(0xE6, 0xE6, 0xE6) });
+            else if (mode != 13) L.swatches.push_back({ mode == 14 ? "Not reached" : "Unfilled", greyC });
+            m_resultsBar->SetLegend(L);
+
+            // Timeline over the recorded frames (none, or a static view: legend only).
+            if (nFrames > 0 && mode <= 12)                          // static views (13+) have no timeline
+            {
+                FlowResultsBar::TimelineData td;
+                td.key = m_fillSerial;
+                for (const Flow::FillFrame& fr : m_fill.frames)
+                {
+                    td.times.push_back(fr.timeS); td.filledPct.push_back(100.0f * fr.filledFrac);
+                    td.inletMPa.push_back(fr.inletMPa); td.phases.push_back(fr.phase);
+                }
+                td.endTime = packed ? m_fill.pack.endS : m_fill.fillTimeS;
+                td.historyT = m_fill.historyTimeS; td.historyMPa = m_fill.historyInletMPa;
+                td.endTitle = packed ? (m_fill.pack.ejectReached ? "Ejectable" : "End") : "End of fill";
+                td.endNote = endNote;
+                m_resultsBar->SetTimeline(td);
+                ShowResultsBar(true, true);
+            }
+            else
+                ShowResultsBar(true, false);
         }
 
-        // Feed network on top, so the gates can be seen landing on the midplane.
-        if (m_hasFeedNetwork && !m_feedNetwork.empty())
-            m_canvas->SetDebugOverlay(
-                NetworkOverlayBatches(m_feedNetwork, m_hasFeedSolve ? &m_feedSolve : nullptr),
-                /*onTop=*/true);
-        else
-            m_canvas->ClearDebugOverlay();
+        // Feed network on top, so the gates can be seen landing on the midplane;
+        // the weld / air-trap markers on top of that.
+        std::vector<GLCanvas::DebugOverlayBatch> ov;
+        if (outlineOverlay)
+        {
+            // Boundary edges (one triangle) of each midplane, as moulded.
+            GLCanvas::DebugOverlayBatch b;
+            b.points = false; b.color = glm::vec3(0.90f); b.size = 1.5f;
+            for (const Flow::MidplaneMesh& m : m_midplanes)
+            {
+                std::unordered_map<uint64_t, int> edgeCount;
+                for (const glm::ivec3& t : m.tris)
+                    for (int j = 0; j < 3; ++j)
+                    {
+                        const uint32_t a = (uint32_t)std::min(t[j], t[(j + 1) % 3]), c = (uint32_t)std::max(t[j], t[(j + 1) % 3]);
+                        ++edgeCount[((uint64_t)a << 32) | c];
+                    }
+                for (const auto& kv : edgeCount)
+                    if (kv.second == 1)
+                    {
+                        b.verts.push_back(m.nodes[(size_t)(kv.first >> 32)]);
+                        b.verts.push_back(m.nodes[(size_t)(kv.first & 0xFFFFFFFFu)]);
+                    }
+            }
+            if (!b.verts.empty()) ov.push_back(b);
+        }
+        else if (m_hasFeedNetwork && !m_feedNetwork.empty())
+            ov = NetworkOverlayBatches(m_feedNetwork, m_hasFeedSolve ? &m_feedSolve : nullptr);
+        if (mode == 12)
+            for (const GLCanvas::DebugOverlayBatch& b : DefectOverlayBatches(m_defects, m_midplanes, overlayT))
+                ov.push_back(b);
+        if (!ov.empty()) m_canvas->SetDebugOverlay(ov, /*onTop=*/true);
+        else             m_canvas->ClearDebugOverlay();
         return;
     }
 
@@ -3542,4 +3958,64 @@ void PreviewPanel::LoadHalves()
             m_canvas->SetPreviewHalfVisible(m_insertFirstIndex + k, false);
 
     m_canvas->Refresh(false);
+}
+
+// ---------------------------------------------------------------------------
+// Fill changed (ran or cleared): back to the end-of-fill state, a new timeline
+// key, and fixed legend ranges for each fill view over the end state and every
+// animation frame (filled nodes only), so the colours mean the same thing on
+// every frame.
+// ---------------------------------------------------------------------------
+void PreviewPanel::OnFillChanged()
+{
+    ++m_fillSerial;
+    m_fillFrame = -1;
+    const float inf = std::numeric_limits<float>::infinity();
+    float lo[5] = { 0.0f, 0.0f, inf, 0.0f, inf }, hi[5] = { -inf, -inf, -inf, -inf, -inf };
+    auto acc = [&](int r, float v) { lo[r] = std::min(lo[r], v); hi[r] = std::max(hi[r], v); };
+    if (m_hasFill)
+    {
+        for (const Flow::PartFillResult& pr : m_fill.parts)
+        {
+            if (!pr.fed) continue;
+            for (size_t i = 0; i < pr.fillTimeS.size(); ++i)
+            {
+                if (pr.fillTimeS[i] < 0.0f) continue;
+                acc(0, pr.fillTimeS[i]);
+                if (i < pr.pressureMPa.size()) acc(1, pr.pressureMPa[i]);
+                if (i < pr.frontTempC.size())  acc(2, pr.frontTempC[i]);
+                if (i < pr.frozenPct.size() && pr.frozenPct[i] >= 0.0f) acc(3, pr.frozenPct[i]);
+                if (i < pr.bulkTempC.size() && pr.bulkTempC[i] > -0.5f)  acc(4, pr.bulkTempC[i]);
+            }
+            for (size_t f = 0; f < m_fill.frames.size(); ++f)
+            {
+                const float tF = m_fill.frames[f].timeS;
+                for (size_t i = 0; i < pr.fillTimeS.size(); ++i)
+                {
+                    if (pr.fillTimeS[i] < 0.0f || pr.fillTimeS[i] > tF) continue;
+                    if (f < pr.framePressureMPa.size()) acc(1, pr.framePressureMPa[f][i]);
+                    if (f < pr.frameFrozenPct.size() && pr.frameFrozenPct[f][i] >= 0.0f) acc(3, pr.frameFrozenPct[f][i]);
+                    if (f < pr.frameBulkTempC.size() && pr.frameBulkTempC[f][i] > -0.5f) acc(4, pr.frameBulkTempC[f][i]);
+                }
+            }
+        }
+    }
+    for (int r = 0; r < 5; ++r)
+    {
+        if (!(hi[r] >= lo[r])) { lo[r] = 0.0f; hi[r] = 1.0f; }
+        m_fillRangeLo[r] = lo[r];
+        m_fillRangeHi[r] = hi[r];
+    }
+    if (m_resultsBar) m_resultsBar->ClearTimeline();
+
+    m_defects = Flow::FillDefects{};
+    if (m_hasFill) m_defects = Flow::DetectFillDefects(m_feedNetwork, m_midplanes, m_fill);
+    m_warp = Flow::WarpResult{};                // re-solved by RunFlowCheck after a packed fill
+}
+
+void PreviewPanel::ShowResultsBar(bool show, bool timeline)
+{
+    if (!m_resultsBar) return;
+    if (!show || !timeline) m_resultsBar->ClearTimeline();
+    if (!show) m_resultsBar->SetLegend(FlowResultsBar::Legend{});   // invalid: hidden
 }

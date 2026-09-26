@@ -350,3 +350,226 @@ growth reducing the effective gap h, and viscosity at the local temperature
 (this is where mould material and mould temperature start to matter). Then
 fill-front animation (time slider over `fillTimeS`), weld lines and air traps
 at the vents, and a machine-pressure-limit field in the Flow card.
+
+## 13. P3 — thermal fill: gap-wise temperature + frozen layer (Sep 2026)
+
+Decision D4 resolved in favour of **gap-wise layers** (not the lumped analytic
+frozen layer): 10 layers per half-gap / radius, graded finer at the wall. The
+fill solver's cost left room for it, and it captures what a lumped model can't:
+hot melt keeping the frozen skin thin near a gate, shear heating in gates, and
+gates / thin sections freezing off.
+
+`GapThermal.h/.cpp` — the kernels, each validated on its own:
+- `LayerGrid` (slab for midplanes / rectangular channels, cylinder for round
+  sprue / runners / gates), `MeltViscosity` (Cross-WLF with ln η0(T) tabulated,
+  fluidity floor below the no-flow temperature), `FluidityIntegral`
+  (S = 2∫z²/η dz, C = (π/2)∫r³/η dr — exact h³/12η, πR⁴/8η for uniform η),
+  `LayerFlowFractions` (the velocity profile per layer),
+  `ConductStep` / `ThermalSweep` (below), `FrozenFraction`,
+  `ContactTemperature` (wall = melt/mould contact temperature from the two
+  effusivities — this is where the mould material enters).
+
+`CoupledFill` with `params.thermal.enabled`:
+- Each control volume carries a layered temperature profile. Feed edges are
+  split into ≤ 5 mm segments (≥ 2 each), so temperature and freezing vary along
+  the sprue / runners / gates and every gate has its own thermal volume.
+- Conductances come from the fluidity integrated across the gap: per layer
+  η(γ̇, T) with the lagged layer shear rate (flow-rate control keeps γ̇ ≈ fixed,
+  so the Picard lag converges like the isothermal one); frozen layers carry
+  (almost) nothing.
+- Each step, after the pressure solve: viscous heating τ²/η per layer from the
+  field that solve used; then **one implicit sweep in descending pressure**:
+  per volume a tridiagonal solve of conduction to the wall + heating +
+  in-plane convection in **conservative form with cross-layer exchange** (where
+  a layer's in- and outflow differ because the profile changes along the flow,
+  the difference crosses to the neighbouring layer, upwinded). Each volume's
+  outflow is balanced to its inflow (obtuse-corner couplings otherwise leave
+  small mismatches that would pump energy in proportion to absolute
+  temperature).
+- Melt reaching an empty volume arrives at the upstream cup-mixing
+  temperature, uniform through the gap (fountain flow).
+- Freeze-off: when the frozen layer chokes the path the fill goes pressure-
+  limited, slows, and stops at 10x the target time as a short shot (the step
+  is capped there; no runaway step). Without a machine limit a 400 MPa safety
+  ceiling applies (with a warning).
+
+Outputs: per node melt-front temperature and frozen share of the gap at end of
+fill; per feed edge max wall shear rate, frozen share and arrival temperature;
+cavity min/max front temperature, max frozen, max wall shear; energy check
+(flow work vs heat gained).
+
+Validated (kernels): slab frozen depth vs the exact series (±0.002 of the
+half-gap), cylinder vs a 400-layer reference, Brinkman viscous heating,
+Poiseuille / parabolic layer shares, Graetz cooling (Nu 7.54, decay length
+within 1% at Courant 0.2 **and** 40), heated flow at any Courant, energy carried
+across a velocity-profile change (exact).
+Validated (solver): wall at melt temp + no heating + Newtonian == the
+isothermal solver exactly; insulated wall: heat gained = flow work (0.25%);
+2 mm PP plate 1 s: pressure +58% over isothermal, frozen 14% mean / 21% max,
+front cooling along the flow, gate shear ~14,000 1/s; the pressure-vs-fill-
+time **U-curve** (minimum near 3 s for that plate); aluminium freezes more
+than steel, a hotter mould or melt lowers pressure, 1 mm freezes a larger
+share than 3 mm; a 1 mm × 400 mm strip that fills isothermally short-shots at
+~190 mm; 23k triangles thermal in ~6–10 s here (isothermal ~5.5 s; a Release
+build is faster).
+
+Not modelled: latent heat of crystallisation (PP freezes a little early), the
+pressure dependence of viscosity (D3 = 0 for this PP anyway), mould-side
+transient heating (the contact temperature is constant), packing.
+
+Preview: the Flow card gains "Max inj. pressure" (default 150 MPa) and a
+"Thermal (frozen layer)" toggle (on by default); the report adds wall
+temperature, front-temperature range, per-part frozen share, per-gate wall
+shear and freezing, and cautions (gate shear over the material guideline,
+gate > 50% frozen, cold front within 20 °C of no-flow); Debug View adds
+"Flow front temp" and "Flow frozen layer".
+
+**Next:** fill-front animation / time slider, weld lines and air traps (vents),
+then packing (Tait pvT) and shrinkage.
+
+## 14. Fill animation + heat-map legend (Sep 2026)
+
+**Solver.** `CoupledFillParams::animationFrames` (default 60): `SolveCoupledFill`
+snapshots the per-node fields at evenly spaced times over the target fill —
+pressure, and on thermal runs the gap-mean melt temperature and frozen share —
+into `PartFillResult::framePressureMPa / frameBulkTempC / frameFrozenPct`, with
+`CoupledFillResult::frames` holding each frame's time, filled share and
+injection pressure. A node is filled at a frame when its fill time is at or
+before the frame time. Fills that run long (pressure-limited) keep recording,
+thinned to at most 3x the frame count; a stalled (freeze-off) fill records up
+to the stall. End-of-fill melt temperature per node is `bulkTempC`. About
+0.15 MB per frame per 12k nodes.
+
+**Results bar** (`FlowResultsBar.h/.cpp`), under the Preview canvas, shown for
+the heat-map views (Flow thickness, Flow midplane, and the five fill views):
+- Timeline (fill views): Play / Pause (~14 frames/s), a scrubber drawn over
+  the fill time with the injection-pressure trace, a tick per frame and the
+  played part highlighted (click / drag; Left / Right step, Home / End), and a
+  readout (time, % filled, injection pressure; "End of fill" at the far end).
+  The far end is the end-of-fill state (pressure at V/P switchover, frozen
+  layer and melt temperature at end of fill) — the same fields as before.
+- Legend: title and unit, the 12-band ramp exactly as the model draws it
+  (`Heatmap::` is shared by both), five value labels, and swatches for the
+  extra colours (Unfilled / Unpaired grey, wall-flagged red).
+- Fill views use one legend range per fill, over the end state and every
+  frame, so a colour means the same value on every frame.
+
+**Views.** Fill time and melt-front temperature reveal the front as the
+timeline advances; pressure, frozen layer and the new **Flow melt temp** (gap-
+mean melt temperature) show the frame's field.
+
+Validated: frame recording (count, order, filled set == fill times, frozen
+layer growing, thinning, off switch); the Preview harness (legend titles /
+ranges, fixed range while scrubbing, the front advancing, switchover field at
+the end, bar hidden for other views, new fill resets the timeline);
+FlowResultsBar and PreviewPanel.cpp compile clean against real wxWidgets 3.2 +
+OpenCASCADE; the bar rendered and played under a virtual display.
+
+**Next:** weld lines and air traps (vents) — done in section 15.
+
+## 15. Weld lines, air traps, venting + Sim Viewer bar (Sep 2026)
+
+`FillDefects.h/.cpp` — `Flow::DetectFillDefects(net, midplanes, fill)`, pure
+post-processing of the fill-time field (~10 ms for 40k triangles):
+- **Weld / meld lines.** Each triangle's flow direction is its fill-time
+  gradient. Across an interior edge where both flows run into the edge
+  (converging — not diverging, as around a gate) and meet at >= 75 degrees, two
+  fronts joined. Edges join into lines through shared nodes; a line is a weld
+  when >= 1/3 of its length meets at >= 135 degrees (head-on), else a meld.
+  Per line: length, when the fronts met, max meeting angle and (thermal) the
+  coldest front temperature — a weld formed more than 20 C below the melt is
+  flagged weak. Limitation: only where fronts meet is traced; the meld line an
+  obstacle leaves trailing downstream once the streams merge is not followed.
+- **Air traps.** Air escapes at the part outline (parting line) and through
+  vents (a vent mouth reaches midplane nodes within 3 mm + half its width).
+  Walking the fill backwards (nodes in decreasing fill time, union-find), an
+  unfilled region that is cut off from both while still holding air is a
+  sealed pocket: reported with its air volume when it sealed, the time, and
+  where it fills last (the air ends up there). Pockets under 3 nodes / 0.5 mm3
+  are fill-time noise and dropped; nested pockets count once.
+- **Last to fill.** Local fill-time maxima (latest within 5 mm) outside the
+  pockets: where the air leaves last, i.e. where vents belong — each says
+  whether a vent mouth reaches it.
+
+Validated: centre gate — no lines, no traps, the four corners fill last; two
+opposed gates — a weld line across the middle (head-on at the centre, ~110
+degrees at the ends, as point gates give), no trap; plate with a hole — a line
+just behind it, none upstream; race-tracking (3 mm rim, 1 mm centre) — a 249
+mm3 air trap in the centre, sealed before it fills; a corner vent is
+recognised as venting that corner only.
+
+**Preview.** The Debug View card is gone: its dropdown, renamed **Sim Viewer
+Select**, and the Wireframe toggle now live permanently at the left of the
+results bar under the canvas; the timeline and legend appear beside them when
+the selected view uses them. New view **Flow welds & air traps**: the filled
+part in a neutral colour with weld lines (near-black), meld lines (purple),
+air traps (red), fill-last points needing a vent (amber) and vented ones
+(green) on top, with a key legend; with the timeline, lines appear when the
+fronts meet and traps when they seal. The report lists them, and air traps
+and weak welds turn the verdict amber.
+
+"Flow melt temp" is the through-wall average including the frozen skin, so
+at end of fill it is lowest near the gate (the melt there has been against
+the wall longest) and rises along the flow — a residence-time effect, present
+with viscous heating off too (heating adds only ~2-5 C on the test plate).
+
+**Next:** packing (Tait pvT) and shrinkage; optionally stream tracking for
+trailing meld lines.
+
+## 16. Packing, holding and cooling — shrinkage (Sep 2026)
+
+`SolveCoupledFill` with `params.pack.enabled` (thermal fills that complete)
+continues past the fill (`FillPackParams`, results in `CoupledFillResult::pack`
+and per part / per gate):
+- **Compressible melt.** Each control volume holds a mass M. While full,
+  M = V x mean over its layers of rho(T, p) from the 2-domain Tait pVT
+  (`TestMaterial::TaitPVT`, now carried in `FillThermalParams::pvt`). Cooling
+  at fixed mass lowers the pressure and draws melt in.
+- **Each step:** temperatures (convection by the last flows + conduction, one
+  implicit sweep; no viscous heating — the flows are slow), fluidities at the
+  new temperatures (frozen layers carry nothing, so gates seal themselves),
+  then the pressure implicitly, linearised in p:
+  `c_i (p_i - p_i^n)/dt + sum rho_e G_e (p_i - p_j) = -(m_i(p^n, T) - M_i)/dt`
+  with the inlet at the pack pressure while holding and 0 afterwards; then the
+  masses from the solved fluxes (exactly conservative).
+- **p >= 0, two-sided active set.** A volume is held at zero pressure only
+  while it would hold less melt than fits at zero (the melt has pulled away
+  from the wall); a held volume that receives more than fits is released.
+  (The one-sided version left scattered over-packed volumes — fixed.)
+- **Hold:** a set time, or (hold time 0) until every gate has a fully frozen
+  section (capped). Seals: each gate's interior sections; with no gates, the
+  cavity entries.
+- **Ejection:** each cavity volume's time for its whole section to fall below
+  the ejection temperature (interpolated inside the step); the run stops when
+  every part is ejectable. Step: 0.02 s growing 25% a step to 0.25 s (implicit
+  Euler cooling reads ~+3% at that on a 2 mm wall; 1 s steps read ~+14%).
+- **Shrinkage:** volumetric shrinkage = 1 - M / (rho(room, 0) V) — directly
+  from the mass each region ended up holding.
+- **Animation:** pack / cool frames continue the fill's (phase 1 / 2), thinned
+  to ~60.
+
+Validated (2 mm PP plate, 1 s fill): mass balance 1e-13 %; full volumes match
+their pVT state to 1e-4 %; packing adds ~7% mass; part mass = room density x
+volume x (1 - shrinkage); shrinkage 1.7% at the gate to 5% at the far end
+(3.9% mean — PP range); more pack pressure -> less shrinkage (6.3 / 4.6 / 4.0%
+at 30 / 60 / 90%); the hold-time study falls until the gate freezes (~7.6 s
+after the fill) and is flat after it; cooling vs the analytic slab time
+h^2/(pi^2 a) ln(4/pi (Tm-Tw)/(Te-Tw)) +3% mean; 3 mm vs 1.5 mm cooling ratio
+3.98 (theory 4); packing keeps the gate region hotter; ~0.6 s to solve.
+
+**Preview.** Flow card: "Pack and cool" (on), "Pack pressure" (% of the fill's
+injection pressure, 80), "Hold time" (s, 0 = until the gates freeze). The
+report adds pack pressure and hold, each gate's freeze time, the ejection time
+and a cycle estimate, part mass (and how much packing added), and per part the
+volumetric shrinkage (mean, range, ~1/3 as a rough linear figure) with
+cautions for > 8% (sink / void) and > 3 points of variation (warpage). Verdict:
+"FILL t s p MPa EJECT t s". Sim Viewer adds "Pack: shrinkage" and "Cooling:
+time to eject"; the timeline now runs through fill, pack and cool (frames
+spaced evenly, phases shaded and named, readout per phase); after packing the
+end of the timeline is the ejection state.
+
+Not modelled: latent heat of crystallisation, mould-side heating, anisotropic
+(flow-induced) shrinkage, so no warpage shape yet.
+
+**Next:** warpage (differential shrinkage through the thickness and across the
+part -> deflection), or cooling-channel design.

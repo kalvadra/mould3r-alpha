@@ -136,6 +136,10 @@ namespace TestMaterial
         // degradation / surface defects (gates are the usual offender)  [1/s].
         double maxShearRate = 100000.0;
 
+        // Solid, room temperature: for warpage (the deformation scale).
+        double elasticModulusMPa = 1340.0;
+        double poissonRatio = 0.40;
+
         // Melt thermal diffusivity α = k / (ρ c_p)  [m²/s].
         double thermalDiffusivity() const
         { return thermalConductivity / (densityMelt * specificHeat); }

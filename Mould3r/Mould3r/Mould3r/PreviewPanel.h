@@ -14,12 +14,15 @@
 #include "FeedNetwork.h"    // Flow::FeedNetwork — 1D feed-system snapshot
 #include "Midplane.h"       // Flow::PartSurface / MidplaneMesh — planform midplane
 #include "CoupledFill.h"    // Flow::CoupledFillResult — feed + cavity fill
+#include "FillDefects.h"    // Flow::FillDefects — weld lines, air traps, last to fill
+#include "Warpage.h"        // Flow::WarpResult — shell warpage from the packing shrinkage
 #include "GridSettings.h"   // GridSettings — forwarded to the preview canvas
 #include "FixtureFile.h"    // FixtureKind — gates cast generation
 
 #include <glm/glm.hpp>      // cached half bounds (perimeter of the cast bases)
 
 class GLCanvas;
+class FlowResultsBar;
 class wxSpinCtrlDouble;
 namespace MeshBoolean { struct Mesh; }   // travel-volume return type (defined in MeshBoolean.h)
 
@@ -227,6 +230,14 @@ private:
     // Returns true if at least one part produced a mesh.
     bool EnsureMidplanes();
 
+    // The last fill changed (ran, or was cleared): restart its timeline at the
+    // end-of-fill state and recompute the fixed legend ranges of its views.
+    void OnFillChanged();
+    // The results bar under the canvas is permanent (it holds Sim Viewer
+    // Select). `show` keeps the legend the caller just set (false clears it);
+    // `timeline` keeps the fill timeline (false clears it).
+    void ShowResultsBar(bool show, bool timeline = false);
+
     // Build one mould half's "travel volume": the shot surface that half owns,
     // swept toward the parting plane by the half's height (see the Separation
     // Test). `side` is 0 (+draw) or 1 (-draw). Returns an empty mesh when that
@@ -310,6 +321,10 @@ private:
     wxTextCtrl* m_flowMeshAreaCtrl = nullptr;  // midplane target triangle area (mm^2)
     wxTextCtrl* m_flowMaxPressureCtrl = nullptr; // machine injection-pressure limit (MPa)
     wxCheckBox* m_flowThermalCheck = nullptr;    // thermal fill (frozen layer) vs isothermal
+    wxCheckBox* m_flowPackCheck = nullptr;       // pack, hold and cool after the fill (thermal only)
+    wxTextCtrl* m_flowPackPressureCtrl = nullptr; // pack pressure, % of the fill's injection pressure
+    wxTextCtrl* m_flowHoldTimeCtrl = nullptr;    // hold time (s); 0 = until the gates freeze
+    wxTextCtrl* m_flowShrinkRatioCtrl = nullptr; // warpage: shrinkage along / across the flow
 
     wxStaticText* m_draftStatus = nullptr;    // "Draft Angle Checks" verdict
     wxStaticText* m_demouldStatus = nullptr;  // "Separation Test" verdict
@@ -367,6 +382,19 @@ private:
     // rebuilt (its per-node arrays index them).
     Flow::CoupledFillResult m_fill;
     bool                    m_hasFill = false;
+
+    // Results bar under the canvas (fill timeline + heat-map legend), the frame
+    // it shows (-1 = end of fill), a serial that changes with every fill (the
+    // timeline's key) and each fill view's legend range, fixed over the whole
+    // animation so colours compare between frames. Index: mode - 7 (fill time,
+    // pressure, front temp, frozen layer, melt temp).
+    FlowResultsBar* m_resultsBar = nullptr;
+    Flow::FillDefects m_defects;               // weld lines / air traps of m_fill
+    Flow::WarpResult  m_warp;                  // warpage of m_fill's parts (after packing)
+    int             m_fillFrame = -1;
+    long            m_fillSerial = 0;
+    float           m_fillRangeLo[5] = { 0, 0, 0, 0, 0 };
+    float           m_fillRangeHi[5] = { 1, 1, 1, 1, 1 };
 
     // Which preview part is the shot (index into the canvas's parts).
     int m_shotHalfIndex = -1;

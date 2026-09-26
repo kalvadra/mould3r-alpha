@@ -57,6 +57,15 @@
     <ClCompile Include="GapThermal.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="FlowResultsBar.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="FillDefects.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Warpage.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="MainFrame.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -198,6 +207,15 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="GapThermal.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="FlowResultsBar.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="FillDefects.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Warpage.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="TestMaterial.h">

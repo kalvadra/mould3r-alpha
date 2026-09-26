@@ -17,6 +17,7 @@
 #endif
 
 #include <cmath>
+#include <cstdio>
 #include <algorithm>
 #include <limits>
 #include <numeric>
@@ -400,6 +401,8 @@ namespace Flow
         double pLimit = (P.maxInjectionPressureMPa > 0.0) ? P.maxInjectionPressureMPa * 1.0e6 : 0.0;
         if (thermal && pLimit <= 0.0) { pLimit = kSafetyCeilingMPa * 1.0e6; ceiling = true; }
         const double vpFrac = std::min(1.0, std::max(0.0, P.vpSwitchFraction));
+        // Progress: the fill's share of the bar (packing takes the rest).
+        const double progFill = (thermal && P.pack.enabled) ? 0.4 : 1.0;
         std::vector<char> fixedT((size_t)ndof, 0);
         fixedT[(size_t)in] = 1;
 
@@ -465,6 +468,52 @@ namespace Flow
         double lastQeff = Q, injectedBeforeLast = injected, tBeforeLast = t;
         double pinLastStep = -1.0;
         double pressureWork = 0.0;
+
+        // Animation frames: the state at the start of a step (pressure from this
+        // step's solve, temperatures before its thermal update, the filled set
+        // so far), taken when the time passes the next frame mark.
+        const int frameTarget = std::max(0, P.animationFrames);
+        double frameDt = (frameTarget > 0) ? fillTime / frameTarget : 0.0;
+        double nextFrameT = 0.0;
+        auto recordFrame = [&](double pinNow)
+        {
+            FillFrame f;
+            f.timeS = (float)t; f.filledFrac = (float)(stored / Vtot); f.inletMPa = (float)(pinNow / 1.0e6);
+            R.frames.push_back(f);
+            for (size_t k = 0; k < parts.size(); ++k)
+            {
+                if (partBase[k] < 0) continue;
+                PartFillResult& pr = R.parts[k];
+                const size_t nn = parts[k].nodes.size();
+                std::vector<float> pf(nn, 0.0f), tb, fz;
+                if (thermal) { tb.assign(nn, -1.0f); fz.assign(nn, -1.0f); }
+                for (size_t i = 0; i < nn; ++i)
+                {
+                    const size_t d = (size_t)(partBase[k] + (int)i);
+                    if (!full[d]) continue;
+                    pf[i] = (float)(p[d] / 1.0e6);
+                    if (thermal && hasT[d])
+                    {
+                        const double* Td = &Tl[d * (size_t)nz];
+                        tb[i] = (float)(MeanTemperature(lg, dofGeom[d], Td) - kZeroC);
+                        fz[i] = (float)(100.0 * FrozenFraction(lg, Td, Tw, Tnf));
+                    }
+                }
+                pr.framePressureMPa.push_back(std::move(pf));
+                if (thermal) { pr.frameBulkTempC.push_back(std::move(tb)); pr.frameFrozenPct.push_back(std::move(fz)); }
+            }
+            while (nextFrameT <= t) nextFrameT += frameDt;
+            // A long (pressure-limited) fill: keep every other frame, double the spacing.
+            if ((int)R.frames.size() > 3 * frameTarget)
+            {
+                auto thin = [](auto& v) { size_t w = 0; for (size_t r = 0; r < v.size(); r += 2) v[w++] = std::move(v[r]); v.resize(w); };
+                thin(R.frames);
+                for (PartFillResult& pr : R.parts) { thin(pr.framePressureMPa); thin(pr.frameBulkTempC); thin(pr.frameFrozenPct); }
+                frameDt *= 2.0;
+                nextFrameT = 0.0;
+                while (nextFrameT <= t) nextFrameT += frameDt;
+            }
+        };
 
         // Mean layer temperature of an element over its filled corners.
         auto elemTemps = [&](const int* nodes, int cnt) -> const double*
@@ -788,6 +837,7 @@ namespace Flow
             R.historyTimeS.push_back((float)t);
             R.historyInletMPa.push_back((float)(pin / 1.0e6));
             R.historyFilledFrac.push_back((float)(stored / Vtot));
+            if (P.animationFrames > 0 && t >= nextFrameT) recordFrame(pin);
 
             // V/P switchover: snapshot the field that drives the step crossing it.
             if (!snapTaken && stored >= vpFrac * Vtot)
@@ -991,7 +1041,7 @@ namespace Flow
                 for (int i : pending) { frontT[(size_t)i] = Tm; hasT[(size_t)i] = 1; }
             }
 
-            if (P.progress && (step % 5) == 0 && !P.progress(std::min(1.0, stored / Vtot)))
+            if (P.progress && (step % 5) == 0 && !P.progress(progFill * std::min(1.0, stored / Vtot)))
             {
                 R.cancelled = true;
                 R.message = "Cancelled.";
@@ -1083,7 +1133,7 @@ namespace Flow
             const size_t nn = m.nodes.size();
             pr.fillTimeS.assign(nn, -1.0f);
             pr.pressureMPa.assign(nn, 0.0f);
-            if (thermal) { pr.frontTempC.assign(nn, 0.0f); pr.frozenPct.assign(nn, -1.0f); }
+            if (thermal) { pr.frontTempC.assign(nn, 0.0f); pr.frozenPct.assign(nn, -1.0f); pr.bulkTempC.assign(nn, -1.0f); }
             double vIn = 0.0, vAll = 0.0, fzV = 0.0, fzW = 0.0;
             float t0 = std::numeric_limits<float>::infinity(), t1 = -1.0f, pMax = 0.0f;
             float tMin = std::numeric_limits<float>::infinity(), tMax = -std::numeric_limits<float>::infinity(), fzMax = 0.0f;
@@ -1100,6 +1150,7 @@ namespace Flow
                 {
                     const float Tc = (float)(frontT[d] - kZeroC), fz = (float)(100.0 * frozen[d]);
                     pr.frontTempC[i] = Tc; pr.frozenPct[i] = fz;
+                    pr.bulkTempC[i] = (float)(MeanTemperature(lg, dofGeom[d], &Tl[d * (size_t)nz]) - kZeroC);
                     tMin = std::min(tMin, Tc); tMax = std::max(tMax, Tc); fzMax = std::max(fzMax, fz);
                     fzV += V[d] * fz; fzW += V[d];
                 }
@@ -1119,6 +1170,445 @@ namespace Flow
         if (thermal && std::isfinite(cavTmin))
         {
             R.minFrontTempC = cavTmin; R.maxFrontTempC = cavTmax; R.maxFrozenPct = cavFz;
+        }
+
+        // ==== Packing, holding and cooling =========================================
+        // Continues from the end-of-fill state (every volume full). Unknown per
+        // volume: its pressure; conserved: its mass M. While a volume is full,
+        // M = V * mean_k rho(T_k, p) over its layers (Tait), so cooling (T down,
+        // rho up) at fixed mass drops the pressure and draws melt in. Each step:
+        //   1. temperatures: convection by the last step's flows + conduction to
+        //      the wall (one implicit sweep, no viscous heating — flows are slow);
+        //   2. fluidities at the new temperatures (frozen layers carry nothing);
+        //   3. pressure, implicit and linearised in p around the last step:
+        //        c_i (p_i - p_i^n)/dt + sum rho_e G_e (p_i - p_j) = -(m_i(p^n, T) - M_i)/dt
+        //      with c_i = V dm/dp, the inlet at the pack pressure while holding (0
+        //      after), and volumes that come out below zero held at zero (active
+        //      set: the melt there has pulled away from the wall);
+        //   4. masses updated from the solved fluxes (exactly conservative).
+        if (thermal && R.complete && P.pack.enabled && !R.cancelled)
+        {
+            const FillPackParams& PK = P.pack;
+            PackResult& K = R.pack;
+            K.ran = true;
+            const TestMaterial::TaitPVT& pvt = TP.pvt;
+            const double Teject = TP.ejectionTempC + kZeroC;
+            const double rhoRoom = 1.0 / pvt.specificVolume(TP.roomTempC + kZeroC, 0.0);
+            auto rhoOf = [&](double T, double pPa) { return 1.0 / pvt.specificVolume(T, std::max(0.0, pPa)); };
+            // d rho / d p within the current (melt / solid) domain.
+            auto drhoOf = [&](double T, double pPa)
+            {
+                pPa = std::max(0.0, pPa);
+                const bool melt = T > pvt.b5 + pvt.b6 * pPa;
+                const double b1 = melt ? pvt.b1m : pvt.b1s, b2 = melt ? pvt.b2m : pvt.b2s;
+                const double b3 = melt ? pvt.b3m : pvt.b3s, b4 = melt ? pvt.b4m : pvt.b4s;
+                const double dT = T - pvt.b5;
+                const double v0 = b1 + b2 * dT, B = b3 * std::exp(-b4 * dT);
+                const double v = v0 * (1.0 - pvt.C * std::log(1.0 + pPa / B));
+                return v0 * pvt.C / ((B + pPa) * v * v);
+            };
+            const double pPack = ((PK.packPressureMPa > 0.0) ? PK.packPressureMPa
+                                                            : PK.packFraction * R.peakInletPressureMPa) * 1.0e6;
+            K.packPressureMPa = (float)(pPack / 1.0e6);
+            const double t0 = R.fillTimeS;
+
+            auto nodeMass = [&](int i, double pPa, double* dmdp)
+            {
+                const int gi = (dofGeom[(size_t)i] == GapGeom::Slab) ? 0 : 1;
+                const double* Ti = &Tl[(size_t)i * (size_t)nz];
+                double m = 0.0, d = 0.0;
+                for (int k = 0; k < nz; ++k)
+                {
+                    m += lg.vf[gi][(size_t)k] * rhoOf(Ti[k], pPa);
+                    if (dmdp) d += lg.vf[gi][(size_t)k] * drhoOf(Ti[k], pPa);
+                }
+                if (dmdp) *dmdp = d * V[(size_t)i];
+                return m * V[(size_t)i];
+            };
+            auto isCavity = [&](int i) { return isMid[(size_t)i] != 0; };
+
+            std::vector<double> pk((size_t)ndof), M((size_t)ndof), mT((size_t)ndof), cN((size_t)ndof), rhoN((size_t)ndof);
+            for (int i = 0; i < ndof; ++i) { pk[(size_t)i] = std::max(0.0, p[(size_t)i]); M[(size_t)i] = nodeMass(i, pk[(size_t)i], nullptr); }
+            double cavMass0 = 0.0;
+            for (int i = 0; i < ndof; ++i) if (isCavity(i)) cavMass0 += M[(size_t)i];
+            double sysMass0 = 0.0;
+            for (int i = 0; i < ndof; ++i) if (i != in) sysMass0 += M[(size_t)i];
+
+            // Seals: each gate's interior sections (fully frozen anywhere = sealed);
+            // with no gates, the cavity entry volumes themselves.
+            struct Seal { int edge; std::vector<int> dofs; double frozenAt = -1.0; };
+            std::vector<Seal> seals;
+            for (size_t ei = 0; ei < net.edges.size(); ++ei)
+            {
+                const FeedEdge& e = net.edges[ei];
+                if (!R.feedEdges[ei].modelled || (e.kind != FeedEdgeKind::Gate && e.kind != FeedEdgeKind::SubRunner)) continue;
+                Seal s; s.edge = (int)ei;
+                for (int d = firstInterior; d < ndof; ++d)
+                    if (interiorEdge[(size_t)(d - firstInterior)] == (int)ei) s.dofs.push_back(d);
+                if (!s.dofs.empty()) seals.push_back(std::move(s));
+            }
+            if (seals.empty())
+                for (const Entry& en : entries)
+                {
+                    Seal s; s.edge = -1;
+                    s.dofs.push_back(partBase[(size_t)en.part] + en.mid);
+                    seals.push_back(std::move(s));
+                }
+
+            std::vector<double> ejectT((size_t)ndof, -1.0), tmaxPrev((size_t)ndof, 0.0);
+            for (int i = 0; i < ndof; ++i)
+            {
+                const double* Ti = &Tl[(size_t)i * (size_t)nz];
+                tmaxPrev[(size_t)i] = *std::max_element(Ti, Ti + nz);
+            }
+            int cavityLeft = 0;
+            for (int i = 0; i < ndof; ++i) if (isCavity(i)) ++cavityLeft;
+            const int cavityTotal = std::max(1, cavityLeft);
+
+            // Pack frames: the state at the end of each step, thinned to PK.frames.
+            const size_t fillFrames = R.frames.size();
+            auto recordPackFrame = [&](double tAbs, double pinPa, int phase)
+            {
+                FillFrame f; f.timeS = (float)tAbs; f.filledFrac = 1.0f; f.inletMPa = (float)(pinPa / 1.0e6); f.phase = phase;
+                R.frames.push_back(f);
+                for (size_t k = 0; k < parts.size(); ++k)
+                {
+                    if (partBase[k] < 0) continue;
+                    PartFillResult& pr = R.parts[k];
+                    const size_t nn = parts[k].nodes.size();
+                    std::vector<float> pf(nn), tb(nn), fz(nn);
+                    for (size_t i = 0; i < nn; ++i)
+                    {
+                        const size_t d = (size_t)(partBase[k] + (int)i);
+                        const double* Td = &Tl[d * (size_t)nz];
+                        pf[i] = (float)(pk[d] / 1.0e6);
+                        tb[i] = (float)(MeanTemperature(lg, dofGeom[d], Td) - kZeroC);
+                        fz[i] = (float)(100.0 * FrozenFraction(lg, Td, Tw, Tnf));
+                    }
+                    pr.framePressureMPa.push_back(std::move(pf));
+                    pr.frameBulkTempC.push_back(std::move(tb));
+                    pr.frameFrozenPct.push_back(std::move(fz));
+                }
+                const size_t nPack = R.frames.size() - fillFrames;
+                if (PK.frames > 0 && (int)nPack > 2 * PK.frames)
+                {
+                    // Keep every other pack frame (the fill's frames stay as they are).
+                    auto thinTail = [&](auto& v)
+                    {
+                        size_t w = fillFrames;
+                        for (size_t r = fillFrames; r < v.size(); r += 2) v[w++] = std::move(v[r]);
+                        if (v.size() > fillFrames && (v.size() - fillFrames) % 2 == 0) v[w++] = std::move(v.back());   // keep the latest
+                        v.resize(w);
+                    };
+                    thinTail(R.frames);
+                    for (PartFillResult& pr : R.parts)
+                        if (!pr.framePressureMPa.empty()) { thinTail(pr.framePressureMPa); thinTail(pr.frameBulkTempC); thinTail(pr.frameFrozenPct); }
+                }
+            };
+
+            std::vector<int> pidx((size_t)ndof, -1);
+            std::vector<char> clamp0((size_t)ndof, 0);
+            std::vector<double> xsol;
+            double tp = 0.0, dt = std::max(1.0e-4, PK.dtInitialS);
+            bool holding = true;
+            const bool autoHold = PK.holdTimeS <= 0.0;
+            const double holdLimit = autoHold ? std::max(0.0, PK.holdMaxS) : PK.holdTimeS;
+            double inletMass = 0.0;
+            int steps = 0;
+            while (true)
+            {
+                if (holding && !autoHold && tp + dt > holdLimit - 1.0e-9) dt = std::max(1.0e-4, holdLimit - tp);
+                const double pin = holding ? pPack : 0.0;
+
+                // ---- 1. temperatures (the last step's flows, no viscous heating) ----
+                pairs.clear();
+                for (size_t i = 0; i < e1.size(); ++i)
+                {
+                    const El1& el = e1[i];
+                    double* fr = &frac1[i * (size_t)nz];
+                    LayerFlowFractions(lg, el.geom, &phi1[i * (size_t)nz], fr);
+                    const double q = el.coef * (pk[(size_t)el.a] - pk[(size_t)el.b]);
+                    if (q > 0.0) pairs.push_back({ el.a, el.b, q, fr });
+                    else if (q < 0.0) pairs.push_back({ el.b, el.a, -q, fr });
+                }
+                for (size_t i = 0; i < e2.size(); ++i)
+                {
+                    const El2& el = e2[i];
+                    double* fr = &frac2[i * (size_t)nz];
+                    LayerFlowFractions(lg, GapGeom::Slab, &phi2[i * (size_t)nz], fr);
+                    static const int prs[3][2] = { {0,1}, {1,2}, {2,0} };
+                    for (const auto& ab : prs)
+                    {
+                        const double cab = -el.S * el.K[ab[0]][ab[1]];
+                        if (cab == 0.0) continue;
+                        const int na = el.n[ab[0]], nbn = el.n[ab[1]];
+                        const double q = cab * (pk[(size_t)na] - pk[(size_t)nbn]);
+                        if (q > 0.0) pairs.push_back({ na, nbn, q, fr });
+                        else if (q < 0.0) pairs.push_back({ nbn, na, -q, fr });
+                    }
+                }
+                inStart.assign((size_t)ndof + 1, 0);
+                for (const Pair& pp : pairs) ++inStart[(size_t)pp.to + 1];
+                for (int i = 0; i < ndof; ++i) inStart[(size_t)i + 1] += inStart[(size_t)i];
+                inFrom.resize(pairs.size()); inQ.resize(pairs.size()); inFrac.resize(pairs.size());
+                {
+                    std::vector<int> fillp(inStart.begin(), inStart.end() - 1);
+                    for (const Pair& pp : pairs)
+                    {
+                        const size_t m = (size_t)fillp[(size_t)pp.to]++;
+                        inFrom[m] = pp.from; inQ[m] = pp.q; inFrac[m] = pp.fr;
+                    }
+                }
+                std::fill(outRate.begin(), outRate.end(), 0.0);
+                for (const Pair& pp : pairs)
+                    for (int k = 0; k < nz; ++k) outRate[(size_t)pp.from * (size_t)nz + (size_t)k] += pp.q * pp.fr[k];
+                order.resize((size_t)ndof);
+                std::iota(order.begin(), order.end(), 0);
+                std::sort(order.begin(), order.end(), [&](int a, int b2) { return pk[(size_t)a] > pk[(size_t)b2]; });
+                ThermalSweep(lg, order, dt, V, dofGeom, dofSizeM, kMelt, rhoCp, Tw, inStart, inFrom, inQ, inFrac,
+                             outRate, nullptr, &fixedT, Tl);
+
+                // ---- 2. fluidities at the new temperatures ----
+                for (size_t i = 0; i < e1.size(); ++i)
+                {
+                    El1& el = e1[i];
+                    const int nodes[2] = { el.a, el.b };
+                    updatePhi(&phi1[i * (size_t)nz], elemTemps(nodes, 2), el.geom, el.size,
+                              std::fabs(pk[(size_t)el.a] - pk[(size_t)el.b]) / el.L);
+                    el.coef = e1Integral(i);
+                }
+                for (size_t i = 0; i < e2.size(); ++i)
+                {
+                    El2& el = e2[i];
+                    const dvec3 gp = el.g[0] * pk[(size_t)el.n[0]] + el.g[1] * pk[(size_t)el.n[1]] + el.g[2] * pk[(size_t)el.n[2]];
+                    updatePhi(&phi2[i * (size_t)nz], elemTemps(el.n, 3), GapGeom::Slab, 0.5 * el.h, glm::length(gp));
+                    el.S = e2Integral(i);
+                }
+
+                // ---- 3. pressure (implicit, active set p >= 0) ----
+                for (int i = 0; i < ndof; ++i)
+                {
+                    double d = 0.0;
+                    mT[(size_t)i] = nodeMass(i, pk[(size_t)i], &d);
+                    cN[(size_t)i] = d;
+                    rhoN[(size_t)i] = mT[(size_t)i] / V[(size_t)i];
+                }
+                std::fill(clamp0.begin(), clamp0.end(), 0);
+                std::vector<double> pNew((size_t)ndof, 0.0), inflowN((size_t)ndof, 0.0);
+                // Mass conductance of every coupled pair, for the flux sums.
+                auto forEachPair = [&](auto&& fn)
+                {
+                    for (const El1& el : e1)
+                        fn(el.a, el.b, 0.5 * (rhoN[(size_t)el.a] + rhoN[(size_t)el.b]) * el.coef);
+                    for (const El2& el : e2)
+                    {
+                        const double rbar = (rhoN[(size_t)el.n[0]] + rhoN[(size_t)el.n[1]] + rhoN[(size_t)el.n[2]]) / 3.0;
+                        for (int a = 0; a < 3; ++a)
+                            for (int b2 = a + 1; b2 < 3; ++b2)
+                            {
+                                const double g = -rbar * el.S * el.K[a][b2];
+                                if (g != 0.0) fn(el.n[a], el.n[b2], g);
+                            }
+                    }
+                };
+                // Active set: a volume is held at p = 0 only while it would hold
+                // less melt than fits at p = 0 (it has pulled away from the wall).
+                // Solved p < 0 -> hold it; held but receiving more than fits -> release.
+                for (int pass = 0; pass < 12; ++pass)
+                {
+                    int nu = 0;
+                    for (int i = 0; i < ndof; ++i) pidx[(size_t)i] = (i == in || clamp0[(size_t)i]) ? -1 : nu++;
+                    auto fixedP = [&](int i) { return (i == in) ? pin : 0.0; };
+                    trip.clear();
+                    Eigen::VectorXd bvec = Eigen::VectorXd::Zero(nu);
+                    for (int i = 0; i < ndof; ++i)
+                    {
+                        const int r = pidx[(size_t)i];
+                        if (r < 0) continue;
+                        trip.emplace_back(r, r, cN[(size_t)i] / dt);
+                        bvec[r] += cN[(size_t)i] / dt * pk[(size_t)i] - (mT[(size_t)i] - M[(size_t)i]) / dt;
+                    }
+                    auto addPair = [&](int a, int b, double g)          // mass conductance g between a and b
+                    {
+                        const int ra = pidx[(size_t)a], rb = pidx[(size_t)b];
+                        if (ra >= 0) { trip.emplace_back(ra, ra, g); if (rb >= 0) trip.emplace_back(ra, rb, -g); else bvec[ra] += g * fixedP(b); }
+                        if (rb >= 0) { trip.emplace_back(rb, rb, g); if (ra >= 0) trip.emplace_back(rb, ra, -g); else bvec[rb] += g * fixedP(a); }
+                    };
+                    forEachPair(addPair);
+                    Eigen::SparseMatrix<double> A(nu, nu);
+                    A.setFromTriplets(trip.begin(), trip.end());
+                    Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> solver;
+                    solver.compute(A);
+                    if (solver.info() != Eigen::Success) { K.message = "Packing solve failed (matrix not factorable)."; break; }
+                    const Eigen::VectorXd x = solver.solve(bvec);
+                    ++K.solves;
+                    bool changed = false;
+                    for (int i = 0; i < ndof; ++i)
+                    {
+                        const int r = pidx[(size_t)i];
+                        pNew[(size_t)i] = (r >= 0) ? x[r] : fixedP(i);
+                        if (r >= 0 && x[r] < 0.0) { clamp0[(size_t)i] = 1; changed = true; }
+                    }
+                    std::fill(inflowN.begin(), inflowN.end(), 0.0);
+                    forEachPair([&](int a, int b, double g)
+                    {
+                        const double q = g * (pNew[(size_t)a] - pNew[(size_t)b]);
+                        inflowN[(size_t)a] -= q; inflowN[(size_t)b] += q;
+                    });
+                    for (int i = 0; i < ndof; ++i)
+                    {
+                        if (!clamp0[(size_t)i] || pidx[(size_t)i] >= 0) continue;     // only volumes held in this pass
+                        const double capacity = mT[(size_t)i] - cN[(size_t)i] * pk[(size_t)i];   // mass that fits at p = 0
+                        if (M[(size_t)i] + dt * inflowN[(size_t)i] > capacity * (1.0 + 1.0e-9))
+                        { clamp0[(size_t)i] = 0; changed = true; }
+                    }
+                    if (!changed) break;
+                }
+                if (!K.message.empty()) break;
+                for (double& v : pNew) v = std::max(0.0, v);
+
+                // ---- 4. masses from the solved fluxes ----
+                auto flow = [&](int a, int b, double g)
+                {
+                    const double q = g * (pNew[(size_t)a] - pNew[(size_t)b]) * dt;   // mass a -> b
+                    M[(size_t)a] -= q; M[(size_t)b] += q;
+                    if (a == in) inletMass += q;
+                    if (b == in) inletMass -= q;
+                };
+                for (const El1& el : e1)
+                    flow(el.a, el.b, 0.5 * (rhoN[(size_t)el.a] + rhoN[(size_t)el.b]) * el.coef);
+                for (const El2& el : e2)
+                {
+                    const double rbar = (rhoN[(size_t)el.n[0]] + rhoN[(size_t)el.n[1]] + rhoN[(size_t)el.n[2]]) / 3.0;
+                    for (int a = 0; a < 3; ++a)
+                        for (int b2 = a + 1; b2 < 3; ++b2)
+                        {
+                            const double g = -rbar * el.S * el.K[a][b2];
+                            if (g != 0.0) flow(el.n[a], el.n[b2], g);
+                        }
+                }
+                pk.swap(pNew);
+                M[(size_t)in] = nodeMass(in, pk[(size_t)in], nullptr);           // the machine's reservoir
+                tp += dt;
+                ++steps;
+                const double tAbs = t0 + tp;
+
+                // ---- tracking ----
+                for (Seal& s : seals)
+                    if (s.frozenAt < 0.0)
+                        for (int d : s.dofs)
+                            if (FrozenFraction(lg, &Tl[(size_t)d * (size_t)nz], Tw, Tnf) >= 0.999) { s.frozenAt = tAbs; break; }
+                bool allSealed = !seals.empty();
+                for (const Seal& s : seals) allSealed = allSealed && s.frozenAt >= 0.0;
+                double cavMax = 0.0;
+                for (int i = 0; i < ndof; ++i)
+                {
+                    if (!isCavity(i)) continue;
+                    cavMax = std::max(cavMax, pk[(size_t)i]);
+                    if (ejectT[(size_t)i] >= 0.0) continue;
+                    const double* Ti = &Tl[(size_t)i * (size_t)nz];
+                    const double tmax = *std::max_element(Ti, Ti + nz);
+                    if (tmax <= Teject)
+                    {
+                        // Interpolate the crossing inside the step.
+                        const double t0s = tAbs - dt, a = tmaxPrev[(size_t)i];
+                        const double f = (a > tmax) ? std::clamp((a - Teject) / (a - tmax), 0.0, 1.0) : 1.0;
+                        ejectT[(size_t)i] = t0s + f * dt;
+                        --cavityLeft;
+                    }
+                    tmaxPrev[(size_t)i] = tmax;
+                }
+                K.historyTimeS.push_back((float)tAbs);
+                K.historyInletMPa.push_back((float)(pin / 1.0e6));
+                K.historyCavityMaxMPa.push_back((float)(cavMax / 1.0e6));
+                R.historyTimeS.push_back((float)tAbs);
+                R.historyInletMPa.push_back((float)(pin / 1.0e6));
+                R.historyFilledFrac.push_back(1.0f);
+                if (P.animationFrames > 0) recordPackFrame(tAbs, pin, holding ? 1 : 2);
+
+                // ---- hold end, stop, next step size ----
+                double dtNext = std::min(PK.dtMaxS, dt * 1.25);
+                if (holding && (autoHold ? (allSealed || tp >= holdLimit - 1.0e-9) : tp >= holdLimit - 1.0e-9))
+                {
+                    holding = false;
+                    K.holdTimeS = (float)tp;
+                    dtNext = std::max(1.0e-4, PK.dtInitialS);                 // the inlet drops: resolve it
+                }
+                dt = dtNext;
+                if (!holding && cavityLeft <= 0) { K.ejectReached = true; break; }
+                if (tp >= PK.maxTimeS) break;
+                const double ejFrac = 1.0 - (double)cavityLeft / cavityTotal;
+                if (P.progress && (steps % 3) == 0 &&
+                    !P.progress(progFill + (1.0 - progFill) * std::min(0.999, 0.15 * std::min(1.0, tp / 5.0) + 0.85 * ejFrac)))
+                { R.cancelled = true; K.message = "Cancelled while packing."; break; }
+            }
+            K.steps = steps;
+            K.endS = (float)(t0 + tp);
+            if (holding) K.holdTimeS = (float)tp;
+
+            // ---- results ----
+            double gf = -1.0;
+            K.gatesFrozen = !seals.empty();
+            for (const Seal& s : seals)
+            {
+                if (s.frozenAt < 0.0) K.gatesFrozen = false;
+                gf = std::max(gf, s.frozenAt);
+                if (s.edge >= 0) R.feedEdges[(size_t)s.edge].freezeS = (float)s.frozenAt;
+            }
+            K.gateFreezeS = K.gatesFrozen ? (float)gf : -1.0f;
+            double worstState = 0.0, sysMass1 = 0.0, cavMass1 = 0.0;
+            for (int i = 0; i < ndof; ++i)
+            {
+                if (i == in) continue;
+                sysMass1 += M[(size_t)i];
+                if (isCavity(i)) cavMass1 += M[(size_t)i];
+                if (pk[(size_t)i] > 0.0)
+                {
+                    const double m = nodeMass(i, pk[(size_t)i], nullptr);
+                    worstState = std::max(worstState, std::fabs(m - M[(size_t)i]) / m);
+                }
+            }
+            K.maxStateErrPct = (float)(100.0 * worstState);
+            K.massBalanceErrPct = (float)(100.0 * ((sysMass1 - sysMass0) - inletMass) / sysMass0);
+            constexpr double kToGrams = 1.0e-6;                                 // (kg/m^3) * mm^3 -> g
+            K.partsMassG = (float)(cavMass1 * kToGrams);
+            K.packedMassG = (float)((cavMass1 - cavMass0) * kToGrams);
+            double ejectAll = 0.0;
+            bool allEject = true;
+            for (size_t k = 0; k < parts.size(); ++k)
+            {
+                if (partBase[k] < 0) continue;
+                PartFillResult& pr = R.parts[k];
+                const size_t nn = parts[k].nodes.size();
+                pr.shrinkPct.assign(nn, 0.0f);
+                pr.ejectTimeS.assign(nn, -1.0f);
+                double sv = 0.0, sw = 0.0, smin = 1e30, smax = -1e30, pe = 0.0, mass = 0.0;
+                bool partEject = true;
+                for (size_t i = 0; i < nn; ++i)
+                {
+                    const size_t d = (size_t)(partBase[k] + (int)i);
+                    const double s = 100.0 * (1.0 - M[d] / (rhoRoom * V[d]));
+                    pr.shrinkPct[i] = (float)s;
+                    pr.ejectTimeS[i] = (float)ejectT[d];
+                    sv += V[d] * s; sw += V[d];
+                    smin = std::min(smin, s); smax = std::max(smax, s);
+                    mass += M[d];
+                    if (ejectT[d] < 0.0) partEject = false; else pe = std::max(pe, ejectT[d]);
+                }
+                pr.meanShrinkPct = (float)(sv / sw);
+                pr.minShrinkPct = (float)smin; pr.maxShrinkPct = (float)smax;
+                pr.ejectS = partEject ? (float)pe : -1.0f;
+                pr.massG = (float)(mass * kToGrams);
+                if (!partEject) allEject = false; else ejectAll = std::max(ejectAll, pe);
+            }
+            K.ejectS = allEject ? (float)ejectAll : -1.0f;
+            if (K.message.empty())
+            {
+                char buf[256];
+                std::snprintf(buf, sizeof buf, "Packed at %.1f MPa for %.2f s; %s.", K.packPressureMPa, K.holdTimeS,
+                              K.ejectReached ? "every part reached the ejection temperature" : "stopped before every part could be ejected");
+                K.message = buf;
+            }
         }
 
         R.ok = true;

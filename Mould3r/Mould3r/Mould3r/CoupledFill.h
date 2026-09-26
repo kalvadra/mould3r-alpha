@@ -71,6 +71,34 @@ namespace Flow
         double mouldEffusivity = 0.0;
         int    layers = 10;                           // per half-gap / radius
         bool   viscousHeating = true;
+        // Packing / cooling (FillPackParams): specific volume v(T, p), the
+        // ejection criterion and the reference temperature for shrinkage.
+        TestMaterial::TaitPVT pvt{};
+        double ejectionTempC = 95.0;                  // ejectable when the whole section is below this
+        double roomTempC = 23.0;                      // shrinkage is reported cooled to this, unloaded
+    };
+
+    // Packing, holding and cooling after a complete thermal fill. The melt is
+    // compressible (Tait pVT): each control volume holds a mass, and while it
+    // is full that mass sets its pressure through v(T, p). The machine holds
+    // the pack pressure at the sprue inlet; cooling shrinks the melt and draws
+    // more in through the still-molten gates until they freeze, after which
+    // the cavity pressure decays as the sealed melt cools (never below zero —
+    // melt that would go into tension pulls away from the wall instead). The
+    // volumetric shrinkage of each volume is then simply 1 - its mass / (room-
+    // temperature density x its volume).
+    struct FillPackParams
+    {
+        bool   enabled = false;                       // needs thermal.enabled and a complete fill
+        double packPressureMPa = 0.0;                 // > 0: absolute pack pressure
+        double packFraction = 0.8;                    // else this share of the fill's injection pressure
+        double holdTimeS = 0.0;                       // <= 0: hold until every gate has frozen (at most holdMaxS)
+        double holdMaxS = 60.0;
+        double maxTimeS = 180.0;                      // stop cooling this long after the fill at most
+        // Time step: starts small, grows 25% a step to dtMaxS (implicit Euler
+        // cooling reads ~2.5% slow at 0.25 s on a 2 mm wall; 1 s would be ~10%).
+        double dtInitialS = 0.02, dtMaxS = 0.25;
+        int    frames = 60;                           // animation frames over pack + cool (fill has its own)
     };
 
     struct CoupledFillParams
@@ -78,6 +106,7 @@ namespace Flow
         double fillTimeS = 1.0;                       // flow-rate controlled
         std::function<double(double)> viscosity;      // eta [Pa.s] at wall shear rate [1/s] (isothermal)
         FillThermalParams thermal;                    // gap-wise thermal model (off = isothermal)
+        FillPackParams pack;                          // packing + cooling after the fill (thermal only)
         double feedSegmentMm = 5.0;                   // feed edges split into segments <= this (>= 2 each)
         double frontFractionPerStep = 0.3;            // share of the front topped out per step
         int    maxSteps  = 20000;
@@ -104,6 +133,11 @@ namespace Flow
         // clamp force are reported when this share of the shot volume is in —
         // while the front is still a full line (the industry "end of fill" read).
         double vpSwitchFraction = 0.98;
+        // Animation frames: snapshots of the per-node fields (pressure, melt
+        // temperature, frozen layer) at roughly this many even intervals over
+        // the target fill time (a fill running longer keeps recording, thinned
+        // to at most 3x as many). 0 = none.
+        int    animationFrames = 60;
         // Called every few steps with the filled fraction (0..1); return false
         // to cancel. Optional.
         std::function<bool(double)> progress;
@@ -125,8 +159,52 @@ namespace Flow
         // Thermal only (empty otherwise), per midplane node:
         std::vector<float> frontTempC;                // melt temperature when the front arrived
         std::vector<float> frozenPct;                 // frozen share of the gap at end of fill (0..100; < 0 unfilled)
+        std::vector<float> bulkTempC;                 // melt (gap-mean) temperature at end of fill
         float minFrontTempC = 0.0f, maxFrontTempC = 0.0f;
         float maxFrozenPct = 0.0f, meanFrozenPct = 0.0f;   // mean is volume-weighted
+
+        // Animation frames (see CoupledFillResult::frames), per frame per
+        // midplane node. A node is filled at frame f when 0 <= fillTimeS <= the
+        // frame's time; unfilled nodes hold 0 (pressure) / -1 (thermal fields).
+        std::vector<std::vector<float>> framePressureMPa;
+        std::vector<std::vector<float>> frameBulkTempC;    // thermal only
+        std::vector<std::vector<float>> frameFrozenPct;    // thermal only
+
+        // Packing / cooling (when it ran), per midplane node:
+        std::vector<float> shrinkPct;                 // volumetric shrinkage, cooled to room temp (%)
+        std::vector<float> ejectTimeS;                // when its whole section got below the ejection
+                                                      // temperature, from the start of injection (< 0: not reached)
+        float meanShrinkPct = 0.0f, minShrinkPct = 0.0f, maxShrinkPct = 0.0f;   // mean volume-weighted
+        float ejectS = -1.0f;                         // whole part below the ejection temperature
+        float massG = 0.0f;                           // part mass at ejection
+    };
+
+    // One animation frame: when it was taken and the overall state then.
+    struct FillFrame
+    {
+        float timeS = 0.0f;
+        float filledFrac = 0.0f;                      // share of the shot volume in
+        float inletMPa = 0.0f;                        // injection pressure
+        int   phase = 0;                              // 0 filling, 1 packing (holding), 2 cooling
+    };
+
+    struct PackResult
+    {
+        bool  ran = false;
+        std::string message;
+        float packPressureMPa = 0.0f;
+        float holdTimeS = 0.0f;                       // pressure held this long after the fill
+        bool  gatesFrozen = false;
+        float gateFreezeS = -1.0f;                    // last gate sealed (from the start of injection)
+        bool  ejectReached = false;
+        float ejectS = -1.0f;                         // every part below the ejection temperature
+        float endS = 0.0f;                            // simulation stopped here
+        float partsMassG = 0.0f;                      // all parts at ejection
+        float packedMassG = 0.0f;                     // of which added after the fill
+        float maxStateErrPct = 0.0f;                  // |mass - mass(T, p)| of full volumes (solver check)
+        float massBalanceErrPct = 0.0f;               // mass gained vs mass through the inlet (solver check)
+        std::vector<float> historyTimeS, historyInletMPa, historyCavityMaxMPa;
+        int   steps = 0, solves = 0;
     };
 
     // Per feed-network edge (same order as FeedNetwork::edges).
@@ -136,6 +214,7 @@ namespace Flow
         float maxWallShearRate = 0.0f;                // over the fill [1/s]
         float frozenPct = -1.0f;                      // thermal: most-frozen point along it at end of fill
         float frontTempC = 0.0f;                      // thermal: melt temperature arriving at its far end
+        float freezeS = -1.0f;                        // packing: sealed (a fully frozen section) at, from injection start
     };
 
     struct CoupledFillResult
@@ -173,6 +252,11 @@ namespace Flow
         // Inlet (injection) pressure through the fill: (time s, pressure MPa)
         // per step, plus the filled share of the shot volume at that step.
         std::vector<float> historyTimeS, historyInletMPa, historyFilledFrac;
+        // Animation frames in time order (per-node values live in each
+        // PartFillResult's frame* arrays, same indexing). The end-of-fill state
+        // is the result's own fields, not a frame.
+        std::vector<FillFrame> frames;
+        PackResult pack;                              // packing + cooling (params.pack.enabled)
         int   steps = 0, dofs = 0, solves = 0;
         std::vector<std::string> warnings;
     };
