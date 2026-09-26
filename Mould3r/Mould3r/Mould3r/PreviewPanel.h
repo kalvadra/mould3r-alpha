@@ -10,6 +10,10 @@
 
 #include "FileImporter.h"   // FileImporter::MeshData
 #include "DesignChecks.h"   // DesignChecks::FaceDraftStats / DraftSample
+#include "FlowMesh.h"       // Flow::FlowMesh / FlowMeshStats (Hele-Shaw P1)
+#include "FeedNetwork.h"    // Flow::FeedNetwork — 1D feed-system snapshot
+#include "Midplane.h"       // Flow::PartSurface / MidplaneMesh — planform midplane
+#include "CoupledFill.h"    // Flow::CoupledFillResult — feed + cavity fill
 #include "GridSettings.h"   // GridSettings — forwarded to the preview canvas
 #include "FixtureFile.h"    // FixtureKind — gates cast generation
 
@@ -47,6 +51,17 @@ struct ShotPreviewInput
     // — whose perimeter is a clean rectangle; a Library mould can't be cast.
     // Carried here so PreviewPanel can gate the Generate Mould Casts flow.
     FixtureKind mouldKind = FixtureKind::Library;
+
+    // The feed system (sprue / runners / gates) + vents + one node per moulded
+    // object, snapshotted as a 1D nodal network at Generate Mould
+    // (GLCanvas::BuildFeedNetwork). Drives the Hele-Shaw flow analysis and its
+    // "Flow network" debug view. May be null (no network built).
+    const Flow::FeedNetwork* feedNetwork = nullptr;
+
+    // Each moulded object's own surface (world space), snapshotted at Generate
+    // Mould (GLCanvas::BuildPartSurfaces) — the source for the part midplane
+    // meshes. objectIndex matches the network's part nodes. May be null.
+    const std::vector<Flow::PartSurface>* partSurfaces = nullptr;
 };
 
 // ===========================================================================
@@ -155,6 +170,10 @@ private:
     // place via UpdateInfoPanel as data changes.
     wxPanel* BuildSimPanel(wxWindow* parent);
     wxPanel* BuildInfoPanel(wxWindow* parent);
+    // The "Physical Setup" bar across the top of the centre column (beneath the
+    // perspective/generate toolbar): injection + mould material dropdowns.
+    // Groundwork for material-dependent simulations.
+    wxPanel* BuildPhysicalSetupBar(wxWindow* parent);
     void     UpdateInfoPanel();
 
     // Entry point for a simulation's Start button. "Draft Angle Checks" runs the
@@ -173,6 +192,15 @@ private:
     // interference region as a red overlay.
     void RunSeparationCheck();
 
+    // Run the Hele-Shaw 2.5D flow analysis on the feed network captured at
+    // Generate Mould: resolve the Physical Setup materials and process fields,
+    // solve the steady feed system (Cross-WLF at melt temp, sprue inlet -> part
+    // nodes) for the feed pressure drop and gate flow split, report it, and
+    // show the "Flow network" debug view. Each part is one lumped node for now;
+    // its cavity flow field is the next step (see HeleShaw2D_Plan.md).
+    // Dispatched from the "Hele-Shaw 2.5D Flow" card.
+    void RunFlowCheck();
+
     // Run the Draft Angle Checks: split the shot at the parting plane, assign
     // each facet's owning mould half by casting a ray along its outward normal
     // into the generated half meshes, then measure signed draft against that
@@ -187,6 +215,17 @@ private:
     // in m_faceDraft*. Cheap no-op when already built for this shot. Returns
     // false when there is no shot or no generated mould halves to work from.
     bool EnsureFaceDraftAnalysis();
+
+    // Ensure the Hele-Shaw flow mesh exists (P1): the shot surface soup with a
+    // per-facet wall thickness from dual-domain opposite-wall pairing, cached in
+    // m_flowMesh / m_flowMeshStats. Cheap no-op when already built for this shot.
+    // Returns false when there is no shot mesh to build from.
+    bool EnsureFlowMesh();
+
+    // Ensure every part's planform midplane mesh exists at the card's target
+    // triangle area (rebuilt when the area changes or after a new generation).
+    // Returns true if at least one part produced a mesh.
+    bool EnsureMidplanes();
 
     // Build one mould half's "travel volume": the shot surface that half owns,
     // swept toward the parting plane by the half's height (see the Separation
@@ -247,6 +286,11 @@ private:
     int m_insertFirstIndex = -1;
     int m_insertCount = 0;
 
+    // Physical Setup bar (top of the centre column): material selections shared
+    // across simulations. Groundwork — no behaviour wired yet.
+    wxChoice* m_injMaterialChoice = nullptr;    // injection material
+    wxChoice* m_mouldMaterialChoice = nullptr;  // mould material
+
     // Design-check parameter fields (left panel) and the verdict read-outs
     // (right panel). Plain text fields styled like the mould-feature inputs:
     // label + field + separate unit label.
@@ -258,8 +302,18 @@ private:
     wxStaticText* m_sigUnitLbl = nullptr;     // significance unit label (tracks the dropdown)
     wxTextCtrl* m_sepMinOverlapCtrl = nullptr; // separation: per-region min overlap volume (mm^3)
     wxTextCtrl* m_sepStartEpsCtrl = nullptr;    // separation: start-offset epsilon off the wall (mm)
+
+    // Hele-Shaw 2.5D Flow process + mesh fields.
+    wxTextCtrl* m_flowFillTimeCtrl = nullptr;  // injection fill time (s)
+    wxTextCtrl* m_flowMeltTempCtrl = nullptr;  // melt temperature (deg C)
+    wxTextCtrl* m_flowMouldTempCtrl = nullptr; // mould-wall temperature (deg C)
+    wxTextCtrl* m_flowMeshAreaCtrl = nullptr;  // midplane target triangle area (mm^2)
+    wxTextCtrl* m_flowMaxPressureCtrl = nullptr; // machine injection-pressure limit (MPa)
+    wxCheckBox* m_flowThermalCheck = nullptr;    // thermal fill (frozen layer) vs isothermal
+
     wxStaticText* m_draftStatus = nullptr;    // "Draft Angle Checks" verdict
     wxStaticText* m_demouldStatus = nullptr;  // "Separation Test" verdict
+    wxStaticText* m_flowStatus = nullptr;     // "Flow Analysis" verdict
 
     // Debug view controls + whether the separation run has produced an
     // interference solid to show (m_hasSepOverlay gates the separation toggle).
@@ -283,6 +337,36 @@ private:
     std::vector<float>        m_faceDraftPosNorm;
     std::vector<unsigned int> m_faceDraftIdx;
     int                       m_faceDraftFallback = 0;  // facets that hit no half (cached)
+
+    // Hele-Shaw flow mesh (P1): the shot surface with a per-facet wall thickness
+    // from dual-domain pairing, plus the pairing/thickness summary. Cached per
+    // shot; built on demand by EnsureFlowMesh and drawn by the "Flow (thickness)"
+    // debug mode. Cleared on reset alongside the draft analysis.
+    Flow::FlowMesh      m_flowMesh;
+    Flow::FlowMeshStats m_flowMeshStats;
+
+    // Feed network snapshot from the last Generate Mould (see ShotPreviewInput)
+    // and the last steady feed solve over it (pressure drop + gate split). The
+    // "Flow network" debug view draws the node tree; the part nodes are where
+    // the cavity mid-surface mesh (rebuilt from source geometry) will attach.
+    Flow::FeedNetwork     m_feedNetwork;
+    bool                  m_hasFeedNetwork = false;
+    Flow::FeedSolveResult m_feedSolve;
+    bool                  m_hasFeedSolve = false;
+
+    // Part surfaces (from Generate Mould) and the planform midplane built from
+    // each at m_midplaneAreaMm2 (-1 = not built). One MidplaneMesh per surface,
+    // kept even when a build fails so the report can say why.
+    std::vector<Flow::PartSurface>  m_partSurfaces;
+    std::vector<Flow::MidplaneMesh> m_midplanes;
+    float                           m_midplaneAreaMm2 = -1.0f;
+
+    // Last coupled fill (feed network + part midplanes filled together). Drives
+    // the "Flow fill time" / "Flow pressure" views and, for thermal runs, "Flow
+    // front temp" / "Flow frozen layer"; cleared whenever the midplanes are
+    // rebuilt (its per-node arrays index them).
+    Flow::CoupledFillResult m_fill;
+    bool                    m_hasFill = false;
 
     // Which preview part is the shot (index into the canvas's parts).
     int m_shotHalfIndex = -1;

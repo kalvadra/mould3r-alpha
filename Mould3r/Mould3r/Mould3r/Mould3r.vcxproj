@@ -144,6 +144,12 @@
     <ClCompile Include="CastingPanel.cpp" />
     <ClCompile Include="CreateFixtureDialog.cpp" />
     <ClCompile Include="DesignChecks.cpp" />
+    <ClCompile Include="FlowMesh.cpp" />
+    <ClCompile Include="FlowSolver.cpp" />
+    <ClCompile Include="FeedNetwork.cpp" />
+    <ClCompile Include="Midplane.cpp" />
+    <ClCompile Include="CoupledFill.cpp" />
+    <ClCompile Include="GapThermal.cpp" />
     <ClCompile Include="FileImporter.cpp" />
     <ClCompile Include="FixtureCanvas.cpp" />
     <ClCompile Include="FixtureEditor.cpp" />
@@ -190,6 +196,14 @@
     <ClInclude Include="CastingPanel.h" />
     <ClInclude Include="CreateFixtureDialog.h" />
     <ClInclude Include="DesignChecks.h" />
+    <ClInclude Include="MeshGrid.h" />
+    <ClInclude Include="FlowMesh.h" />
+    <ClInclude Include="FlowSolver.h" />
+    <ClInclude Include="FeedNetwork.h" />
+    <ClInclude Include="Midplane.h" />
+    <ClInclude Include="CoupledFill.h" />
+    <ClInclude Include="GapThermal.h" />
+    <ClInclude Include="TestMaterial.h" />
     <ClInclude Include="FileImporter.h" />
     <ClInclude Include="FixtureCanvas.h" />
     <ClInclude Include="FixtureEditor.h" />

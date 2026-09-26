@@ -4028,6 +4028,16 @@ void MainFrame::OnGenerateMould(wxCommandEvent&)
         {
             ShotPreviewInput shot;
             shot.sceneIsMesh = m_canvas->IsSceneMeshType();
+
+            // Snapshot the feed system (sprue / runners / gates / vents + one
+            // node per moulded object) as a 1D network for the flow analysis,
+            // at the same moment as the cut it describes. SetData copies it.
+            const Flow::FeedNetwork feedNetwork = m_canvas->BuildFeedNetwork();
+            shot.feedNetwork = &feedNetwork;
+            // ...and each moulded object's own surface, the source for the
+            // part midplane meshes (built in Preview at the target tri area).
+            const std::vector<Flow::PartSurface> partSurfaces = m_canvas->BuildPartSurfaces();
+            shot.partSurfaces = &partSurfaces;
             // Which mould kind produced this run — the preview locks cast
             // generation to procedural (Parametric / Dynamic) moulds.
             shot.mouldKind = m_fixtureDef.kind;

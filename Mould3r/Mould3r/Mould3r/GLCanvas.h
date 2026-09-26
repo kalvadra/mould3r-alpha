@@ -32,6 +32,8 @@
 #include "MainFrame.h"
 #include "MouldFeature.h"
 #include "ProjectFile.h"
+#include "FeedNetwork.h"    // Flow::FeedNetwork — the 1D feed-system snapshot
+#include "Midplane.h"       // Flow::PartSurface — part surfaces for the midplane
 
 struct GPUMesh
 {
@@ -498,6 +500,41 @@ public:
 
     // Forget ray geometry and hide both overlays.
     void ClearShotDebugRays();
+
+    // ---- Multi-batch debug overlay (preview) -------------------------------
+    // A list of independently coloured line / point batches, drawn with the
+    // flat shader after the scene. With `onTop` the overlay ignores depth so it
+    // reads through the mould halves and shot (used by the flow feed-network
+    // view, whose centrelines run inside the steel). World-space geometry.
+    struct DebugOverlayBatch
+    {
+        bool                   points = false;   // false: GL_LINES vertex pairs
+        glm::vec3              color{ 1.0f };
+        float                  size = 2.0f;      // line width / point size (px)
+        std::vector<glm::vec3> verts;
+    };
+    // Replace the overlay with `batches` and show it.
+    void SetDebugOverlay(const std::vector<DebugOverlayBatch>& batches, bool onTop = true);
+    // Hide the overlay (GL buffers are released on the next Set / DestroyGL).
+    void ClearDebugOverlay();
+
+    // ---- Flow analysis: feed-system snapshot ------------------------------
+    // Snapshot the sprue, runners, gates and vents — plus one PART node per
+    // moulded object — as a 1D nodal network (Flow::FeedNetwork) for the
+    // Hele-Shaw analysis. Feature path ends become nodes (runners are split
+    // where a gate attaches part-way along them); each edge carries its path
+    // length and the feature's specified cross-section, assumed over the whole
+    // edge. Dimensions are read from the same UI fields the geometry uses, so
+    // the network matches what Generate Mould cut. Called by MainFrame right
+    // after a successful GenerateMould and handed to the Preview perspective.
+    Flow::FeedNetwork BuildFeedNetwork() const;
+
+    // Snapshot each moulded object's own surface in world space (the object's
+    // mesh through its model matrix) for the flow analysis' planform midplane.
+    // Same object filter and "Part N" numbering as BuildFeedNetwork's part
+    // nodes; objectIndex is the join key. Taken at Generate Mould alongside the
+    // network, so the midplane is built from the part itself, not the shot.
+    std::vector<Flow::PartSurface> BuildPartSurfaces() const;
 
     // ---- Design-check debug solid ------------------------------------------
     // Upload a free-standing solid (e.g. the interference region from the
@@ -1524,6 +1561,21 @@ private:
     GLsizei m_debugContactVertCount = 0;
     bool    m_showDebugRays = false;
     bool    m_showDebugContacts = false;
+
+    // Multi-batch debug overlay (see SetDebugOverlay): one VAO/VBO per batch.
+    struct DebugOverlayGL
+    {
+        GLuint    vao = 0;
+        GLuint    vbo = 0;
+        GLsizei   count = 0;
+        bool      points = false;
+        glm::vec3 color{ 1.0f };
+        float     size = 2.0f;
+    };
+    std::vector<DebugOverlayGL> m_debugOverlay;
+    bool m_showDebugOverlay  = false;
+    bool m_debugOverlayOnTop = true;
+    void DestroyDebugOverlayGL();   // needs a current context
 
     // Free-standing lit debug solid (the separation test's interference region).
     // Stored as a SceneObject so the normal mesh upload/render path applies.
