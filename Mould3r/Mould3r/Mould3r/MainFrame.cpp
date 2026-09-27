@@ -685,6 +685,8 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
 
     // ---- Preview page: the embedded preview perspective --------------------
     m_previewPanel = new PreviewPanel(m_book);
+    // A results window's "Open View" can be pressed from any perspective.
+    m_previewPanel->onShowRequested = [this] { SetPerspective(Perspective::Preview); };
 
     // ---- Casting page: the embedded mould-cast perspective -----------------
     m_castingPanel = new CastingPanel(m_book);

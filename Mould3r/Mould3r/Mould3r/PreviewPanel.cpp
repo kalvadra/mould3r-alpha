@@ -10,6 +10,7 @@
 #include "FlowResultsBar.h"
 #include "MouldCastDialog.h"
 #include "MeshBoolean.h"   // split the shot at y=0 and fuse a half into each base
+#include "ResultsDetails.h" // the Details window behind each results card
 
 // OCC — BREP cast bodies (STEP-exportable) for BREP scenes.
 #include <opencascade/BRepPrimAPI_MakeBox.hxx>
@@ -690,11 +691,9 @@ void PreviewPanel::SetData(const std::vector<FileImporter::MeshData>& halves,
     m_shotFaceIds.clear();
     m_halfMeshPos.clear();
     m_halfMeshIdx.clear();
-    m_faceDraftSamples.clear();
-    m_faceDraftPosNorm.clear();
-    m_faceDraftIdx.clear();
+    for (OwnershipMesh& o : m_ownership) o.clear();
     m_lastFaceDraftStats = DesignChecks::FaceDraftStats{};
-    m_faceDraftFallback = 0;
+    m_lastSeparation = SeparationRun{};
     m_flowMesh = Flow::FlowMesh{};
     m_flowMeshStats = Flow::FlowMeshStats{};
     m_feedNetwork = Flow::FeedNetwork{};
@@ -819,11 +818,9 @@ void PreviewPanel::ClearData()
     m_shotFaceIds.clear();
     m_halfMeshPos.clear();
     m_halfMeshIdx.clear();
-    m_faceDraftSamples.clear();
-    m_faceDraftPosNorm.clear();
-    m_faceDraftIdx.clear();
+    for (OwnershipMesh& o : m_ownership) o.clear();
     m_lastFaceDraftStats = DesignChecks::FaceDraftStats{};
-    m_faceDraftFallback = 0;
+    m_lastSeparation = SeparationRun{};
     m_flowMesh = Flow::FlowMesh{};
     m_flowMeshStats = Flow::FlowMeshStats{};
     m_feedNetwork = Flow::FeedNetwork{};
@@ -1027,8 +1024,8 @@ wxPanel* PreviewPanel::BuildSimPanel(wxWindow* parent)
     makeCard("Draft Angle Checks", [this, &addStart](wxWindow* body, wxBoxSizer* bs)
     {
         const wxString deg = wxString::FromUTF8("\xC2\xB0");
-        m_failDraftCtrl    = AddFieldRow(body, bs, "Fail below:", "1.0", deg);
-        m_warnDraftCtrl    = AddFieldRow(body, bs, "Warn below:", "3.0", deg);
+        m_failDraftCtrl    = AddFieldRow(body, bs, "Fail below:", "0.5", deg);
+        m_warnDraftCtrl    = AddFieldRow(body, bs, "Warn below:", "2.0", deg);
         m_backdraftEpsCtrl = AddFieldRow(body, bs,
             wxString::FromUTF8("Back-draft \xce\xb5:"), "0.1", deg);
         m_backdraftEpsCtrl->SetToolTip(
@@ -1057,7 +1054,7 @@ wxPanel* PreviewPanel::BuildSimPanel(wxWindow* parent)
         bs->Add(m_sigModeChoice, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 8);
 
         auto* sigRow = new wxBoxSizer(wxHORIZONTAL);
-        m_sigValueCtrl = new wxTextCtrl(body, wxID_ANY, "0",
+        m_sigValueCtrl = new wxTextCtrl(body, wxID_ANY, "3",
             wxDefaultPosition, wxSize(kFieldWidth, 22));
         m_sigValueCtrl->SetBackgroundColour(Style::BtnSmall);
         m_sigValueCtrl->SetForegroundColour(Style::TextPrimary);
@@ -1079,6 +1076,21 @@ wxPanel* PreviewPanel::BuildSimPanel(wxWindow* parent)
                 m_sigUnitLbl->SetLabel(m_sigModeChoice->GetSelection() == 0
                     ? wxString("%") : wxString::FromUTF8("mm\xC2\xB2"));
         });
+
+        // Cavity only: analyse the parts' own model meshes instead of the whole
+        // shot, so the sprue / runners / gates don't count toward the verdict.
+        m_draftCavityCheck = new wxCheckBox(body, wxID_ANY, "Cavity only (model mesh)");
+        m_draftCavityCheck->SetForegroundColour(Style::TextPrimary);
+        m_draftCavityCheck->SetBackgroundColour(Style::CardBg);
+        m_draftCavityCheck->SetToolTip(
+            "Analyse only the moulded parts, using their own model meshes, instead "
+            "of the whole shot mesh (which also carries the sprue, runners and "
+            "gates). The significance % is then of the cavity's surface.");
+        m_draftCavityCheck->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent&)
+        {
+            if (m_debugModeChoice && m_debugModeChoice->GetSelection() == 1) UpdateDraftOverlay();
+        });
+        bs->Add(m_draftCavityCheck, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
 
         addStart(body, bs, "Draft Angle Checks");
     });
@@ -1106,6 +1118,20 @@ wxPanel* PreviewPanel::BuildSimPanel(wxWindow* parent)
             "Per-region floor: a connected overlap region below this volume is "
             "discarded as noise. A continuous region at or above it counts as a "
             "collision, so many tiny separate slivers are filtered out.");
+        m_sepCavityCheck = new wxCheckBox(body, wxID_ANY, "Cavity only (model mesh)");
+        m_sepCavityCheck->SetForegroundColour(Style::TextPrimary);
+        m_sepCavityCheck->SetBackgroundColour(Style::CardBg);
+        m_sepCavityCheck->SetToolTip(
+            "Sweep only the moulded parts' own model meshes instead of the whole "
+            "shot, so the feed system (sprue, runners, gates) can't read as a "
+            "collision.");
+        m_sepCavityCheck->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent&)
+        {
+            const int m = m_debugModeChoice ? m_debugModeChoice->GetSelection() : 0;
+            if (m == 2 || m == 3) UpdateDraftOverlay();
+        });
+        bs->Add(m_sepCavityCheck, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
+
         addStart(body, bs, "Separation Test");
 
         m_sepOverlayCheck = new wxCheckBox(body, wxID_ANY, "Show mould overlay");
@@ -1301,20 +1327,49 @@ wxPanel* PreviewPanel::BuildInfoPanel(wxWindow* parent)
 
     // ---- Results: one verdict card per simulation -------------------------
     addSectionHeader("RESULTS");
-    auto makeVerdictCard = [&](const wxString& titleText) -> wxStaticText*
+    // Each card: the test name, its verdict (one result per line), and a row
+    // of "Details" (the numbers behind the verdict, in a window of their own)
+    // and "Export" (the same tables as CSV), disabled until the test has run.
+    auto makeVerdictCard = [&](const wxString& titleText, int cardIndex) -> wxStaticText*
     {
         auto [card, cs] = makeCard(titleText);
+
         auto* value = new wxStaticText(card, wxID_ANY, "Not run");
         value->SetForegroundColour(Style::TextMuted);
         value->SetFont(wxFont(11, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
             wxFONTWEIGHT_BOLD, false, "Segoe UI"));
-        cs->Add(value, 0, wxLEFT | wxRIGHT | wxTOP | wxBOTTOM, 10);
+        cs->Add(value, 0, wxLEFT | wxRIGHT | wxTOP, 10);
+
+        auto makeBtn = [&](const wxString& label, const wxString& tip) -> RoundedButton*
+        {
+            auto* btn = new RoundedButton(card, wxID_ANY, label,
+                wxDefaultPosition, wxSize(-1, 24), wxBORDER_NONE);
+            btn->SetBackgroundColour(Style::BtnSmall);
+            btn->SetForegroundColour(Style::TextPrimary);
+            btn->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+                wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
+            btn->SetToolTip(tip);
+            btn->Enable(false);
+            return btn;
+        };
+        RoundedButton* details = makeBtn("Details", "Open the numerical results of the last run");
+        RoundedButton* exportBtn = makeBtn("Export", "Save the numerical results of the last run as CSV");
+        details->Bind(wxEVT_BUTTON,
+            [this, cardIndex](wxCommandEvent&) { ShowResultsDetails(cardIndex); });
+        exportBtn->Bind(wxEVT_BUTTON,
+            [this, cardIndex](wxCommandEvent&) { ExportResults(cardIndex); });
+        m_detailsBtn[cardIndex] = details;
+        m_exportBtn[cardIndex] = exportBtn;
+        auto* btnRow = new wxBoxSizer(wxHORIZONTAL);
+        btnRow->Add(details, 1, wxRIGHT, 6);
+        btnRow->Add(exportBtn, 1);
+        cs->Add(btnRow, 0, wxEXPAND | wxALL, 10);
         return value;
     };
 
-    m_draftStatus = makeVerdictCard("Draft Angle Checks");
-    m_demouldStatus = makeVerdictCard("Separation Test");
-    m_flowStatus = makeVerdictCard("Flow Analysis");
+    m_draftStatus = makeVerdictCard("Draft Angle Checks", CardDraft);
+    m_demouldStatus = makeVerdictCard("Separation Test", CardSeparation);
+    m_flowStatus = makeVerdictCard("Flow Analysis", CardFlow);
 
     column->SetSizer(colSizer);
     outerSizer->Add(column, 1, wxEXPAND);
@@ -1377,6 +1432,7 @@ void PreviewPanel::UpdateInfoPanel()
         m_flowStatus->SetLabel("Not run");
         m_flowStatus->SetForegroundColour(Style::TextMuted);
     }
+    ClearResultsReports();   // the Details windows follow the cards
 
     if (m_infoPanel) m_infoPanel->Layout();
 }
@@ -1985,38 +2041,147 @@ void PreviewPanel::OnGenerateMouldCasts()
 }
 
 // ---------------------------------------------------------------------------
-// Ensure the parting-split, ownership-assigned shot mesh exists (shared by the
-// Draft Angle Checks and the Separation Test): split the shot at the parting
-// plane, then cast the ownership ray into the generated half meshes. Cached in
-// m_faceDraft* until the shot changes (SetData clears it). False when there is
-// no shot or no generated mould halves.
+// The cavity alone, for the design checks: every moulded part's own model mesh
+// (captured at Generate Mould, world space) as one posNorm soup, without the
+// feed system the shot mesh carries. Vertices are welded by position (so the
+// Separation Test's travel prism finds each patch's outline) and each part is
+// wound outward — a mirrored placement flips the winding, caught by the sign
+// of its enclosed volume — with area-weighted vertex normals, which the
+// ownership ray uses to orient each facet outward.
 // ---------------------------------------------------------------------------
-bool PreviewPanel::EnsureFaceDraftAnalysis()
+static void BuildCavityPosNorm(const std::vector<Flow::PartSurface>& parts,
+                               std::vector<float>& posNorm, std::vector<unsigned int>& idx)
 {
-    if (!m_faceDraftSamples.empty() && m_faceDraftIdx.size() >= 3)
-        return true;                                   // already built for this shot
+    posNorm.clear();
+    idx.clear();
+    struct Key
+    {
+        long long x, y, z;
+        bool operator==(const Key& o) const { return x == o.x && y == o.y && z == o.z; }
+    };
+    struct KeyHash
+    {
+        size_t operator()(const Key& k) const
+        {
+            size_t h = std::hash<long long>()(k.x);
+            h ^= std::hash<long long>()(k.y) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+            h ^= std::hash<long long>()(k.z) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+            return h;
+        }
+    };
+    for (const Flow::PartSurface& ps : parts)
+    {
+        const size_t nv = ps.xyz.size() / 3;
+        if (nv < 3 || ps.indices.size() < 3) continue;
+        auto P = [&](size_t v) { return glm::dvec3(ps.xyz[v * 3], ps.xyz[v * 3 + 1], ps.xyz[v * 3 + 2]); };
 
-    if (!m_hasShot || m_shotMesh.posNorm.empty() || m_shotMesh.indices.empty())
-        return false;
+        double vol6 = 0.0;   // 6 x enclosed volume: < 0 = wound inward
+        for (size_t t = 0; t + 2 < ps.indices.size(); t += 3)
+        {
+            const unsigned a = ps.indices[t], b = ps.indices[t + 1], c = ps.indices[t + 2];
+            if (a >= nv || b >= nv || c >= nv) continue;
+            vol6 += glm::dot(P(a), glm::cross(P(b), P(c)));
+        }
+        const bool flip = vol6 < 0.0;
+
+        // Weld on a 1e-4 mm grid.
+        std::unordered_map<Key, unsigned, KeyHash> weld;
+        std::vector<unsigned> remap(nv);
+        std::vector<glm::dvec3> pos;
+        for (size_t v = 0; v < nv; ++v)
+        {
+            const glm::dvec3 p = P(v);
+            const Key k{ std::llround(p.x * 1.0e4), std::llround(p.y * 1.0e4), std::llround(p.z * 1.0e4) };
+            auto it = weld.find(k);
+            if (it == weld.end())
+            {
+                it = weld.emplace(k, (unsigned)pos.size()).first;
+                pos.push_back(p);
+            }
+            remap[v] = it->second;
+        }
+        std::vector<glm::dvec3> nrm(pos.size(), glm::dvec3(0.0));
+        const unsigned base = (unsigned)(posNorm.size() / 6);
+        for (size_t t = 0; t + 2 < ps.indices.size(); t += 3)
+        {
+            if (ps.indices[t] >= nv || ps.indices[t + 1] >= nv || ps.indices[t + 2] >= nv) continue;
+            unsigned a = remap[ps.indices[t]], b = remap[ps.indices[t + 1]], c = remap[ps.indices[t + 2]];
+            if (flip) std::swap(b, c);
+            if (a == b || b == c || a == c) continue;
+            const glm::dvec3 cr = glm::cross(pos[b] - pos[a], pos[c] - pos[a]);
+            if (glm::dot(cr, cr) <= 1.0e-24) continue;   // degenerate
+            nrm[a] += cr; nrm[b] += cr; nrm[c] += cr;     // area-weighted
+            idx.push_back(base + a); idx.push_back(base + b); idx.push_back(base + c);
+        }
+        for (size_t v = 0; v < pos.size(); ++v)
+        {
+            const double L = std::sqrt(glm::dot(nrm[v], nrm[v]));
+            const glm::dvec3 n = (L > 0.0) ? nrm[v] / L : glm::dvec3(0.0, 1.0, 0.0);
+            posNorm.push_back((float)pos[v].x); posNorm.push_back((float)pos[v].y); posNorm.push_back((float)pos[v].z);
+            posNorm.push_back((float)n.x);      posNorm.push_back((float)n.y);      posNorm.push_back((float)n.z);
+        }
+    }
+}
+
+int PreviewPanel::DraftSource() const
+{
+    return (m_draftCavityCheck && m_draftCavityCheck->GetValue()) ? SourceCavity : SourceShot;
+}
+
+int PreviewPanel::SeparationSource() const
+{
+    return (m_sepCavityCheck && m_sepCavityCheck->GetValue()) ? SourceCavity : SourceShot;
+}
+
+// ---------------------------------------------------------------------------
+// Ensure the parting-split, ownership-assigned mesh exists for `source` (shared
+// by the Draft Angle Checks and the Separation Test): split the whole shot, or
+// the cavity's part meshes, at the parting plane, then cast the ownership ray
+// into the generated half meshes. Cached in m_ownership[source] until the
+// generation changes (SetData clears it). False when there is nothing to
+// analyse or no generated mould halves.
+// ---------------------------------------------------------------------------
+bool PreviewPanel::EnsureFaceDraftAnalysis(int source)
+{
+    source = (source == SourceCavity) ? SourceCavity : SourceShot;
+    OwnershipMesh& own = m_ownership[source];
+    if (own.ready()) return true;                      // already built for this generation
+
     bool haveHalves = false;
     for (const auto& hi : m_halfMeshIdx) if (hi.size() >= 3) { haveHalves = true; break; }
     if (!haveHalves) return false;
+    wxBusyCursor busy;                                 // the ownership ray over every facet
+
+    std::vector<float>        cavityPosNorm;
+    std::vector<unsigned int> srcIdx;
+    const std::vector<float>* srcPosNorm = &cavityPosNorm;
+    if (source == SourceCavity)
+    {
+        if (m_partSurfaces.empty()) return false;
+        BuildCavityPosNorm(m_partSurfaces, cavityPosNorm, srcIdx);
+    }
+    else
+    {
+        if (!m_hasShot || m_shotMesh.posNorm.empty() || m_shotMesh.indices.empty())
+            return false;
+        srcPosNorm = &m_shotMesh.posNorm;
+        srcIdx.assign(m_shotMesh.indices.begin(), m_shotMesh.indices.end());
+    }
+    if (srcPosNorm->empty() || srcIdx.size() < 3) return false;
 
     // Only the draw axis + parting plane drive the split and ownership ray (the
     // thresholds are applied later, per check), so a single cached build serves
     // both checks and survives threshold edits.
     DesignChecks::FaceDraftParams params;
-    std::vector<unsigned int> shotIdx(m_shotMesh.indices.begin(), m_shotMesh.indices.end());
     DesignChecks::SplitMeshByPlane(
-        m_shotMesh.posNorm, shotIdx, params.drawAxis, params.partingOffset,
-        m_faceDraftPosNorm, m_faceDraftIdx);
+        *srcPosNorm, srcIdx, params.drawAxis, params.partingOffset, own.posNorm, own.idx);
 
     int fallback = 0;
-    m_faceDraftSamples = DesignChecks::BuildFaceDraftSamples(
-        m_faceDraftPosNorm, m_faceDraftIdx, m_halfMeshPos, m_halfMeshIdx,
+    own.samples = DesignChecks::BuildFaceDraftSamples(
+        own.posNorm, own.idx, m_halfMeshPos, m_halfMeshIdx,
         /*triFaceId=*/{}, params, &fallback);
-    m_faceDraftFallback = fallback;
-    return !m_faceDraftSamples.empty();
+    own.fallback = fallback;
+    return own.ready();
 }
 
 // ---------------------------------------------------------------------------
@@ -2083,10 +2248,11 @@ bool PreviewPanel::EnsureMidplanes()
 // "Travel volume A/B" debug views. Empty when the side owns nothing or has no
 // height. Assumes EnsureFaceDraftAnalysis has run.
 // ---------------------------------------------------------------------------
-MeshBoolean::Mesh PreviewPanel::BuildSideTravelVolume(int side, float startEps) const
+MeshBoolean::Mesh PreviewPanel::BuildSideTravelVolume(int side, float startEps, int source) const
 {
     MeshBoolean::Mesh empty;
-    if (m_faceDraftSamples.empty() || m_faceDraftIdx.size() < 3) return empty;
+    const OwnershipMesh& own = m_ownership[source == SourceCavity ? SourceCavity : SourceShot];
+    if (!own.ready()) return empty;
 
     glm::vec3 draw = DesignChecks::FaceDraftParams{}.drawAxis;   // +Y
     { const float L = std::sqrt(glm::dot(draw, draw)); if (L > 1.0e-12f) draw /= L; }
@@ -2115,10 +2281,10 @@ MeshBoolean::Mesh PreviewPanel::BuildSideTravelVolume(int side, float startEps) 
     }
     if (sideHeight <= 0.0f) return empty;
 
-    const size_t splitTris = m_faceDraftIdx.size() / 3;
+    const size_t splitTris = own.idx.size() / 3;
     std::vector<unsigned char> mask(splitTris, 0);
     bool any = false;
-    for (const DesignChecks::DraftSample& smp : m_faceDraftSamples)
+    for (const DesignChecks::DraftSample& smp : own.samples)
     {
         const int t = smp.faceId - 1;
         if (t >= 0 && t < (int)splitTris && smp.half == side) { mask[(size_t)t] = 1; any = true; }
@@ -2129,7 +2295,7 @@ MeshBoolean::Mesh PreviewPanel::BuildSideTravelVolume(int side, float startEps) 
     const float     eps    = std::max(0.0f, startEps);
     const glm::vec3 travel = dir * sideHeight;
     const glm::vec3 start  = dir * std::min(eps, sideHeight * 0.5f);  // lift off the wall
-    return BuildTravelPrism(m_faceDraftPosNorm, m_faceDraftIdx, mask, travel, start);
+    return BuildTravelPrism(own.posNorm, own.idx, mask, travel, start);
 }
 
 // ---------------------------------------------------------------------------
@@ -2141,7 +2307,17 @@ MeshBoolean::Mesh PreviewPanel::BuildSideTravelVolume(int side, float startEps) 
 // ---------------------------------------------------------------------------
 void PreviewPanel::RunFaceDraftCheck()
 {
-    if (!EnsureFaceDraftAnalysis())
+    const int source = DraftSource();
+    if (source == SourceCavity && m_partSurfaces.empty())
+    {
+        wxMessageBox(
+            "\"Cavity only\" analyses the parts' own model meshes, which weren't "
+            "captured with this generation.\n\nRe-generate the mould, or untick "
+            "\"Cavity only (model mesh)\".",
+            "Draft Angle Checks", wxOK | wxICON_INFORMATION, this);
+        return;
+    }
+    if (!EnsureFaceDraftAnalysis(source))
     {
         wxMessageBox(
             "This check needs a shot model and the generated mould halves to "
@@ -2152,20 +2328,21 @@ void PreviewPanel::RunFaceDraftCheck()
     }
 
     DesignChecks::FaceDraftParams params;   // draw axis + parting plane default
-    params.failDraftDeg = (float)std::clamp(ParseField(m_failDraftCtrl, 1.0), 0.0, 45.0);
-    params.warnDraftDeg = (float)std::clamp(ParseField(m_warnDraftCtrl, 3.0), 0.0, 45.0);
+    params.failDraftDeg = (float)std::clamp(ParseField(m_failDraftCtrl, 0.5), 0.0, 45.0);
+    params.warnDraftDeg = (float)std::clamp(ParseField(m_warnDraftCtrl, 2.0), 0.0, 45.0);
     if (params.warnDraftDeg < params.failDraftDeg)
         params.warnDraftDeg = params.failDraftDeg;
     params.backdraftEpsDeg = (float)std::clamp(ParseField(m_backdraftEpsCtrl, 0.1), 0.0, 45.0);
     // Significance filter: dropdown picks % of surface area vs absolute mm^2.
     params.significanceByPercent = !m_sigModeChoice || m_sigModeChoice->GetSelection() == 0;
-    params.significanceValue = (float)std::max(0.0, ParseField(m_sigValueCtrl, 0.0));
+    params.significanceValue = (float)std::max(0.0, ParseField(m_sigValueCtrl, 3.0));
 
     // The parting-split, ownership-assigned mesh was built by
     // EnsureFaceDraftAnalysis (shared with the Separation Test). Classify its
     // samples against the current thresholds + significance filter.
-    m_lastFaceDraftStats = DesignChecks::ClassifyFaceDraft(m_faceDraftSamples, params);
-    m_lastFaceDraftStats.fallbackCount = m_faceDraftFallback;
+    const OwnershipMesh& own = m_ownership[source];
+    m_lastFaceDraftStats = DesignChecks::ClassifyFaceDraft(own.samples, params);
+    m_lastFaceDraftStats.fallbackCount = own.fallback;
 
     // Verdict card.
     wxString verdict; wxColour col; long icon = wxICON_INFORMATION;
@@ -2196,7 +2373,9 @@ void PreviewPanel::RunFaceDraftCheck()
     wxString msg;
     msg << "Draft Angle Checks: " << verdict << "\n";
     msg << "Per-facet draft vs the half that forms each face "
-        << "(ray-assigned ownership).\n\n";
+        << "(ray-assigned ownership).\n";
+    msg << "Mesh: " << (source == SourceCavity ? "cavity only (part model meshes)"
+                                               : "whole shot (parts + feed system)") << "\n\n";
     msg << "Facets: " << st.totalFaces << "\n";
     msg << "  Pass: " << st.passCount << "\n";
     msg << "  Warn: " << st.warnCount
@@ -2227,7 +2406,10 @@ void PreviewPanel::RunFaceDraftCheck()
     if (st.fallbackCount > 0)
         msg << "\n" << st.fallbackCount
             << " facet(s) hit no half; assigned by parting-plane side.";
+    msg << "\n\nDetails (on the results card) lists the draft distribution, each "
+           "half, and where the failing areas are.";
 
+    SetResultsReport(CardDraft, BuildDraftReport(params, source, verdict, col));
     wxMessageBox(msg, "Draft Angle Checks", wxOK | icon, this);
 }
 
@@ -2241,7 +2423,17 @@ void PreviewPanel::RunFaceDraftCheck()
 // ---------------------------------------------------------------------------
 void PreviewPanel::RunSeparationCheck()
 {
-    if (!EnsureFaceDraftAnalysis())
+    const int source = SeparationSource();
+    if (source == SourceCavity && m_partSurfaces.empty())
+    {
+        wxMessageBox(
+            "\"Cavity only\" sweeps the parts' own model meshes, which weren't "
+            "captured with this generation.\n\nRe-generate the mould, or untick "
+            "\"Cavity only (model mesh)\".",
+            "Separation Test", wxOK | wxICON_INFORMATION, this);
+        return;
+    }
+    if (!EnsureFaceDraftAnalysis(source))
     {
         wxMessageBox(
             "This check needs a shot model and the generated mould halves.\n\n"
@@ -2275,10 +2467,19 @@ void PreviewPanel::RunSeparationCheck()
         halfSide[h] = (cs >= 0.0) ? 0 : 1;
     }
 
-    // Which sides own any shot surface (for the "tested" count).
+    // Which sides own any shot surface (for the "tested" count), and how much.
+    SeparationRun run;
+    run.source = source;
+    run.startEps = startEps;
+    run.minOverlap = minOverlap;
     bool sideSurf[2] = { false, false };
-    for (const DesignChecks::DraftSample& smp : m_faceDraftSamples)
-        if (smp.half == 0 || smp.half == 1) sideSurf[smp.half] = true;
+    for (const DesignChecks::DraftSample& smp : m_ownership[source].samples)
+        if (smp.half == 0 || smp.half == 1)
+        {
+            sideSurf[smp.half] = true;
+            run.ownedTris[smp.half] += 1;
+            run.ownedAreaMm2[smp.half] += smp.area;
+        }
 
     // Per side: build the travel prism (shared helper), intersect with each half
     // mesh on that side, then split the overlap into connected regions and keep
@@ -2295,6 +2496,20 @@ void PreviewPanel::RunSeparationCheck()
     auto keepRegion = [&](const MeshBoolean::Mesh& region, int side, double vol)
     {
         perSideVol[side] += vol;
+        SeparationRegion reg;
+        reg.side = side;
+        reg.volumeMm3 = vol;
+        reg.lo = glm::vec3(std::numeric_limits<float>::max());
+        reg.hi = glm::vec3(-std::numeric_limits<float>::max());
+        for (size_t v = 0; v + 2 < region.verts.size(); v += 3)
+        {
+            const glm::vec3 p(region.verts[v], region.verts[v + 1], region.verts[v + 2]);
+            reg.lo = glm::min(reg.lo, p);
+            reg.hi = glm::max(reg.hi, p);
+        }
+        if (region.verts.size() < 3) reg.lo = reg.hi = glm::vec3(0.0f);
+        run.regions.push_back(reg);
+        run.sideRegions[side] += 1;
         const uint32_t base = (uint32_t)(overlapViz.verts.size() / 3);
         overlapViz.verts.insert(overlapViz.verts.end(),
             region.verts.begin(), region.verts.end());
@@ -2304,7 +2519,7 @@ void PreviewPanel::RunSeparationCheck()
     for (int side = 0; side < 2; ++side)
     {
         if (!sideSurf[side]) continue;
-        MeshBoolean::Mesh prism = BuildSideTravelVolume(side, startEps);
+        MeshBoolean::Mesh prism = BuildSideTravelVolume(side, startEps, source);
         if (prism.empty()) { perSideStat[side] = 2; continue; }
 
         MeshBoolean::RepairResult rp = MeshBoolean::ValidateAndRepair(prism);
@@ -2332,7 +2547,7 @@ void PreviewPanel::RunSeparationCheck()
             {
                 const double v = MeshBoolean::Volume(comp);
                 if (v >= (double)minOverlap) { keepRegion(comp, side, v); ++sigRegions; }
-                else if (v > 0.0)            { ++tinyRegions; }
+                else if (v > 0.0)            { ++tinyRegions; run.sideTiny[side] += 1; }
             }
         }
         if (perSideVol[side] > 0.0) perSideStat[side] = 1;
@@ -2381,7 +2596,9 @@ void PreviewPanel::RunSeparationCheck()
     wxString msg;
     msg << "Separation Test: " << verdict << "\n";
     msg << "Each half's owned surface swept toward the parting plane, tested "
-        << "for overlap with that half's steel.\n\n";
+        << "for overlap with that half's steel.\n";
+    msg << "Mesh: " << (source == SourceCavity ? "cavity only (part model meshes)"
+                                               : "whole shot (parts + feed system)") << "\n\n";
     msg << "Sides tested: " << tested << "\n";
     msg << "Sides collided: " << collided << "\n";
     if (notEval > 0)
@@ -2407,6 +2624,14 @@ void PreviewPanel::RunSeparationCheck()
         msg << "\nEnable \"Show mould overlay\" to see the interference region "
                "(red); hide the Shot toggle to view it clearly.";
 
+    for (int side = 0; side < 2; ++side)
+    {
+        run.sideSurf[side] = sideSurf[side];
+        run.sideStat[side] = perSideStat[side];
+        run.sideVol[side] = perSideVol[side];
+    }
+    m_lastSeparation = run;
+    SetResultsReport(CardSeparation, BuildSeparationReport(run, verdict, verdictColour));
     wxMessageBox(msg, "Separation Test", wxOK | iconFlag, this);
 }
 
@@ -2960,8 +3185,9 @@ void PreviewPanel::RunFlowCheck()
             for (const Flow::PartFillResult& pr : fr.parts)
                 if (pr.fed && pr.fillEndS >= 0.0f) { tFirst = std::min(tFirst, pr.fillEndS); tLast = std::max(tLast, pr.fillEndS); }
             if (tLast >= 0.0f && tLast - tFirst > 0.05f * fr.fillTimeS) spreadOK = false;
-            wxString verdict = wxString::Format("FILL %.2f s  %.1f MPa", fr.fillTimeS, fr.peakInletPressureMPa);
-            if (fr.pack.ran && fr.pack.ejectReached) verdict << wxString::Format("  EJECT %.1f s", fr.pack.ejectS);
+            // One result per line (the fill time is an input, so not repeated here).
+            wxString verdict = wxString::Format("PRESSURE %.1f MPa", fr.peakInletPressureMPa);
+            if (fr.pack.ran && fr.pack.ejectReached) verdict << wxString::Format("\nEJECT %.1f s", fr.pack.ejectS);
             m_flowStatus->SetLabel(verdict);
             const bool clean = spreadOK && fr.warnings.empty() && net.warnings.empty() && !fr.pressureLimited &&
                                fillCautions == 0;
@@ -3031,6 +3257,31 @@ void PreviewPanel::RunFlowCheck()
         if (m_debugModeChoice->GetSelection() <= 0)
             m_debugModeChoice->SetSelection(m_hasFill ? 7 : (haveMidplanes ? 6 : 5));   // fill time / midplane / network
         UpdateDraftOverlay();
+    }
+
+    // The numbers behind the card, for its Details window.
+    {
+        FlowRunInputs in;
+        in.material = wxString::FromUTF8(poly.name);
+        in.mould = wxString::FromUTF8(mould.name);
+        in.fillTimeS = fillTime;
+        in.meltC = meltC;
+        in.mouldC = mouldC;
+        in.wallC = wallC;
+        in.eta0 = eta0;
+        in.maxInjMPa = maxInjMPa;
+        in.packPct = packPct;
+        in.holdS = holdS;
+        in.shrinkRatio = std::clamp(ParseField(m_flowShrinkRatioCtrl, 1.0), 0.5, 2.0);
+        in.meshAreaMm2 = m_midplaneAreaMm2;
+        in.shotVolMm3 = shotVol;
+        in.flowRateMm3s = Q;
+        in.noFlowC = poly.noFlowTempC;
+        in.ejectC = poly.ejectionTempC;
+        in.maxShearRate = poly.maxShearRate;
+        in.thermal = thermalOn;
+        in.pack = packOn;
+        SetResultsReport(CardFlow, BuildFlowReport(in));
     }
 
     wxMessageBox(msg, "Hele-Shaw 2.5D Flow", wxOK | wxICON_INFORMATION, this);
@@ -3593,9 +3844,12 @@ void PreviewPanel::UpdateDraftOverlay()
         return;
     }
 
-    // All other modes need the ownership analysis; build it on demand.
-    if (m_shotHalfIndex < 0 || !EnsureFaceDraftAnalysis()
-        || m_faceDraftIdx.size() < 3 || m_faceDraftPosNorm.empty())
+    // All other modes need an ownership analysis (the travel volumes the
+    // Separation Test card's mesh, the draft view the Draft card's); build it on
+    // demand.
+    const int ownSource = (mode == 2 || mode == 3) ? SeparationSource() : DraftSource();
+    if (m_shotHalfIndex < 0 || !EnsureFaceDraftAnalysis(ownSource)
+        || m_ownership[ownSource].posNorm.empty())
     {
         m_canvas->ClearShotDebugColoring();
         m_canvas->SetShotDebugWireframe(false);
@@ -3606,7 +3860,7 @@ void PreviewPanel::UpdateDraftOverlay()
     {
         const int side = (mode == 2) ? 0 : 1;
         const float startEps = (float)std::max(0.0, ParseField(m_sepStartEpsCtrl, 0.001));
-        MeshBoolean::Mesh vol = BuildSideTravelVolume(side, startEps);
+        MeshBoolean::Mesh vol = BuildSideTravelVolume(side, startEps, ownSource);
         if (vol.empty())
         {
             m_canvas->ClearShotDebugColoring();
@@ -3625,14 +3879,15 @@ void PreviewPanel::UpdateDraftOverlay()
         return;
     }
 
-    const float failDeg = (float)std::clamp(ParseField(m_failDraftCtrl, 1.0), 0.0, 45.0);
-    float       warnDeg = (float)std::clamp(ParseField(m_warnDraftCtrl, 3.0), 0.0, 45.0);
+    const OwnershipMesh& own = m_ownership[ownSource];
+    const float failDeg = (float)std::clamp(ParseField(m_failDraftCtrl, 0.5), 0.0, 45.0);
+    float       warnDeg = (float)std::clamp(ParseField(m_warnDraftCtrl, 2.0), 0.0, 45.0);
     if (warnDeg < failDeg) warnDeg = failDeg;
     const float bdEps = (float)std::clamp(ParseField(m_backdraftEpsCtrl, 0.1), 0.0, 45.0);
 
     // Worst (lowest) signed draft per split-triangle key (faceId == tri + 1).
     std::unordered_map<int, float> draftOfFace;
-    for (const DesignChecks::DraftSample& s : m_faceDraftSamples)
+    for (const DesignChecks::DraftSample& s : own.samples)
     {
         if (s.faceId <= 0) continue;
         auto it = draftOfFace.find(s.faceId);
@@ -3650,7 +3905,7 @@ void PreviewPanel::UpdateDraftOverlay()
     groups[2].color = kYellow;  groups[2].emissive = true;
     groups[3].color = kNeutral; groups[3].emissive = false;
 
-    const std::vector<unsigned int>& I = m_faceDraftIdx;
+    const std::vector<unsigned int>& I = own.idx;
     for (size_t t = 0; t + 2 < I.size(); t += 3)
     {
         const int key = (int)(t / 3) + 1;
@@ -3668,7 +3923,7 @@ void PreviewPanel::UpdateDraftOverlay()
         groups[(size_t)g].indices.push_back(I[t+1]);
         groups[(size_t)g].indices.push_back(I[t+2]);
     }
-    m_canvas->SetShotDebugMesh(m_shotHalfIndex, m_faceDraftPosNorm, groups);
+    m_canvas->SetShotDebugMesh(m_shotHalfIndex, own.posNorm, groups);
     m_canvas->SetShotDebugWireframe(wire);
 }
 
@@ -3753,6 +4008,59 @@ void PreviewPanel::BuildVisibilityChecks(int halfCount, bool hasShot, int insert
 
     m_visPanel->Layout();
     if (m_visPanel->GetParent()) m_visPanel->GetParent()->Layout();
+}
+
+// ---------------------------------------------------------------------------
+// Hide every preview body except the shot: mould halves, inserts and cast
+// bodies. The Preview Output Bodies checkboxes follow (every checkbox in that
+// card is a visibility toggle: per part, keyed kHalfToggleIdBase + index; the
+// inserts' one; and the cast groups' master boxes).
+// ---------------------------------------------------------------------------
+void PreviewPanel::ShowOnlyShot()
+{
+    if (!m_canvas || m_shotHalfIndex < 0) return;
+    const int n = m_canvas->GetPreviewHalfCount();
+    for (int i = 0; i < n; ++i)
+        m_canvas->SetPreviewHalfVisible(i, i == m_shotHalfIndex);
+
+    const int shotId = kHalfToggleIdBase + m_shotHalfIndex;
+    std::function<void(wxWindow*)> walk = [&](wxWindow* w)
+    {
+        for (wxWindow* c : w->GetChildren())
+        {
+            if (auto* cb = wxDynamicCast(c, wxCheckBox)) cb->SetValue(cb->GetId() == shotId);
+            walk(c);
+        }
+    };
+    if (m_visPanel) walk(m_visPanel);
+    m_canvas->Refresh();
+}
+
+// ---------------------------------------------------------------------------
+// "Open View" from a results window: the Preview perspective, only the shot
+// visible, and the Sim Viewer on the result's view. Deferred a beat so the
+// perspective switch (and any pending upload) lands first.
+// ---------------------------------------------------------------------------
+void PreviewPanel::OpenResultsView(int card, int view)
+{
+    if (onShowRequested) onShowRequested();
+    CallAfter([this, card, view]
+    {
+        ShowOnlyShot();
+        if (card == CardSeparation)
+        {
+            // The interference solid sits inside the shot: show it over a
+            // transparent wireframe shot (plain shot when there's nothing to show).
+            if (m_sepOverlayCheck) m_sepOverlayCheck->SetValue(m_hasSepOverlay);
+            if (m_debugWireCheck)  m_debugWireCheck->SetValue(m_hasSepOverlay);
+            UpdateSeparationOverlay();
+        }
+        if (m_debugModeChoice && view >= 0 && view < (int)m_debugModeChoice->GetCount())
+            m_debugModeChoice->SetSelection(view);
+        UpdateDraftOverlay();
+        if (m_canvas) m_canvas->Refresh();
+        if (wxWindow* top = wxGetTopLevelParent(this)) top->Raise();
+    });
 }
 
 // ---------------------------------------------------------------------------

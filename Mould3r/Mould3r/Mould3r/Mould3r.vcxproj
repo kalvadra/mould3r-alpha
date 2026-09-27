@@ -153,6 +153,8 @@
     <ClCompile Include="FlowResultsBar.cpp" />
     <ClCompile Include="FillDefects.cpp" />
     <ClCompile Include="Warpage.cpp" />
+    <ClCompile Include="ResultsDetails.cpp" />
+    <ClCompile Include="PreviewResultsDetails.cpp" />
     <ClCompile Include="FileImporter.cpp" />
     <ClCompile Include="FixtureCanvas.cpp" />
     <ClCompile Include="FixtureEditor.cpp" />
@@ -209,6 +211,7 @@
     <ClInclude Include="FlowResultsBar.h" />
     <ClInclude Include="FillDefects.h" />
     <ClInclude Include="Warpage.h" />
+    <ClInclude Include="ResultsDetails.h" />
     <ClInclude Include="TestMaterial.h" />
     <ClInclude Include="FileImporter.h" />
     <ClInclude Include="FixtureCanvas.h" />

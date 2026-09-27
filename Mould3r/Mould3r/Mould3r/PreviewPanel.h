@@ -5,6 +5,7 @@
 #include <wx/checkbox.h>
 #include <vector>
 #include <unordered_map>
+#include <functional>
 
 #include <opencascade/TopoDS_Shape.hxx>  // shot BREP, stored for face checks
 
@@ -16,6 +17,7 @@
 #include "CoupledFill.h"    // Flow::CoupledFillResult — feed + cavity fill
 #include "FillDefects.h"    // Flow::FillDefects — weld lines, air traps, last to fill
 #include "Warpage.h"        // Flow::WarpResult — shell warpage from the packing shrinkage
+#include "ResultsDetails.h" // ResultsDetails::Report — the numbers behind each results card
 #include "GridSettings.h"   // GridSettings — forwarded to the preview canvas
 #include "FixtureFile.h"    // FixtureKind — gates cast generation
 
@@ -23,6 +25,7 @@
 
 class GLCanvas;
 class FlowResultsBar;
+class RoundedButton;
 class wxSpinCtrlDouble;
 namespace MeshBoolean { struct Mesh; }   // travel-volume return type (defined in MeshBoolean.h)
 
@@ -131,6 +134,11 @@ public:
     // been generated. MainFrame's "Export Mould Casts" writes one file per entry
     // — STEP when the body carries a shape (BREP scene), else STL.
     bool HasCastBodies() const { return !m_castExports.empty(); }
+
+    // Asks the host to bring the Preview perspective forward (MainFrame sets
+    // it). Used by a results window's "Open View", which may be pressed while
+    // another perspective is showing.
+    std::function<void()> onShowRequested;
     const std::vector<CastExportBody>& GetCastExportBodies() const
     {
         return m_castExports;
@@ -204,6 +212,14 @@ private:
     // Dispatched from the "Hele-Shaw 2.5D Flow" card.
     void RunFlowCheck();
 
+    // Which mesh an ownership analysis runs on: the whole shot (parts + feed
+    // system: sprue, runners, gates) or the cavity only — the moulded parts'
+    // own model meshes (m_partSurfaces), so the feed system doesn't colour the
+    // verdict. Each has its own cached analysis (m_ownership[source]).
+    enum AnalysisSource { SourceShot = 0, SourceCavity = 1 };
+    int DraftSource() const;        // per the Draft Angle Checks card's "Cavity only" box
+    int SeparationSource() const;   // per the Separation Test card's box
+
     // Run the Draft Angle Checks: split the shot at the parting plane, assign
     // each facet's owning mould half by casting a ray along its outward normal
     // into the generated half meshes, then measure signed draft against that
@@ -212,12 +228,13 @@ private:
     // Remesh-free; runs on the shot display mesh, on BREP and mesh scenes alike.
     void RunFaceDraftCheck();
 
-    // Ensure the parting-split, ownership-assigned shot mesh exists (the shared
-    // foundation for the Draft Angle Checks and the Separation Test): splits the
-    // shot at the parting plane and casts the ownership ray, caching the result
-    // in m_faceDraft*. Cheap no-op when already built for this shot. Returns
-    // false when there is no shot or no generated mould halves to work from.
-    bool EnsureFaceDraftAnalysis();
+    // Ensure the parting-split, ownership-assigned mesh for `source` exists (the
+    // shared foundation for the Draft Angle Checks and the Separation Test):
+    // splits the shot (or the cavity's part meshes) at the parting plane and
+    // casts the ownership ray, caching the result in m_ownership[source]. Cheap
+    // no-op when already built for this generation. Returns false when there is
+    // nothing to analyse (no shot / no part meshes) or no generated halves.
+    bool EnsureFaceDraftAnalysis(int source);
 
     // Ensure the Hele-Shaw flow mesh exists (P1): the shot surface soup with a
     // per-facet wall thickness from dual-domain opposite-wall pairing, cached in
@@ -243,8 +260,62 @@ private:
     // Test). `side` is 0 (+draw) or 1 (-draw). Returns an empty mesh when that
     // side owns no surface or the sweep can't be formed. `startEps` lifts the
     // swept prism off the coincident cavity wall (mm) to suppress contact noise.
-    // Assumes the ownership analysis is current (call EnsureFaceDraftAnalysis).
-    MeshBoolean::Mesh BuildSideTravelVolume(int side, float startEps) const;
+    // Assumes the ownership analysis for `source` is current (call
+    // EnsureFaceDraftAnalysis).
+    MeshBoolean::Mesh BuildSideTravelVolume(int side, float startEps, int source) const;
+
+    // ---- Results details (the "Details" button on each results card) ------
+    // Card index: 0 Draft Angle Checks, 1 Separation Test, 2 Flow Analysis.
+    enum ResultsCard { CardDraft = 0, CardSeparation = 1, CardFlow = 2, CardCount = 3 };
+    // Store a card's report, enable its Details button, refresh an open window.
+    void SetResultsReport(int card, const ResultsDetails::Report& report);
+    // Open (or raise) the card's details window.
+    void ShowResultsDetails(int card);
+    // Save the card's results as CSV (asks for the file).
+    void ExportResults(int card);
+    // A results window's "Open View": bring the Preview forward with only the
+    // shot body visible and the Sim Viewer on `view` (for the Separation Test,
+    // the red interference overlay over a wireframe shot).
+    void OpenResultsView(int card, int view);
+    // Hide every preview body but the shot (checkboxes kept in step).
+    void ShowOnlyShot();
+    // Every card back to "not run" (a new generation / cleared scene).
+    void ClearResultsReports();
+
+    // What the last Separation Test found, for its report.
+    struct SeparationRegion
+    {
+        int       side = 0;
+        double    volumeMm3 = 0.0;
+        glm::vec3 lo{ 0.0f }, hi{ 0.0f };   // bounds (mm)
+    };
+    struct SeparationRun
+    {
+        int    source = SourceShot;
+        float  startEps = 0.0f, minOverlap = 0.0f;
+        bool   sideSurf[2] = { false, false };
+        int    sideStat[2] = { 0, 0 };      // 0 clear, 1 collision, 2 not evaluable
+        double sideVol[2] = { 0.0, 0.0 };
+        int    sideRegions[2] = { 0, 0 }, sideTiny[2] = { 0, 0 };
+        int    ownedTris[2] = { 0, 0 };
+        double ownedAreaMm2[2] = { 0.0, 0.0 };
+        std::vector<SeparationRegion> regions;
+    };
+    // The inputs a flow run used, for its report.
+    struct FlowRunInputs
+    {
+        wxString material, mould;
+        double fillTimeS = 0, meltC = 0, mouldC = 0, wallC = 0, eta0 = 0;
+        double maxInjMPa = 0, packPct = 0, holdS = 0, shrinkRatio = 1, meshAreaMm2 = 0;
+        double shotVolMm3 = 0, flowRateMm3s = 0;
+        double noFlowC = 0, ejectC = 0, maxShearRate = 0;
+        bool   thermal = false, pack = false;
+    };
+    ResultsDetails::Report BuildDraftReport(const DesignChecks::FaceDraftParams& params, int source,
+                                            const wxString& verdict, const wxColour& colour) const;
+    ResultsDetails::Report BuildSeparationReport(const SeparationRun& run,
+                                                 const wxString& verdict, const wxColour& colour) const;
+    ResultsDetails::Report BuildFlowReport(const FlowRunInputs& in) const;
 
     // Apply or clear the Draft Angle Checks overlay per the Debug View dropdown:
     // None (clear, optional wireframe) or "Draft (ray)" (the parting-split
@@ -313,6 +384,8 @@ private:
     wxStaticText* m_sigUnitLbl = nullptr;     // significance unit label (tracks the dropdown)
     wxTextCtrl* m_sepMinOverlapCtrl = nullptr; // separation: per-region min overlap volume (mm^3)
     wxTextCtrl* m_sepStartEpsCtrl = nullptr;    // separation: start-offset epsilon off the wall (mm)
+    wxCheckBox* m_draftCavityCheck = nullptr;   // draft: cavity only (part model meshes)
+    wxCheckBox* m_sepCavityCheck = nullptr;     // separation: cavity only (part model meshes)
 
     // Hele-Shaw 2.5D Flow process + mesh fields.
     wxTextCtrl* m_flowFillTimeCtrl = nullptr;  // injection fill time (s)
@@ -330,6 +403,13 @@ private:
     wxStaticText* m_demouldStatus = nullptr;  // "Separation Test" verdict
     wxStaticText* m_flowStatus = nullptr;     // "Flow Analysis" verdict
 
+    // Each results card's report, its "Details" / "Export" buttons and its
+    // (modeless, reused) details window, created on first use.
+    ResultsDetails::Report m_reports[CardCount];
+    RoundedButton*         m_detailsBtn[CardCount] = { nullptr, nullptr, nullptr };
+    RoundedButton*         m_exportBtn[CardCount] = { nullptr, nullptr, nullptr };
+    ResultsDetailsDialog*  m_detailsDlg[CardCount] = { nullptr, nullptr, nullptr };
+
     // Debug view controls + whether the separation run has produced an
     // interference solid to show (m_hasSepOverlay gates the separation toggle).
     wxChoice*   m_debugModeChoice = nullptr;  // debug view: None / Draft (ray)
@@ -343,15 +423,23 @@ private:
     wxStaticText* m_volPrimary = nullptr;    // "12.345 cm³"
     wxStaticText* m_volSecondary = nullptr;  // "0.753 in³"
 
-    // Draft Angle Checks (ray-assigned half ownership): the per-facet samples,
-    // the last classification, and the parting-plane-split analysis mesh the
-    // check runs on and the "Draft (ray)" overlay renders (6 floats/vertex +
-    // its own indices).
-    std::vector<DesignChecks::DraftSample> m_faceDraftSamples;
-    DesignChecks::FaceDraftStats           m_lastFaceDraftStats;
-    std::vector<float>        m_faceDraftPosNorm;
-    std::vector<unsigned int> m_faceDraftIdx;
-    int                       m_faceDraftFallback = 0;  // facets that hit no half (cached)
+    // Ray-assigned half ownership, one per AnalysisSource (whole shot / cavity
+    // only): the parting-plane-split analysis mesh the Draft Angle Checks and
+    // the Separation Test run on and the "Draft (ray)" / travel-volume views
+    // render (6 floats/vertex + its own indices), its per-facet samples
+    // (faceId = triangle + 1), and how many facets hit no half.
+    struct OwnershipMesh
+    {
+        std::vector<float>                     posNorm;
+        std::vector<unsigned int>              idx;
+        std::vector<DesignChecks::DraftSample> samples;
+        int                                    fallback = 0;
+        bool ready() const { return !samples.empty() && idx.size() >= 3; }
+        void clear() { posNorm.clear(); idx.clear(); samples.clear(); fallback = 0; }
+    };
+    OwnershipMesh                m_ownership[2];
+    DesignChecks::FaceDraftStats m_lastFaceDraftStats;   // last Draft Angle Checks classification
+    SeparationRun                m_lastSeparation;       // last Separation Test
 
     // Hele-Shaw flow mesh (P1): the shot surface with a per-facet wall thickness
     // from dual-domain pairing, plus the pairing/thickness summary. Cached per
