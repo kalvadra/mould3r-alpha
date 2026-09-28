@@ -68,6 +68,12 @@ struct ShotPreviewInput
     // Mould (GLCanvas::BuildPartSurfaces) — the source for the part midplane
     // meshes. objectIndex matches the network's part nodes. May be null.
     const std::vector<Flow::PartSurface>* partSurfaces = nullptr;
+
+    // Auto-embed flag markers (GLCanvas::GetLastEmbedFlagMeshes): one red
+    // sphere, world space, around each vent / gate whose mouth couldn't be
+    // embedded in its part. Shown translucent behind a single "Embed warnings"
+    // checkbox. Null / empty = nothing flagged, no checkbox.
+    const std::vector<FileImporter::MeshData>* embedFlags = nullptr;
 };
 
 // ===========================================================================
@@ -149,7 +155,8 @@ private:
     // then a "Shot" checkbox when a shot model is present, into m_visPanel (in
     // the left column, above the Simulations section). Re-runnable: call
     // ClearVisibilityChecks first to drop the previous set.
-    void BuildVisibilityChecks(int halfCount, bool hasShot, int insertCount);
+    void BuildVisibilityChecks(int halfCount, bool hasShot, int insertCount,
+        int embedFlagCount = 0);
     void ClearVisibilityChecks();
 
     // One child body inside a cast group (Top Cast / Bottom Cast).
@@ -367,6 +374,14 @@ private:
     wxCheckBox* m_insertCheck = nullptr;
     int m_insertFirstIndex = -1;
     int m_insertCount = 0;
+
+    // Auto-embed flag markers (red translucent spheres), loaded after the
+    // inserts as one contiguous block behind the single m_embedCheck — same
+    // scheme as the inserts above.
+    std::vector<FileImporter::MeshData> m_pendingEmbedFlags;
+    wxCheckBox* m_embedCheck = nullptr;
+    int m_embedFirstIndex = -1;
+    int m_embedCount = 0;
 
     // Physical Setup bar (top of the centre column): material selections shared
     // across simulations. Groundwork — no behaviour wired yet.

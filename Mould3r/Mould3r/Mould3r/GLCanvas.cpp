@@ -85,6 +85,7 @@
 #include "MeshOps.h"
 #include "MeshBoolean.h"
 #include "MouldFeature.h"
+#include "FeatureEmbed.h"   // Auto-embed: gate / vent mouth embed analysis
 
 // Radius of the green sphere drawn at each vent placement point (world units)
 static constexpr float kVentMarkerRadius = 1.5f;
@@ -2381,6 +2382,11 @@ static bool BuildVentCutPieces(const VentInstance& vent,
     const FeaturePath& vp = vent.path;
     if (!xs.valid || !vp.valid) return false;
 
+    // Start overrun actually cut: the user's Overrun (start), or the Auto-embed
+    // extension when that is deeper (see GLCanvas::RunAutoEmbedAnalysis). The
+    // end overrun is untouched.
+    const float overrunStart = std::max(vp.overrunStart, vent.embedExtension);
+
     auto toOCC = [](const glm::vec3& v) { return gp_Pnt(v.x, v.y, v.z); };
 
     // ---- Simple: straight prism (unchanged from the original cut) ----------
@@ -2411,13 +2417,13 @@ static bool BuildVentCutPieces(const VentInstance& vent,
         if (rawLen < 1e-6f) return false;
         const glm::vec3 sweepDir = rawSweep / rawLen;
 
-        const glm::vec3 originOffset = -sweepDir * vp.overrunStart;
+        const glm::vec3 originOffset = -sweepDir * overrunStart;
         gp_Trsf offsetTrsf;
         offsetTrsf.SetTranslation(gp_Vec(originOffset.x, originOffset.y, originOffset.z));
         const TopoDS_Shape offsetFace =
             BRepBuilderAPI_Transform(face.Face(), offsetTrsf, /*copy=*/true).Shape();
 
-        const float     totalLen = rawLen + vp.overrunStart + vp.overrunEnd;
+        const float     totalLen = rawLen + overrunStart + vp.overrunEnd;
         const glm::vec3 totalSweep = sweepDir * totalLen;
         const gp_Vec    sweepVec(totalSweep.x, totalSweep.y, totalSweep.z);
 
@@ -2433,7 +2439,7 @@ static bool BuildVentCutPieces(const VentInstance& vent,
 
     // Extend the very first / very last station past the surface, same as the
     // preview sweep and the Simple prism.
-    stations.front().pos -= stations.front().tangent * vp.overrunStart;
+    stations.front().pos -= stations.front().tangent * overrunStart;
     stations.back().pos  += stations.back().tangent  * vp.overrunEnd;
 
     // Half-extents from the baked cross-section (symmetric, so the sideAxis sign
@@ -2743,6 +2749,272 @@ static FeaturePath GateSubRunnerCutPath(const FeaturePath& subPath,
 // split); used by GenerateMould's mesh-scene shot and insert preview bodies.
 static FileImporter::MeshData MakeDisplayMesh(std::vector<float> verts,
     std::vector<uint32_t> indices);
+
+// ===========================================================================
+// Auto-embed
+//
+// A vent / gate is cut as a straight channel whose START cross-section sits on
+// the plane through its placed point. On a curved or obliquely-approached part
+// surface some of that cross-section lies OUTSIDE the part, leaving a wedge of
+// steel across part of the mouth. RunAutoEmbedAnalysis measures, per feature,
+// how far back along the channel axis each part of the mouth has to travel to
+// reach the part (FeatureEmbed::Analyze on the objects' CPU meshes) and stores
+// the extension that seats all of it. The cut sites use
+// max(user overrun, embedExtension).
+//
+// If some of the mouth can't reach the part within the limit (the channel is
+// locally bigger than the part, or it would need more than 10 mm), the feature
+// is NOT extended — it cuts with its plain overrun — and is flagged: listed in
+// the Generate warning and marked with a red sphere in Preview.
+//
+// Thin walls (extending through the back of the part) are deliberately not
+// guarded yet — respectCeiling = false — pending the out-of-bounds analysis.
+// ===========================================================================
+namespace
+{
+    constexpr float kAutoEmbedMaxMm   = 10.0f;  // extension limit
+    constexpr float kAutoEmbedMargin  = 0.1f;   // vent: past the deepest entry
+    constexpr float kGateCutEpsMm     = 0.1f;   // == kCutEps at the gate cut sites
+    constexpr float kGateMinRadiusMm  = 0.01f;  // == the gate cone's radius floor
+
+    // Red marker sphere (world space) for a flagged feature.
+    FileImporter::MeshData EmbedFlagSphere(const glm::vec3& c, float r)
+    {
+        const int stacks = 16, slices = 24;
+        std::vector<float>    v;
+        std::vector<uint32_t> idx;
+        v.reserve(size_t(stacks + 1) * slices * 3);
+        for (int a = 0; a <= stacks; ++a)
+        {
+            const float th = glm::pi<float>() * float(a) / float(stacks);
+            for (int b = 0; b < slices; ++b)
+            {
+                const float ph = glm::two_pi<float>() * float(b) / float(slices);
+                v.push_back(c.x + r * std::sin(th) * std::cos(ph));
+                v.push_back(c.y + r * std::cos(th));
+                v.push_back(c.z + r * std::sin(th) * std::sin(ph));
+            }
+        }
+        for (int a = 0; a < stacks; ++a)
+            for (int b = 0; b < slices; ++b)
+            {
+                const uint32_t p = a * slices + b,       q = a * slices + (b + 1) % slices;
+                const uint32_t r0 = (a + 1) * slices + b, s = (a + 1) * slices + (b + 1) % slices;
+                // Outward winding (CCW seen from outside).
+                if (a > 0)          { idx.push_back(p); idx.push_back(q);  idx.push_back(r0); }
+                if (a < stacks - 1) { idx.push_back(q); idx.push_back(s);  idx.push_back(r0); }
+            }
+        return MakeDisplayMesh(std::move(v), std::move(idx));
+    }
+}
+
+void GLCanvas::RunAutoEmbedAnalysis()
+{
+    m_lastEmbedFlags.clear();
+    m_lastEmbedFlagMeshes.clear();
+    for (VentInstance& v : m_vents) v.embedExtension = 0.0f;
+    for (GateFeature& g : m_gates)  g.embedExtension = 0.0f;
+
+    bool  ventOn = true, gateOn = true;
+    float gateRadius = 1.5f, draftAngle = 1.0f;
+    if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+    {
+        ventOn     = frame->IsVentAutoEmbed();
+        gateOn     = frame->IsGateAutoEmbed();
+        gateRadius = frame->GetGateDiameter() * 0.5f;
+        draftAngle = frame->GetGateDraftAngle();
+    }
+    if ((!ventOn || m_vents.empty()) && (!gateOn || m_gates.empty())) return;
+
+    // The cavity is the union of every moulded object. Cache each one's
+    // world bounding sphere so a feature only traces the objects its line
+    // bundle can actually reach (Analyze still does the exact per-triangle
+    // filtering inside those).
+    struct Body { FeatureEmbed::BodyMesh mesh; glm::vec3 centre; float radius; };
+    std::vector<Body> bodies;
+    for (const SceneObject& obj : m_objects)
+    {
+        if (obj.cpuVerts.size() < 9 || obj.cpuIndices.size() < 3) continue;
+        const glm::mat4 M = obj.BuildModelMatrix();
+        glm::vec3 lo(std::numeric_limits<float>::max());
+        glm::vec3 hi(-std::numeric_limits<float>::max());
+        for (size_t i = 0; i + 2 < obj.cpuVerts.size(); i += 3)
+        {
+            const glm::vec3 p(obj.cpuVerts[i], obj.cpuVerts[i + 1], obj.cpuVerts[i + 2]);
+            lo = glm::min(lo, p);
+            hi = glm::max(hi, p);
+        }
+        const float stretch = std::max({ glm::length(glm::vec3(M[0])),
+                                         glm::length(glm::vec3(M[1])),
+                                         glm::length(glm::vec3(M[2])) });
+        Body b;
+        b.mesh   = FeatureEmbed::BodyMesh{ &obj.cpuVerts, &obj.cpuIndices, M };
+        b.centre = glm::vec3(M * glm::vec4((lo + hi) * 0.5f, 1.0f));
+        b.radius = 0.5f * glm::length(hi - lo) * stretch;
+        bodies.push_back(b);
+    }
+
+    auto bodiesNear = [&](const glm::vec3& origin, const glm::vec3& axis, float bundleR)
+    {
+        std::vector<FeatureEmbed::BodyMesh> out;
+        for (const Body& b : bodies)
+            if (glm::length(glm::cross(b.centre - origin, axis)) <= b.radius + bundleR + 0.01f)
+                out.push_back(b.mesh);
+        return out;
+    };
+
+    // Analyse one mouth. Returns the extension to apply (0 = unresolved or
+    // nothing needed) and records a flag + marker when unresolved.
+    auto analyse = [&](bool isGate, int index, const glm::vec3& origin,
+                       const glm::vec3& intoPart, const std::vector<glm::vec3>& offsets,
+                       const FeatureEmbed::Params& params, float markerRadius) -> float
+    {
+        float bundleR = 0.0f;
+        for (const glm::vec3& o : offsets) bundleR = std::max(bundleR, glm::length(o));
+
+        const FeatureEmbed::Result r = FeatureEmbed::Analyze(origin, intoPart, offsets,
+            bodiesNear(origin, intoPart, bundleR), params);
+
+        // Resolved = every line that could be traced reaches the part within
+        // the limit. (Unreliable lines — an open mesh right at the mouth —
+        // can't be measured either way, so they don't block on their own.)
+        const int  reachable = r.embedded + r.gap;
+        const bool resolved  = r.analysed && reachable > 0 &&
+                               r.unreachable == 0 && !r.ceilingLimited;
+        if (resolved) return r.extension;
+
+        EmbedFlag f;
+        f.isGate      = isGate;
+        f.index       = index;
+        f.samples     = r.samples;
+        f.unreachable = r.unreachable;
+        f.noPart      = reachable == 0;
+        f.limit       = params.maxExtension;
+        m_lastEmbedFlags.push_back(f);
+        m_lastEmbedFlagMeshes.push_back(EmbedFlagSphere(origin, markerRadius));
+        return 0.0f;
+    };
+
+    // ---- Vents ----------------------------------------------------------
+    if (ventOn)
+    {
+        FeatureEmbed::Params vp;
+        vp.maxExtension   = kAutoEmbedMaxMm;
+        vp.margin         = kAutoEmbedMargin;
+        vp.respectCeiling = false;
+
+        for (int i = 0; i < (int)m_vents.size(); ++i)
+        {
+            VentInstance& vent = m_vents[i];
+            const VentCrossSection& xs = vent.crossSection;
+            const FeaturePath& path = vent.path;
+            if (!xs.valid || !path.valid) continue;
+
+            // The mouth frame exactly as BuildVentCutPieces cuts it: the
+            // Simple prism starts at path.start and sweeps start->end; a
+            // complex route starts at its first station along that station's
+            // tangent (for a smooth path that is the Bezier tangent, not the
+            // chord to node 1).
+            const float hw = 0.5f * glm::length(xs.corners[1] - xs.corners[0]);
+            const float hd = 0.5f * glm::length(xs.corners[3] - xs.corners[0]);
+            if (hw < 1e-6f || hd < 1e-6f) continue;
+
+            glm::vec3 origin, tangent, side;
+            const glm::vec3 up(0.0f, 1.0f, 0.0f);
+            if (path.kind == PathKind::Simple)
+            {
+                const glm::vec3 d = path.end - path.start;
+                if (glm::length(d) < 1e-6f) continue;
+                origin  = path.start;
+                tangent = glm::normalize(d);
+                side    = glm::normalize(xs.corners[1] - xs.corners[0]);
+            }
+            else
+            {
+                const std::vector<PathStation> st = SamplePath(path);
+                if (st.size() < 2) continue;
+                origin  = st.front().pos;
+                tangent = st.front().tangent;
+                side    = st.front().sideAxis;
+            }
+
+            const std::vector<glm::vec3> offsets =
+                FeatureEmbed::RectSamples(side, up, hw, hd);
+            vent.embedExtension = analyse(false, i, origin, -tangent, offsets, vp,
+                std::sqrt(hw * hw + hd * hd) * 1.6f + 1.0f);
+        }
+    }
+
+    // ---- Gates ----------------------------------------------------------
+    if (gateOn && gateRadius > 1e-6f)
+    {
+        // The gate cone narrows by tan(draft) per mm as it is pushed back; past
+        // (radius - floor) / tan(draft) the cut clamps the back radius to the
+        // floor and the mouth diameter would grow. So the draft caps the
+        // extension too. kCutEps is added by the cut on top of the overrun, so
+        // it comes off the budget here and no extra margin is added.
+        const float tanDraft = std::tan(glm::radians(glm::clamp(draftAngle, 0.0f, 45.0f)));
+        float limit = kAutoEmbedMaxMm;
+        if (tanDraft > 1e-6f)
+            limit = std::min(limit, (gateRadius - kGateMinRadiusMm) / tanDraft - kGateCutEpsMm);
+        limit = std::max(limit, 0.0f);
+
+        FeatureEmbed::Params gp;
+        gp.maxExtension   = limit;
+        gp.margin         = 0.0f;
+        gp.respectCeiling = false;
+
+        for (int i = 0; i < (int)m_gates.size(); ++i)
+        {
+            GateFeature& gf = m_gates[i];
+            if (!gf.subPath.valid) continue;
+
+            // First-leg direction — the axis the gate cone is cut along.
+            glm::vec3 firstVec;
+            if (gf.subPath.kind == PathKind::Complex && gf.subPath.nodes.size() >= 2)
+                firstVec = gf.subPath.nodes[1].pos - gf.subPath.nodes[0].pos;
+            else
+                firstVec = gf.subPath.end - gf.subPath.start;
+            if (glm::length(firstVec) < 1e-6f) continue;
+            const glm::vec3 pathDir = glm::normalize(firstVec);
+
+            // Lines are sampled at the mouth radius and run parallel to the
+            // axis. The real cone narrows slightly going back, which only makes
+            // it reach a convex surface sooner, so this errs deep, not short.
+            const std::vector<glm::vec3> offsets =
+                FeatureEmbed::DiscSamples(pathDir, gateRadius);
+            gf.embedExtension = analyse(true, i, gf.point.worldPos, -pathDir, offsets, gp,
+                gateRadius * 1.6f + 1.0f);
+        }
+    }
+}
+
+wxString GLCanvas::BuildEmbedWarningText() const
+{
+    if (m_lastEmbedFlags.empty()) return wxString();
+
+    wxString text = wxString::Format(
+        "Auto-embed couldn't fully seat %d feature%s in the part:\n\n",
+        (int)m_lastEmbedFlags.size(), m_lastEmbedFlags.size() == 1 ? "" : "s");
+
+    for (const EmbedFlag& f : m_lastEmbedFlags)
+    {
+        const wxString name = wxString::Format("%s %d",
+            f.isGate ? "Gate" : "Vent", f.index + 1);
+        if (f.noPart)
+            text += wxString::Format(
+                "  - %s: its mouth never meets the part within %.1f mm.\n",
+                name, f.limit);
+        else
+            text += wxString::Format(
+                "  - %s: %.0f%% of its mouth can't reach the part within %.1f mm.\n",
+                name, 100.0 * f.unreachable / std::max(1, f.samples), f.limit);
+    }
+
+    text += "\nThese were cut with their normal overrun and are marked with a red "
+            "sphere in Preview. Try reducing the gate / vent size or moving it.";
+    return text;
+}
 
 // ---------------------------------------------------------------------------
 // Generate Mould Operation — Cuts objects, vents, runners, and sprues from blank mold halves
@@ -3893,6 +4165,13 @@ bool GLCanvas::GenerateMould()
     SetCurrent(*m_context);
     InitGLOnce();
 
+    // Auto-embed: measure every vent / gate mouth against the parts once, up
+    // front, so every cut / shot site below reads the same per-feature
+    // embedExtension. Flags (features that couldn't be seated) are reported
+    // after the run and handed to Preview as red marker spheres.
+    progress.Update(0, "Checking gate / vent embedding...");
+    RunAutoEmbedAnalysis();
+
     // Tier 0 speed-up: turn on OpenCascade's intra-operation parallelism. Every
     // BRepAlgoAPI_Cut / _Fuse / _Common reads this global default when it's
     // constructed, so setting it here makes each boolean op below (and those in
@@ -4241,8 +4520,12 @@ bool GLCanvas::GenerateMould()
                 // recovers the legacy behaviour, while a non-zero overrun
                 // produces the same shape as the preview built in
                 // RebuildGateSolids.
+                //
+                // Auto-embed: when the measured extension that seats the whole
+                // gate mouth is deeper than the user's overrun it takes over
+                // (per gate; 0 when off / unresolved -> plain overrun).
                 static constexpr float kCutEps = 0.1f;
-                const float backExt = kCutEps + overrun;
+                const float backExt = kCutEps + std::max(overrun, gf.embedExtension);
                 const glm::vec3 originExt = origin - pathDir * backExt;
                 const gp_Ax2    gateAxExt(gp_Pnt(originExt.x, originExt.y, originExt.z), occDir);
 
@@ -4883,8 +5166,16 @@ bool GLCanvas::GenerateMould()
 
     progress.Update(totalSteps, "Done.");
     Refresh(false);
-    wxMessageBox("Mould generated successfully.",
-        "Generate Mould", wxOK | wxICON_INFORMATION, this);
+
+    // Auto-embed flags don't stop the run (flagged features were cut with their
+    // plain overrun) but the user is told which ones need attention.
+    const wxString embedWarning = BuildEmbedWarningText();
+    if (embedWarning.empty())
+        wxMessageBox("Mould generated successfully.",
+            "Generate Mould", wxOK | wxICON_INFORMATION, this);
+    else
+        wxMessageBox("Mould generated with warnings.\n\n" + embedWarning,
+            "Generate Mould", wxOK | wxICON_WARNING, this);
     return true;
 }
 
@@ -4899,7 +5190,8 @@ bool GLCanvas::GenerateMould()
 
 void GLCanvas::AddPreviewHalf(const FileImporter::MeshData& mesh,
     const std::string& label,
-    const glm::vec3& baseColor)
+    const glm::vec3& baseColor,
+    float alpha)
 {
     // Materialise GPU buffers in this canvas's context. The caller (PreviewPanel)
     // makes the context current before invoking us, but make sure regardless —
@@ -4911,6 +5203,7 @@ void GLCanvas::AddPreviewHalf(const FileImporter::MeshData& mesh,
     half.label = label;
     half.visible = true;
     half.baseColor = baseColor;
+    half.alpha = glm::clamp(alpha, 0.0f, 1.0f);
     // Identity pose: the mesh vertices are already in world space.
     half.obj.pos = glm::vec3(0.0f);
     half.obj.yawDeg = half.obj.pitchDeg = half.obj.rollDeg = 0.0f;
@@ -5297,6 +5590,7 @@ void GLCanvas::RenderPreview(const glm::mat4& view, const glm::mat4& proj,
         const PreviewHalf& half = m_previewHalves[hi];
         if (!half.visible) continue;
         if (half.obj.mesh.vao == 0 || half.obj.mesh.indexCount == 0) continue;
+        if (half.alpha < 1.0f) continue;   // translucent parts: drawn last, below
 
         const glm::mat4 model = half.obj.BuildModelMatrix();
         glUniformMatrix4fv(locModel, 1, GL_FALSE, &model[0][0]);
@@ -5387,6 +5681,39 @@ void GLCanvas::RenderPreview(const glm::mat4& view, const glm::mat4& proj,
         glBindVertexArray(m_debugSolidObj.mesh.vao);
         glDrawElements(GL_TRIANGLES, m_debugSolidObj.mesh.indexCount, GL_UNSIGNED_INT, 0);
         glBindVertexArray(0);
+    }
+
+    // Translucent preview parts (Auto-embed flag markers) after everything
+    // opaque: blended, depth-tested but not depth-written, so the flagged
+    // feature and the part stay visible through the marker.
+    {
+        bool anyTranslucent = false;
+        for (const PreviewHalf& half : m_previewHalves)
+            if (half.visible && half.alpha < 1.0f && half.obj.mesh.vao &&
+                half.obj.mesh.indexCount > 0) { anyTranslucent = true; break; }
+
+        if (anyTranslucent)
+        {
+            const GLint locAlpha = glGetUniformLocation(m_program, "uAlpha");
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glDepthMask(GL_FALSE);
+            for (const PreviewHalf& half : m_previewHalves)
+            {
+                if (!half.visible || half.alpha >= 1.0f) continue;
+                if (half.obj.mesh.vao == 0 || half.obj.mesh.indexCount == 0) continue;
+                const glm::mat4 model = half.obj.BuildModelMatrix();
+                glUniformMatrix4fv(locModel, 1, GL_FALSE, &model[0][0]);
+                glUniform3fv(locBase, 1, &half.baseColor[0]);
+                glUniform1f(locAlpha, half.alpha);
+                glBindVertexArray(half.obj.mesh.vao);
+                glDrawElements(GL_TRIANGLES, half.obj.mesh.indexCount, GL_UNSIGNED_INT, 0);
+                glBindVertexArray(0);
+            }
+            glUniform1f(locAlpha, 1.0f);
+            glDepthMask(GL_TRUE);
+            glDisable(GL_BLEND);
+        }
     }
 
     glUseProgram(0);
@@ -5693,7 +6020,8 @@ bool GLCanvas::BuildShotModel(TopoDS_Shape& out,
             const float     totalLen = glm::length(gf.subPath.end - origin);
             const gp_Dir occDir(pathDir.x, pathDir.y, pathDir.z);
 
-            const float backExt = kCutEps + overrun;
+            // Auto-embed extension per gate, same rule as the mould cut.
+            const float backExt = kCutEps + std::max(overrun, gf.embedExtension);
             const glm::vec3 originExt = origin - pathDir * backExt;
             const gp_Ax2    gateAxExt(gp_Pnt(originExt.x, originExt.y, originExt.z), occDir);
 

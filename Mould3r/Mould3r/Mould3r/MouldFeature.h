@@ -266,6 +266,14 @@ struct VentInstance
     glm::vec3 localPos{ 0.0f, 0.0f, 0.0f };
     glm::vec3 localNormal{ 0.0f, 0.0f, 1.0f };
 
+    // Auto-embed result: the back-extension (mm, from the placed point into
+    // the part) that seats the WHOLE start cross-section inside the part.
+    // Derived at Generate Mould by GLCanvas::RunAutoEmbedAnalysis and never
+    // saved. 0 when Auto-embed is off, nothing needed extending, or the mouth
+    // couldn't be embedded within the limit (the feature is then flagged and
+    // cut with its plain overrun). Cut sites use max(overrun, embedExtension).
+    float     embedExtension = 0.0f;
+
     void Destroy() { solid.Destroy(); }
 };
 
@@ -329,6 +337,14 @@ struct GateFeature
     // origin; nodes.back() is the feed attach point (auto-snapped while Simple,
     // freely authored while Complex).
     FeaturePath subPath;
+
+    // Auto-embed result: the back-extension (mm, from the placed point into
+    // the part) that seats the WHOLE start cross-section inside the part.
+    // Derived at Generate Mould by GLCanvas::RunAutoEmbedAnalysis and never
+    // saved. 0 when Auto-embed is off, nothing needed extending, or the mouth
+    // couldn't be embedded within the limit (the feature is then flagged and
+    // cut with its plain overrun). Cut sites use max(overrun, embedExtension).
+    float     embedExtension = 0.0f;
 
     void Destroy() { solid.Destroy(); subRunnerSolid.Destroy(); }
 };

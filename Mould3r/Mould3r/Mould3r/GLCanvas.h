@@ -416,9 +416,12 @@ public:
     // model read distinctly from the grey mould halves. Parts start visible.
     // Must be called with this canvas's GL context current — PreviewPanel
     // arranges that.
+    // `alpha` < 1 draws the part translucent, after every opaque part and
+    // without depth writes (used for the Auto-embed flag markers).
     void AddPreviewHalf(const FileImporter::MeshData& mesh,
         const std::string& label,
-        const glm::vec3& baseColor = glm::vec3(0.80f, 0.80f, 0.85f));
+        const glm::vec3& baseColor = glm::vec3(0.80f, 0.80f, 0.85f),
+        float alpha = 1.0f);
 
     // Number of preview parts (mould halves + shot) currently loaded.
     int  GetPreviewHalfCount() const { return (int)m_previewHalves.size(); }
@@ -560,6 +563,15 @@ public:
     const std::vector<FileImporter::MeshData>& GetLastInsertMeshes() const
     {
         return m_lastInsertMeshes;
+    }
+
+    // Auto-embed flag markers from the most recent GenerateMould: one red
+    // sphere (world space) around each vent / gate whose mouth could not be
+    // fully embedded in its part within the extension limit. PreviewPanel shows
+    // them as one toggleable "Embed warnings" body. Empty when nothing flagged.
+    const std::vector<FileImporter::MeshData>& GetLastEmbedFlagMeshes() const
+    {
+        return m_lastEmbedFlagMeshes;
     }
 
     // The "shot" model from the most recent successful GenerateMould: the
@@ -976,6 +988,21 @@ private:
     // nothing contributed or the fuse failed outright. Read by GenerateMould.
     bool BuildShotModel(TopoDS_Shape& out,
         std::vector<TopoDS_Shape>* objectShapesOut = nullptr);
+
+    // Auto-embed (run once at the top of GenerateMould). For every vent / gate
+    // whose card has Auto-embed ticked, measure how far its start cross-section
+    // sits outside the moulded parts along the channel axis (FeatureEmbed) and
+    // store the back-extension that seats the whole mouth in embedExtension.
+    // Features that can't be seated within the limit (10 mm; less for a gate
+    // whose draft would shrink the cone to nothing first) keep
+    // embedExtension = 0 — so they cut with their plain overrun — and are
+    // recorded in m_lastEmbedFlags + m_lastEmbedFlagMeshes for the warning and
+    // the Preview markers.
+    void RunAutoEmbedAnalysis();
+
+    // Multi-line summary of m_lastEmbedFlags for the Generate warning; empty
+    // when nothing was flagged.
+    wxString BuildEmbedWarningText() const;
 
     // Build the "Cast Shot Body": BuildShotModel's shot fused with the features
     // deliberately excluded from it — vents (their cut channels), inserts grown
@@ -1515,6 +1542,7 @@ private:
         std::string label;
         bool        visible = true;
         glm::vec3   baseColor{ 0.80f, 0.80f, 0.85f };
+        float       alpha = 1.0f;   // < 1: translucent pass (see RenderPreview)
     };
     std::vector<PreviewHalf> m_previewHalves;
 
@@ -1625,6 +1653,21 @@ private:
     // as their own category, in the same yellow they use in the Prepare view.
     // Empty when there were no inserts.
     std::vector<FileImporter::MeshData> m_lastInsertMeshes;
+
+    // Auto-embed flags from the most recent GenerateMould (see
+    // RunAutoEmbedAnalysis). One entry per vent / gate that couldn't be
+    // embedded; m_lastEmbedFlagMeshes holds the matching red marker spheres.
+    struct EmbedFlag
+    {
+        bool      isGate = false;
+        int       index = -1;          // into m_vents / m_gates
+        int       samples = 0;         // cross-section sample lines
+        int       unreachable = 0;     // lines that never met a part in range
+        bool      noPart = false;      // no line met a part at all
+        float     limit = 0.0f;        // extension limit used (mm)
+    };
+    std::vector<EmbedFlag>              m_lastEmbedFlags;
+    std::vector<FileImporter::MeshData> m_lastEmbedFlagMeshes;
 
 
     // Vent features (consolidated: point + path + cross-section + solid)

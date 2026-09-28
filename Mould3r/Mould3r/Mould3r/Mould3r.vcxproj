@@ -144,6 +144,7 @@
     <ClCompile Include="CastingPanel.cpp" />
     <ClCompile Include="CreateFixtureDialog.cpp" />
     <ClCompile Include="DesignChecks.cpp" />
+    <ClCompile Include="FeatureEmbed.cpp" />
     <ClCompile Include="FlowMesh.cpp" />
     <ClCompile Include="FlowSolver.cpp" />
     <ClCompile Include="FeedNetwork.cpp" />
@@ -201,6 +202,7 @@
     <ClInclude Include="CastingPanel.h" />
     <ClInclude Include="CreateFixtureDialog.h" />
     <ClInclude Include="DesignChecks.h" />
+    <ClInclude Include="FeatureEmbed.h" />
     <ClInclude Include="MeshGrid.h" />
     <ClInclude Include="FlowMesh.h" />
     <ClInclude Include="FlowSolver.h" />

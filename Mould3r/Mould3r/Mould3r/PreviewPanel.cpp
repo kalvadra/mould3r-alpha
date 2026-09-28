@@ -671,6 +671,11 @@ void PreviewPanel::SetData(const std::vector<FileImporter::MeshData>& halves,
     // Stash the new data, replacing whatever the previous generation left.
     m_pendingHalves = halves;
     m_pendingInserts = inserts;
+    m_pendingEmbedFlags.clear();
+    if (shot.embedFlags)
+        for (const FileImporter::MeshData& m : *shot.embedFlags)
+            if (!m.posNorm.empty() && !m.indices.empty())
+                m_pendingEmbedFlags.push_back(m);
 
     // Cache the combined bounding box of the mould halves now, while we still
     // hold their meshes — LoadHalves drops the CPU copies afterwards. The cast
@@ -772,9 +777,17 @@ void PreviewPanel::SetData(const std::vector<FileImporter::MeshData>& halves,
         ? (int)halves.size() + (m_hasShot ? 1 : 0)
         : -1;
 
-    // Cast bodies (bases / walls) append after the halves, shot and inserts.
-    // Record that boundary so a cast re-generation can truncate back to it.
-    m_castAnchorCount = (int)halves.size() + (m_hasShot ? 1 : 0) + m_insertCount;
+    // Auto-embed flag markers follow the inserts, again as one block.
+    m_embedCount = (int)m_pendingEmbedFlags.size();
+    m_embedFirstIndex = (m_embedCount > 0)
+        ? (int)halves.size() + (m_hasShot ? 1 : 0) + m_insertCount
+        : -1;
+
+    // Cast bodies (bases / walls) append after the halves, shot, inserts and
+    // embed markers. Record that boundary so a cast re-generation can truncate
+    // back to it.
+    m_castAnchorCount = (int)halves.size() + (m_hasShot ? 1 : 0) + m_insertCount
+        + m_embedCount;
 
     // Reset the overlay state carried over from the previous generation. The
     // Sim Viewer selection and wireframe toggle are sticky: they persist across
@@ -794,7 +807,7 @@ void PreviewPanel::SetData(const std::vector<FileImporter::MeshData>& halves,
 
     // Rebuild the dynamic UI for the new part set.
     ClearVisibilityChecks();
-    BuildVisibilityChecks((int)halves.size(), m_hasShot, m_insertCount);
+    BuildVisibilityChecks((int)halves.size(), m_hasShot, m_insertCount, m_embedCount);
     UpdateInfoPanel();
 
     // The mesh upload waits until we're actually visible — a canvas on a hidden
@@ -813,6 +826,10 @@ void PreviewPanel::ClearData()
     m_insertCheck = nullptr;
     m_insertFirstIndex = -1;
     m_insertCount = 0;
+    m_pendingEmbedFlags.clear();
+    m_embedCheck = nullptr;
+    m_embedFirstIndex = -1;
+    m_embedCount = 0;
     m_shotMesh = FileImporter::MeshData();
     m_shotShape = TopoDS_Shape();
     m_shotFaceIds.clear();
@@ -3942,12 +3959,14 @@ void PreviewPanel::UpdateSeparationOverlay()
 // (Re)build the show/hide visibility checkboxes for the current part set, into
 // m_visPanel (left column). One per mould half, then "Shot" if present.
 // ---------------------------------------------------------------------------
-void PreviewPanel::BuildVisibilityChecks(int halfCount, bool hasShot, int insertCount)
+void PreviewPanel::BuildVisibilityChecks(int halfCount, bool hasShot, int insertCount,
+    int embedFlagCount)
 {
     if (!m_visPanel) return;
     auto* vSizer = m_visPanel->GetSizer();
 
-    const bool anyParts = (halfCount > 0) || hasShot || (insertCount > 0);
+    const bool anyParts = (halfCount > 0) || hasShot || (insertCount > 0)
+        || (embedFlagCount > 0);
     if (m_visEmptyLabel) m_visEmptyLabel->Show(!anyParts);
 
     auto addCheck = [&](int partIndex, const wxString& label, const wxString& tip,
@@ -4004,6 +4023,32 @@ void PreviewPanel::BuildVisibilityChecks(int halfCount, bool hasShot, int insert
             });
         vSizer->Add(cb, 0, wxEXPAND | wxALL, 6);
         m_insertCheck = cb;
+    }
+
+    // Auto-embed flag markers: ONE checkbox for every red sphere, driving the
+    // block [firstIdx, firstIdx + embedFlagCount) after the inserts. Visible by
+    // default so a flagged gate / vent is noticed. Label in red to match.
+    m_embedCheck = nullptr;
+    if (embedFlagCount > 0)
+    {
+        const int firstIdx = halfCount + (hasShot ? 1 : 0) + insertCount;
+        auto* cb = new wxCheckBox(m_visPanel, kHalfToggleIdBase + firstIdx,
+            wxString::Format("Embed warnings (%d)", embedFlagCount));
+        cb->SetForegroundColour(wxColour(230, 80, 80));
+        cb->SetBackgroundColour(Style::CardBg);
+        cb->SetValue(true);
+        cb->SetToolTip("Show / hide the red markers on gates / vents that "
+            "Auto-embed couldn't fully seat in the part (see the Generate warning)");
+        cb->Bind(wxEVT_CHECKBOX,
+            [this, firstIdx, embedFlagCount](wxCommandEvent& evt)
+            {
+                if (!m_canvas) return;
+                const bool on = evt.IsChecked();
+                for (int k = 0; k < embedFlagCount; ++k)
+                    m_canvas->SetPreviewHalfVisible(firstIdx + k, on);
+            });
+        vSizer->Add(cb, 0, wxEXPAND | wxALL, 6);
+        m_embedCheck = cb;
     }
 
     m_visPanel->Layout();
@@ -4081,6 +4126,12 @@ void PreviewPanel::ClearVisibilityChecks()
         if (vSizer) vSizer->Detach(m_insertCheck);
         m_insertCheck->Destroy();
         m_insertCheck = nullptr;
+    }
+    if (m_embedCheck)
+    {
+        if (vSizer) vSizer->Detach(m_embedCheck);
+        m_embedCheck->Destroy();
+        m_embedCheck = nullptr;
     }
     ClearCastChecks();
     if (m_visEmptyLabel) m_visEmptyLabel->Show(true);
@@ -4245,12 +4296,23 @@ void PreviewPanel::LoadHalves()
             "Insert " + std::to_string(i + 1), insertColor);
     }
 
-    // Half + insert meshes are now on the GPU; drop the CPU copies (the shot is
-    // kept for the design checks).
+    // Auto-embed flag markers after the inserts: translucent red spheres, so
+    // the flagged gate / vent stays visible inside its marker.
+    for (size_t i = 0; i < m_pendingEmbedFlags.size(); ++i)
+    {
+        const glm::vec3 flagColor(0.95f, 0.12f, 0.12f);
+        m_canvas->AddPreviewHalf(m_pendingEmbedFlags[i],
+            "Embed warning " + std::to_string(i + 1), flagColor, /*alpha=*/0.35f);
+    }
+
+    // Half + insert + marker meshes are now on the GPU; drop the CPU copies
+    // (the shot is kept for the design checks).
     m_pendingHalves.clear();
     m_pendingHalves.shrink_to_fit();
     m_pendingInserts.clear();
     m_pendingInserts.shrink_to_fit();
+    m_pendingEmbedFlags.clear();
+    m_pendingEmbedFlags.shrink_to_fit();
 
     // Apply the initial checkbox states to the freshly loaded parts (parts are
     // added visible, so hide any whose checkbox starts unchecked — e.g. Half A).
@@ -4264,6 +4326,9 @@ void PreviewPanel::LoadHalves()
     if (m_insertCheck && !m_insertCheck->GetValue() && m_insertFirstIndex >= 0)
         for (int k = 0; k < m_insertCount; ++k)
             m_canvas->SetPreviewHalfVisible(m_insertFirstIndex + k, false);
+    if (m_embedCheck && !m_embedCheck->GetValue() && m_embedFirstIndex >= 0)
+        for (int k = 0; k < m_embedCount; ++k)
+            m_canvas->SetPreviewHalfVisible(m_embedFirstIndex + k, false);
 
     m_canvas->Refresh(false);
 }

@@ -125,6 +125,7 @@ bool ProjectFile::Save(const std::string& path,
     file << "ventLength       = " << data.params.ventLength << "\n";
     file << "ventOverrunStart = " << data.params.ventOverrunStart << "\n";
     file << "ventOverrunEnd   = " << data.params.ventOverrunEnd << "\n";
+    file << "ventAutoEmbed    = " << (data.params.ventAutoEmbed ? "true" : "false") << "\n";
     file << "sprueDiameter    = " << data.params.sprueDiameter << "\n";
     file << "sprueDraftAngle  = " << data.params.sprueDraftAngle << "\n";
     file << "sprueColdSlugDepth = " << data.params.sprueColdSlugDepth << "\n";
@@ -134,6 +135,8 @@ bool ProjectFile::Save(const std::string& path,
     file << "runnerColdPlugDist = " << data.params.runnerColdPlugDist << "\n";
     file << "gateDiameter     = " << data.params.gateDiameter << "\n";
     file << "gateDraftAngle   = " << data.params.gateDraftAngle << "\n";
+    file << "gateOverrun      = " << data.params.gateOverrun << "\n";
+    file << "gateAutoEmbed    = " << (data.params.gateAutoEmbed ? "true" : "false") << "\n";
     file << "subRunnerDiameter = " << data.params.subRunnerDiameter << "\n";
     file << "ejectorDiameter   = " << data.params.ejectorDiameter << "\n";
     file << "ejectorLength     = " << data.params.ejectorLength << "\n";
@@ -472,6 +475,9 @@ bool ProjectFile::Load(const std::string& path,
             else if (key == "runnerColdPlugDist") p.runnerColdPlugDist = ParseFloat(val, p.runnerColdPlugDist);
             else if (key == "gateDiameter")      p.gateDiameter = ParseFloat(val, p.gateDiameter);
             else if (key == "gateDraftAngle")    p.gateDraftAngle = ParseFloat(val, p.gateDraftAngle);
+            else if (key == "gateOverrun")       p.gateOverrun = ParseFloat(val, p.gateOverrun);
+            else if (key == "ventAutoEmbed")     p.ventAutoEmbed = ParseBool(val);
+            else if (key == "gateAutoEmbed")     p.gateAutoEmbed = ParseBool(val);
             else if (key == "subRunnerDiameter") p.subRunnerDiameter = ParseFloat(val, p.subRunnerDiameter);
             else if (key == "ejectorDiameter")   p.ejectorDiameter = ParseFloat(val, p.ejectorDiameter);
             else if (key == "ejectorLength")     p.ejectorLength = ParseFloat(val, p.ejectorLength);

@@ -103,6 +103,13 @@ public:
     float GetGateDiameter() const;
     float GetGateDraftAngle() const;
     float GetGateOverrun() const;
+
+    // "Auto-embed" checkboxes (Vent / Gate cards, both on by default). When on,
+    // Generate Mould measures how far each vent / gate mouth sits outside its
+    // part and extends that feature's back-overrun (up to 10 mm) until the whole
+    // mouth is embedded; see GLCanvas::RunAutoEmbedAnalysis.
+    bool IsVentAutoEmbed() const;
+    bool IsGateAutoEmbed() const;
     float GetSubRunnerDiameter() const;
 
     float GetEjectorDiameter() const;
@@ -358,6 +365,9 @@ private:
     RoundedButton* MakePlaceButton(wxWindow* parent, int id,
         const wxString& label);
 
+    // Builds one "Auto-embed" checkbox (Vent / Gate cards), default checked.
+    wxCheckBox* MakeAutoEmbedCheck(wxWindow* parent, const wxString& what);
+
     // Vent field members
     wxChoice* m_ventTypeChoice = nullptr;
     wxPanel* m_ventDimsPanel = nullptr;
@@ -365,6 +375,7 @@ private:
     wxTextCtrl* m_ventWidth = nullptr;
     wxTextCtrl* m_ventOverrunStart = nullptr;
     wxTextCtrl* m_ventOverrunEnd = nullptr;
+    wxCheckBox* m_ventAutoEmbed = nullptr;   // "Auto-embed" (default on)
 
     // Sprue field members
     wxChoice* m_sprueTypeChoice = nullptr;
@@ -384,6 +395,7 @@ private:
     wxTextCtrl* m_gateDiameter = nullptr;
     wxTextCtrl* m_gateDraftAngle = nullptr;
     wxTextCtrl* m_gateOverrun = nullptr;     // mm extension into the model
+    wxCheckBox* m_gateAutoEmbed = nullptr;   // "Auto-embed" (default on)
 
     // Sub-runner field members (within the Gates section)
     wxChoice* m_subRunnerTypeChoice = nullptr;

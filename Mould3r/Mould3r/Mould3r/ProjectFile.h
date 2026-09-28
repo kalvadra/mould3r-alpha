@@ -168,6 +168,11 @@ struct ProjectParameters
     float gateDiameter = 3.0f;
     float gateDraftAngle = 1.0f;
     float gateOverrun = 0.0f;          // mm extension backward into the model
+
+    // "Auto-embed" toggles (Vent / Gate cards). Default ON, so older project
+    // files without the keys load with the feature enabled.
+    bool  ventAutoEmbed = true;
+    bool  gateAutoEmbed = true;
     float subRunnerDiameter = 5.0f;
 
     float ejectorDiameter = 3.0f;
