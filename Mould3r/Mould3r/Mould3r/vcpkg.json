@@ -1,6 +1,6 @@
 {
   "name": "mould3r",
-  "version-string": "0.5.0",
+  "version-string": "0.7.0",
   "description": "Mould3r - injection mould design",
   "dependencies": [
     "wxwidgets",

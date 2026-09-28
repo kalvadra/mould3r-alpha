@@ -26,7 +26,7 @@
 // PATCH fixes bugs. The update checker's comparison is a straight
 // major/minor/patch ordering, so these must only ever move forward.
 #define MOULD3R_VERSION_MAJOR   0
-#define MOULD3R_VERSION_MINOR   6
+#define MOULD3R_VERSION_MINOR   7
 #define MOULD3R_VERSION_PATCH   0
 
 // ---- Derived strings -------------------------------------------------------
