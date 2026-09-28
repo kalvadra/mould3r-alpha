@@ -22,6 +22,7 @@
 #include <opencascade/STEPControl_Writer.hxx>
 #include <opencascade/IFSelect_ReturnStatus.hxx>
 #include <opencascade/TopoDS_Shape.hxx>
+#include "DesignChecks.h"   // DesignChecks types shared with the preview
 
 #include "camera.h"
 #include "FileImporter.h"
@@ -31,6 +32,8 @@
 #include "MainFrame.h"
 #include "MouldFeature.h"
 #include "ProjectFile.h"
+#include "FeedNetwork.h"    // Flow::FeedNetwork — the 1D feed-system snapshot
+#include "Midplane.h"       // Flow::PartSurface — part surfaces for the midplane
 
 struct GPUMesh
 {
@@ -413,9 +416,12 @@ public:
     // model read distinctly from the grey mould halves. Parts start visible.
     // Must be called with this canvas's GL context current — PreviewPanel
     // arranges that.
+    // `alpha` < 1 draws the part translucent, after every opaque part and
+    // without depth writes (used for the Auto-embed flag markers).
     void AddPreviewHalf(const FileImporter::MeshData& mesh,
         const std::string& label,
-        const glm::vec3& baseColor = glm::vec3(0.80f, 0.80f, 0.85f));
+        const glm::vec3& baseColor = glm::vec3(0.80f, 0.80f, 0.85f),
+        float alpha = 1.0f);
 
     // Number of preview parts (mould halves + shot) currently loaded.
     int  GetPreviewHalfCount() const { return (int)m_previewHalves.size(); }
@@ -462,6 +468,27 @@ public:
     // Turn debug colouring off — the shot returns to its normal single colour.
     void ClearShotDebugColoring();
 
+    // Draw the active debug colouring as a wireframe (edges only) instead of
+    // filled triangles. Useful for inspecting the analysis mesh itself.
+    void SetShotDebugWireframe(bool on);
+
+    // Like SetShotDebugGroups, but the debug body is a supplied mesh (posNorm,
+    // 6 floats/vertex) rather than the shot's display mesh - used to draw the
+    // draft "area grid" remesh, whose triangles the group EBOs index. Rendered
+    // with the shot half's model matrix, so pass the shot half index.
+    void SetShotDebugMesh(int halfIndex,
+        const std::vector<float>& posNorm,
+        const std::vector<ShotDebugGroup>& groups);
+
+    // Inspect-face (preview): when on, a left click picks a triangle of the
+    // supplied CPU mesh (xyz per vertex, in halfIndex's local space) and
+    // reports its index (or -1 on a miss) via the callback, instead of orbiting.
+    void SetInspectMode(bool on) { m_inspectMode = on; }
+    void SetInspectMesh(int halfIndex, const std::vector<float>& verts,
+        const std::vector<unsigned int>& indices)
+    { m_inspectHalf = halfIndex; m_inspectVerts = verts; m_inspectIdx = indices; }
+    void SetOnInspectHit(std::function<void(int)> cb) { m_onInspectHit = std::move(cb); }
+
     // ---- Design-check debug rays -------------------------------------------
     // Upload accessibility-ray debug geometry for the preview: `rayLineVerts`
     // is GL_LINES vertex pairs (world space) for the ray segments, and
@@ -476,6 +503,41 @@ public:
 
     // Forget ray geometry and hide both overlays.
     void ClearShotDebugRays();
+
+    // ---- Multi-batch debug overlay (preview) -------------------------------
+    // A list of independently coloured line / point batches, drawn with the
+    // flat shader after the scene. With `onTop` the overlay ignores depth so it
+    // reads through the mould halves and shot (used by the flow feed-network
+    // view, whose centrelines run inside the steel). World-space geometry.
+    struct DebugOverlayBatch
+    {
+        bool                   points = false;   // false: GL_LINES vertex pairs
+        glm::vec3              color{ 1.0f };
+        float                  size = 2.0f;      // line width / point size (px)
+        std::vector<glm::vec3> verts;
+    };
+    // Replace the overlay with `batches` and show it.
+    void SetDebugOverlay(const std::vector<DebugOverlayBatch>& batches, bool onTop = true);
+    // Hide the overlay (GL buffers are released on the next Set / DestroyGL).
+    void ClearDebugOverlay();
+
+    // ---- Flow analysis: feed-system snapshot ------------------------------
+    // Snapshot the sprue, runners, gates and vents — plus one PART node per
+    // moulded object — as a 1D nodal network (Flow::FeedNetwork) for the
+    // Hele-Shaw analysis. Feature path ends become nodes (runners are split
+    // where a gate attaches part-way along them); each edge carries its path
+    // length and the feature's specified cross-section, assumed over the whole
+    // edge. Dimensions are read from the same UI fields the geometry uses, so
+    // the network matches what Generate Mould cut. Called by MainFrame right
+    // after a successful GenerateMould and handed to the Preview perspective.
+    Flow::FeedNetwork BuildFeedNetwork() const;
+
+    // Snapshot each moulded object's own surface in world space (the object's
+    // mesh through its model matrix) for the flow analysis' planform midplane.
+    // Same object filter and "Part N" numbering as BuildFeedNetwork's part
+    // nodes; objectIndex is the join key. Taken at Generate Mould alongside the
+    // network, so the midplane is built from the part itself, not the shot.
+    std::vector<Flow::PartSurface> BuildPartSurfaces() const;
 
     // ---- Design-check debug solid ------------------------------------------
     // Upload a free-standing solid (e.g. the interference region from the
@@ -501,6 +563,15 @@ public:
     const std::vector<FileImporter::MeshData>& GetLastInsertMeshes() const
     {
         return m_lastInsertMeshes;
+    }
+
+    // Auto-embed flag markers from the most recent GenerateMould: one red
+    // sphere (world space) around each vent / gate whose mouth could not be
+    // fully embedded in its part within the extension limit. PreviewPanel shows
+    // them as one toggleable "Embed warnings" body. Empty when nothing flagged.
+    const std::vector<FileImporter::MeshData>& GetLastEmbedFlagMeshes() const
+    {
+        return m_lastEmbedFlagMeshes;
     }
 
     // The "shot" model from the most recent successful GenerateMould: the
@@ -545,14 +616,6 @@ public:
     // mapped back to the shot's display triangles for colouring.
     const std::vector<int>& GetLastShotFaceIds() const { return m_lastShotFaceIds; }
 
-    // The post-cut mould-half solids (BREP) from the most recent successful
-    // GenerateMould, in fixture order. Used by the separation-based
-    // demoldability check (translate each half off the shot and test for
-    // interference). Empty when no mould was generated.
-    const std::vector<TopoDS_Shape>& GetLastHalfShapes() const
-    {
-        return m_lastHalfShapes;
-    }
 
     // Scene-mutation callback. MainFrame registers a callback that
     // invalidates the Export button when anything that would stale a
@@ -923,7 +986,23 @@ private:
     // with the same geometry the cut loop uses, then fused pairwise. Returns
     // true and fills `out` when a non-null union results; returns false when
     // nothing contributed or the fuse failed outright. Read by GenerateMould.
-    bool BuildShotModel(TopoDS_Shape& out);
+    bool BuildShotModel(TopoDS_Shape& out,
+        std::vector<TopoDS_Shape>* objectShapesOut = nullptr);
+
+    // Auto-embed (run once at the top of GenerateMould). For every vent / gate
+    // whose card has Auto-embed ticked, measure how far its start cross-section
+    // sits outside the moulded parts along the channel axis (FeatureEmbed) and
+    // store the back-extension that seats the whole mouth in embedExtension.
+    // Features that can't be seated within the limit (10 mm; less for a gate
+    // whose draft would shrink the cone to nothing first) keep
+    // embedExtension = 0 — so they cut with their plain overrun — and are
+    // recorded in m_lastEmbedFlags + m_lastEmbedFlagMeshes for the warning and
+    // the Preview markers.
+    void RunAutoEmbedAnalysis();
+
+    // Multi-line summary of m_lastEmbedFlags for the Generate warning; empty
+    // when nothing was flagged.
+    wxString BuildEmbedWarningText() const;
 
     // Build the "Cast Shot Body": BuildShotModel's shot fused with the features
     // deliberately excluded from it — vents (their cut channels), inserts grown
@@ -1463,6 +1542,7 @@ private:
         std::string label;
         bool        visible = true;
         glm::vec3   baseColor{ 0.80f, 0.80f, 0.85f };
+        float       alpha = 1.0f;   // < 1: translucent pass (see RenderPreview)
     };
     std::vector<PreviewHalf> m_previewHalves;
 
@@ -1481,11 +1561,22 @@ private:
     struct ShotDebugView
     {
         bool    active = false;
+        bool    wireframe = false;
         int     halfIndex = -1;
         GLuint  vao = 0;
+        GLuint  ownVbo = 0;   // non-zero when the debug body is its own mesh
         std::vector<DebugGroupGPU> groups;
     };
     ShotDebugView m_shotDebug;
+
+    // Inspect-face picking (preview).
+    bool m_inspectMode = false;
+    int  m_inspectHalf = -1;
+    wxPoint m_inspectDownPos;
+    std::vector<float>        m_inspectVerts;
+    std::vector<unsigned int> m_inspectIdx;
+    std::function<void(int)>  m_onInspectHit;
+    void InspectPickAt(int mouseX, int mouseY);
 
     // Accessibility-ray debug overlay (preview): ray segments drawn as GL_LINES
     // and contact points as GL_POINTS via the flat shader. Geometry is world
@@ -1498,6 +1589,21 @@ private:
     GLsizei m_debugContactVertCount = 0;
     bool    m_showDebugRays = false;
     bool    m_showDebugContacts = false;
+
+    // Multi-batch debug overlay (see SetDebugOverlay): one VAO/VBO per batch.
+    struct DebugOverlayGL
+    {
+        GLuint    vao = 0;
+        GLuint    vbo = 0;
+        GLsizei   count = 0;
+        bool      points = false;
+        glm::vec3 color{ 1.0f };
+        float     size = 2.0f;
+    };
+    std::vector<DebugOverlayGL> m_debugOverlay;
+    bool m_showDebugOverlay  = false;
+    bool m_debugOverlayOnTop = true;
+    void DestroyDebugOverlayGL();   // needs a current context
 
     // Free-standing lit debug solid (the separation test's interference region).
     // Stored as a SceneObject so the normal mesh upload/render path applies.
@@ -1540,10 +1646,6 @@ private:
     TopoDS_Shape           m_lastShotShape;
     std::vector<int>       m_lastShotFaceIds;
 
-    // The post-cut mould-half solids (BREP), in fixture order, retained for the
-    // separation-based demoldability check.
-    std::vector<TopoDS_Shape> m_lastHalfShapes;
-
     // Display meshes of the inserts as they stood at the most recent
     // GenerateMould (world-space, tessellated from each insert's UNSCALED body
     // — the same void removed from the shot). One per insert. Consumed by
@@ -1551,6 +1653,21 @@ private:
     // as their own category, in the same yellow they use in the Prepare view.
     // Empty when there were no inserts.
     std::vector<FileImporter::MeshData> m_lastInsertMeshes;
+
+    // Auto-embed flags from the most recent GenerateMould (see
+    // RunAutoEmbedAnalysis). One entry per vent / gate that couldn't be
+    // embedded; m_lastEmbedFlagMeshes holds the matching red marker spheres.
+    struct EmbedFlag
+    {
+        bool      isGate = false;
+        int       index = -1;          // into m_vents / m_gates
+        int       samples = 0;         // cross-section sample lines
+        int       unreachable = 0;     // lines that never met a part in range
+        bool      noPart = false;      // no line met a part at all
+        float     limit = 0.0f;        // extension limit used (mm)
+    };
+    std::vector<EmbedFlag>              m_lastEmbedFlags;
+    std::vector<FileImporter::MeshData> m_lastEmbedFlagMeshes;
 
 
     // Vent features (consolidated: point + path + cross-section + solid)

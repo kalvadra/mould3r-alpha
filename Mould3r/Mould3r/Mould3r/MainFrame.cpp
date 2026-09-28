@@ -685,6 +685,8 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
 
     // ---- Preview page: the embedded preview perspective --------------------
     m_previewPanel = new PreviewPanel(m_book);
+    // A results window's "Open View" can be pressed from any perspective.
+    m_previewPanel->onShowRequested = [this] { SetPerspective(Perspective::Preview); };
 
     // ---- Casting page: the embedded mould-cast perspective -----------------
     m_castingPanel = new CastingPanel(m_book);
@@ -2707,6 +2709,35 @@ float MainFrame::GetGateOverrun() const
     return static_cast<float>(v) * (m_imperial ? 25.4f : 1.0f);
 }
 
+// Auto-embed toggles (default on; a missing control reads as on).
+bool MainFrame::IsVentAutoEmbed() const
+{
+    return !m_ventAutoEmbed || m_ventAutoEmbed->GetValue();
+}
+
+bool MainFrame::IsGateAutoEmbed() const
+{
+    return !m_gateAutoEmbed || m_gateAutoEmbed->GetValue();
+}
+
+// Shared builder for the two "Auto-embed" checkboxes, styled like the card's
+// muted 8pt field labels. `what` is "vent" / "gate" for the tooltip.
+wxCheckBox* MainFrame::MakeAutoEmbedCheck(wxWindow* parent, const wxString& what)
+{
+    auto* cb = new wxCheckBox(parent, wxID_ANY, "Auto-embed");
+    cb->SetValue(true);
+    cb->SetBackgroundColour(Style::CardBg);
+    cb->SetForegroundColour(Style::TextMuted);
+    cb->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+    cb->SetToolTip("On Generate Mould, extend each " + what + " back into the part "
+        "(up to 10 mm) until its whole cross-section is embedded, so a curved or "
+        "angled surface can't leave a wall of steel across the " + what + " mouth.\n"
+        "If it can't be embedded within 10 mm, the " + what + " is cut with its "
+        "normal overrun and flagged in Preview.");
+    return cb;
+}
+
 float MainFrame::GetSubRunnerDiameter() const
 {
     if (!m_subRunnerDiameter) return 5.0f;
@@ -3100,6 +3131,8 @@ void MainFrame::OnSaveProject(wxCommandEvent&)
         p.gateDiameter = GetGateDiameter();
         p.gateDraftAngle = GetGateDraftAngle();
         p.gateOverrun = GetGateOverrun();
+        p.ventAutoEmbed = IsVentAutoEmbed();
+        p.gateAutoEmbed = IsGateAutoEmbed();
         p.subRunnerDiameter = GetSubRunnerDiameter();
         p.ejectorDiameter = GetEjectorDiameter();
         p.ejectorLength = GetEjectorLength();
@@ -3533,6 +3566,8 @@ void MainFrame::SetParameterFields(const ProjectParameters& p)
     setField(m_gateDiameter, p.gateDiameter * conv);
     setField(m_gateDraftAngle, p.gateDraftAngle);           // degrees — no conversion
     setField(m_gateOverrun, p.gateOverrun * conv);
+    if (m_ventAutoEmbed) m_ventAutoEmbed->SetValue(p.ventAutoEmbed);
+    if (m_gateAutoEmbed) m_gateAutoEmbed->SetValue(p.gateAutoEmbed);
     setField(m_subRunnerDiameter, p.subRunnerDiameter * conv);
     setField(m_ejectorDiameter, p.ejectorDiameter * conv);
     setField(m_ejectorLength, p.ejectorLength * conv);
@@ -4028,16 +4063,27 @@ void MainFrame::OnGenerateMould(wxCommandEvent&)
         {
             ShotPreviewInput shot;
             shot.sceneIsMesh = m_canvas->IsSceneMeshType();
+
+            // Snapshot the feed system (sprue / runners / gates / vents + one
+            // node per moulded object) as a 1D network for the flow analysis,
+            // at the same moment as the cut it describes. SetData copies it.
+            const Flow::FeedNetwork feedNetwork = m_canvas->BuildFeedNetwork();
+            shot.feedNetwork = &feedNetwork;
+            // ...and each moulded object's own surface, the source for the
+            // part midplane meshes (built in Preview at the target tri area).
+            const std::vector<Flow::PartSurface> partSurfaces = m_canvas->BuildPartSurfaces();
+            shot.partSurfaces = &partSurfaces;
             // Which mould kind produced this run — the preview locks cast
             // generation to procedural (Parametric / Dynamic) moulds.
             shot.mouldKind = m_fixtureDef.kind;
+            // Auto-embed flag markers (red spheres) — empty when none flagged.
+            shot.embedFlags = &m_canvas->GetLastEmbedFlagMeshes();
             if (m_canvas->HasLastShotMesh())
             {
                 shot.mesh = &m_canvas->GetLastShotMesh();
                 shot.shape = &m_canvas->GetLastShotShape();
                 shot.faceIds = &m_canvas->GetLastShotFaceIds();
                 shot.volumeMm3 = m_canvas->GetLastShotVolumeMm3();
-                shot.halves = &m_canvas->GetLastHalfShapes();
                 // Augmented shot (vents + scaled inserts + ejectors) for the
                 // cast-mould bases; null-safe when none was built. The BREP is
                 // passed too so the bases can be built as STEP-exportable solids
@@ -4302,6 +4348,13 @@ wxPanel* MainFrame::CreateVentsContent(wxWindow* parent)
     addDimRow("Width:", m_ventWidth, "2.0");
     addDimRow("Overrun (start):", m_ventOverrunStart, "0.5");
     addDimRow("Overrun (end):", m_ventOverrunEnd, "0.5");
+
+    // Auto-embed: at Generate, measure how far the vent mouth sits outside the
+    // part (curved / oblique surfaces) and extend Overrun (start) until the
+    // whole cross-section is embedded, up to 10 mm. If it can't be embedded
+    // within that, the vent is cut with the Overrun (start) above and flagged.
+    m_ventAutoEmbed = MakeAutoEmbedCheck(m_ventDimsPanel, "vent");
+    dimsSizer->Add(m_ventAutoEmbed, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
 
     m_ventDimsPanel->SetSizer(dimsSizer);
     settingsSizer->Add(m_ventDimsPanel, 0, wxEXPAND | wxBOTTOM, 10);
@@ -4780,6 +4833,11 @@ wxPanel* MainFrame::CreateGatesContent(wxWindow* parent)
     // the parting surface). The radius at the parting surface is preserved
     // — see RebuildGateSolids for the math.
     addRow(dimsPanel, dimsSizer, "Overrun:", m_gateOverrun, "0.0", "mm");
+    // Auto-embed: see the vent card. Extends the gate's back-overrun until
+    // the whole gate mouth is inside the part (up to 10 mm), else falls back
+    // to Overrun above and flags the gate.
+    m_gateAutoEmbed = MakeAutoEmbedCheck(dimsPanel, "gate");
+    dimsSizer->Add(m_gateAutoEmbed, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
     dimsPanel->SetSizer(dimsSizer);
     settingsSizer->Add(dimsPanel, 0, wxEXPAND | wxBOTTOM, 6);
 

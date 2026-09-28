@@ -10,6 +10,7 @@
 #include <set>
 
 #include "GLCanvas.h"
+#include "DesignChecks.h"   // Severity / Separation types shared with the preview
 #include <wx/dcclient.h>
 #include <wx/log.h>
 #include <wx/msgdlg.h>
@@ -84,6 +85,7 @@
 #include "MeshOps.h"
 #include "MeshBoolean.h"
 #include "MouldFeature.h"
+#include "FeatureEmbed.h"   // Auto-embed: gate / vent mouth embed analysis
 
 // Radius of the green sphere drawn at each vent placement point (world units)
 static constexpr float kVentMarkerRadius = 1.5f;
@@ -2380,6 +2382,11 @@ static bool BuildVentCutPieces(const VentInstance& vent,
     const FeaturePath& vp = vent.path;
     if (!xs.valid || !vp.valid) return false;
 
+    // Start overrun actually cut: the user's Overrun (start), or the Auto-embed
+    // extension when that is deeper (see GLCanvas::RunAutoEmbedAnalysis). The
+    // end overrun is untouched.
+    const float overrunStart = std::max(vp.overrunStart, vent.embedExtension);
+
     auto toOCC = [](const glm::vec3& v) { return gp_Pnt(v.x, v.y, v.z); };
 
     // ---- Simple: straight prism (unchanged from the original cut) ----------
@@ -2410,13 +2417,13 @@ static bool BuildVentCutPieces(const VentInstance& vent,
         if (rawLen < 1e-6f) return false;
         const glm::vec3 sweepDir = rawSweep / rawLen;
 
-        const glm::vec3 originOffset = -sweepDir * vp.overrunStart;
+        const glm::vec3 originOffset = -sweepDir * overrunStart;
         gp_Trsf offsetTrsf;
         offsetTrsf.SetTranslation(gp_Vec(originOffset.x, originOffset.y, originOffset.z));
         const TopoDS_Shape offsetFace =
             BRepBuilderAPI_Transform(face.Face(), offsetTrsf, /*copy=*/true).Shape();
 
-        const float     totalLen = rawLen + vp.overrunStart + vp.overrunEnd;
+        const float     totalLen = rawLen + overrunStart + vp.overrunEnd;
         const glm::vec3 totalSweep = sweepDir * totalLen;
         const gp_Vec    sweepVec(totalSweep.x, totalSweep.y, totalSweep.z);
 
@@ -2432,7 +2439,7 @@ static bool BuildVentCutPieces(const VentInstance& vent,
 
     // Extend the very first / very last station past the surface, same as the
     // preview sweep and the Simple prism.
-    stations.front().pos -= stations.front().tangent * vp.overrunStart;
+    stations.front().pos -= stations.front().tangent * overrunStart;
     stations.back().pos  += stations.back().tangent  * vp.overrunEnd;
 
     // Half-extents from the baked cross-section (symmetric, so the sideAxis sign
@@ -2742,6 +2749,272 @@ static FeaturePath GateSubRunnerCutPath(const FeaturePath& subPath,
 // split); used by GenerateMould's mesh-scene shot and insert preview bodies.
 static FileImporter::MeshData MakeDisplayMesh(std::vector<float> verts,
     std::vector<uint32_t> indices);
+
+// ===========================================================================
+// Auto-embed
+//
+// A vent / gate is cut as a straight channel whose START cross-section sits on
+// the plane through its placed point. On a curved or obliquely-approached part
+// surface some of that cross-section lies OUTSIDE the part, leaving a wedge of
+// steel across part of the mouth. RunAutoEmbedAnalysis measures, per feature,
+// how far back along the channel axis each part of the mouth has to travel to
+// reach the part (FeatureEmbed::Analyze on the objects' CPU meshes) and stores
+// the extension that seats all of it. The cut sites use
+// max(user overrun, embedExtension).
+//
+// If some of the mouth can't reach the part within the limit (the channel is
+// locally bigger than the part, or it would need more than 10 mm), the feature
+// is NOT extended — it cuts with its plain overrun — and is flagged: listed in
+// the Generate warning and marked with a red sphere in Preview.
+//
+// Thin walls (extending through the back of the part) are deliberately not
+// guarded yet — respectCeiling = false — pending the out-of-bounds analysis.
+// ===========================================================================
+namespace
+{
+    constexpr float kAutoEmbedMaxMm   = 10.0f;  // extension limit
+    constexpr float kAutoEmbedMargin  = 0.1f;   // vent: past the deepest entry
+    constexpr float kGateCutEpsMm     = 0.1f;   // == kCutEps at the gate cut sites
+    constexpr float kGateMinRadiusMm  = 0.01f;  // == the gate cone's radius floor
+
+    // Red marker sphere (world space) for a flagged feature.
+    FileImporter::MeshData EmbedFlagSphere(const glm::vec3& c, float r)
+    {
+        const int stacks = 16, slices = 24;
+        std::vector<float>    v;
+        std::vector<uint32_t> idx;
+        v.reserve(size_t(stacks + 1) * slices * 3);
+        for (int a = 0; a <= stacks; ++a)
+        {
+            const float th = glm::pi<float>() * float(a) / float(stacks);
+            for (int b = 0; b < slices; ++b)
+            {
+                const float ph = glm::two_pi<float>() * float(b) / float(slices);
+                v.push_back(c.x + r * std::sin(th) * std::cos(ph));
+                v.push_back(c.y + r * std::cos(th));
+                v.push_back(c.z + r * std::sin(th) * std::sin(ph));
+            }
+        }
+        for (int a = 0; a < stacks; ++a)
+            for (int b = 0; b < slices; ++b)
+            {
+                const uint32_t p = a * slices + b,       q = a * slices + (b + 1) % slices;
+                const uint32_t r0 = (a + 1) * slices + b, s = (a + 1) * slices + (b + 1) % slices;
+                // Outward winding (CCW seen from outside).
+                if (a > 0)          { idx.push_back(p); idx.push_back(q);  idx.push_back(r0); }
+                if (a < stacks - 1) { idx.push_back(q); idx.push_back(s);  idx.push_back(r0); }
+            }
+        return MakeDisplayMesh(std::move(v), std::move(idx));
+    }
+}
+
+void GLCanvas::RunAutoEmbedAnalysis()
+{
+    m_lastEmbedFlags.clear();
+    m_lastEmbedFlagMeshes.clear();
+    for (VentInstance& v : m_vents) v.embedExtension = 0.0f;
+    for (GateFeature& g : m_gates)  g.embedExtension = 0.0f;
+
+    bool  ventOn = true, gateOn = true;
+    float gateRadius = 1.5f, draftAngle = 1.0f;
+    if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+    {
+        ventOn     = frame->IsVentAutoEmbed();
+        gateOn     = frame->IsGateAutoEmbed();
+        gateRadius = frame->GetGateDiameter() * 0.5f;
+        draftAngle = frame->GetGateDraftAngle();
+    }
+    if ((!ventOn || m_vents.empty()) && (!gateOn || m_gates.empty())) return;
+
+    // The cavity is the union of every moulded object. Cache each one's
+    // world bounding sphere so a feature only traces the objects its line
+    // bundle can actually reach (Analyze still does the exact per-triangle
+    // filtering inside those).
+    struct Body { FeatureEmbed::BodyMesh mesh; glm::vec3 centre; float radius; };
+    std::vector<Body> bodies;
+    for (const SceneObject& obj : m_objects)
+    {
+        if (obj.cpuVerts.size() < 9 || obj.cpuIndices.size() < 3) continue;
+        const glm::mat4 M = obj.BuildModelMatrix();
+        glm::vec3 lo(std::numeric_limits<float>::max());
+        glm::vec3 hi(-std::numeric_limits<float>::max());
+        for (size_t i = 0; i + 2 < obj.cpuVerts.size(); i += 3)
+        {
+            const glm::vec3 p(obj.cpuVerts[i], obj.cpuVerts[i + 1], obj.cpuVerts[i + 2]);
+            lo = glm::min(lo, p);
+            hi = glm::max(hi, p);
+        }
+        const float stretch = std::max({ glm::length(glm::vec3(M[0])),
+                                         glm::length(glm::vec3(M[1])),
+                                         glm::length(glm::vec3(M[2])) });
+        Body b;
+        b.mesh   = FeatureEmbed::BodyMesh{ &obj.cpuVerts, &obj.cpuIndices, M };
+        b.centre = glm::vec3(M * glm::vec4((lo + hi) * 0.5f, 1.0f));
+        b.radius = 0.5f * glm::length(hi - lo) * stretch;
+        bodies.push_back(b);
+    }
+
+    auto bodiesNear = [&](const glm::vec3& origin, const glm::vec3& axis, float bundleR)
+    {
+        std::vector<FeatureEmbed::BodyMesh> out;
+        for (const Body& b : bodies)
+            if (glm::length(glm::cross(b.centre - origin, axis)) <= b.radius + bundleR + 0.01f)
+                out.push_back(b.mesh);
+        return out;
+    };
+
+    // Analyse one mouth. Returns the extension to apply (0 = unresolved or
+    // nothing needed) and records a flag + marker when unresolved.
+    auto analyse = [&](bool isGate, int index, const glm::vec3& origin,
+                       const glm::vec3& intoPart, const std::vector<glm::vec3>& offsets,
+                       const FeatureEmbed::Params& params, float markerRadius) -> float
+    {
+        float bundleR = 0.0f;
+        for (const glm::vec3& o : offsets) bundleR = std::max(bundleR, glm::length(o));
+
+        const FeatureEmbed::Result r = FeatureEmbed::Analyze(origin, intoPart, offsets,
+            bodiesNear(origin, intoPart, bundleR), params);
+
+        // Resolved = every line that could be traced reaches the part within
+        // the limit. (Unreliable lines — an open mesh right at the mouth —
+        // can't be measured either way, so they don't block on their own.)
+        const int  reachable = r.embedded + r.gap;
+        const bool resolved  = r.analysed && reachable > 0 &&
+                               r.unreachable == 0 && !r.ceilingLimited;
+        if (resolved) return r.extension;
+
+        EmbedFlag f;
+        f.isGate      = isGate;
+        f.index       = index;
+        f.samples     = r.samples;
+        f.unreachable = r.unreachable;
+        f.noPart      = reachable == 0;
+        f.limit       = params.maxExtension;
+        m_lastEmbedFlags.push_back(f);
+        m_lastEmbedFlagMeshes.push_back(EmbedFlagSphere(origin, markerRadius));
+        return 0.0f;
+    };
+
+    // ---- Vents ----------------------------------------------------------
+    if (ventOn)
+    {
+        FeatureEmbed::Params vp;
+        vp.maxExtension   = kAutoEmbedMaxMm;
+        vp.margin         = kAutoEmbedMargin;
+        vp.respectCeiling = false;
+
+        for (int i = 0; i < (int)m_vents.size(); ++i)
+        {
+            VentInstance& vent = m_vents[i];
+            const VentCrossSection& xs = vent.crossSection;
+            const FeaturePath& path = vent.path;
+            if (!xs.valid || !path.valid) continue;
+
+            // The mouth frame exactly as BuildVentCutPieces cuts it: the
+            // Simple prism starts at path.start and sweeps start->end; a
+            // complex route starts at its first station along that station's
+            // tangent (for a smooth path that is the Bezier tangent, not the
+            // chord to node 1).
+            const float hw = 0.5f * glm::length(xs.corners[1] - xs.corners[0]);
+            const float hd = 0.5f * glm::length(xs.corners[3] - xs.corners[0]);
+            if (hw < 1e-6f || hd < 1e-6f) continue;
+
+            glm::vec3 origin, tangent, side;
+            const glm::vec3 up(0.0f, 1.0f, 0.0f);
+            if (path.kind == PathKind::Simple)
+            {
+                const glm::vec3 d = path.end - path.start;
+                if (glm::length(d) < 1e-6f) continue;
+                origin  = path.start;
+                tangent = glm::normalize(d);
+                side    = glm::normalize(xs.corners[1] - xs.corners[0]);
+            }
+            else
+            {
+                const std::vector<PathStation> st = SamplePath(path);
+                if (st.size() < 2) continue;
+                origin  = st.front().pos;
+                tangent = st.front().tangent;
+                side    = st.front().sideAxis;
+            }
+
+            const std::vector<glm::vec3> offsets =
+                FeatureEmbed::RectSamples(side, up, hw, hd);
+            vent.embedExtension = analyse(false, i, origin, -tangent, offsets, vp,
+                std::sqrt(hw * hw + hd * hd) * 1.6f + 1.0f);
+        }
+    }
+
+    // ---- Gates ----------------------------------------------------------
+    if (gateOn && gateRadius > 1e-6f)
+    {
+        // The gate cone narrows by tan(draft) per mm as it is pushed back; past
+        // (radius - floor) / tan(draft) the cut clamps the back radius to the
+        // floor and the mouth diameter would grow. So the draft caps the
+        // extension too. kCutEps is added by the cut on top of the overrun, so
+        // it comes off the budget here and no extra margin is added.
+        const float tanDraft = std::tan(glm::radians(glm::clamp(draftAngle, 0.0f, 45.0f)));
+        float limit = kAutoEmbedMaxMm;
+        if (tanDraft > 1e-6f)
+            limit = std::min(limit, (gateRadius - kGateMinRadiusMm) / tanDraft - kGateCutEpsMm);
+        limit = std::max(limit, 0.0f);
+
+        FeatureEmbed::Params gp;
+        gp.maxExtension   = limit;
+        gp.margin         = 0.0f;
+        gp.respectCeiling = false;
+
+        for (int i = 0; i < (int)m_gates.size(); ++i)
+        {
+            GateFeature& gf = m_gates[i];
+            if (!gf.subPath.valid) continue;
+
+            // First-leg direction — the axis the gate cone is cut along.
+            glm::vec3 firstVec;
+            if (gf.subPath.kind == PathKind::Complex && gf.subPath.nodes.size() >= 2)
+                firstVec = gf.subPath.nodes[1].pos - gf.subPath.nodes[0].pos;
+            else
+                firstVec = gf.subPath.end - gf.subPath.start;
+            if (glm::length(firstVec) < 1e-6f) continue;
+            const glm::vec3 pathDir = glm::normalize(firstVec);
+
+            // Lines are sampled at the mouth radius and run parallel to the
+            // axis. The real cone narrows slightly going back, which only makes
+            // it reach a convex surface sooner, so this errs deep, not short.
+            const std::vector<glm::vec3> offsets =
+                FeatureEmbed::DiscSamples(pathDir, gateRadius);
+            gf.embedExtension = analyse(true, i, gf.point.worldPos, -pathDir, offsets, gp,
+                gateRadius * 1.6f + 1.0f);
+        }
+    }
+}
+
+wxString GLCanvas::BuildEmbedWarningText() const
+{
+    if (m_lastEmbedFlags.empty()) return wxString();
+
+    wxString text = wxString::Format(
+        "Auto-embed couldn't fully seat %d feature%s in the part:\n\n",
+        (int)m_lastEmbedFlags.size(), m_lastEmbedFlags.size() == 1 ? "" : "s");
+
+    for (const EmbedFlag& f : m_lastEmbedFlags)
+    {
+        const wxString name = wxString::Format("%s %d",
+            f.isGate ? "Gate" : "Vent", f.index + 1);
+        if (f.noPart)
+            text += wxString::Format(
+                "  - %s: its mouth never meets the part within %.1f mm.\n",
+                name, f.limit);
+        else
+            text += wxString::Format(
+                "  - %s: %.0f%% of its mouth can't reach the part within %.1f mm.\n",
+                name, 100.0 * f.unreachable / std::max(1, f.samples), f.limit);
+    }
+
+    text += "\nThese were cut with their normal overrun and are marked with a red "
+            "sphere in Preview. Try reducing the gate / vent size or moving it.";
+    return text;
+}
 
 // ---------------------------------------------------------------------------
 // Generate Mould Operation — Cuts objects, vents, runners, and sprues from blank mold halves
@@ -3884,7 +4157,6 @@ bool GLCanvas::GenerateMould()
     m_lastShotVolumeMm3 = 0.0;
     m_lastShotShape = TopoDS_Shape();
     m_lastShotFaceIds.clear();
-    m_lastHalfShapes.clear();
     m_lastInsertMeshes.clear();
     m_lastCastShotMesh = FileImporter::MeshData{};
     m_lastCastShotShape = TopoDS_Shape();
@@ -3892,6 +4164,13 @@ bool GLCanvas::GenerateMould()
 
     SetCurrent(*m_context);
     InitGLOnce();
+
+    // Auto-embed: measure every vent / gate mouth against the parts once, up
+    // front, so every cut / shot site below reads the same per-feature
+    // embedExtension. Flags (features that couldn't be seated) are reported
+    // after the run and handed to Preview as red marker spheres.
+    progress.Update(0, "Checking gate / vent embedding...");
+    RunAutoEmbedAnalysis();
 
     // Tier 0 speed-up: turn on OpenCascade's intra-operation parallelism. Every
     // BRepAlgoAPI_Cut / _Fuse / _Common reads this global default when it's
@@ -4241,8 +4520,12 @@ bool GLCanvas::GenerateMould()
                 // recovers the legacy behaviour, while a non-zero overrun
                 // produces the same shape as the preview built in
                 // RebuildGateSolids.
+                //
+                // Auto-embed: when the measured extension that seats the whole
+                // gate mouth is deeper than the user's overrun it takes over
+                // (per gate; 0 when off / unresolved -> plain overrun).
                 static constexpr float kCutEps = 0.1f;
-                const float backExt = kCutEps + overrun;
+                const float backExt = kCutEps + std::max(overrun, gf.embedExtension);
                 const glm::vec3 originExt = origin - pathDir * backExt;
                 const gp_Ax2    gateAxExt(gp_Pnt(originExt.x, originExt.y, originExt.z), occDir);
 
@@ -4705,10 +4988,6 @@ bool GLCanvas::GenerateMould()
         // world space (the fixture transform was baked into `result` above),
         // so the preview renders it at an identity pose.
         m_lastMouldMeshes.push_back(meshData);
-
-        // Retain the half solid (world space, post-cut) for the separation
-        // demoldability check, kept in lockstep with m_lastMouldMeshes.
-        m_lastHalfShapes.push_back(result);
     }
 
     // ---- Phase 3b/3c: mesh-scene orphan resolution + finalize -------------
@@ -4755,13 +5034,11 @@ bool GLCanvas::GenerateMould()
             meshData.posNorm = std::move(split.posNorm);
             meshData.indices = std::move(split.indices);
 
-            // Keep this fixture's carved half for STL export, and push to the
-            // preview / separation lists in lockstep (same order as a BREP scene
-            // would). fix.mouldShape holds the retained BREP result for this half.
+            // Keep this fixture's carved half for STL export and push it to the
+            // preview list (same order a BREP scene would).
             fix.mouldMesh    = meshData;
             fix.hasMouldMesh = true;
             m_lastMouldMeshes.push_back(meshData);
-            m_lastHalfShapes.push_back(fix.mouldShape);
         }
     }
 
@@ -4775,7 +5052,8 @@ bool GLCanvas::GenerateMould()
     if (!m_sceneIsMesh)
     {
         TopoDS_Shape shotShape;
-        if (BuildShotModel(shotShape))
+        std::vector<TopoDS_Shape> shotObjectShapes;
+        if (BuildShotModel(shotShape, &shotObjectShapes))
         {
             // Volume straight off the fused BREP (not the mesh) — accurate and
             // overlap-safe. Geometry is in mm, so this is cubic mm.
@@ -4789,6 +5067,9 @@ bool GLCanvas::GenerateMould()
             TessellateShapeToMesh(shotShape, m_lastShotMesh, &m_lastShotFaceIds);
             m_hasLastShotMesh =
                 !m_lastShotMesh.posNorm.empty() && !m_lastShotMesh.indices.empty();
+
+            // The Draft Angle Checks run in the preview from the shot mesh and
+            // the generated mould halves; nothing to precompute here.
         }
     }
     else
@@ -4809,6 +5090,9 @@ bool GLCanvas::GenerateMould()
             m_lastShotFaceIds.clear();
             m_hasLastShotMesh =
                 !m_lastShotMesh.posNorm.empty() && !m_lastShotMesh.indices.empty();
+
+            // The Draft Angle Checks run in the preview from the shot mesh and
+            // the generated mould halves; nothing to precompute here.
         }
     }
 
@@ -4882,8 +5166,16 @@ bool GLCanvas::GenerateMould()
 
     progress.Update(totalSteps, "Done.");
     Refresh(false);
-    wxMessageBox("Mould generated successfully.",
-        "Generate Mould", wxOK | wxICON_INFORMATION, this);
+
+    // Auto-embed flags don't stop the run (flagged features were cut with their
+    // plain overrun) but the user is told which ones need attention.
+    const wxString embedWarning = BuildEmbedWarningText();
+    if (embedWarning.empty())
+        wxMessageBox("Mould generated successfully.",
+            "Generate Mould", wxOK | wxICON_INFORMATION, this);
+    else
+        wxMessageBox("Mould generated with warnings.\n\n" + embedWarning,
+            "Generate Mould", wxOK | wxICON_WARNING, this);
     return true;
 }
 
@@ -4898,7 +5190,8 @@ bool GLCanvas::GenerateMould()
 
 void GLCanvas::AddPreviewHalf(const FileImporter::MeshData& mesh,
     const std::string& label,
-    const glm::vec3& baseColor)
+    const glm::vec3& baseColor,
+    float alpha)
 {
     // Materialise GPU buffers in this canvas's context. The caller (PreviewPanel)
     // makes the context current before invoking us, but make sure regardless —
@@ -4910,6 +5203,7 @@ void GLCanvas::AddPreviewHalf(const FileImporter::MeshData& mesh,
     half.label = label;
     half.visible = true;
     half.baseColor = baseColor;
+    half.alpha = glm::clamp(alpha, 0.0f, 1.0f);
     // Identity pose: the mesh vertices are already in world space.
     half.obj.pos = glm::vec3(0.0f);
     half.obj.yawDeg = half.obj.pitchDeg = half.obj.rollDeg = 0.0f;
@@ -4979,6 +5273,7 @@ void GLCanvas::SetShotDebugGroups(int halfIndex,
         if (g.ebo) { glDeleteBuffers(1, &g.ebo); g.ebo = 0; }
     m_shotDebug.groups.clear();
     if (m_shotDebug.vao) { glDeleteVertexArrays(1, &m_shotDebug.vao); m_shotDebug.vao = 0; }
+    if (m_shotDebug.ownVbo) { glDeleteBuffers(1, &m_shotDebug.ownVbo); m_shotDebug.ownVbo = 0; }
 
     // Debug VAO references the part's existing vertex buffer (pos + normal,
     // 6-float stride) so lighting matches the normal pass; only the element
@@ -5018,6 +5313,66 @@ void GLCanvas::ClearShotDebugColoring()
 {
     m_shotDebug.active = false;
     m_shotDebug.halfIndex = -1;
+    Refresh(false);
+}
+
+void GLCanvas::SetShotDebugWireframe(bool on)
+{
+    if (m_shotDebug.wireframe == on) return;
+    m_shotDebug.wireframe = on;
+    Refresh(false);
+}
+
+void GLCanvas::SetShotDebugMesh(int halfIndex,
+    const std::vector<float>& posNorm,
+    const std::vector<ShotDebugGroup>& groups)
+{
+    if (halfIndex < 0 || halfIndex >= (int)m_previewHalves.size()) return;
+    if (posNorm.size() < 18) return;   // need at least one triangle
+
+    SetCurrent(*m_context);
+    InitGLOnce();
+
+    for (auto& g : m_shotDebug.groups)
+        if (g.ebo) { glDeleteBuffers(1, &g.ebo); g.ebo = 0; }
+    m_shotDebug.groups.clear();
+    if (m_shotDebug.vao) { glDeleteVertexArrays(1, &m_shotDebug.vao); m_shotDebug.vao = 0; }
+    if (m_shotDebug.ownVbo) { glDeleteBuffers(1, &m_shotDebug.ownVbo); m_shotDebug.ownVbo = 0; }
+
+    // The debug body is its OWN mesh (the area-grid remesh), uploaded here as
+    // a pos+normal (6-float stride) buffer; group EBOs index its triangles.
+    glGenBuffers(1, &m_shotDebug.ownVbo);
+    glBindBuffer(GL_ARRAY_BUFFER, m_shotDebug.ownVbo);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(posNorm.size() * sizeof(float)),
+        posNorm.data(), GL_STATIC_DRAW);
+
+    glGenVertexArrays(1, &m_shotDebug.vao);
+    glBindVertexArray(m_shotDebug.vao);
+    glBindBuffer(GL_ARRAY_BUFFER, m_shotDebug.ownVbo);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * (GLsizei)sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * (GLsizei)sizeof(float),
+        (void*)(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+
+    for (const ShotDebugGroup& grp : groups)
+    {
+        if (grp.indices.empty()) continue;
+        DebugGroupGPU gpu;
+        gpu.color = grp.color;
+        gpu.emissive = grp.emissive;
+        gpu.count = (GLsizei)grp.indices.size();
+        glGenBuffers(1, &gpu.ebo);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gpu.ebo);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+            (GLsizeiptr)(grp.indices.size() * sizeof(uint32_t)),
+            grp.indices.data(), GL_STATIC_DRAW);
+        m_shotDebug.groups.push_back(gpu);
+    }
+
+    glBindVertexArray(0);
+    m_shotDebug.halfIndex = halfIndex;
+    m_shotDebug.active = true;
     Refresh(false);
 }
 
@@ -5066,6 +5421,59 @@ void GLCanvas::ClearShotDebugRays()
     m_showDebugContacts = false;
     m_debugRayVertCount = 0;
     m_debugContactVertCount = 0;
+    Refresh(false);
+}
+
+// ---------------------------------------------------------------------------
+// Multi-batch debug overlay (flow feed-network view etc.).
+// ---------------------------------------------------------------------------
+void GLCanvas::DestroyDebugOverlayGL()
+{
+    for (DebugOverlayGL& g : m_debugOverlay)
+    {
+        if (g.vbo) { glDeleteBuffers(1, &g.vbo);      g.vbo = 0; }
+        if (g.vao) { glDeleteVertexArrays(1, &g.vao); g.vao = 0; }
+    }
+    m_debugOverlay.clear();
+}
+
+void GLCanvas::SetDebugOverlay(const std::vector<DebugOverlayBatch>& batches, bool onTop)
+{
+    SetCurrent(*m_context);
+    InitGLOnce();
+    DestroyDebugOverlayGL();
+
+    for (const DebugOverlayBatch& b : batches)
+    {
+        if (b.verts.empty()) continue;
+        DebugOverlayGL g;
+        g.points = b.points;
+        g.color  = b.color;
+        g.size   = b.size;
+        glGenVertexArrays(1, &g.vao);
+        glGenBuffers(1, &g.vbo);
+        glBindVertexArray(g.vao);
+        glBindBuffer(GL_ARRAY_BUFFER, g.vbo);
+        glBufferData(GL_ARRAY_BUFFER,
+            (GLsizeiptr)(b.verts.size() * sizeof(glm::vec3)),
+            b.verts.data(), GL_STATIC_DRAW);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * (GLsizei)sizeof(float), (void*)0);
+        glEnableVertexAttribArray(0);
+        glBindVertexArray(0);
+        g.count = (GLsizei)b.verts.size();
+        m_debugOverlay.push_back(g);
+    }
+    m_debugOverlayOnTop = onTop;
+    m_showDebugOverlay  = !m_debugOverlay.empty();
+    Refresh(false);
+}
+
+void GLCanvas::ClearDebugOverlay()
+{
+    // Flag-only (no GL context needed, like ClearShotDebugRays); the buffers are
+    // released by the next SetDebugOverlay or by DestroyGL.
+    if (!m_showDebugOverlay) return;
+    m_showDebugOverlay = false;
     Refresh(false);
 }
 
@@ -5182,6 +5590,7 @@ void GLCanvas::RenderPreview(const glm::mat4& view, const glm::mat4& proj,
         const PreviewHalf& half = m_previewHalves[hi];
         if (!half.visible) continue;
         if (half.obj.mesh.vao == 0 || half.obj.mesh.indexCount == 0) continue;
+        if (half.alpha < 1.0f) continue;   // translucent parts: drawn last, below
 
         const glm::mat4 model = half.obj.BuildModelMatrix();
         glUniformMatrix4fv(locModel, 1, GL_FALSE, &model[0][0]);
@@ -5196,6 +5605,14 @@ void GLCanvas::RenderPreview(const glm::mat4& view, const glm::mat4& proj,
             const GLint locEmis = glGetUniformLocation(m_program, "uEmissive");
 
             glBindVertexArray(m_shotDebug.vao);
+            const bool wf = m_shotDebug.wireframe;
+            GLboolean cullWas = GL_FALSE;
+            if (wf)
+            {
+                cullWas = glIsEnabled(GL_CULL_FACE);
+                if (cullWas) glDisable(GL_CULL_FACE);   // show back edges too
+                glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
+            }
             bool flattened = false;
             for (const DebugGroupGPU& g : m_shotDebug.groups)
             {
@@ -5226,6 +5643,11 @@ void GLCanvas::RenderPreview(const glm::mat4& view, const glm::mat4& proj,
                 glUniform3fv(locBase, 1, &g.color[0]);
                 glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g.ebo);
                 glDrawElements(GL_TRIANGLES, g.count, GL_UNSIGNED_INT, 0);
+            }
+            if (wf)
+            {
+                glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+                if (cullWas) glEnable(GL_CULL_FACE);
             }
             glBindVertexArray(0);
 
@@ -5261,6 +5683,39 @@ void GLCanvas::RenderPreview(const glm::mat4& view, const glm::mat4& proj,
         glBindVertexArray(0);
     }
 
+    // Translucent preview parts (Auto-embed flag markers) after everything
+    // opaque: blended, depth-tested but not depth-written, so the flagged
+    // feature and the part stay visible through the marker.
+    {
+        bool anyTranslucent = false;
+        for (const PreviewHalf& half : m_previewHalves)
+            if (half.visible && half.alpha < 1.0f && half.obj.mesh.vao &&
+                half.obj.mesh.indexCount > 0) { anyTranslucent = true; break; }
+
+        if (anyTranslucent)
+        {
+            const GLint locAlpha = glGetUniformLocation(m_program, "uAlpha");
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glDepthMask(GL_FALSE);
+            for (const PreviewHalf& half : m_previewHalves)
+            {
+                if (!half.visible || half.alpha >= 1.0f) continue;
+                if (half.obj.mesh.vao == 0 || half.obj.mesh.indexCount == 0) continue;
+                const glm::mat4 model = half.obj.BuildModelMatrix();
+                glUniformMatrix4fv(locModel, 1, GL_FALSE, &model[0][0]);
+                glUniform3fv(locBase, 1, &half.baseColor[0]);
+                glUniform1f(locAlpha, half.alpha);
+                glBindVertexArray(half.obj.mesh.vao);
+                glDrawElements(GL_TRIANGLES, half.obj.mesh.indexCount, GL_UNSIGNED_INT, 0);
+                glBindVertexArray(0);
+            }
+            glUniform1f(locAlpha, 1.0f);
+            glDepthMask(GL_TRUE);
+            glDisable(GL_BLEND);
+        }
+    }
+
     glUseProgram(0);
 
     // Accessibility-ray debug overlay (flat shader): ray segments + contacts.
@@ -5292,6 +5747,40 @@ void GLCanvas::RenderPreview(const glm::mat4& view, const glm::mat4& proj,
             glBindVertexArray(0);
             glPointSize(1.0f);
         }
+        glUseProgram(0);
+    }
+
+    // Multi-batch debug overlay (flat shader): per-batch colour + size. Drawn
+    // with depth testing off when on-top, so e.g. the feed-network centrelines
+    // read through the steel they run inside.
+    if (m_flatProgram && m_showDebugOverlay && !m_debugOverlay.empty())
+    {
+        glUseProgram(m_flatProgram);
+        const glm::mat4 VP = proj * view;
+        glUniformMatrix4fv(m_flat_uVP, 1, GL_FALSE, &VP[0][0]);
+        const GLboolean depthWas = glIsEnabled(GL_DEPTH_TEST);
+        if (m_debugOverlayOnTop) glDisable(GL_DEPTH_TEST);
+        for (const DebugOverlayGL& b : m_debugOverlay)
+        {
+            if (!b.vao || b.count <= 0) continue;
+            const glm::vec4 col(b.color, 1.0f);
+            glUniform4fv(m_flat_uColor, 1, &col[0]);
+            glBindVertexArray(b.vao);
+            if (b.points)
+            {
+                glPointSize(b.size);
+                glDrawArrays(GL_POINTS, 0, b.count);
+                glPointSize(1.0f);
+            }
+            else
+            {
+                glLineWidth(b.size);
+                glDrawArrays(GL_LINES, 0, b.count);
+                glLineWidth(1.0f);
+            }
+            glBindVertexArray(0);
+        }
+        if (m_debugOverlayOnTop && depthWas) glEnable(GL_DEPTH_TEST);
         glUseProgram(0);
     }
 
@@ -5367,7 +5856,8 @@ bool GLCanvas::BuildInsertCutSolid(const InsertFeature& in, float scalePct,
     return true;
 }
 
-bool GLCanvas::BuildShotModel(TopoDS_Shape& out)
+bool GLCanvas::BuildShotModel(TopoDS_Shape& out,
+    std::vector<TopoDS_Shape>* objectShapesOut)
 {
     std::vector<TopoDS_Shape> shapes;
 
@@ -5400,7 +5890,13 @@ bool GLCanvas::BuildShotModel(TopoDS_Shape& out)
         );
         BRepBuilderAPI_Transform objXform(objShape, objTrsf, true);
         if (!objXform.Shape().IsNull())
+        {
             shapes.push_back(objXform.Shape());
+            // Retain the world-space part surface so the draft analysis can tag
+            // each shot face as belonging to a cavity (objectId) vs the feed
+            // system. Feed primitives below are never added here.
+            if (objectShapesOut) objectShapesOut->push_back(objXform.Shape());
+        }
     }
 
     static constexpr float kCutEps = 0.1f;
@@ -5524,7 +6020,8 @@ bool GLCanvas::BuildShotModel(TopoDS_Shape& out)
             const float     totalLen = glm::length(gf.subPath.end - origin);
             const gp_Dir occDir(pathDir.x, pathDir.y, pathDir.z);
 
-            const float backExt = kCutEps + overrun;
+            // Auto-embed extension per gate, same rule as the mould cut.
+            const float backExt = kCutEps + std::max(overrun, gf.embedExtension);
             const glm::vec3 originExt = origin - pathDir * backExt;
             const gp_Ax2    gateAxExt(gp_Pnt(originExt.x, originExt.y, originExt.z), occDir);
 
@@ -7362,6 +7859,36 @@ void GLCanvas::ClearInserts()
 }
 
 // ---------------------------------------------------------------------------
+// InspectPickAt — ray-cast the inspect mesh (in its half's local space) and
+// report the hit triangle index (-1 on miss) to the inspect callback.
+void GLCanvas::InspectPickAt(int mouseX, int mouseY)
+{
+    if (!m_onInspectHit) return;
+    if (m_inspectHalf < 0 || m_inspectHalf >= (int)m_previewHalves.size()) return;
+    if (m_inspectVerts.size() < 9 || m_inspectIdx.size() < 3) { m_onInspectHit(-1); return; }
+
+    glm::vec3 rayOrig, rayDir;
+    BuildMouseRay(mouseX, mouseY, rayOrig, rayDir);
+
+    const glm::mat4 inv = glm::inverse(m_previewHalves[m_inspectHalf].obj.BuildModelMatrix());
+    const glm::vec3 lo = glm::vec3(inv * glm::vec4(rayOrig, 1.0f));
+    const glm::vec3 ld = glm::normalize(glm::vec3(inv * glm::vec4(rayDir, 0.0f)));
+
+    int bestTri = -1; float bestT = 1.0e30f;
+    const size_t nt = m_inspectIdx.size() / 3;
+    for (size_t t = 0; t < nt; ++t)
+    {
+        const unsigned int a = m_inspectIdx[t*3], b = m_inspectIdx[t*3+1], c = m_inspectIdx[t*3+2];
+        if (a*3+2 >= m_inspectVerts.size() || b*3+2 >= m_inspectVerts.size() || c*3+2 >= m_inspectVerts.size()) continue;
+        const glm::vec3 v0(m_inspectVerts[a*3], m_inspectVerts[a*3+1], m_inspectVerts[a*3+2]);
+        const glm::vec3 v1(m_inspectVerts[b*3], m_inspectVerts[b*3+1], m_inspectVerts[b*3+2]);
+        const glm::vec3 v2(m_inspectVerts[c*3], m_inspectVerts[c*3+1], m_inspectVerts[c*3+2]);
+        float tt;
+        if (RayTriangle(lo, ld, v0, v1, v2, tt) && tt > 0.0f && tt < bestT) { bestT = tt; bestTri = (int)t; }
+    }
+    m_onInspectHit(bestTri);
+}
+
 // BuildMouseRay — unprojects mouse coordinates into a world-space ray.
 // ---------------------------------------------------------------------------
 void GLCanvas::BuildMouseRay(int mouseX, int mouseY,
@@ -9779,6 +10306,8 @@ void GLCanvas::DestroyGL()
     if (m_debugRayVao) { glDeleteVertexArrays(1, &m_debugRayVao);     m_debugRayVao = 0; }
     if (m_debugContactVbo) { glDeleteBuffers(1, &m_debugContactVbo);      m_debugContactVbo = 0; }
     if (m_debugContactVao) { glDeleteVertexArrays(1, &m_debugContactVao); m_debugContactVao = 0; }
+    DestroyDebugOverlayGL();
+    m_showDebugOverlay = false;
     m_debugSolidObj.mesh.Destroy();
     if (m_vbo) { glDeleteBuffers(1, &m_vbo);               m_vbo = 0; }
     if (m_vao) { glDeleteVertexArrays(1, &m_vao);          m_vao = 0; }
@@ -12786,8 +13315,23 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
     // selection, transform, or feature placement.
     if (m_previewMode)
     {
-        if (evt.LeftDown()) { m_lmb = true;  m_hasLast = false; }
-        if (evt.LeftUp()) { m_lmb = false; if (HasCapture()) ReleaseMouse(); }
+        // Inspect-face: dragging still orbits; a click (no drag) picks a face.
+        if (evt.LeftDown())
+        {
+            m_lmb = true; m_hasLast = false;
+            if (m_inspectMode) m_inspectDownPos = evt.GetPosition();
+        }
+        if (evt.LeftUp())
+        {
+            m_lmb = false; if (HasCapture()) ReleaseMouse();
+            if (m_inspectMode)
+            {
+                const wxPoint up = evt.GetPosition();
+                int ddx = up.x - m_inspectDownPos.x; if (ddx < 0) ddx = -ddx;
+                int ddy = up.y - m_inspectDownPos.y; if (ddy < 0) ddy = -ddy;
+                if (ddx <= 3 && ddy <= 3) InspectPickAt(up.x, up.y);   // a click, not a drag
+            }
+        }
         if (evt.MiddleDown()) { m_mmb = true;  m_hasLast = false; CaptureMouse(); }
         if (evt.MiddleUp()) { m_mmb = false; if (HasCapture()) ReleaseMouse(); }
         if (evt.RightDown()) { m_rmb = true;  m_hasLast = false; CaptureMouse(); }
@@ -14973,4 +15517,404 @@ void GLCanvas::RebuildAllFeatures()
     RebuildIndexerSolids();
     for (auto& in : m_inserts) ReanchorInsert(in);
     Refresh(false);
+}
+
+// ===========================================================================
+// BuildFeedNetwork — snapshot the feed system as a 1D nodal network for the
+// Hele-Shaw flow analysis (see Flow::FeedNetwork).
+//
+//   * One PART node per moulded (imported) object, at its world bounding-box
+//     centre. The part's own flow field is a later step; for now it is a lump.
+//   * Sprue: inlet (pathStart) -> parting point -> end. A direct-injection
+//     sprue links its end into the part it lands on.
+//   * Runners: parting point -> end along the swept centreline, split into
+//     separate edges wherever a gate's sub-runner attaches part-way along.
+//   * Gates: feed attach -> [sub-runner @ sub-runner dia] -> transition ->
+//     [gate frustum @ gate orifice dia] -> gate mouth -> part. The split
+//     mirrors RebuildGateSolids exactly (same taper length, first-leg clamp and
+//     straight "gate fills the whole path" degenerate).
+//   * Vents: part -> vent mouth -> [rect width x depth] -> outlet (air side).
+//
+// Each feature's specified section is assumed over the whole of its edge. The
+// cold slug and runner cold plugs are dead ends that carry no steady flow and
+// are left out for now.
+// ===========================================================================
+Flow::FeedNetwork GLCanvas::BuildFeedNetwork() const
+{
+    using namespace Flow;
+    FeedNetwork net;
+    const float kMerge  = 0.05f;   // mm: coincident feature ends become one node
+    const float kAttach = 1.0f;    // mm: max gap for a gate to count as attached
+
+    // Dimensions: the same UI fields the preview solids and the cut read.
+    float runnerD = 5.0f, gateD = 3.0f, gateDraft = 1.0f, subD = 5.0f;
+    float ventDepth = 5.0f, ventW = 2.0f, ventOvS = 0.5f, ventOvE = 0.5f;
+    if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(const_cast<GLCanvas*>(this))))
+    {
+        runnerD   = frame->GetRunnerDiameter();
+        gateD     = frame->GetGateDiameter();
+        gateDraft = frame->GetGateDraftAngle();
+        subD      = frame->GetSubRunnerDiameter();
+        frame->GetVentDimensions(ventDepth, ventW, ventOvS, ventOvE);
+    }
+
+    // ---- Part nodes -------------------------------------------------------
+    struct PartInfo { int node = -1; glm::vec3 lo{ 0.0f }, hi{ 0.0f }, ctr{ 0.0f }; };
+    std::vector<int>      partOfObject(m_objects.size(), -1);
+    std::vector<PartInfo> parts;
+    for (size_t i = 0; i < m_objects.size(); ++i)
+    {
+        const SceneObject& obj = m_objects[i];
+        if (obj.role != ObjectRole::Imported) continue;
+        if (obj.sourcePath.empty() && !obj.hasSourceShape) continue;
+        if (obj.cpuVerts.size() < 3) continue;
+
+        glm::vec3 llo(1e30f), lhi(-1e30f);
+        for (size_t v = 0; v + 2 < obj.cpuVerts.size(); v += 3)
+        {
+            const glm::vec3 p(obj.cpuVerts[v], obj.cpuVerts[v + 1], obj.cpuVerts[v + 2]);
+            llo = glm::min(llo, p); lhi = glm::max(lhi, p);
+        }
+        const glm::mat4 M = obj.BuildModelMatrix();
+        PartInfo pi;
+        pi.ctr = glm::vec3(M * glm::vec4(0.5f * (llo + lhi), 1.0f));
+        pi.lo = glm::vec3(1e30f); pi.hi = glm::vec3(-1e30f);
+        for (int c = 0; c < 8; ++c)
+        {
+            const glm::vec3 corner((c & 1) ? lhi.x : llo.x, (c & 2) ? lhi.y : llo.y,
+                                   (c & 4) ? lhi.z : llo.z);
+            const glm::vec3 w(M * glm::vec4(corner, 1.0f));
+            pi.lo = glm::min(pi.lo, w); pi.hi = glm::max(pi.hi, w);
+        }
+        std::string name = obj.sourcePath;
+        const size_t slash = name.find_last_of("/\\");
+        if (slash != std::string::npos) name = name.substr(slash + 1);
+        pi.node = net.addNode(pi.ctr, FeedNodeKind::Part, (int)i, 0.0f,
+            "Part " + std::to_string(parts.size() + 1) + (name.empty() ? "" : " (" + name + ")"));
+        partOfObject[i] = (int)parts.size();
+        parts.push_back(pi);
+    }
+    if (parts.empty())
+        net.warnings.push_back("No moulded objects - nothing for the feed system to fill.");
+
+    // The part a point belongs to: its parent object when parented, else the
+    // object whose bounding box is nearest (inside = 0), centre distance as a
+    // tie-break.
+    auto partNodeFor = [&](const glm::vec3& p, int parentIndex) -> int
+    {
+        if (parentIndex >= 0 && parentIndex < (int)partOfObject.size() &&
+            partOfObject[(size_t)parentIndex] >= 0)
+            return parts[(size_t)partOfObject[(size_t)parentIndex]].node;
+        int best = -1; float bestD = 1e30f, bestC = 1e30f;
+        for (size_t k = 0; k < parts.size(); ++k)
+        {
+            const glm::vec3 q = glm::clamp(p, parts[k].lo, parts[k].hi);
+            const float d  = glm::length(q - p);
+            const float cd = glm::length(parts[k].ctr - p);
+            if (d < bestD - 1e-4f || (std::fabs(d - bestD) <= 1e-4f && cd < bestC))
+            { bestD = d; bestC = cd; best = (int)k; }
+        }
+        return (best >= 0) ? parts[(size_t)best].node : -1;
+    };
+
+    // ---- Sprue ------------------------------------------------------------
+    int partingNode = -1;
+    if (!m_sprue.hasPoint)
+    {
+        net.warnings.push_back("No sprue placed - the network has no injection inlet.");
+    }
+    else
+    {
+        const FeedSection sprueSec = MakeCircleSection(2.0f * m_sprue.radius);
+        const glm::vec3 S = m_sprue.pathStart, Ep = m_sprue.pathEnd;
+        const int inlet = net.addNode(S, FeedNodeKind::SprueInlet, -1, 0.0f, "Sprue inlet");
+        net.inletNode = inlet;
+
+        int prev = inlet;
+        glm::vec3 prevPos = S;
+        if (m_sprue.hasPartingPoint)
+        {
+            partingNode = net.addNode(m_sprue.partingPos, FeedNodeKind::SprueParting, -1,
+                                      kMerge, "Sprue @ parting");
+            if (partingNode != prev)
+            {
+                net.addEdge(prev, partingNode, FeedEdgeKind::Sprue,
+                            glm::length(m_sprue.partingPos - prevPos), sprueSec, 0, "Sprue");
+                prev = partingNode; prevPos = m_sprue.partingPos;
+            }
+        }
+        const int endNode = net.addNode(Ep, FeedNodeKind::SprueEnd, -1, kMerge, "Sprue end");
+        if (endNode != prev)
+            net.addEdge(prev, endNode, FeedEdgeKind::Sprue, glm::length(Ep - prevPos),
+                        sprueSec, 0, "Sprue");
+
+        if (m_sprue.isDirectInjection)
+        {
+            const int pn = partNodeFor(Ep, -1);
+            if (pn >= 0)
+                net.addEdge(endNode, pn, FeedEdgeKind::CavityIn, 0.0f, FeedSection{}, 0,
+                            "Direct injection -> part");
+            else
+                net.warnings.push_back("Direct-injection sprue does not reach a moulded object.");
+        }
+    }
+
+    // ---- Runner centrelines ----------------------------------------------
+    struct RunnerInfo { std::vector<glm::vec3> poly; std::vector<float> arc; bool valid = false; };
+    std::vector<RunnerInfo> runners(m_runners.size());
+    if (m_sprue.hasPartingPoint)
+    {
+        for (size_t r = 0; r < m_runners.size(); ++r)
+        {
+            RunnerInfo& ri = runners[r];
+            RunnerCenterline(m_runners[r].path, m_sprue.partingPos, m_runners[r].point, ri.poly);
+            if (ri.poly.size() < 2) continue;
+            ri.arc.assign(ri.poly.size(), 0.0f);
+            for (size_t k = 1; k < ri.poly.size(); ++k)
+                ri.arc[k] = ri.arc[k - 1] + glm::length(ri.poly[k] - ri.poly[k - 1]);
+            ri.valid = ri.arc.back() > 1e-6f;
+        }
+    }
+    else if (!m_runners.empty())
+    {
+        net.warnings.push_back("Runners are placed but the sprue has no parting-plane feed point.");
+    }
+
+    // ---- Where each gate meets the feed (NearestFeedPoint's candidates) ---
+    struct GateAttach { bool ok = false; bool onSprue = false; int runner = -1; float arc = 0.0f; glm::vec3 pos{ 0.0f }; };
+    std::vector<GateAttach> attach(m_gates.size());
+    for (size_t g = 0; g < m_gates.size(); ++g)
+    {
+        const GateFeature& gf = m_gates[g];
+        if (!gf.subPath.valid) continue;
+        const glm::vec3 A = gf.subPath.end;
+        float best = kAttach;
+        GateAttach ga;
+        if (m_sprue.hasPartingPoint)
+        {
+            const float d = glm::length(m_sprue.partingPos - A);
+            if (d <= best) { best = d; ga = GateAttach{}; ga.ok = true; ga.onSprue = true; ga.pos = m_sprue.partingPos; }
+        }
+        for (size_t r = 0; r < runners.size(); ++r)
+        {
+            const RunnerInfo& ri = runners[r];
+            if (!ri.valid) continue;
+            for (size_t k = 0; k + 1 < ri.poly.size(); ++k)
+            {
+                const glm::vec3 P0 = ri.poly[k], dP = ri.poly[k + 1] - ri.poly[k];
+                const float L2 = glm::dot(dP, dP);
+                const float t  = (L2 > 1e-12f) ? glm::clamp(glm::dot(A - P0, dP) / L2, 0.0f, 1.0f) : 0.0f;
+                const glm::vec3 C = P0 + dP * t;
+                const float dist = glm::length(C - A);
+                if (dist < best)
+                {
+                    best = dist;
+                    ga = GateAttach{};
+                    ga.ok = true; ga.runner = (int)r;
+                    ga.arc = ri.arc[k] + t * std::sqrt(L2);
+                    ga.pos = C;
+                }
+            }
+        }
+        attach[g] = ga;
+    }
+
+    std::vector<int> gateFeedNode(m_gates.size(), -1);
+    for (size_t g = 0; g < m_gates.size(); ++g)
+        if (attach[g].ok && attach[g].onSprue) gateFeedNode[g] = partingNode;
+
+    // ---- Runner edges, split at gate attach points ------------------------
+    const FeedSection runnerSec = MakeCircleSection(runnerD);
+    for (size_t r = 0; r < runners.size(); ++r)
+    {
+        const RunnerInfo& ri = runners[r];
+        if (!ri.valid) continue;
+        const float total = ri.arc.back();
+        const std::string rl = "Runner " + std::to_string(r + 1);
+
+        std::vector<std::pair<float, int>> stops;   // (arc length, gate index)
+        for (size_t g = 0; g < m_gates.size(); ++g)
+            if (attach[g].ok && attach[g].runner == (int)r)
+                stops.push_back({ attach[g].arc, (int)g });
+        std::sort(stops.begin(), stops.end(),
+                  [](const std::pair<float, int>& a, const std::pair<float, int>& b)
+                  { return a.first < b.first; });
+
+        int   prevNode = (partingNode >= 0) ? partingNode
+                       : net.addNode(ri.poly.front(), FeedNodeKind::SprueParting, -1, kMerge);
+        float prevArc  = 0.0f;
+        std::vector<int> atEnd;                      // gates attached at the runner end
+        for (const auto& st : stops)
+        {
+            if (st.first - prevArc <= kMerge)       { gateFeedNode[(size_t)st.second] = prevNode; continue; }
+            if (total - st.first <= kMerge)         { atEnd.push_back(st.second); continue; }
+            const int j = net.addNode(attach[(size_t)st.second].pos, FeedNodeKind::Junction, -1,
+                                      kMerge, rl + " junction");
+            if (j != prevNode)
+                net.addEdge(prevNode, j, FeedEdgeKind::Runner, st.first - prevArc, runnerSec,
+                            (int)r, rl);
+            gateFeedNode[(size_t)st.second] = j;
+            prevNode = j; prevArc = st.first;
+        }
+        const int endNode = net.addNode(ri.poly.back(), FeedNodeKind::RunnerEnd, -1, kMerge,
+                                        rl + " end");
+        if (endNode != prevNode)
+            net.addEdge(prevNode, endNode, FeedEdgeKind::Runner, std::max(0.0f, total - prevArc),
+                        runnerSec, (int)r, rl);
+        for (int g : atEnd) gateFeedNode[(size_t)g] = endNode;
+    }
+
+    // ---- Gates: feed -> sub-runner -> transition -> gate -> mouth -> part --
+    const float gateR = 0.5f * gateD, subR = 0.5f * subD;
+    const float tanDraft = std::tan(glm::radians(glm::clamp(gateDraft, 0.0f, 45.0f)));
+    const FeedSection gateSec = MakeCircleSection(gateD);
+    const FeedSection subSec  = MakeCircleSection(subD);
+    for (size_t g = 0; g < m_gates.size(); ++g)
+    {
+        const GateFeature& gf = m_gates[g];
+        const std::string gl = "Gate " + std::to_string(g + 1);
+        if (!gf.subPath.valid)
+        { net.warnings.push_back(gl + " has no route to the feed system (skipped)."); continue; }
+
+        const glm::vec3 origin = gf.point.worldPos;
+        const glm::vec3 firstVec =
+            (gf.subPath.kind == PathKind::Complex && gf.subPath.nodes.size() >= 2)
+            ? gf.subPath.nodes[1].pos - gf.subPath.nodes[0].pos
+            : gf.subPath.end - gf.subPath.start;
+        const float firstLegLen = glm::length(firstVec);
+        if (firstLegLen < 1e-6f)
+        { net.warnings.push_back(gl + " has a zero-length route (skipped)."); continue; }
+        const glm::vec3 pathDir = firstVec / firstLegLen;
+        const float totalLen = glm::length(gf.subPath.end - origin);
+
+        float taperLen = std::numeric_limits<float>::max();
+        if (tanDraft > 1e-6f && subR > gateR) taperLen = (subR - gateR) / tanDraft;
+        const bool simpleFull = gf.subPath.nodes.size() <= 2 && taperLen >= totalLen;
+
+        const int mouth = net.addNode(origin, FeedNodeKind::GateOrigin, gf.parentIndex, 0.0f,
+                                      gl + " mouth");
+        const int part = partNodeFor(origin, gf.parentIndex);
+        if (part >= 0)
+        {
+            net.addEdge(mouth, part, FeedEdgeKind::CavityIn, 0.0f, FeedSection{}, (int)g,
+                        gl + " -> part");
+            net.nodes[(size_t)mouth].objectIndex = net.nodes[(size_t)part].objectIndex;
+        }
+        else
+        {
+            net.warnings.push_back(gl + " is not on a moulded object.");
+        }
+
+        int feed = gateFeedNode[g];
+        if (feed < 0)
+        {
+            feed = net.addNode(gf.subPath.end, FeedNodeKind::Junction, -1, kMerge,
+                               gl + " feed end (unattached)");
+            net.warnings.push_back(gl + " is not attached to the sprue or a runner.");
+        }
+
+        if (simpleFull)
+        {
+            net.addEdge(feed, mouth, FeedEdgeKind::Gate, totalLen, gateSec, (int)g, gl);
+        }
+        else
+        {
+            const float     taperOnLeg   = std::min(taperLen, firstLegLen);
+            const glm::vec3 transitionPt = origin + pathDir * taperOnLeg;
+            const int trans = net.addNode(transitionPt, FeedNodeKind::GateTransition, -1, 0.0f,
+                                          gl + " transition");
+            net.addEdge(trans, mouth, FeedEdgeKind::Gate, taperOnLeg, gateSec, (int)g, gl);
+
+            const FeaturePath sub = GateSubRunnerCutPath(gf.subPath, transitionPt);
+            std::vector<glm::vec3> poly;
+            for (const PathStation& s : SamplePath(sub)) poly.push_back(s.pos);
+            const float subLen = (poly.size() >= 2) ? PolylineLengthMm(poly)
+                                                    : glm::length(gf.subPath.end - transitionPt);
+            net.addEdge(feed, trans, FeedEdgeKind::SubRunner, subLen, subSec, (int)g,
+                        gl + " sub-runner");
+        }
+    }
+
+    // ---- Vents: part -> mouth -> channel -> outlet --------------------------
+    // BuildBoxSweepMesh(path, width, depth) takes the UI "length" field as the
+    // channel depth, so the section is ventW x ventDepth.
+    const FeedSection ventSec = MakeRectSection(ventW, ventDepth);
+    for (size_t v = 0; v < m_vents.size(); ++v)
+    {
+        const VentInstance& vi = m_vents[v];
+        const std::string vl = "Vent " + std::to_string(v + 1);
+        if (!vi.path.valid)
+        { net.warnings.push_back(vl + " has no path to the perimeter (skipped)."); continue; }
+
+        std::vector<glm::vec3> poly;
+        for (const PathStation& s : SamplePath(vi.path)) poly.push_back(s.pos);
+        if (poly.size() < 2) poly = { vi.path.start, vi.path.end };
+
+        const int mouth  = net.addNode(poly.front(), FeedNodeKind::VentStart, vi.parentIndex, 0.0f,
+                                       vl + " mouth");
+        const int outlet = net.addNode(poly.back(), FeedNodeKind::VentOutlet, -1, 0.0f,
+                                       vl + " outlet");
+        net.addEdge(mouth, outlet, FeedEdgeKind::Vent, PolylineLengthMm(poly), ventSec, (int)v, vl);
+
+        const int part = partNodeFor(vi.point.worldPos, vi.parentIndex);
+        if (part >= 0)
+        {
+            net.addEdge(part, mouth, FeedEdgeKind::CavityOut, 0.0f, FeedSection{}, (int)v,
+                        "part -> " + vl);
+            net.nodes[(size_t)mouth].objectIndex = net.nodes[(size_t)part].objectIndex;
+        }
+    }
+
+    // ---- Topology sanity --------------------------------------------------
+    for (const PartInfo& p : parts)
+    {
+        bool fed = false, vented = false;
+        for (const FeedEdge& e : net.edges)
+        {
+            if (e.a != p.node && e.b != p.node) continue;
+            if (e.kind == FeedEdgeKind::CavityIn)  fed = true;
+            if (e.kind == FeedEdgeKind::CavityOut) vented = true;
+        }
+        const std::string& lbl = net.nodes[(size_t)p.node].label;
+        if (!fed)    net.warnings.push_back(lbl + " has no gate or direct-injection feed.");
+        if (!vented) net.warnings.push_back(lbl + " has no vents.");
+    }
+    return net;
+}
+
+// ===========================================================================
+// BuildPartSurfaces — each moulded object's own surface, world space, for the
+// planform midplane (see Flow::BuildPlanformMidplane). Mirrors the part-node
+// filter / numbering in BuildFeedNetwork so labels and objectIndex line up.
+// ===========================================================================
+std::vector<Flow::PartSurface> GLCanvas::BuildPartSurfaces() const
+{
+    std::vector<Flow::PartSurface> out;
+    int ordinal = 0;
+    for (size_t i = 0; i < m_objects.size(); ++i)
+    {
+        const SceneObject& obj = m_objects[i];
+        if (obj.role != ObjectRole::Imported) continue;
+        if (obj.sourcePath.empty() && !obj.hasSourceShape) continue;
+        if (obj.cpuVerts.size() < 3) continue;
+        ++ordinal;
+
+        Flow::PartSurface ps;
+        ps.objectIndex = (int)i;
+        std::string name = obj.sourcePath;
+        const size_t slash = name.find_last_of("/\\");
+        if (slash != std::string::npos) name = name.substr(slash + 1);
+        ps.label = "Part " + std::to_string(ordinal) + (name.empty() ? "" : " (" + name + ")");
+
+        const glm::mat4 M = obj.BuildModelMatrix();
+        ps.xyz.resize(obj.cpuVerts.size() - obj.cpuVerts.size() % 3);
+        for (size_t v = 0; v + 2 < obj.cpuVerts.size(); v += 3)
+        {
+            const glm::vec4 w = M * glm::vec4(obj.cpuVerts[v], obj.cpuVerts[v + 1], obj.cpuVerts[v + 2], 1.0f);
+            ps.xyz[v] = w.x; ps.xyz[v + 1] = w.y; ps.xyz[v + 2] = w.z;
+        }
+        ps.indices.assign(obj.cpuIndices.begin(), obj.cpuIndices.end());
+        out.push_back(std::move(ps));
+    }
+    return out;
 }

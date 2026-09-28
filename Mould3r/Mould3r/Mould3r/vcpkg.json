@@ -8,6 +8,9 @@
     "glad",
     "opencascade",
     "glm",
-    "manifold"
+    "manifold",
+    "eigen3",
+    "clipper2",
+    "cdt"
   ]
 }

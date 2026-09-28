@@ -5,18 +5,29 @@
 #include <wx/checkbox.h>
 #include <vector>
 #include <unordered_map>
+#include <functional>
 
 #include <opencascade/TopoDS_Shape.hxx>  // shot BREP, stored for face checks
 
 #include "FileImporter.h"   // FileImporter::MeshData
-#include "DesignChecks.h"   // DesignChecks::DemoldabilityResult
+#include "DesignChecks.h"   // DesignChecks::FaceDraftStats / DraftSample
+#include "FlowMesh.h"       // Flow::FlowMesh / FlowMeshStats (Hele-Shaw P1)
+#include "FeedNetwork.h"    // Flow::FeedNetwork — 1D feed-system snapshot
+#include "Midplane.h"       // Flow::PartSurface / MidplaneMesh — planform midplane
+#include "CoupledFill.h"    // Flow::CoupledFillResult — feed + cavity fill
+#include "FillDefects.h"    // Flow::FillDefects — weld lines, air traps, last to fill
+#include "Warpage.h"        // Flow::WarpResult — shell warpage from the packing shrinkage
+#include "ResultsDetails.h" // ResultsDetails::Report — the numbers behind each results card
 #include "GridSettings.h"   // GridSettings — forwarded to the preview canvas
 #include "FixtureFile.h"    // FixtureKind — gates cast generation
 
 #include <glm/glm.hpp>      // cached half bounds (perimeter of the cast bases)
 
 class GLCanvas;
+class FlowResultsBar;
+class RoundedButton;
 class wxSpinCtrlDouble;
+namespace MeshBoolean { struct Mesh; }   // travel-volume return type (defined in MeshBoolean.h)
 
 // Bundle of the shot artefacts handed to the preview. All pointers may be null
 // (no shot). The panel copies what it keeps; the caller need not preserve the
@@ -27,7 +38,6 @@ struct ShotPreviewInput
     const TopoDS_Shape*           shape = nullptr;    // BREP for face checks
     const std::vector<int>*       faceIds = nullptr;  // per display tri -> face
     double                        volumeMm3 = 0.0;
-    const std::vector<TopoDS_Shape>* halves = nullptr;  // half solids (separation)
 
     // The "Cast Shot Body" (standard shot + vents + scaled inserts + ejector
     // pins), used only by cast-mould base generation. May be null (no cast shot
@@ -47,6 +57,23 @@ struct ShotPreviewInput
     // — whose perimeter is a clean rectangle; a Library mould can't be cast.
     // Carried here so PreviewPanel can gate the Generate Mould Casts flow.
     FixtureKind mouldKind = FixtureKind::Library;
+
+    // The feed system (sprue / runners / gates) + vents + one node per moulded
+    // object, snapshotted as a 1D nodal network at Generate Mould
+    // (GLCanvas::BuildFeedNetwork). Drives the Hele-Shaw flow analysis and its
+    // "Flow network" debug view. May be null (no network built).
+    const Flow::FeedNetwork* feedNetwork = nullptr;
+
+    // Each moulded object's own surface (world space), snapshotted at Generate
+    // Mould (GLCanvas::BuildPartSurfaces) — the source for the part midplane
+    // meshes. objectIndex matches the network's part nodes. May be null.
+    const std::vector<Flow::PartSurface>* partSurfaces = nullptr;
+
+    // Auto-embed flag markers (GLCanvas::GetLastEmbedFlagMeshes): one red
+    // sphere, world space, around each vent / gate whose mouth couldn't be
+    // embedded in its part. Shown translucent behind a single "Embed warnings"
+    // checkbox. Null / empty = nothing flagged, no checkbox.
+    const std::vector<FileImporter::MeshData>* embedFlags = nullptr;
 };
 
 // ===========================================================================
@@ -113,6 +140,11 @@ public:
     // been generated. MainFrame's "Export Mould Casts" writes one file per entry
     // — STEP when the body carries a shape (BREP scene), else STL.
     bool HasCastBodies() const { return !m_castExports.empty(); }
+
+    // Asks the host to bring the Preview perspective forward (MainFrame sets
+    // it). Used by a results window's "Open View", which may be pressed while
+    // another perspective is showing.
+    std::function<void()> onShowRequested;
     const std::vector<CastExportBody>& GetCastExportBodies() const
     {
         return m_castExports;
@@ -123,7 +155,8 @@ private:
     // then a "Shot" checkbox when a shot model is present, into m_visPanel (in
     // the left column, above the Simulations section). Re-runnable: call
     // ClearVisibilityChecks first to drop the previous set.
-    void BuildVisibilityChecks(int halfCount, bool hasShot, int insertCount);
+    void BuildVisibilityChecks(int halfCount, bool hasShot, int insertCount,
+        int embedFlagCount = 0);
     void ClearVisibilityChecks();
 
     // One child body inside a cast group (Top Cast / Bottom Cast).
@@ -155,11 +188,15 @@ private:
     // place via UpdateInfoPanel as data changes.
     wxPanel* BuildSimPanel(wxWindow* parent);
     wxPanel* BuildInfoPanel(wxWindow* parent);
+    // The "Physical Setup" bar across the top of the centre column (beneath the
+    // perspective/generate toolbar): injection + mould material dropdowns.
+    // Groundwork for material-dependent simulations.
+    wxPanel* BuildPhysicalSetupBar(wxWindow* parent);
     void     UpdateInfoPanel();
 
-    // Stub entry point for kicking off a simulation. "Design Checks" runs the
-    // demoldability assessment (see RunDemoldabilityCheck); any other named
-    // simulation reports that it isn't implemented yet.
+    // Entry point for a simulation's Start button. "Draft Angle Checks" runs the
+    // face-by-face draft check (RunFaceDraftCheck); "Separation Test" runs the
+    // collision check; any other name reports it isn't implemented.
     void OnStartSimulation(const wxString& simName);
 
     // Open the "Generate Mould Casts" dialog (wall + base characteristics for
@@ -168,63 +205,134 @@ private:
     // them to the preview scene is a later step.
     void OnGenerateMouldCasts();
 
-    // Run the demoldability check on the retained shot mesh using the draft
-    // thresholds from the left-panel fields, then report the verdict (results
-    // dialog + the status line in the information panel).
-    void RunDemoldabilityCheck();
-
-    // Run the alternative separation/collision demoldability check: lift each
-    // mould half off the shot and test for interference. Reports the verdict
-    // and shows the interference region as a red overlay for comparison with
-    // the analytic undercut faces.
+    // Run the separation/collision demoldability check: lift each mould half
+    // off the shot and test for interference. Reports the verdict and shows the
+    // interference region as a red overlay.
     void RunSeparationCheck();
 
-    // Compute (and cache) the demoldability result from the current thresholds,
-    // without any UI. Returns false when there is no shot to analyse.
-    bool ComputeDemoldability();
+    // Run the Hele-Shaw 2.5D flow analysis on the feed network captured at
+    // Generate Mould: resolve the Physical Setup materials and process fields,
+    // solve the steady feed system (Cross-WLF at melt temp, sprue inlet -> part
+    // nodes) for the feed pressure drop and gate flow split, report it, and
+    // show the "Flow network" debug view. Each part is one lumped node for now;
+    // its cavity flow field is the next step (see HeleShaw2D_Plan.md).
+    // Dispatched from the "Hele-Shaw 2.5D Flow" card.
+    void RunFlowCheck();
 
-    // Apply or clear the Draft Angle Checks mould overlay according to the
-    // "Show mould overlay" checkbox on that card. When shown, the shot is
-    // recoloured (against the current thresholds) into one combined view:
-    // fail faces red, warn faces yellow, everything else its normal colour,
-    // drawn as highlights (flat/full-intensity) rather than shaded.
+    // Which mesh an ownership analysis runs on: the whole shot (parts + feed
+    // system: sprue, runners, gates) or the cavity only — the moulded parts'
+    // own model meshes (m_partSurfaces), so the feed system doesn't colour the
+    // verdict. Each has its own cached analysis (m_ownership[source]).
+    enum AnalysisSource { SourceShot = 0, SourceCavity = 1 };
+    int DraftSource() const;        // per the Draft Angle Checks card's "Cavity only" box
+    int SeparationSource() const;   // per the Separation Test card's box
+
+    // Run the Draft Angle Checks: split the shot at the parting plane, assign
+    // each facet's owning mould half by casting a ray along its outward normal
+    // into the generated half meshes, then measure signed draft against that
+    // half's pull. Reports per-facet pass/warn/fail counts (gated by the
+    // minimum-significant-area filter) and drives the "Draft (ray)" overlay.
+    // Remesh-free; runs on the shot display mesh, on BREP and mesh scenes alike.
+    void RunFaceDraftCheck();
+
+    // Ensure the parting-split, ownership-assigned mesh for `source` exists (the
+    // shared foundation for the Draft Angle Checks and the Separation Test):
+    // splits the shot (or the cavity's part meshes) at the parting plane and
+    // casts the ownership ray, caching the result in m_ownership[source]. Cheap
+    // no-op when already built for this generation. Returns false when there is
+    // nothing to analyse (no shot / no part meshes) or no generated halves.
+    bool EnsureFaceDraftAnalysis(int source);
+
+    // Ensure the Hele-Shaw flow mesh exists (P1): the shot surface soup with a
+    // per-facet wall thickness from dual-domain opposite-wall pairing, cached in
+    // m_flowMesh / m_flowMeshStats. Cheap no-op when already built for this shot.
+    // Returns false when there is no shot mesh to build from.
+    bool EnsureFlowMesh();
+
+    // Ensure every part's planform midplane mesh exists at the card's target
+    // triangle area (rebuilt when the area changes or after a new generation).
+    // Returns true if at least one part produced a mesh.
+    bool EnsureMidplanes();
+
+    // The last fill changed (ran, or was cleared): restart its timeline at the
+    // end-of-fill state and recompute the fixed legend ranges of its views.
+    void OnFillChanged();
+    // The results bar under the canvas is permanent (it holds Sim Viewer
+    // Select). `show` keeps the legend the caller just set (false clears it);
+    // `timeline` keeps the fill timeline (false clears it).
+    void ShowResultsBar(bool show, bool timeline = false);
+
+    // Build one mould half's "travel volume": the shot surface that half owns,
+    // swept toward the parting plane by the half's height (see the Separation
+    // Test). `side` is 0 (+draw) or 1 (-draw). Returns an empty mesh when that
+    // side owns no surface or the sweep can't be formed. `startEps` lifts the
+    // swept prism off the coincident cavity wall (mm) to suppress contact noise.
+    // Assumes the ownership analysis for `source` is current (call
+    // EnsureFaceDraftAnalysis).
+    MeshBoolean::Mesh BuildSideTravelVolume(int side, float startEps, int source) const;
+
+    // ---- Results details (the "Details" button on each results card) ------
+    // Card index: 0 Draft Angle Checks, 1 Separation Test, 2 Flow Analysis.
+    enum ResultsCard { CardDraft = 0, CardSeparation = 1, CardFlow = 2, CardCount = 3 };
+    // Store a card's report, enable its Details button, refresh an open window.
+    void SetResultsReport(int card, const ResultsDetails::Report& report);
+    // Open (or raise) the card's details window.
+    void ShowResultsDetails(int card);
+    // Save the card's results as CSV (asks for the file).
+    void ExportResults(int card);
+    // A results window's "Open View": bring the Preview forward with only the
+    // shot body visible and the Sim Viewer on `view` (for the Separation Test,
+    // the red interference overlay over a wireframe shot).
+    void OpenResultsView(int card, int view);
+    // Hide every preview body but the shot (checkboxes kept in step).
+    void ShowOnlyShot();
+    // Every card back to "not run" (a new generation / cleared scene).
+    void ClearResultsReports();
+
+    // What the last Separation Test found, for its report.
+    struct SeparationRegion
+    {
+        int       side = 0;
+        double    volumeMm3 = 0.0;
+        glm::vec3 lo{ 0.0f }, hi{ 0.0f };   // bounds (mm)
+    };
+    struct SeparationRun
+    {
+        int    source = SourceShot;
+        float  startEps = 0.0f, minOverlap = 0.0f;
+        bool   sideSurf[2] = { false, false };
+        int    sideStat[2] = { 0, 0 };      // 0 clear, 1 collision, 2 not evaluable
+        double sideVol[2] = { 0.0, 0.0 };
+        int    sideRegions[2] = { 0, 0 }, sideTiny[2] = { 0, 0 };
+        int    ownedTris[2] = { 0, 0 };
+        double ownedAreaMm2[2] = { 0.0, 0.0 };
+        std::vector<SeparationRegion> regions;
+    };
+    // The inputs a flow run used, for its report.
+    struct FlowRunInputs
+    {
+        wxString material, mould;
+        double fillTimeS = 0, meltC = 0, mouldC = 0, wallC = 0, eta0 = 0;
+        double maxInjMPa = 0, packPct = 0, holdS = 0, shrinkRatio = 1, meshAreaMm2 = 0;
+        double shotVolMm3 = 0, flowRateMm3s = 0;
+        double noFlowC = 0, ejectC = 0, maxShearRate = 0;
+        bool   thermal = false, pack = false;
+    };
+    ResultsDetails::Report BuildDraftReport(const DesignChecks::FaceDraftParams& params, int source,
+                                            const wxString& verdict, const wxColour& colour) const;
+    ResultsDetails::Report BuildSeparationReport(const SeparationRun& run,
+                                                 const wxString& verdict, const wxColour& colour) const;
+    ResultsDetails::Report BuildFlowReport(const FlowRunInputs& in) const;
+
+    // Apply or clear the Draft Angle Checks overlay per the Debug View dropdown:
+    // None (clear, optional wireframe) or "Draft (ray)" (the parting-split
+    // analysis mesh coloured by per-facet signed draft).
     void UpdateDraftOverlay();
 
     // Show or hide the Separation Test mould overlay (the red interference
     // solid produced by the last run) according to that card's "Show mould
     // overlay" checkbox. A no-op when no interference solid is available.
     void UpdateSeparationOverlay();
-
-    // Debug visualisation: recolour the shot so the facets flagged by one
-    // category draw red and all others green. category: 0 = undercuts,
-    // 1 = warnings, 2 = fails. Pressing the active category again clears it.
-    void ShowDebugCategory(int category);
-
-    // Debug visualisation: recolour the shot by draft sign relative to the
-    // pull axis (up / down / vertical / mixed), using the analytic normals the
-    // checks use — to expose any inverted normals. Pressing again clears it.
-    void ShowDraftSign();
-
-    // Debug visualisation: toggle the accessibility-ray overlay (yellow ray
-    // segments, first 10 mm) and the contact markers (red points where failing
-    // rays struck the shot). Independent on/off toggles.
-    void ToggleDebugRays();
-    void ToggleDebugContacts();
-
-    // Recompute the demoldability result (capturing undercut rays) and push the
-    // ray-segment + contact geometry to the canvas. Called before showing
-    // either ray overlay so the geometry matches the current shot.
-    void RefreshRayGeometry();
-
-    // Push a debug overlay to the canvas: partition the shot's display
-    // triangles by their source face's group (groupOfFace maps a 1-based face
-    // index to a group index; faces not present use defaultGroup), one colour
-    // per group. `emissive` (optional, per group) flags which groups draw as
-    // flat full-intensity highlights instead of shaded; missing entries are
-    // treated as not emissive.
-    void ApplyFaceGroups(const std::unordered_map<int, int>& groupOfFace,
-        const std::vector<glm::vec3>& colors, int defaultGroup,
-        const std::vector<bool>& emissive = {});
 
     // Upload the captured meshes into the canvas's context (halves first, then
     // the shot) and enable the toggles. Run via CallAfter so the canvas window
@@ -267,20 +375,60 @@ private:
     int m_insertFirstIndex = -1;
     int m_insertCount = 0;
 
+    // Auto-embed flag markers (red translucent spheres), loaded after the
+    // inserts as one contiguous block behind the single m_embedCheck — same
+    // scheme as the inserts above.
+    std::vector<FileImporter::MeshData> m_pendingEmbedFlags;
+    wxCheckBox* m_embedCheck = nullptr;
+    int m_embedFirstIndex = -1;
+    int m_embedCount = 0;
+
+    // Physical Setup bar (top of the centre column): material selections shared
+    // across simulations. Groundwork — no behaviour wired yet.
+    wxChoice* m_injMaterialChoice = nullptr;    // injection material
+    wxChoice* m_mouldMaterialChoice = nullptr;  // mould material
+
     // Design-check parameter fields (left panel) and the verdict read-outs
     // (right panel). Plain text fields styled like the mould-feature inputs:
     // label + field + separate unit label.
-    wxTextCtrl* m_failDraftCtrl = nullptr;   // draft fail threshold (deg)
-    wxTextCtrl* m_warnDraftCtrl = nullptr;   // draft warn threshold (deg)
-    wxTextCtrl* m_liftCtrl = nullptr;        // separation lift (mm)
-    wxStaticText* m_draftStatus = nullptr;   // "Draft Angle Checks" verdict
-    wxStaticText* m_demouldStatus = nullptr; // "Separation Test" verdict
+    wxTextCtrl* m_failDraftCtrl = nullptr;    // draft fail threshold (deg)
+    wxTextCtrl* m_warnDraftCtrl = nullptr;    // draft warn threshold (deg)
+    wxTextCtrl* m_backdraftEpsCtrl = nullptr; // back-draft epsilon (deg)
+    wxChoice*   m_sigModeChoice = nullptr;    // significance: % of surface vs absolute mm^2
+    wxTextCtrl* m_sigValueCtrl = nullptr;     // significance threshold value
+    wxStaticText* m_sigUnitLbl = nullptr;     // significance unit label (tracks the dropdown)
+    wxTextCtrl* m_sepMinOverlapCtrl = nullptr; // separation: per-region min overlap volume (mm^3)
+    wxTextCtrl* m_sepStartEpsCtrl = nullptr;    // separation: start-offset epsilon off the wall (mm)
+    wxCheckBox* m_draftCavityCheck = nullptr;   // draft: cavity only (part model meshes)
+    wxCheckBox* m_sepCavityCheck = nullptr;     // separation: cavity only (part model meshes)
 
-    // "Show mould overlay" checkboxes under each simulation's Start button, and
-    // whether the separation run has produced an interference solid to show.
-    // The checkbox state itself is read from the controls; m_hasSepOverlay
-    // gates the separation toggle so checking it before a run does nothing.
-    wxCheckBox* m_draftOverlayCheck = nullptr;
+    // Hele-Shaw 2.5D Flow process + mesh fields.
+    wxTextCtrl* m_flowFillTimeCtrl = nullptr;  // injection fill time (s)
+    wxTextCtrl* m_flowMeltTempCtrl = nullptr;  // melt temperature (deg C)
+    wxTextCtrl* m_flowMouldTempCtrl = nullptr; // mould-wall temperature (deg C)
+    wxTextCtrl* m_flowMeshAreaCtrl = nullptr;  // midplane target triangle area (mm^2)
+    wxTextCtrl* m_flowMaxPressureCtrl = nullptr; // machine injection-pressure limit (MPa)
+    wxCheckBox* m_flowThermalCheck = nullptr;    // thermal fill (frozen layer) vs isothermal
+    wxCheckBox* m_flowPackCheck = nullptr;       // pack, hold and cool after the fill (thermal only)
+    wxTextCtrl* m_flowPackPressureCtrl = nullptr; // pack pressure, % of the fill's injection pressure
+    wxTextCtrl* m_flowHoldTimeCtrl = nullptr;    // hold time (s); 0 = until the gates freeze
+    wxTextCtrl* m_flowShrinkRatioCtrl = nullptr; // warpage: shrinkage along / across the flow
+
+    wxStaticText* m_draftStatus = nullptr;    // "Draft Angle Checks" verdict
+    wxStaticText* m_demouldStatus = nullptr;  // "Separation Test" verdict
+    wxStaticText* m_flowStatus = nullptr;     // "Flow Analysis" verdict
+
+    // Each results card's report, its "Details" / "Export" buttons and its
+    // (modeless, reused) details window, created on first use.
+    ResultsDetails::Report m_reports[CardCount];
+    RoundedButton*         m_detailsBtn[CardCount] = { nullptr, nullptr, nullptr };
+    RoundedButton*         m_exportBtn[CardCount] = { nullptr, nullptr, nullptr };
+    ResultsDetailsDialog*  m_detailsDlg[CardCount] = { nullptr, nullptr, nullptr };
+
+    // Debug view controls + whether the separation run has produced an
+    // interference solid to show (m_hasSepOverlay gates the separation toggle).
+    wxChoice*   m_debugModeChoice = nullptr;  // debug view: None / Draft (ray)
+    wxCheckBox* m_debugWireCheck = nullptr;   // debug view: wireframe toggle
     wxCheckBox* m_sepOverlayCheck = nullptr;
     bool        m_hasSepOverlay = false;
 
@@ -290,19 +438,69 @@ private:
     wxStaticText* m_volPrimary = nullptr;    // "12.345 cm³"
     wxStaticText* m_volSecondary = nullptr;  // "0.753 in³"
 
-    // Cached result of the last demoldability run, reused by the debug buttons.
-    DesignChecks::DemoldabilityResult m_lastResult;
-    bool m_hasResult = false;
+    // Ray-assigned half ownership, one per AnalysisSource (whole shot / cavity
+    // only): the parting-plane-split analysis mesh the Draft Angle Checks and
+    // the Separation Test run on and the "Draft (ray)" / travel-volume views
+    // render (6 floats/vertex + its own indices), its per-facet samples
+    // (faceId = triangle + 1), and how many facets hit no half.
+    struct OwnershipMesh
+    {
+        std::vector<float>                     posNorm;
+        std::vector<unsigned int>              idx;
+        std::vector<DesignChecks::DraftSample> samples;
+        int                                    fallback = 0;
+        bool ready() const { return !samples.empty() && idx.size() >= 3; }
+        void clear() { posNorm.clear(); idx.clear(); samples.clear(); fallback = 0; }
+    };
+    OwnershipMesh                m_ownership[2];
+    DesignChecks::FaceDraftStats m_lastFaceDraftStats;   // last Draft Angle Checks classification
+    SeparationRun                m_lastSeparation;       // last Separation Test
 
-    // Triggering rays of the last run's undercut faces, for the ray overlay.
-    std::vector<DesignChecks::UndercutRay> m_undercutRays;
-    bool m_showRays = false;
-    bool m_showContacts = false;
+    // Hele-Shaw flow mesh (P1): the shot surface with a per-facet wall thickness
+    // from dual-domain pairing, plus the pairing/thickness summary. Cached per
+    // shot; built on demand by EnsureFlowMesh and drawn by the "Flow (thickness)"
+    // debug mode. Cleared on reset alongside the draft analysis.
+    Flow::FlowMesh      m_flowMesh;
+    Flow::FlowMeshStats m_flowMeshStats;
 
-    // Which preview part is the shot (index into the canvas's parts), and which
-    // debug category is currently shown (-1 = none).
+    // Feed network snapshot from the last Generate Mould (see ShotPreviewInput)
+    // and the last steady feed solve over it (pressure drop + gate split). The
+    // "Flow network" debug view draws the node tree; the part nodes are where
+    // the cavity mid-surface mesh (rebuilt from source geometry) will attach.
+    Flow::FeedNetwork     m_feedNetwork;
+    bool                  m_hasFeedNetwork = false;
+    Flow::FeedSolveResult m_feedSolve;
+    bool                  m_hasFeedSolve = false;
+
+    // Part surfaces (from Generate Mould) and the planform midplane built from
+    // each at m_midplaneAreaMm2 (-1 = not built). One MidplaneMesh per surface,
+    // kept even when a build fails so the report can say why.
+    std::vector<Flow::PartSurface>  m_partSurfaces;
+    std::vector<Flow::MidplaneMesh> m_midplanes;
+    float                           m_midplaneAreaMm2 = -1.0f;
+
+    // Last coupled fill (feed network + part midplanes filled together). Drives
+    // the "Flow fill time" / "Flow pressure" views and, for thermal runs, "Flow
+    // front temp" / "Flow frozen layer"; cleared whenever the midplanes are
+    // rebuilt (its per-node arrays index them).
+    Flow::CoupledFillResult m_fill;
+    bool                    m_hasFill = false;
+
+    // Results bar under the canvas (fill timeline + heat-map legend), the frame
+    // it shows (-1 = end of fill), a serial that changes with every fill (the
+    // timeline's key) and each fill view's legend range, fixed over the whole
+    // animation so colours compare between frames. Index: mode - 7 (fill time,
+    // pressure, front temp, frozen layer, melt temp).
+    FlowResultsBar* m_resultsBar = nullptr;
+    Flow::FillDefects m_defects;               // weld lines / air traps of m_fill
+    Flow::WarpResult  m_warp;                  // warpage of m_fill's parts (after packing)
+    int             m_fillFrame = -1;
+    long            m_fillSerial = 0;
+    float           m_fillRangeLo[5] = { 0, 0, 0, 0, 0 };
+    float           m_fillRangeHi[5] = { 1, 1, 1, 1, 1 };
+
+    // Which preview part is the shot (index into the canvas's parts).
     int m_shotHalfIndex = -1;
-    int m_activeDebugCategory = -1;
 
     // Cast generation state. m_mouldKind gates the flow (only Parametric /
     // Dynamic can be cast). m_castAnchorCount is the number of non-cast preview
@@ -325,7 +523,14 @@ private:
     FileImporter::MeshData              m_shotMesh;
     TopoDS_Shape                        m_shotShape;
     std::vector<int>                    m_shotFaceIds;
-    std::vector<TopoDS_Shape>           m_halfShapes;   // for the separation test
+
+    // Mould-half surface soups (xyz positions + indices, one entry per half),
+    // retained from the half display meshes in SetData. Used by the Draft Angle
+    // Checks ownership ray and by the Separation Test's sweep/overlap. The half
+    // MeshData themselves are uploaded then dropped, so these lightweight copies
+    // are kept explicitly.
+    std::vector<std::vector<float>>        m_halfMeshPos;
+    std::vector<std::vector<unsigned int>> m_halfMeshIdx;
     bool                                m_hasShot = false;
     double                              m_shotVolumeMm3 = 0.0;
 

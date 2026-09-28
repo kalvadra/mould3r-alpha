@@ -3,6 +3,7 @@
 #include <glm/glm.hpp>
 #include <string>
 #include <vector>
+#include <functional>
 
 class TopoDS_Shape;   // analysed at BREP level (see .cpp for OCC includes)
 
@@ -33,131 +34,115 @@ namespace DesignChecks
 {
     enum class Severity { Pass, Warning, Fail };
 
-    struct Issue
+    // One per-facet draft sample produced by the face-by-face check. No geometry
+    // is retained, so the array is small and cheap to reduce over.
+    struct DraftSample
     {
-        Severity    severity = Severity::Pass;
-        std::string description;
-        glm::vec3   location{ 0.0f };  // representative world point
+        float signedDraftDeg = 90.0f; // asin(n . pull) in deg; + releases, - back-draft
+        float area           = 0.0f;  // triangle area (mm^2) - the weight
+        int   objectId       = -1;    // reserved (per-cavity); unused, always -1
+        int   faceId         = -1;    // overlay key: split-triangle index + 1
+        int   half           = -1;    // owning mould half: 0 = +drawAxis, 1 = -drawAxis
+        bool  trapped        = false; // reserved; unused (trapped check omitted)
+    };
+    // ======================================================================
+    // Face-by-face draft check (ray-assigned mould-half ownership)
+    //
+    // A lighter, remesh-free alternative to the area-weighted score above. It
+    // runs directly on the shot's display mesh and, per triangle:
+    //   1. Orients the facet normal outward (via the interpolated vertex normal).
+    //   2. Assigns the OWNING mould half by casting a ray from just outside the
+    //      facet along its outward normal into the supplied half meshes — the
+    //      nearest half hit is the half whose steel forms that facet. The half
+    //      meshes must already be the post-cut, orphan-resolved solids (the
+    //      generator's ResolveOrphanVolumes has run), so a facet formed by the
+    //      opposite half's steel (an overhang) is owned correctly rather than by
+    //      the crude "which side of y=0 the centroid sits on".
+    //   3. Measures signed draft relative to the OWNING half's pull direction.
+    // A facet whose ray hits no half falls back to the parting-plane side of its
+    // centroid. Trapped/undercut testing is intentionally omitted here.
+    // ======================================================================
+    struct FaceDraftParams
+    {
+        glm::vec3 drawAxis      = glm::vec3(0.0f, 1.0f, 0.0f); // halves part +/-
+        float     failDraftDeg  = 1.0f;   // signed draft below this => fail
+        float     warnDraftDeg  = 3.0f;   // ... below this (>= fail) => warning
+        float     rayEpsilon    = 1.0e-3f;// ray start offset off the origin facet
+        float     partingOffset = 0.0f;   // parting-plane position along drawAxis
+        // Facets within this of vertical read as zero-draft, not back-draft: a
+        // signed draft in [-backdraftEpsDeg, 0) is a near-vertical wall, not a
+        // true negative-draft (undercut) face. Only affects the back-draft tally
+        // and the back-draft overlay band, never the fail/warn thresholds.
+        float     backdraftEpsDeg = 0.1f;
+
+        // Minimum significant area: a flagged band (fail, or warn) counts toward
+        // the verdict only once its total facet area reaches this threshold, so
+        // isolated mesh-artifact facets don't fail an otherwise-good part. The
+        // threshold is either a percentage of the shot's total surface area or an
+        // absolute area in mm^2, per significanceByPercent. Zero disables it
+        // (any flagged area counts). The per-facet overlay colours are unaffected
+        // — suppression changes only the overall verdict.
+        bool      significanceByPercent = true;  // true: value is % of surface area
+        float     significanceValue     = 0.0f;  // percent (0..100) or absolute mm^2
     };
 
-    struct DemoldabilityResult
+    // Split a shot mesh soup (posNorm, 6 floats/vertex + index buffer) by the
+    // parting plane dot(p, planeNormal) == planeOffset. Any triangle straddling
+    // the plane is cut so no output triangle crosses it; the new edge vertices
+    // land exactly on the plane, with linearly interpolated (renormalised)
+    // normals, and are welded so the parting line is a shared ring of vertices.
+    // Non-straddling triangles pass through unchanged. This is step 1 of the
+    // face-by-face draft method (clean per-half ownership at the parting line).
+    void SplitMeshByPlane(
+        const std::vector<float>& posNorm,
+        const std::vector<unsigned int>& indices,
+        const glm::vec3& planeNormal,
+        float planeOffset,
+        std::vector<float>& outPosNorm,
+        std::vector<unsigned int>& outIndices,
+        float onPlaneEps = 1.0e-5f);
+
+    struct FaceDraftStats
     {
-        Severity           overall = Severity::Pass;
-        std::vector<Issue> issues;
+        Severity overall = Severity::Pass; // verdict after the significance filter
+        int  totalFaces    = 0;
+        int  passCount     = 0;
+        int  warnCount     = 0;            // >= fail, < warn
+        int  failCount     = 0;            // < fail (includes back-draft)
+        int  backdraftCount= 0;            // < -backdraftEpsDeg (subset of fail)
+        int  fallbackCount = 0;            // owner from parting-side fallback
+        float minDraftDeg  = 90.0f;        // smallest signed draft over the shot
 
-        // Offending faces by category, as 1-based indices into the shot's
-        // TopExp::MapShapes(TopAbs_FACE) map. A face appears in at most one.
-        std::vector<int> undercutFaces;   // blocked along the pull axis
-        std::vector<int> failDraftFaces;  // worst draft below fail threshold
-        std::vector<int> warnDraftFaces;  // worst draft below warn threshold
-
-        // Summary figures.
-        float minDraftDeg    = 90.0f;  // smallest face draft over the shot
-        int   undercutCount  = 0;
-        int   failDraftCount = 0;
-        int   warnDraftCount = 0;
-        int   totalFaces     = 0;
+        // Areas (mm^2) behind the verdict, and the resolved significance gate.
+        float failAreaMm2      = 0.0f;     // area of fail-band facets
+        float warnAreaMm2      = 0.0f;     // area of warn-band facets
+        float totalAreaMm2     = 0.0f;     // whole shot surface area scored
+        float significanceMm2  = 0.0f;     // resolved absolute threshold applied
+        bool  failSuppressed   = false;    // fail facets existed but below threshold
+        bool  warnSuppressed   = false;    // warn facets existed but below threshold
     };
 
-    struct Params
-    {
-        glm::vec3 drawAxis = glm::vec3(0.0f, 1.0f, 0.0f);  // pull axis (+/-)
+    // Build one sample per shot facet with ray-assigned half ownership. `posNorm`
+    // is the shot display mesh (6 floats/vertex). `halfVerts`/`halfIndices` are
+    // the per-half surface soups (xyz per vertex + index buffer) the ownership
+    // ray is cast against; each half's +/- side is inferred from its centroid.
+    // `triFaceId` (one entry per shot triangle) sets each sample's faceId key so
+    // the caller's overlay can map it back (BREP face id on a BREP scene); pass
+    // empty to key by 1-based triangle index. `outFallbackCount`, when non-null,
+    // receives the number of facets that fell back to the parting-plane side.
+    std::vector<DraftSample> BuildFaceDraftSamples(
+        const std::vector<float>& posNorm,
+        const std::vector<unsigned int>& indices,
+        const std::vector<std::vector<float>>& halfVerts,
+        const std::vector<std::vector<unsigned int>>& halfIndices,
+        const std::vector<int>& triFaceId = {},
+        const FaceDraftParams& params = FaceDraftParams{},
+        int* outFallbackCount = nullptr);
 
-        float failDraftDeg = 1.0f;   // worst-draft below this => fail
-        float warnDraftDeg = 3.0f;   // ... below this (but >= fail) => warning
-
-        // When false, the accessibility (undercut) analysis is skipped entirely
-        // — only the draft assessment runs. Used by the "Draft Angle Checks"
-        // simulation, which is concerned solely with draft; the separate
-        // demoulding (separation) test covers trapping/undercuts.
-        bool checkUndercuts = true;
-
-        // Ray start offset along the pull axis (world units) to skip the
-        // originating surface when testing accessibility.
-        float rayEpsilon = 1.0e-3f;
-
-        // Linear deflection for the sampling tessellation. Coarser than the
-        // display mesh — accessibility is analytic, so this only sets how
-        // densely each face is probed.
-        float sampleDeflection = 0.25f;
-    };
-
-    // One accessibility ray that registered a block (i.e. flagged its face as
-    // an undercut): where it started on the shot surface, the unit pull
-    // direction tested, and the nearest point where it struck the shot again.
-    // Recorded for debugging/visualisation.
-    struct UndercutRay
-    {
-        glm::vec3 origin;  // on the originating face
-        glm::vec3 dir;     // unit pull direction tested
-        glm::vec3 hit;     // nearest contact point on the shot
-    };
-
-    // Run the demoldability assessment on the shot BREP. Returns a Pass result
-    // with no issues when the shape is null or has no analysable faces. When
-    // `debugRays` is non-null it is filled with the triggering ray of each
-    // undercut face (one per undercut face) for visualisation.
-    DemoldabilityResult CheckDemoldability(
-        const TopoDS_Shape& shot,
-        const Params& params = Params{},
-        std::vector<UndercutRay>* debugRays = nullptr);
-
-    // ---- Debug: draft-sign classification ----------------------------------
-    // Which way each face points relative to the pull axis, using the SAME
-    // analytic normals the demoldability check uses — so it isolates whether
-    // those normals are oriented as expected (a planar wall that clearly faces
-    // up but lands in `downFaces` indicates an inverted normal). A curved face
-    // whose samples disagree (e.g. a cylinder spanning the parting plane) is
-    // reported as `mixed`. Face indices are 1-based into the shot's
-    // TopExp::MapShapes(TopAbs_FACE) map, as for DemoldabilityResult.
-    struct DraftSignResult
-    {
-        std::vector<int> upFaces;        // all samples face +drawAxis
-        std::vector<int> downFaces;      // all samples face -drawAxis
-        std::vector<int> verticalFaces;  // all samples ~parallel to pull
-        std::vector<int> mixedFaces;     // samples disagree (up and down)
-        int totalFaces = 0;
-    };
-
-    DraftSignResult ClassifyDraftSign(
-        const TopoDS_Shape& shot,
-        const Params& params = Params{});
-
-    // ---- Alternative: separation (collision) demoldability -----------------
-    // A physically-direct check: lift each mould half a small distance along
-    // its draw direction and test for interference with the shot. Any overlap
-    // is a true undercut (a region where steel drives into the body). This is
-    // an independent cross-check of CheckDemoldability's analytic undercut
-    // detection; note it only finds hard locks, not insufficient draft (a
-    // vertical wall slides without colliding).
-    struct SeparationParams
-    {
-        glm::vec3 drawAxis = glm::vec3(0.0f, 1.0f, 0.0f);  // halves part along +/-
-        float     liftMm = 1.0f;        // separation distance
-        double    volumeThreshold = 1.0e-3;  // ignore sub-this overlap (noise)
-    };
-
-    struct SeparationResult
-    {
-        Severity overall = Severity::Pass;
-        int      halvesTested = 0;
-        int      halvesCollided = 0;
-        int      halvesFailedToEval = 0;   // the boolean could not be computed
-        double   totalOverlapVolume = 0.0; // cubic mm
-
-        // Aligned to the input halves vector.
-        std::vector<double> perHalfVolume;
-        std::vector<int>    perHalfStatus;  // 0 clear, 1 collision, 2 eval-failed
-    };
-
-    // Run the separation check. Each half is lifted along the side of drawAxis
-    // its centroid lies on, then intersected with the shot. When `outOverlap`
-    // is non-null it receives a compound of the interference regions (for
-    // visualisation); it is null/empty when nothing collided.
-    SeparationResult CheckSeparation(
-        const TopoDS_Shape& shot,
-        const std::vector<TopoDS_Shape>& halves,
-        const SeparationParams& params = SeparationParams{},
-        TopoDS_Shape* outOverlap = nullptr);
+    // Per-face reduction: tally each sample against the fail/warn thresholds.
+    // (One sample == one facet, so these are true per-face counts.)
+    FaceDraftStats ClassifyFaceDraft(
+        const std::vector<DraftSample>& samples,
+        const FaceDraftParams& params = FaceDraftParams{});
 
 }  // namespace DesignChecks
