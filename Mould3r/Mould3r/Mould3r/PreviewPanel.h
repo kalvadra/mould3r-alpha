@@ -20,6 +20,8 @@
 #include "ResultsDetails.h" // ResultsDetails::Report — the numbers behind each results card
 #include "GridSettings.h"   // GridSettings — forwarded to the preview canvas
 #include "FixtureFile.h"    // FixtureKind — gates cast generation
+#include "MaterialLibrary.h" // the material library behind the Physical Setup dropdowns
+#include "MaterialResolve.h" // library material -> simulation properties (+ derived / fallback notes)
 
 #include <glm/glm.hpp>      // cached half bounds (perimeter of the cast bases)
 
@@ -123,6 +125,22 @@ public:
     // can't change while Preview is showing — syncing on entry is enough).
     void SetGridSettings(const GridSettings& s);
 
+    // Rescan the material library (built-ins + Materials/ folders) and refill
+    // the Physical Setup dropdowns, keeping the current selections when they
+    // still exist. Call after a material has been added to the library.
+    void ReloadMaterialLibrary();
+
+    // Open the Add Material dialog for `kind` (the "+" buttons and the
+    // Materials menu both land here); on save, rescan and select the new
+    // material in its dropdown.
+    void AddMaterialToLibrary(MaterialKind kind);
+
+    // Library summary for the Materials > Reload menu: entry counts and any
+    // files skipped at the last scan.
+    int InjectionMaterialCount() const { return (int)m_materialLib.Injection().size(); }
+    int MouldMaterialCount() const { return (int)m_materialLib.Mould().size(); }
+    const std::vector<std::string>& MaterialLibraryProblems() const { return m_materialLib.ScanProblems(); }
+
     // One exportable cast body: a filename-safe suffix, the display mesh (always
     // present, used for STL export), and — in a BREP scene — the exact OCC solid
     // (used for STEP export). `hasShape` gates the STEP path.
@@ -189,8 +207,8 @@ private:
     wxPanel* BuildSimPanel(wxWindow* parent);
     wxPanel* BuildInfoPanel(wxWindow* parent);
     // The "Physical Setup" bar across the top of the centre column (beneath the
-    // perspective/generate toolbar): injection + mould material dropdowns.
-    // Groundwork for material-dependent simulations.
+    // perspective/generate toolbar): injection + mould material dropdowns,
+    // filled from the material library.
     wxPanel* BuildPhysicalSetupBar(wxWindow* parent);
     void     UpdateInfoPanel();
 
@@ -218,6 +236,13 @@ private:
     // its cavity flow field is the next step (see HeleShaw2D_Plan.md).
     // Dispatched from the "Hele-Shaw 2.5D Flow" card.
     void RunFlowCheck();
+
+    // End-of-run notice shared by the simulations: "<sim> is complete", the
+    // verdict in a few words (read off the card's status label, so the two
+    // can't disagree) and a pointer to that card's Details button. The icon
+    // follows the verdict colour (green / amber / red).
+    void ShowSimCompleteNotice(const wxString& simName, const wxString& cardTitle,
+                               const wxStaticText* status);
 
     // Which mesh an ownership analysis runs on: the whole shot (parts + feed
     // system: sprue, runners, gates) or the cavity only — the moulded parts'
@@ -317,6 +342,13 @@ private:
         double shotVolMm3 = 0, flowRateMm3s = 0;
         double noFlowC = 0, ejectC = 0, maxShearRate = 0;
         bool   thermal = false, pack = false;
+        // Material values this run used that were derived from datasheet
+        // values or fell back to generic ones (MaterialResolve notes).
+        struct MaterialNoteRow { wxString material, quantity, text; bool fallback = false; };
+        std::vector<MaterialNoteRow> materialNotes;
+        // What turned the verdict amber: fill cautions, solver and feed-
+        // network warnings (Summary tab, "Cautions").
+        std::vector<wxString> cautions;
     };
     ResultsDetails::Report BuildDraftReport(const DesignChecks::FaceDraftParams& params, int source,
                                             const wxString& verdict, const wxColour& colour) const;
@@ -384,9 +416,27 @@ private:
     int m_embedCount = 0;
 
     // Physical Setup bar (top of the centre column): material selections shared
-    // across simulations. Groundwork — no behaviour wired yet.
+    // across simulations, filled from m_materialLib (choice index == library
+    // index). m_libraryIssues is an amber marker shown (tooltip = details) when
+    // library files were skipped at the last scan.
     wxChoice* m_injMaterialChoice = nullptr;    // injection material
     wxChoice* m_mouldMaterialChoice = nullptr;  // mould material
+    wxStaticText* m_libraryIssues = nullptr;
+    MaterialLibrary m_materialLib;
+    std::string m_appliedInjKey;   // injection material whose process defaults the Flow card holds
+
+    // Refill both dropdowns from m_materialLib, selecting the entries with
+    // these keys (MaterialLibraryEntry::Key) when present, else the first.
+    void RefreshMaterialChoices(const std::string& injKey, const std::string& mouldKey);
+    // Seed the Flow card's melt / mould temperature fields from the selected
+    // injection material's recommended values (only when the selection changed,
+    // or `force`).
+    void ApplyInjectionProcessDefaults(bool force = false);
+    // Fetch (re-reading library files from disk) and resolve the selected
+    // materials. Returns false after reporting the error when a selected file
+    // can't be read. File-level warnings (malformed values, ...) are returned.
+    bool ResolveSelectedMaterials(ResolvedInjectionMaterial& inj, ResolvedMouldMaterial& mould,
+                                  std::vector<wxString>& fileWarnings);
 
     // Design-check parameter fields (left panel) and the verdict read-outs
     // (right panel). Plain text fields styled like the mould-feature inputs:

@@ -294,6 +294,11 @@ private:
     // the canvas so the rendered grid updates.
     void OnGridSettings(wxCommandEvent&);
     void OnAbout(wxCommandEvent&);
+    // Materials menu (every perspective's bar): add to a library, open the
+    // library folder, rescan it. The library itself lives in PreviewPanel.
+    void OnMaterialAdd(wxCommandEvent&);
+    void OnMaterialOpenFolder(wxCommandEvent&);
+    void OnMaterialReload(wxCommandEvent&);
     void OnCheckForUpdates(wxCommandEvent&);
     void OnToggleAutoUpdateCheck(wxCommandEvent&);
     void OnPartingNearlyOrphan(wxCommandEvent&);
@@ -324,6 +329,7 @@ private:
     // reflecting the current m_gridSettings in the shape radio state.
     wxMenu* BuildGridMenu();
     wxMenu* BuildHelpMenu();
+    wxMenu* BuildMaterialsMenu();   // fresh instance per menu bar, like BuildHelpMenu
 
     // Drive the ribbon perspective tabs so the active one reads as selected.
     // Safe to call before the tabs exist (no-ops).
@@ -689,6 +695,10 @@ private:
         ID_MeshQualityHigh,
         ID_CheckForUpdates,
         ID_AutoUpdateCheck,
-        ID_StartupUpdateTimer
+        ID_StartupUpdateTimer,
+        ID_MaterialAddInjection,
+        ID_MaterialAddMould,
+        ID_MaterialOpenFolder,
+        ID_MaterialReload
     };
 };

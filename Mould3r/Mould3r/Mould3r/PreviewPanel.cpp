@@ -6,6 +6,9 @@
 #include "style.h"
 #include "DesignChecks.h"
 #include "TestMaterial.h"   // material data for the Hele-Shaw flow scaffold
+#include "MaterialLibrary.h" // Physical Setup dropdowns
+#include "MaterialResolve.h" // library material -> solver properties + derived / fallback notes
+#include "MaterialEditorDialog.h" // "+" buttons: add a material to the library
 #include "RoundedButton.h"
 #include "FlowResultsBar.h"
 #include "MouldCastDialog.h"
@@ -605,9 +608,9 @@ PreviewPanel::PreviewPanel(wxWindow* parent)
 
 // ---------------------------------------------------------------------------
 // Physical Setup bar — a thin toolbar across the top of the centre column with
-// the material selections shared across simulations. Groundwork: the dropdowns
-// are stored (m_injMaterialChoice / m_mouldMaterialChoice) for future sims to
-// read, but nothing consumes them yet.
+// the material selections shared across simulations. The dropdowns list the
+// material library (built-ins + Materials/ folders, see MaterialLibrary.h);
+// the flow check resolves the selected entries (MaterialResolve.h).
 // ---------------------------------------------------------------------------
 wxPanel* PreviewPanel::BuildPhysicalSetupBar(wxWindow* parent)
 {
@@ -640,11 +643,34 @@ wxPanel* PreviewPanel::BuildPhysicalSetupBar(wxWindow* parent)
         return choice;
     };
 
-    wxArrayString injOpts;   injOpts.Add("Generic Polypropylene");
-    m_injMaterialChoice = addChoice("Injection Material:", injOpts);
+    // Small "+" to the right of a dropdown: add a material of that kind.
+    auto addPlus = [&](MaterialKind kind, const wxString& tip)
+    {
+        auto* plus = new RoundedButton(bar, wxID_ANY, "+", wxDefaultPosition, wxSize(22, 22), wxBORDER_NONE);
+        plus->SetBackgroundColour(Style::BtnSecondary);
+        plus->SetForegroundColour(*wxWHITE);
+        plus->SetFont(wxFont(10, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_BOLD, false, "Segoe UI"));
+        plus->SetToolTip(tip);
+        plus->Bind(wxEVT_BUTTON, [this, kind](wxCommandEvent&) { AddMaterialToLibrary(kind); });
+        row->Add(plus, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
+    };
 
-    wxArrayString mouldOpts; mouldOpts.Add("Steel"); mouldOpts.Add("Aluminum");
-    m_mouldMaterialChoice = addChoice("Mould Material:", mouldOpts);
+    // Filled from the material library below (ReloadMaterialLibrary).
+    m_injMaterialChoice = addChoice("Injection Material:", wxArrayString());
+    addPlus(MaterialKind::Injection, "Add an injection material to the library...");
+    m_mouldMaterialChoice = addChoice("Mould Material:", wxArrayString());
+    addPlus(MaterialKind::Mould, "Add a mould material to the library...");
+
+    // Amber marker, shown only when library files were skipped at the last
+    // scan (unreadable / wrong kind); its tooltip lists them.
+    m_libraryIssues = new wxStaticText(bar, wxID_ANY, wxString::FromUTF8("\xe2\x9a\xa0 Library"));
+    m_libraryIssues->SetForegroundColour(wxColour(0xE0, 0x9B, 0x20));
+    m_libraryIssues->SetBackgroundColour(Style::CardBg);
+    m_libraryIssues->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+    row->Add(m_libraryIssues, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 10);
+    m_libraryIssues->Hide();
 
     row->AddStretchSpacer(1);
 
@@ -658,7 +684,155 @@ wxPanel* PreviewPanel::BuildPhysicalSetupBar(wxWindow* parent)
     outer->Add(divider, 0, wxEXPAND);
 
     bar->SetSizer(outer);
+
+    // Picking an injection material seeds the Flow card's melt / mould
+    // temperatures with its recommended values.
+    m_injMaterialChoice->Bind(wxEVT_CHOICE,
+        [this](wxCommandEvent&) { ApplyInjectionProcessDefaults(); });
+    ReloadMaterialLibrary();
     return bar;
+}
+
+// ---------------------------------------------------------------------------
+// Material library <-> Physical Setup dropdowns.
+// ---------------------------------------------------------------------------
+void PreviewPanel::ReloadMaterialLibrary()
+{
+    // Remember the current selections by key: indices shift when files come
+    // and go between scans.
+    auto keyAt = [](const auto& entries, wxChoice* ch)
+    {
+        const int i = ch ? ch->GetSelection() : -1;
+        return (i >= 0 && (size_t)i < entries.size()) ? entries[(size_t)i].Key() : std::string();
+    };
+    const std::string injKey = keyAt(m_materialLib.Injection(), m_injMaterialChoice);
+    const std::string mouldKey = keyAt(m_materialLib.Mould(), m_mouldMaterialChoice);
+
+    m_materialLib.Reload();
+    RefreshMaterialChoices(injKey, mouldKey);
+}
+
+void PreviewPanel::AddMaterialToLibrary(MaterialKind kind)
+{
+    // Parent on the top-level frame: this panel may be on a hidden book page
+    // (the Materials menu works from every perspective).
+    MaterialEditorDialog dlg(wxGetTopLevelParent(this), kind);
+    if (dlg.ShowModal() != wxID_OK) return;
+
+    // Rescan (keeping the other dropdown's selection), then select the new
+    // material by its file.
+    ReloadMaterialLibrary();
+    const std::string key = "file:" + dlg.SavedPath();
+    if (kind == MaterialKind::Injection)
+    {
+        const int i = m_materialLib.FindInjection(key);
+        if (i >= 0 && m_injMaterialChoice)
+        {
+            m_injMaterialChoice->SetSelection(i);
+            ApplyInjectionProcessDefaults();
+        }
+    }
+    else
+    {
+        const int i = m_materialLib.FindMould(key);
+        if (i >= 0 && m_mouldMaterialChoice) m_mouldMaterialChoice->SetSelection(i);
+    }
+}
+
+void PreviewPanel::RefreshMaterialChoices(const std::string& injKey, const std::string& mouldKey)
+{
+    if (!m_injMaterialChoice || !m_mouldMaterialChoice) return;
+
+    auto fill = [](wxChoice* ch, const auto& entries, int sel)
+    {
+        ch->Freeze();
+        ch->Clear();
+        for (const auto& e : entries)
+            ch->Append(wxString::FromUTF8(e.displayName.c_str()));
+        ch->SetSelection(entries.empty() ? wxNOT_FOUND : std::max(0, sel));
+        ch->Thaw();
+        // Size to the longest name (the choice was created empty).
+        ch->InvalidateBestSize();
+        ch->SetMinSize(wxSize(std::max(150, ch->GetBestSize().x), -1));
+    };
+    fill(m_injMaterialChoice, m_materialLib.Injection(), m_materialLib.FindInjection(injKey));
+    fill(m_mouldMaterialChoice, m_materialLib.Mould(), m_materialLib.FindMould(mouldKey));
+    // Where the files come from (it's next to the executable, not the project).
+    m_injMaterialChoice->SetToolTip("Built-in materials plus the files in\n" +
+        wxString(MaterialFile::LibraryFolder(MaterialKind::Injection)));
+    m_mouldMaterialChoice->SetToolTip("Built-in materials plus the files in\n" +
+        wxString(MaterialFile::LibraryFolder(MaterialKind::Mould)));
+
+    if (m_libraryIssues)
+    {
+        const std::vector<std::string>& probs = m_materialLib.ScanProblems();
+        wxString tip = wxString::Format("%d material library file(s) couldn't be listed:\n", (int)probs.size());
+        for (const std::string& p : probs) tip << "\n" << wxString(p);   // paths: native encoding
+        m_libraryIssues->SetToolTip(probs.empty() ? wxString() : tip);
+        m_libraryIssues->Show(!probs.empty());
+    }
+    if (wxWindow* bar = m_injMaterialChoice->GetParent()) bar->Layout();
+
+    ApplyInjectionProcessDefaults();   // no-op unless the injection selection changed
+}
+
+void PreviewPanel::ApplyInjectionProcessDefaults(bool force)
+{
+    const std::vector<InjectionLibraryEntry>& lib = m_materialLib.Injection();
+    const int sel = m_injMaterialChoice ? m_injMaterialChoice->GetSelection() : -1;
+    if (sel < 0 || (size_t)sel >= lib.size() || !m_flowMeltTempCtrl || !m_flowMouldTempCtrl) return;
+    const std::string key = lib[(size_t)sel].Key();
+    if (!force && key == m_appliedInjKey) return;
+    m_appliedInjKey = key;
+
+    // Scan-time data is enough for the defaults (the run re-reads the file).
+    const ResolvedInjectionMaterial r = ResolveInjectionMaterial(lib[(size_t)sel].data);
+    m_flowMeltTempCtrl->ChangeValue(wxString::Format("%g", r.props.recMeltTempC));
+    m_flowMouldTempCtrl->ChangeValue(wxString::Format("%g", r.props.recMouldTempC));
+}
+
+bool PreviewPanel::ResolveSelectedMaterials(ResolvedInjectionMaterial& inj, ResolvedMouldMaterial& mould,
+                                            std::vector<wxString>& fileWarnings)
+{
+    const std::vector<InjectionLibraryEntry>& il = m_materialLib.Injection();
+    const std::vector<MouldLibraryEntry>& ml = m_materialLib.Mould();
+    if (il.empty() || ml.empty()) return false;   // never: the built-ins are always listed
+    auto pick = [](wxChoice* ch, size_t n)
+    {
+        const int i = ch ? ch->GetSelection() : 0;
+        return (size_t)std::clamp(i, 0, (int)n - 1);
+    };
+    const InjectionLibraryEntry& ie = il[pick(m_injMaterialChoice, il.size())];
+    const MouldLibraryEntry& me = ml[pick(m_mouldMaterialChoice, ml.size())];
+
+    auto fail = [this](const char* what, const std::string& name, const std::string& err)
+    {
+        wxMessageBox(wxString("Couldn't read the ") + what + " material \"" + wxString::FromUTF8(name.c_str()) +
+                     "\":\n\n" + wxString(err) +
+                     "\n\nIt may have been moved, renamed or deleted. Pick another material, "
+                     "or put the file back and generate again to rescan the library.",
+                     "Materials", wxOK | wxICON_ERROR, this);
+        return false;
+    };
+
+    std::string err;
+    std::vector<std::string> w;
+    InjectionMaterialData id;
+    if (!MaterialLibrary::Fetch(ie, id, err, &w)) return fail("injection", ie.displayName, err);
+    for (const std::string& s : w)
+        fileWarnings.push_back(wxString::FromUTF8(ie.displayName.c_str()) + ": " + wxString::FromUTF8(s.c_str()));
+
+    w.clear();
+    MouldMaterialData md;
+    if (!MaterialLibrary::Fetch(me, md, err, &w)) return fail("mould", me.displayName, err);
+    for (const std::string& s : w)
+        fileWarnings.push_back(wxString::FromUTF8(me.displayName.c_str()) + ": " + wxString::FromUTF8(s.c_str()));
+
+    inj = ResolveInjectionMaterial(id);
+    mould = ResolveMouldMaterial(md);
+    inj.name = ie.displayName;     // the (unique) name the dropdown shows
+    mould.name = me.displayName;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -668,6 +842,10 @@ void PreviewPanel::SetData(const std::vector<FileImporter::MeshData>& halves,
     const ShotPreviewInput& shot,
     const std::vector<FileImporter::MeshData>& inserts)
 {
+    // Rescan the material library on every generation, so files added to the
+    // Materials folders since the last one show up (selections are kept).
+    ReloadMaterialLibrary();
+
     // Stash the new data, replacing whatever the previous generation left.
     m_pendingHalves = halves;
     m_pendingInserts = inserts;
@@ -2362,15 +2540,15 @@ void PreviewPanel::RunFaceDraftCheck()
     m_lastFaceDraftStats.fallbackCount = own.fallback;
 
     // Verdict card.
-    wxString verdict; wxColour col; long icon = wxICON_INFORMATION;
+    wxString verdict; wxColour col;
     switch (m_lastFaceDraftStats.overall)
     {
     case DesignChecks::Severity::Pass:
-        verdict = "PASS";    col = wxColour(0x26, 0xAB, 0x36); icon = wxICON_INFORMATION; break;
+        verdict = "PASS";    col = wxColour(0x26, 0xAB, 0x36); break;
     case DesignChecks::Severity::Warning:
-        verdict = "WARNING"; col = wxColour(0xE0, 0x9B, 0x20); icon = wxICON_WARNING;     break;
+        verdict = "WARNING"; col = wxColour(0xE0, 0x9B, 0x20); break;
     case DesignChecks::Severity::Fail:
-        verdict = "FAIL";    col = wxColour(0xD0, 0x46, 0x46); icon = wxICON_ERROR;       break;
+        verdict = "FAIL";    col = wxColour(0xD0, 0x46, 0x46); break;
     }
     if (m_draftStatus)
     {
@@ -2384,50 +2562,8 @@ void PreviewPanel::RunFaceDraftCheck()
     if (m_debugModeChoice && m_debugModeChoice->GetSelection() <= 0) m_debugModeChoice->SetSelection(1);
     UpdateDraftOverlay();
 
-    const wxString deg = wxString::FromUTF8("\xC2\xB0");
-    const wxString mm2 = wxString::FromUTF8(" mm\xC2\xB2");
-    const DesignChecks::FaceDraftStats& st = m_lastFaceDraftStats;
-    wxString msg;
-    msg << "Draft Angle Checks: " << verdict << "\n";
-    msg << "Per-facet draft vs the half that forms each face "
-        << "(ray-assigned ownership).\n";
-    msg << "Mesh: " << (source == SourceCavity ? "cavity only (part model meshes)"
-                                               : "whole shot (parts + feed system)") << "\n\n";
-    msg << "Facets: " << st.totalFaces << "\n";
-    msg << "  Pass: " << st.passCount << "\n";
-    msg << "  Warn: " << st.warnCount
-        << "   (< " << wxString::Format("%.1f", params.warnDraftDeg) << deg << ",  "
-        << wxString::Format("%.3f", st.warnAreaMm2) << mm2 << ")\n";
-    msg << "  Fail: " << st.failCount
-        << "   (< " << wxString::Format("%.1f", params.failDraftDeg) << deg << ",  "
-        << wxString::Format("%.3f", st.failAreaMm2) << mm2 << ")\n";
-    msg << "  Back-draft: " << st.backdraftCount
-        << "   (< -" << wxString::Format("%.2g", params.backdraftEpsDeg) << deg << ")\n\n";
-    msg << "Min draft: " << wxString::Format("%.2f", st.minDraftDeg) << deg << "\n";
-
-    // Significance gate (when enabled): report the threshold and any suppression.
-    if (params.significanceValue > 0.0f)
-    {
-        msg << "\nSignificance gate: ";
-        if (params.significanceByPercent)
-            msg << wxString::Format("%.3g", params.significanceValue) << "% of surface = "
-                << wxString::Format("%.3f", st.significanceMm2) << mm2 << "\n";
-        else
-            msg << wxString::Format("%.3f", st.significanceMm2) << mm2 << "\n";
-        if (st.failSuppressed)
-            msg << "  Failing area below the gate \xe2\x80\x94 not counted as a fail.\n";
-        if (st.warnSuppressed)
-            msg << "  Warning area below the gate \xe2\x80\x94 not counted as a warning.\n";
-    }
-
-    if (st.fallbackCount > 0)
-        msg << "\n" << st.fallbackCount
-            << " facet(s) hit no half; assigned by parting-plane side.";
-    msg << "\n\nDetails (on the results card) lists the draft distribution, each "
-           "half, and where the failing areas are.";
-
     SetResultsReport(CardDraft, BuildDraftReport(params, source, verdict, col));
-    wxMessageBox(msg, "Draft Angle Checks", wxOK | icon, this);
+    ShowSimCompleteNotice("Draft Angle Checks", "Draft Angle Checks", m_draftStatus);
 }
 
 // ---------------------------------------------------------------------------
@@ -2504,8 +2640,6 @@ void PreviewPanel::RunSeparationCheck()
     // slivers while a continuous overlap still counts.
     double perSideVol[2]  = { 0.0, 0.0 };   // summed SIGNIFICANT overlap per side
     int    perSideStat[2] = { 0, 0 };       // 0 clear, 1 collision, 2 not evaluable
-    int    sigRegions  = 0;                 // regions kept (>= floor)
-    int    tinyRegions = 0;                 // regions discarded (< floor)
     MeshBoolean::Mesh overlapViz;
     std::string err;
 
@@ -2563,8 +2697,8 @@ void PreviewPanel::RunSeparationCheck()
             for (const MeshBoolean::Mesh& comp : comps)
             {
                 const double v = MeshBoolean::Volume(comp);
-                if (v >= (double)minOverlap) { keepRegion(comp, side, v); ++sigRegions; }
-                else if (v > 0.0)            { ++tinyRegions; run.sideTiny[side] += 1; }
+                if (v >= (double)minOverlap) { keepRegion(comp, side, v); }
+                else if (v > 0.0)            { run.sideTiny[side] += 1; }
             }
         }
         if (perSideVol[side] > 0.0) perSideStat[side] = 1;
@@ -2572,10 +2706,8 @@ void PreviewPanel::RunSeparationCheck()
         else                        perSideStat[side] = 0;
     }
 
-    const double totalVol = perSideVol[0] + perSideVol[1];
     const int collided = (perSideStat[0]==1?1:0) + (perSideStat[1]==1?1:0);
     const int notEval  = (perSideStat[0]==2?1:0) + (perSideStat[1]==2?1:0);
-    const int tested   = (sideSurf[0]?1:0) + (sideSurf[1]?1:0);
 
     // Overlay (red): sew the accumulated overlap mesh into a shape. Its
     // visibility follows this card's "Show mould overlay" checkbox.
@@ -2591,15 +2723,15 @@ void PreviewPanel::RunSeparationCheck()
     else if (notEval  > 0) overall = DesignChecks::Severity::Warning;
     else                   overall = DesignChecks::Severity::Pass;
 
-    wxString verdict; wxColour verdictColour; long iconFlag = wxICON_INFORMATION;
+    wxString verdict; wxColour verdictColour;
     switch (overall)
     {
     case DesignChecks::Severity::Pass:
-        verdict = "PASS"; verdictColour = wxColour(0x26,0xAB,0x36); iconFlag = wxICON_INFORMATION; break;
+        verdict = "PASS"; verdictColour = wxColour(0x26,0xAB,0x36); break;
     case DesignChecks::Severity::Warning:
-        verdict = "INCONCLUSIVE"; verdictColour = wxColour(0xE0,0x9B,0x20); iconFlag = wxICON_WARNING; break;
+        verdict = "INCONCLUSIVE"; verdictColour = wxColour(0xE0,0x9B,0x20); break;
     case DesignChecks::Severity::Fail:
-        verdict = "FAIL"; verdictColour = wxColour(0xD0,0x46,0x46); iconFlag = wxICON_ERROR; break;
+        verdict = "FAIL"; verdictColour = wxColour(0xD0,0x46,0x46); break;
     }
     if (m_demouldStatus)
     {
@@ -2607,39 +2739,6 @@ void PreviewPanel::RunSeparationCheck()
         m_demouldStatus->SetForegroundColour(verdictColour);
         if (m_infoPanel) m_infoPanel->Layout();
     }
-
-    const wxString mm3 = wxString::FromUTF8(" mm\xC2\xB3");
-    const wxString mm  = " mm";
-    wxString msg;
-    msg << "Separation Test: " << verdict << "\n";
-    msg << "Each half's owned surface swept toward the parting plane, tested "
-        << "for overlap with that half's steel.\n";
-    msg << "Mesh: " << (source == SourceCavity ? "cavity only (part model meshes)"
-                                               : "whole shot (parts + feed system)") << "\n\n";
-    msg << "Sides tested: " << tested << "\n";
-    msg << "Sides collided: " << collided << "\n";
-    if (notEval > 0)
-        msg << "Sides not evaluable: " << notEval << " (mesh boolean failed)\n";
-    msg << "Overlap regions kept: " << sigRegions;
-    if (tinyRegions > 0) msg << "   (" << tinyRegions << " below floor, discarded)";
-    msg << "\n";
-    msg << "Significant overlap: " << wxString::Format("%.3f", totalVol) << mm3 << "\n";
-    msg << "Start \xce\xb5: " << wxString::Format("%.3g", startEps) << mm
-        << ",  noise floor: " << wxString::Format("%.3g", minOverlap) << mm3 << "\n\n";
-
-    const char* sideName[2] = { "A (+draw)", "B (-draw)" };
-    for (int side = 0; side < 2; ++side)
-    {
-        if (!sideSurf[side]) continue;
-        const char* s = perSideStat[side]==1 ? "COLLISION"
-            : perSideStat[side]==2 ? "not evaluable" : "clear";
-        msg << "  Half " << sideName[side] << ": " << s
-            << wxString::Format("  (overlap %.3f", perSideVol[side]) << mm3 << ")\n";
-    }
-
-    if (collided > 0)
-        msg << "\nEnable \"Show mould overlay\" to see the interference region "
-               "(red); hide the Shot toggle to view it clearly.";
 
     for (int side = 0; side < 2; ++side)
     {
@@ -2649,7 +2748,7 @@ void PreviewPanel::RunSeparationCheck()
     }
     m_lastSeparation = run;
     SetResultsReport(CardSeparation, BuildSeparationReport(run, verdict, verdictColour));
-    wxMessageBox(msg, "Separation Test", wxOK | iconFlag, this);
+    ShowSimCompleteNotice("Separation Test", "Separation Test", m_demouldStatus);
 }
 
 // ---------------------------------------------------------------------------
@@ -2676,13 +2775,17 @@ void PreviewPanel::RunFlowCheck()
     }
     const Flow::FeedNetwork& net = m_feedNetwork;
 
-    // Materials from the Physical Setup bar. Only Generic Polypropylene is
-    // offered for injection today; the mould toggle picks steel / aluminium.
-    const TestMaterial::PolymerMaterial& poly = TestMaterial::kGenericPolypropylene;
-    const bool mouldIsAlu =
-        m_mouldMaterialChoice && m_mouldMaterialChoice->GetSelection() == 1;
-    const TestMaterial::MouldMaterial& mould =
-        mouldIsAlu ? TestMaterial::kMouldAluminum : TestMaterial::kMouldSteel;
+    // Materials from the Physical Setup bar, resolved from the library: every
+    // value is given, derived from the datasheet values, or a generic fallback
+    // (MaterialResolve.h). Library files are re-read, so hand edits count.
+    ResolvedInjectionMaterial injMat;
+    ResolvedMouldMaterial mouldMat;
+    std::vector<wxString> materialFileWarnings;
+    if (!ResolveSelectedMaterials(injMat, mouldMat, materialFileWarnings)) return;
+    const TestMaterial::PolymerMaterial& poly = injMat.props;
+    const TestMaterial::MouldMaterial& mould = mouldMat.props;
+    const wxString injName = wxString::FromUTF8(injMat.name.c_str());
+    const wxString mouldName = wxString::FromUTF8(mouldMat.name.c_str());
 
     // Process fields, defaulting to the material's recommended window.
     const double fillTime = std::max(0.01, ParseField(m_flowFillTimeCtrl, 1.0));
@@ -2698,6 +2801,50 @@ void PreviewPanel::RunFlowCheck()
     const bool   packOn = thermalOn && (!m_flowPackCheck || m_flowPackCheck->GetValue());
     const double packPct = std::clamp(ParseField(m_flowPackPressureCtrl, 80.0), 5.0, 150.0);
     const double holdS = std::clamp(ParseField(m_flowHoldTimeCtrl, 0.0), 0.0, 120.0);
+
+    // Material values THIS run consumes that were derived or fell back (an
+    // isothermal fill doesn't care about a missing conductivity). Fallbacks
+    // are warned about up front, with the option not to run.
+    const unsigned matUses = MatUseFill | (thermalOn ? MatUseThermal : 0u) |
+                             (packOn ? (MatUsePack | MatUseWarp) : 0u);
+    std::vector<FlowRunInputs::MaterialNoteRow> matNotes;
+    int matFallbacks = 0;
+    auto collectNotes = [&](const wxString& matName, const std::vector<MaterialNote>& notes)
+    {
+        for (const MaterialNote* n : MaterialNotesFor(notes, matUses))
+        {
+            const bool fb = n->level == MaterialNote::Level::Fallback;
+            matNotes.push_back({ matName, wxString::FromUTF8(n->quantity.c_str()),
+                                 wxString::FromUTF8(n->message.c_str()), fb });
+            if (fb) ++matFallbacks;
+        }
+    };
+    collectNotes(injName, injMat.notes);
+    collectNotes(mouldName, mouldMat.notes);
+    if (matFallbacks > 0 || !materialFileWarnings.empty())
+    {
+        auto Ux = [](const char* utf8) { return wxString::FromUTF8(utf8); };
+        wxString w;
+        if (matFallbacks > 0)
+        {
+            w << "Some values this simulation needs aren't in the selected material data and can't "
+                 "be derived from it, so generic fallback values will be used:\n\n";
+            for (const FlowRunInputs::MaterialNoteRow& r : matNotes)
+                if (r.fallback)
+                    w << Ux("\xe2\x80\xa2 ") << r.material << Ux(" \xe2\x80\x94 ") << r.quantity << ": " << r.text << "\n";
+        }
+        if (!materialFileWarnings.empty())
+        {
+            w << (matFallbacks > 0 ? "\n" : "") << "Problems reading the material files (those values were skipped):\n\n";
+            for (const wxString& s : materialFileWarnings) w << Ux("\xe2\x80\xa2 ") << s << "\n";
+        }
+        w << "\nResults that depend on these values are less reliable. Run the simulation anyway?";
+        wxMessageDialog dlg(this, w, Ux("Hele-Shaw 2.5D Flow \xe2\x80\x94 material data"),
+                            wxYES_NO | wxNO_DEFAULT | wxICON_WARNING);
+        dlg.SetYesNoLabels("Run anyway", "Cancel");
+        if (dlg.ShowModal() != wxID_YES) return;
+    }
+
     // Wall temperature the melt sees: contact temperature of melt and mould
     // from their effusivities sqrt(k rho c) (the fill solver uses the same).
     const double eMelt = std::sqrt(poly.thermalConductivity * poly.densityMelt * poly.specificHeat);
@@ -2757,14 +2904,18 @@ void PreviewPanel::RunFlowCheck()
 
     const wxString deg = wxString::FromUTF8("\xC2\xB0""C");
     auto U = [](const char* utf8) { return wxString::FromUTF8(utf8); };  // non-ASCII literals
+    // Run log. No longer shown at the end of the run (ShowSimCompleteNotice
+    // points to the card's Details instead, which carries these numbers and,
+    // as of the notice change, the cautions gathered below). Still assembled
+    // because the cautions are computed alongside it; candidate for removal.
     wxString msg;
     msg << U("Hele-Shaw 2.5D Flow \xe2\x80\x94 ") << (thermalOn ? "thermal" : "isothermal")
         << " fill (1D feed + 2.5D part midplanes).\n\n";
 
-    msg << "Injection material: " << poly.name << U("  (\xce\xb7""0 @ ")
+    msg << "Injection material: " << injName << U("  (\xce\xb7""0 @ ")
         << wxString::Format("%.0f", meltC) << deg << ": "
         << wxString::Format("%.0f", eta0) << U(" Pa\xc2\xb7s)\n");
-    msg << "Mould material: " << mould.name
+    msg << "Mould material: " << mouldName
         << (thermalOn ? wxString::Format("  (wall contact temperature %.1f", wallC) + deg + ")\n"
                       : wxString("  (not used: isothermal run)\n"));
     msg << "Process: fill " << wxString::Format("%.2f", fillTime) << " s, melt "
@@ -2777,6 +2928,15 @@ void PreviewPanel::RunFlowCheck()
             << U(" cm\xc2\xb3 / fill time)\n\n");
     else
         msg << "Injection rate: unknown (no shot volume from the last generation)\n\n";
+
+    if (!matNotes.empty())
+    {
+        msg << "Material data this run used that wasn't given directly:\n";
+        for (const FlowRunInputs::MaterialNoteRow& r : matNotes)
+            msg << (r.fallback ? U("  \xe2\x9a\xa0 FALLBACK ") : U("  \xe2\x80\xa2 derived ")) << r.material
+                << U(" \xe2\x80\x94 ") << r.quantity << ": " << r.text << "\n";
+        msg << "\n";
+    }
 
     using EK = Flow::FeedEdgeKind;
     const int nSub = net.countEdges(EK::SubRunner);
@@ -2952,6 +3112,7 @@ void PreviewPanel::RunFlowCheck()
     }
     const Flow::CoupledFillResult& fr = m_fill;
     int fillCautions = 0;
+    std::vector<wxString> runCautions;   // for the Details "Cautions" table
     if (fillRan)
     {
         msg << U("Fill \xe2\x80\x94 feed + part midplanes together (Cross-WLF")
@@ -3000,7 +3161,7 @@ void PreviewPanel::RunFlowCheck()
             if (fr.thermal)
             {
                 msg << "  thermal: wall " << wxString::Format("%.1f", fr.wallTempC) << deg
-                    << " (melt / " << mould.name << " contact), melt front "
+                    << " (melt / " << mouldName << " contact), melt front "
                     << wxString::Format("%.0f", fr.minFrontTempC) << U("\xe2\x80\x93")
                     << wxString::Format("%.0f", fr.maxFrontTempC) << deg << " (melt in at "
                     << wxString::Format("%.0f", meltC) << deg << ")\n";
@@ -3179,6 +3340,8 @@ void PreviewPanel::RunFlowCheck()
                        "bending from unequal mould-half temperatures and buckling aren't modelled yet)\n";
             }
             fillCautions = (int)cautions.size();
+            runCautions = cautions;
+            for (const std::string& w : fr.warnings) runCautions.push_back(wxString::FromUTF8(w.c_str()));
             for (const wxString& c : cautions)
                 msg << U("  \xe2\x9a\xa0 ") << c << "\n";
             for (const std::string& w : fr.warnings)
@@ -3201,13 +3364,19 @@ void PreviewPanel::RunFlowCheck()
             float tFirst = 1e30f, tLast = -1.0f;
             for (const Flow::PartFillResult& pr : fr.parts)
                 if (pr.fed && pr.fillEndS >= 0.0f) { tFirst = std::min(tFirst, pr.fillEndS); tLast = std::max(tLast, pr.fillEndS); }
-            if (tLast >= 0.0f && tLast - tFirst > 0.05f * fr.fillTimeS) spreadOK = false;
+            if (tLast >= 0.0f && tLast - tFirst > 0.05f * fr.fillTimeS)
+            {
+                spreadOK = false;
+                runCautions.push_back(wxString::Format("The parts finish %.3f s apart (%.0f%% of the fill)",
+                                                       tLast - tFirst, 100.0f * (tLast - tFirst) / fr.fillTimeS) +
+                    U(" \xe2\x80\x94 unbalanced: the early parts are over-packed while the rest fill."));
+            }
             // One result per line (the fill time is an input, so not repeated here).
             wxString verdict = wxString::Format("PRESSURE %.1f MPa", fr.peakInletPressureMPa);
             if (fr.pack.ran && fr.pack.ejectReached) verdict << wxString::Format("\nEJECT %.1f s", fr.pack.ejectS);
             m_flowStatus->SetLabel(verdict);
             const bool clean = spreadOK && fr.warnings.empty() && net.warnings.empty() && !fr.pressureLimited &&
-                               fillCautions == 0;
+                               fillCautions == 0 && matFallbacks == 0;   // fallback material data -> amber
             m_flowStatus->SetForegroundColour(clean ? wxColour(0x26, 0xAB, 0x36) : wxColour(0xE0, 0x9B, 0x20));
         }
         else if (fr.cancelled)
@@ -3241,6 +3410,8 @@ void PreviewPanel::RunFlowCheck()
         msg << "\n";
     }
 
+    for (const std::string& w : net.warnings)
+        runCautions.push_back("Feed network: " + wxString::FromUTF8(w.c_str()));
     if (!net.warnings.empty())
     {
         msg << "Network warnings:\n";
@@ -3279,8 +3450,10 @@ void PreviewPanel::RunFlowCheck()
     // The numbers behind the card, for its Details window.
     {
         FlowRunInputs in;
-        in.material = wxString::FromUTF8(poly.name);
-        in.mould = wxString::FromUTF8(mould.name);
+        in.material = injName;
+        in.mould = mouldName;
+        in.materialNotes = matNotes;
+        in.cautions = runCautions;
         in.fillTimeS = fillTime;
         in.meltC = meltC;
         in.mouldC = mouldC;
@@ -3301,7 +3474,28 @@ void PreviewPanel::RunFlowCheck()
         SetResultsReport(CardFlow, BuildFlowReport(in));
     }
 
-    wxMessageBox(msg, "Hele-Shaw 2.5D Flow", wxOK | wxICON_INFORMATION, this);
+    ShowSimCompleteNotice("Hele-Shaw 2.5D Flow", "Flow Analysis", m_flowStatus);
+}
+
+// ---------------------------------------------------------------------------
+// End-of-run notice: complete + the card's verdict + where the details are.
+// ---------------------------------------------------------------------------
+void PreviewPanel::ShowSimCompleteNotice(const wxString& simName, const wxString& cardTitle,
+                                         const wxStaticText* status)
+{
+    wxString verdict = status ? status->GetLabel() : wxString();
+    verdict.Replace("\n", ", ");   // the card shows one result per line
+    long icon = wxICON_INFORMATION;
+    if (status)
+    {
+        const wxColour c = status->GetForegroundColour();
+        if (c == wxColour(0xD0, 0x46, 0x46)) icon = wxICON_ERROR;           // red verdicts
+        else if (c == wxColour(0xE0, 0x9B, 0x20)) icon = wxICON_WARNING;    // amber verdicts
+    }
+    wxString msg = simName + " is complete.";
+    if (!verdict.empty()) msg << "\n\nResult: " << verdict;
+    msg << "\n\nFor the full results, click Details on the " << cardTitle << " card.";
+    wxMessageBox(msg, simName, wxOK | icon, this);
 }
 
 // ---------------------------------------------------------------------------

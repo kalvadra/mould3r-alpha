@@ -120,6 +120,18 @@
     <ClCompile Include="FixtureFile.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="MaterialFile.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="MaterialLibrary.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="MaterialResolve.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="MaterialEditorDialog.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="AppConfig.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -279,6 +291,18 @@
       <Filter>Header Files\TransformHandlers</Filter>
     </ClInclude>
     <ClInclude Include="FixtureFile.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="MaterialFile.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="MaterialLibrary.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="MaterialResolve.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="MaterialEditorDialog.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="AppConfig.h">

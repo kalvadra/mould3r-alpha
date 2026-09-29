@@ -44,6 +44,7 @@
 #include "VentEditToolbar.h"   // Part 5: floating complex-vent-path toolbar
 #include "SprueEditToolbar.h"  // Edit Sprue floating toolbar
 #include "WindowEffects.h"     // DWM corner rounding for the main frame
+#include "MaterialFile.h"      // Materials menu: library folder location
 #include "style.h"
 
 // ---------------------------------------------------------------------------
@@ -552,6 +553,10 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
     Bind(wxEVT_MENU, &MainFrame::OnToggleAutoUpdateCheck, this, ID_AutoUpdateCheck);
     Bind(wxEVT_MENU, &MainFrame::OnPartingNearlyOrphan, this, ID_PartingNearlyOrphan);
     Bind(wxEVT_MENU, &MainFrame::OnSetupNearOrphanChecks, this, ID_PartingSetup);
+    Bind(wxEVT_MENU, &MainFrame::OnMaterialAdd, this, ID_MaterialAddInjection);
+    Bind(wxEVT_MENU, &MainFrame::OnMaterialAdd, this, ID_MaterialAddMould);
+    Bind(wxEVT_MENU, &MainFrame::OnMaterialOpenFolder, this, ID_MaterialOpenFolder);
+    Bind(wxEVT_MENU, &MainFrame::OnMaterialReload, this, ID_MaterialReload);
 
     // Mesh quality radio items just persist the chosen preset; the next
     // import picks it up via MeshImportSettings::GetQuality().
@@ -1125,6 +1130,7 @@ wxMenuBar* MainFrame::BuildPrepareMenuBar()
         importMenu->Check(ID_MeshQualityHigh, q == MeshImportSettings::Quality::High);
     }
 
+    menuBar->Append(BuildMaterialsMenu(), "&Materials");
     menuBar->Append(BuildHelpMenu(), "&Help");
 
     return menuBar;
@@ -1171,6 +1177,59 @@ wxMenu* MainFrame::BuildHelpMenu()
 }
 
 // ---------------------------------------------------------------------------
+// BuildMaterialsMenu — the material library, on every perspective's bar (like
+// Help, built fresh per bar: a wxMenu belongs to one wxMenuBar). All bars bind
+// to the same handlers, which forward to PreviewPanel (the library's owner).
+// ---------------------------------------------------------------------------
+wxMenu* MainFrame::BuildMaterialsMenu()
+{
+    auto* m = new wxMenu();
+    m->Append(ID_MaterialAddInjection, "Add to Injection Material Library...");
+    m->Append(ID_MaterialAddMould, "Add to Mould Material Library...");
+    m->AppendSeparator();
+    m->Append(ID_MaterialOpenFolder, "Open Material Library Folder");
+    m->Append(ID_MaterialReload, "Reload Material Library");
+    return m;
+}
+
+void MainFrame::OnMaterialAdd(wxCommandEvent& e)
+{
+    if (!m_previewPanel) return;
+    m_previewPanel->AddMaterialToLibrary(
+        e.GetId() == ID_MaterialAddMould ? MaterialKind::Mould : MaterialKind::Injection);
+}
+
+void MainFrame::OnMaterialOpenFolder(wxCommandEvent&)
+{
+    std::string err;
+    if (!MaterialFile::EnsureLibraryFolders(err))
+    {
+        wxMessageBox(wxString(err), "Materials", wxOK | wxICON_ERROR, this);
+        return;
+    }
+    const wxString dir(MaterialFile::LibraryRoot());
+    if (!wxLaunchDefaultApplication(dir))
+        wxMessageBox("Couldn't open the folder:\n\n" + dir, "Materials", wxOK | wxICON_WARNING, this);
+}
+
+void MainFrame::OnMaterialReload(wxCommandEvent&)
+{
+    if (!m_previewPanel) return;
+    m_previewPanel->ReloadMaterialLibrary();
+    wxString msg = wxString::Format(
+        "Material library reloaded: %d injection and %d mould materials (built-ins included).\n\nLibrary folder:\n",
+        m_previewPanel->InjectionMaterialCount(), m_previewPanel->MouldMaterialCount());
+    msg << wxString(MaterialFile::LibraryRoot());
+    const std::vector<std::string>& probs = m_previewPanel->MaterialLibraryProblems();
+    if (!probs.empty())
+    {
+        msg << "\n\nSkipped:";
+        for (const std::string& p : probs) msg << "\n" << wxString::FromUTF8("\xe2\x80\xa2 ") << wxString(p);
+    }
+    wxMessageBox(msg, "Materials", wxOK | (probs.empty() ? wxICON_INFORMATION : wxICON_WARNING), this);
+}
+
+// ---------------------------------------------------------------------------
 // BuildPreviewMenuBar — minimal for now (File -> Exit). Grows as preview-
 // specific actions (e.g. a View menu for the debug overlays) are added.
 // ---------------------------------------------------------------------------
@@ -1181,6 +1240,7 @@ wxMenuBar* MainFrame::BuildPreviewMenuBar()
 
     auto* menuBar = new wxMenuBar();
     menuBar->Append(fileMenu, "&File");
+    menuBar->Append(BuildMaterialsMenu(), "&Materials");
     menuBar->Append(BuildHelpMenu(), "&Help");
     return menuBar;
 }
@@ -1196,6 +1256,7 @@ wxMenuBar* MainFrame::BuildCastingMenuBar()
 
     auto* menuBar = new wxMenuBar();
     menuBar->Append(fileMenu, "&File");
+    menuBar->Append(BuildMaterialsMenu(), "&Materials");
     menuBar->Append(BuildHelpMenu(), "&Help");
     return menuBar;
 }

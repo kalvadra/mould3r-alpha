@@ -160,6 +160,10 @@
     <ClCompile Include="FixtureCanvas.cpp" />
     <ClCompile Include="FixtureEditor.cpp" />
     <ClCompile Include="FixtureFile.cpp" />
+    <ClCompile Include="MaterialFile.cpp" />
+    <ClCompile Include="MaterialLibrary.cpp" />
+    <ClCompile Include="MaterialResolve.cpp" />
+    <ClCompile Include="MaterialEditorDialog.cpp" />
     <ClCompile Include="GLCanvas.cpp" />
     <ClCompile Include="GLLoader.cpp" />
     <ClCompile Include="GridRenderer.cpp" />
@@ -219,6 +223,10 @@
     <ClInclude Include="FixtureCanvas.h" />
     <ClInclude Include="FixtureEditor.h" />
     <ClInclude Include="FixtureFile.h" />
+    <ClInclude Include="MaterialFile.h" />
+    <ClInclude Include="MaterialLibrary.h" />
+    <ClInclude Include="MaterialResolve.h" />
+    <ClInclude Include="MaterialEditorDialog.h" />
     <ClInclude Include="GLCanvas.h" />
     <ClInclude Include="GLLoader.h" />
     <ClInclude Include="GridRenderer.h" />
