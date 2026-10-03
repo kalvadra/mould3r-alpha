@@ -472,6 +472,13 @@ public:
     // filled triangles. Useful for inspecting the analysis mesh itself.
     void SetShotDebugWireframe(bool on);
 
+    // Draw the active debug colouring filled AND outline every triangle in
+    // `color` (the fill is pushed back by a polygon offset so the edges win the
+    // depth test). Used by the 3D mesh view to show element edges. Reset to off
+    // by every SetShotDebugGroups / SetShotDebugMesh; ignored while the
+    // wireframe mode is on (that already draws edges only).
+    void SetShotDebugEdges(bool on, const glm::vec3& color = glm::vec3(0.08f, 0.09f, 0.11f));
+
     // Like SetShotDebugGroups, but the debug body is a supplied mesh (posNorm,
     // 6 floats/vertex) rather than the shot's display mesh - used to draw the
     // draft "area grid" remesh, whose triangles the group EBOs index. Rendered
@@ -1562,6 +1569,8 @@ private:
     {
         bool    active = false;
         bool    wireframe = false;
+        bool    edges = false;                        // filled + triangle outlines
+        glm::vec3 edgeColor{ 0.08f, 0.09f, 0.11f };
         int     halfIndex = -1;
         GLuint  vao = 0;
         GLuint  ownVbo = 0;   // non-zero when the debug body is its own mesh

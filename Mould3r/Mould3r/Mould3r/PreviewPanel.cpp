@@ -9,6 +9,9 @@
 #include "MaterialLibrary.h" // Physical Setup dropdowns
 #include "MaterialResolve.h" // library material -> solver properties + derived / fallback notes
 #include "MaterialEditorDialog.h" // "+" buttons: add a material to the library
+#include "TetMeshJob.h"      // 3D mesher: surface weld, stats
+#include "TetMeshRunner.h"   // 3D mesher: worker process
+#include <wx/textdlg.h>
 #include "RoundedButton.h"
 #include "FlowResultsBar.h"
 #include "MouldCastDialog.h"
@@ -572,13 +575,22 @@ PreviewPanel::PreviewPanel(wxWindow* parent)
         modes.Add("Cooling: time to eject");
         modes.Add("Warp: deflection");
         modes.Add("Warp: shape change");
+        modes.Add("3D mesh");                        // kViewVolumeMesh
+        modes.Add("3D fill time");                   // kViewFill3DTime
+        modes.Add("3D pressure");                    // kViewFill3DPressure
+        modes.Add("3D melt temperature");            // kViewFill3DTemp
+        modes.Add("3D front temperature");           // kViewFill3DFrontTemp
+        modes.Add("3D frozen layer");                // kViewFill3DFrozen
+        modes.Add("3D pack: shrinkage");             // kViewPack3DShrink
+        modes.Add("3D cooling: time to eject");      // kViewCool3DEject
         m_debugModeChoice = new wxChoice(host, wxID_ANY, wxDefaultPosition,
             wxDefaultSize, modes);
         m_debugModeChoice->SetSelection(0);
         m_debugModeChoice->SetToolTip(
             "What the view shows: the analysis overlays (draft, travel volumes, "
             "wall thickness) and the flow results. Flow views need a Hele-Shaw "
-            "2.5D Flow run; the fill views play back with the timeline.");
+            "2.5D Flow run; the fill views play back with the timeline. \"3D mesh\" "
+            "shows the 3D Flow Analysis volume mesh with a section plane.");
         m_debugModeChoice->Bind(wxEVT_CHOICE,
             [this](wxCommandEvent&) { UpdateDraftOverlay(); });
         m_resultsBar->AddControl(m_debugModeChoice, wxALIGN_CENTER_VERTICAL | wxRIGHT, 10);
@@ -593,6 +605,58 @@ PreviewPanel::PreviewPanel(wxWindow* parent)
         m_debugWireCheck->Bind(wxEVT_CHECKBOX,
             [this](wxCommandEvent&) { UpdateDraftOverlay(); });
         m_resultsBar->AddControl(m_debugWireCheck, wxALIGN_CENTER_VERTICAL, 0);
+
+        // Section plane for the "3D mesh" view (shown with that view only):
+        // axis, position along the mesh's extent, which side to keep, and
+        // quality colouring.
+        m_sectionGroup = new wxPanel(host, wxID_ANY);
+        m_sectionGroup->SetBackgroundColour(Style::CardBg);
+        auto* sg = new wxBoxSizer(wxHORIZONTAL);
+        auto* secLbl = new wxStaticText(m_sectionGroup, wxID_ANY, "Section:");
+        secLbl->SetForegroundColour(Style::TextMuted);
+        secLbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+        sg->Add(secLbl, 0, wxALIGN_CENTER_VERTICAL | wxLEFT | wxRIGHT, 6);
+        wxArrayString axes;
+        axes.Add("Off"); axes.Add("X"); axes.Add("Y"); axes.Add("Z");
+        m_sectionAxisChoice = new wxChoice(m_sectionGroup, wxID_ANY, wxDefaultPosition, wxDefaultSize, axes);
+        m_sectionAxisChoice->SetSelection(1);
+        m_sectionAxisChoice->SetToolTip("Cut the mesh with a plane across this axis to see the elements inside.");
+        sg->Add(m_sectionAxisChoice, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 6);
+        m_sectionSlider = new wxSlider(m_sectionGroup, wxID_ANY, 500, 0, 1000,
+            wxDefaultPosition, wxSize(FromDIP(120), -1), wxSL_HORIZONTAL);
+        m_sectionSlider->SetBackgroundColour(Style::CardBg);
+        m_sectionSlider->SetToolTip("Where the section plane sits along the mesh.");
+        sg->Add(m_sectionSlider, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
+        m_sectionFlipCheck = new wxCheckBox(m_sectionGroup, wxID_ANY, "Flip");
+        m_sectionFlipCheck->SetForegroundColour(Style::TextPrimary);
+        m_sectionFlipCheck->SetBackgroundColour(Style::CardBg);
+        m_sectionFlipCheck->SetToolTip("Keep the other side of the section plane.");
+        sg->Add(m_sectionFlipCheck, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
+        auto* colLbl = new wxStaticText(m_sectionGroup, wxID_ANY, "Colour:");
+        colLbl->SetForegroundColour(Style::TextMuted);
+        colLbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+        sg->Add(colLbl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 6);
+        wxArrayString cols;
+        cols.Add("Mesh"); cols.Add("Quality"); cols.Add("Boundary");
+        m_meshColourChoice = new wxChoice(m_sectionGroup, wxID_ANY, wxDefaultPosition, wxDefaultSize, cols);
+        m_meshColourChoice->SetSelection(0);
+        m_meshColourChoice->SetToolTip(wxString::FromUTF8(
+            "Mesh: the surface and the section.\n"
+            "Quality: each element by its smallest dihedral angle - blue is well shaped "
+            "(a regular tetrahedron has 70.5\xc2\xb0), red is a sliver (under ~10\xc2\xb0).\n"
+            "Boundary: the boundary conditions - inlets (gate mouths / sprue entry), vents, "
+            "the parting line and the walls."));
+        sg->Add(m_meshColourChoice, 0, wxALIGN_CENTER_VERTICAL);
+        m_sectionGroup->SetSizer(sg);
+        m_resultsBar->AddControl(m_sectionGroup, wxALIGN_CENTER_VERTICAL | wxLEFT, 6);
+        m_sectionGroup->Hide();
+
+        m_sectionAxisChoice->Bind(wxEVT_CHOICE, [this](wxCommandEvent&) { UpdateSectionControls(); RequestVolumeMeshRedraw(); });
+        m_sectionSlider->Bind(wxEVT_SLIDER, [this](wxCommandEvent&) { RequestVolumeMeshRedraw(); });
+        m_sectionFlipCheck->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent&) { RequestVolumeMeshRedraw(); });
+        m_meshColourChoice->Bind(wxEVT_CHOICE, [this](wxCommandEvent&) { RequestVolumeMeshRedraw(); });
     }
     middle->Add(centre, 1, wxEXPAND);
 
@@ -712,6 +776,101 @@ void PreviewPanel::ReloadMaterialLibrary()
     RefreshMaterialChoices(injKey, mouldKey);
 }
 
+// ---------------------------------------------------------------------------
+// Phase 0 harness: mesh the shot with fTetWild in the worker process.
+// ---------------------------------------------------------------------------
+void PreviewPanel::RunTetMeshTest()
+{
+    wxWindow* top = wxGetTopLevelParent(this);
+    const wxString title = "3D Mesh Test (fTetWild)";
+    if (!m_hasShot || m_shotMesh.posNorm.empty() || m_shotMesh.indices.empty())
+    {
+        wxMessageBox("There is no shot to mesh. Generate the mould first.", title, wxOK | wxICON_INFORMATION, top);
+        return;
+    }
+
+    // The shot's display buffer is flat-shaded (split per face); weld it into
+    // a shared-vertex surface for the mesher.
+    const TetMesh::Surface surf = TetMesh::WeldSurface(m_shotMesh.posNorm.data(), m_shotMesh.posNorm.size() / 6, 6,
+                                                       m_shotMesh.indices.data(), m_shotMesh.indices.size());
+    double mn[3] = { 1e300, 1e300, 1e300 }, mx[3] = { -1e300, -1e300, -1e300 };
+    for (size_t i = 0; i < surf.VertexCount(); ++i)
+        for (int k = 0; k < 3; ++k)
+        {
+            mn[k] = std::min(mn[k], surf.verts[3 * i + k]);
+            mx[k] = std::max(mx[k], surf.verts[3 * i + k]);
+        }
+    const double diag = std::sqrt((mx[0] - mn[0]) * (mx[0] - mn[0]) + (mx[1] - mn[1]) * (mx[1] - mn[1]) +
+                                  (mx[2] - mn[2]) * (mx[2] - mn[2]));
+    if (surf.TriangleCount() < 4 || !(diag > 0.0))
+    {
+        wxMessageBox("The shot surface is empty.", title, wxOK | wxICON_WARNING, top);
+        return;
+    }
+
+    // Target edge length: default bbox diagonal / 40 (coarse enough to be quick).
+    wxTextEntryDialog ask(top,
+        wxString::Format("Target tetrahedron edge length (mm).\n\nThe shot is %.1f mm across (bounding-box diagonal). "
+                         "Halving the edge length multiplies the element count by about 8 and the time by more.",
+                         diag),
+        title, wxString::Format("%.3g", diag / 40.0));
+    if (ask.ShowModal() != wxID_OK) return;
+    double edge = 0.0;
+    if (!ask.GetValue().ToDouble(&edge) || !(edge > 0.0))
+    {
+        wxMessageBox("Enter a positive edge length in mm.", title, wxOK | wxICON_WARNING, top);
+        return;
+    }
+
+    TetMesh::Params prm;
+    prm.edgeLength = edge;   // envelope: fTetWild default (bounding-box diagonal / 1000)
+    TetMeshOutcome o = RunTetMeshJobModal(top, surf, prm, title);
+
+    switch (o.kind)
+    {
+    case TetMeshOutcome::Kind::Cancelled:
+        return;
+    case TetMeshOutcome::Kind::LaunchFailed:
+    case TetMeshOutcome::Kind::Crashed:
+    case TetMeshOutcome::Kind::Failed:
+        wxMessageBox(o.detail.empty() ? wxString("Meshing failed.") : o.detail, title, wxOK | wxICON_ERROR, top);
+        return;
+    case TetMeshOutcome::Kind::Ok:
+        break;
+    }
+
+    const TetMesh::Stats st = TetMesh::ComputeStats(o.result.mesh);
+    const double surfVol = std::fabs(TetMesh::SurfaceVolume(surf));
+    auto U = [](const char* s) { return wxString::FromUTF8(s); };
+    auto pct = [](double a, double b) { return b > 0.0 ? 100.0 * (a / b - 1.0) : 0.0; };
+    wxString msg;
+    msg << wxString::Format("%zu tetrahedra, %zu vertices, %zu boundary faces\n", st.tets, st.verts, st.boundaryFaces);
+    msg << wxString::Format("Mean edge %.3g mm (target %.3g mm)\n\n", st.meanEdgeMm, edge);
+    msg << U("Volume: ") << wxString::Format("%.2f", st.volumeMm3) << U(" mm\xc2\xb3\n");
+    msg << U("  shot surface: ") << wxString::Format("%.2f", surfVol) << U(" mm\xc2\xb3 (")
+        << wxString::Format("%+.3f%%", pct(st.volumeMm3, surfVol)) << ")\n";
+    if (m_shotVolumeMm3 > 0.0)
+        msg << U("  shot at Generate Mould: ") << wxString::Format("%.2f", m_shotVolumeMm3) << U(" mm\xc2\xb3 (")
+            << wxString::Format("%+.3f%%", pct(st.volumeMm3, m_shotVolumeMm3)) << ")\n";
+    msg << U("\nQuality: dihedral angles ") << wxString::Format("%.1f", st.minDihedralDeg) << U("\xc2\xb0\xe2\x80\x93")
+        << wxString::Format("%.1f", st.maxDihedralDeg) << U("\xc2\xb0, ") << st.slivers
+        << U(" sliver(s) under 5\xc2\xb0");
+    if (st.nonPositive > 0) msg << wxString::Format(", %zu inverted (!)", st.nonPositive);
+    msg << "\n\n";
+    msg << wxString::Format("Input surface: %zu triangles, %zu vertices after welding\n", surf.TriangleCount(), surf.VertexCount());
+    msg << wxString::Format("Time: %.1f s meshing, %.1f s total (worker start, file I/O)", o.result.workerSeconds, o.wallSeconds);
+    msg << "\n\nSim Viewer: \"3D mesh\" shows it (section plane in the bar below the view).";
+
+    // Keep it for the 3D mesh view / Export Mesh (whole shot, default envelope).
+    StoreVolumeMesh(std::move(o.result.mesh), /*fullShot=*/true, edge, diag / 1000.0, 0.0, surfVol,
+                    surf.TriangleCount(), o.result.workerSeconds, o.wallSeconds);
+    TagVolumeBoundary();
+    wxMessageBox(msg, title, wxOK | wxICON_INFORMATION, top);
+    ShowOnlyShot();
+    if (m_debugModeChoice) m_debugModeChoice->SetSelection(kViewVolumeMesh);
+    UpdateDraftOverlay();
+}
+
 void PreviewPanel::AddMaterialToLibrary(MaterialKind kind)
 {
     // Parent on the top-level frame: this panel may be on a hidden book page
@@ -789,6 +948,9 @@ void PreviewPanel::ApplyInjectionProcessDefaults(bool force)
     const ResolvedInjectionMaterial r = ResolveInjectionMaterial(lib[(size_t)sel].data);
     m_flowMeltTempCtrl->ChangeValue(wxString::Format("%g", r.props.recMeltTempC));
     m_flowMouldTempCtrl->ChangeValue(wxString::Format("%g", r.props.recMouldTempC));
+    // The 3D card keeps its own process settings, seeded the same way.
+    if (m_flow3dMeltTempCtrl)  m_flow3dMeltTempCtrl->ChangeValue(wxString::Format("%g", r.props.recMeltTempC));
+    if (m_flow3dMouldTempCtrl) m_flow3dMouldTempCtrl->ChangeValue(wxString::Format("%g", r.props.recMouldTempC));
 }
 
 bool PreviewPanel::ResolveSelectedMaterials(ResolvedInjectionMaterial& inj, ResolvedMouldMaterial& mould,
@@ -889,6 +1051,11 @@ void PreviewPanel::SetData(const std::vector<FileImporter::MeshData>& halves,
     m_fill = Flow::CoupledFillResult{};
     m_hasFill = false;
     OnFillChanged();
+    m_volMesh = VolumeMesh{};
+    m_thinWallMm[0] = m_thinWallMm[1] = -1.0;
+    m_fill3d = Flow3D::FillResult{};
+    m_hasFill3d = false;
+    if (m_flow3dExportMeshBtn) m_flow3dExportMeshBtn->Enable(false);
     m_hasShot = false;
     m_shotVolumeMm3 = 0.0;
     m_castShotMesh = FileImporter::MeshData();
@@ -1028,6 +1195,11 @@ void PreviewPanel::ClearData()
     m_fill = Flow::CoupledFillResult{};
     m_hasFill = false;
     OnFillChanged();
+    m_volMesh = VolumeMesh{};
+    m_thinWallMm[0] = m_thinWallMm[1] = -1.0;
+    m_fill3d = Flow3D::FillResult{};
+    m_hasFill3d = false;
+    if (m_flow3dExportMeshBtn) m_flow3dExportMeshBtn->Enable(false);
     m_hasShot = false;
     m_shotVolumeMm3 = 0.0;
     m_castShotMesh = FileImporter::MeshData();
@@ -1413,6 +1585,117 @@ wxPanel* PreviewPanel::BuildSimPanel(wxWindow* parent)
         addStart(body, bs, "Hele-Shaw 2.5D Flow");
     });
 
+    // ---- 3D Flow Analysis ---------------------------------------------------
+    // Full 3D (tetrahedral) filling analysis, its own card with its own process
+    // settings. Stage 1: the volume mesh (fTetWild, in the worker process) of
+    // the part cavities — the feed system then stays a 1D beam network like
+    // the 2.5D analysis — or, with "Simulate full shot volume", of the whole
+    // shot with the melt entering at the sprue. The element size follows the
+    // thinnest wall so the melt sees several elements across it.
+    makeCard("3D Flow Analysis", [this, &addStart](wxWindow* body, wxBoxSizer* bs)
+    {
+        const wxString degC = wxString::FromUTF8("\xC2\xB0""C");
+        m_flow3dFillTimeCtrl  = AddFieldRow(body, bs, "Fill time:", "1.0", "s");
+        m_flow3dFillTimeCtrl->SetToolTip(
+            "Target time to fill the meshed volume (the cavities, or the whole shot with "
+            "\"Simulate full shot volume\"): the injection rate is that volume over this time.");
+        m_flow3dMeltTempCtrl  = AddFieldRow(body, bs, "Melt temp:", "230", degC);
+        m_flow3dMeltTempCtrl->SetToolTip("The melt's temperature: sets its viscosity (held constant through the fill for now).");
+        m_flow3dMouldTempCtrl = AddFieldRow(body, bs, "Mould temp:", "40", degC);
+        m_flow3dMouldTempCtrl->SetToolTip("Mould temperature. With the mould material it sets the wall temperature the melt sees (thermal fill).");
+        m_flow3dMaxPressureCtrl = AddFieldRow(body, bs, "Max inj. pressure:", "150", "MPa");
+        m_flow3dMaxPressureCtrl->SetToolTip(
+            "The machine's injection-pressure limit. If the fill needs more, the machine holds "
+            "this pressure and the fill slows.");
+
+        m_flow3dFullShotCheck = new wxCheckBox(body, wxID_ANY, "Simulate full shot volume");
+        m_flow3dFullShotCheck->SetForegroundColour(Style::TextPrimary);
+        m_flow3dFullShotCheck->SetBackgroundColour(Style::CardBg);
+        m_flow3dFullShotCheck->SetToolTip(
+            "On: mesh the whole shot - sprue, runners, gates and parts - as one 3D volume, "
+            "with the melt entering where the sprue meets the injection point. Most "
+            "faithful at the gates, but many more elements.\n"
+            "Off: mesh only the part cavities in 3D; the sprue, runners and gates are "
+            "solved as a 1D beam network (as in the 2.5D analysis) feeding the gates.");
+        bs->Add(m_flow3dFullShotCheck, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
+
+        m_flow3dThermalCheck = new wxCheckBox(body, wxID_ANY, "Thermal (frozen layer)");
+        m_flow3dThermalCheck->SetValue(true);
+        m_flow3dThermalCheck->SetForegroundColour(Style::TextPrimary);
+        m_flow3dThermalCheck->SetBackgroundColour(Style::CardBg);
+        m_flow3dThermalCheck->SetToolTip(
+            "Track the melt temperature: carried with the flow, conducted, heated by shear and "
+            "cooled into the mould, with the frozen skin that grows on the walls and narrows the "
+            "flow. Off = isothermal (melt temperature everywhere; faster but optimistic).");
+        bs->Add(m_flow3dThermalCheck, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
+
+        m_flow3dPackCheck = new wxCheckBox(body, wxID_ANY, "Pack and cool");
+        m_flow3dPackCheck->SetValue(true);
+        m_flow3dPackCheck->SetForegroundColour(Style::TextPrimary);
+        m_flow3dPackCheck->SetBackgroundColour(Style::CardBg);
+        m_flow3dPackCheck->SetToolTip(
+            "After the fill, hold the pack pressure until the gates freeze, then cool to the "
+            "ejection temperature: gate freeze, time to eject, part mass and volumetric "
+            "shrinkage. Needs Thermal.");
+        bs->Add(m_flow3dPackCheck, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
+        m_flow3dPackPressureCtrl = AddFieldRow(body, bs, "Pack pressure:", "80", "%");
+        m_flow3dPackPressureCtrl->SetToolTip(
+            "Pack / hold pressure as a percentage of the fill's peak machine pressure "
+            "(typically 50-80%).");
+        m_flow3dHoldTimeCtrl = AddFieldRow(body, bs, "Hold time:", "0", "s");
+        m_flow3dHoldTimeCtrl->SetToolTip(
+            "How long the pack pressure is held after the fill. 0 = until the gates have "
+            "frozen.");
+
+        auto* denLbl = new wxStaticText(body, wxID_ANY, "Mesh density:");
+        denLbl->SetForegroundColour(Style::TextMuted);
+        denLbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+        bs->Add(denLbl, 0, wxLEFT | wxRIGHT | wxTOP, 10);
+        wxArrayString dens;
+        dens.Add("Coarse (2 across the wall)");
+        dens.Add("Standard (3 across)");
+        dens.Add("Fine (4 across)");
+        dens.Add("Very fine (6 across)");
+        m_flow3dDensityChoice = new wxChoice(body, wxID_ANY, wxDefaultPosition, wxDefaultSize, dens);
+        m_flow3dDensityChoice->SetSelection(1);
+        m_flow3dDensityChoice->SetToolTip(
+            "How many elements span the thinnest wall. The element edge length is the "
+            "thin-wall thickness divided by this. Each step finer multiplies the element "
+            "count (and the run time) by roughly 2-3x.");
+        bs->Add(m_flow3dDensityChoice, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 8);
+        m_flow3dEdgeCtrl = AddFieldRow(body, bs, "Edge length:", "auto", "mm");
+        m_flow3dEdgeCtrl->SetToolTip(
+            "\"auto\" sizes the elements from the thinnest wall and the density above. "
+            "Enter a length (mm) to set it yourself.");
+
+        auto* note = new wxStaticText(body, wxID_ANY,
+            "Start meshes (or reuses the mesh if its\n"
+            "settings haven't changed), then fills it\n"
+            "(Sim Viewer: the 3D ... views).");
+        note->SetForegroundColour(Style::TextMuted);
+        note->SetBackgroundColour(Style::CardBg);
+        note->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+        bs->Add(note, 0, wxLEFT | wxRIGHT | wxTOP, 10);
+
+        addStart(body, bs, "3D Flow Analysis");
+
+        m_flow3dExportMeshBtn = new RoundedButton(body, wxID_ANY, "Export Mesh...",
+            wxDefaultPosition, wxSize(-1, 26), wxBORDER_NONE);
+        m_flow3dExportMeshBtn->SetBackgroundColour(Style::BtnSmall);
+        m_flow3dExportMeshBtn->SetForegroundColour(Style::TextPrimary);
+        m_flow3dExportMeshBtn->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
+        m_flow3dExportMeshBtn->SetToolTip(
+            "Save the last 3D mesh as .vtu (opens in ParaView, with the element quality and "
+            "the boundary faces tagged by condition) or .msh (Gmsh, boundary faces as "
+            "named physical groups).");
+        m_flow3dExportMeshBtn->Enable(false);
+        m_flow3dExportMeshBtn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { ExportVolumeMesh(); });
+        bs->Add(m_flow3dExportMeshBtn, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
+    });
+
     sizer->AddSpacer(12);
     scrollWin->SetSizer(sizer);
     colSizer->Add(scrollWin, 1, wxEXPAND);
@@ -1565,6 +1848,7 @@ wxPanel* PreviewPanel::BuildInfoPanel(wxWindow* parent)
     m_draftStatus = makeVerdictCard("Draft Angle Checks", CardDraft);
     m_demouldStatus = makeVerdictCard("Separation Test", CardSeparation);
     m_flowStatus = makeVerdictCard("Flow Analysis", CardFlow);
+    m_flow3dStatus = makeVerdictCard("3D Flow Analysis", CardFlow3D);
 
     column->SetSizer(colSizer);
     outerSizer->Add(column, 1, wxEXPAND);
@@ -1627,6 +1911,11 @@ void PreviewPanel::UpdateInfoPanel()
         m_flowStatus->SetLabel("Not run");
         m_flowStatus->SetForegroundColour(Style::TextMuted);
     }
+    if (m_flow3dStatus)
+    {
+        m_flow3dStatus->SetLabel("Not run");
+        m_flow3dStatus->SetForegroundColour(Style::TextMuted);
+    }
     ClearResultsReports();   // the Details windows follow the cards
 
     if (m_infoPanel) m_infoPanel->Layout();
@@ -1652,6 +1941,11 @@ void PreviewPanel::OnStartSimulation(const wxString& simName)
     if (simName == "Hele-Shaw 2.5D Flow")
     {
         RunFlowCheck();
+        return;
+    }
+    if (simName == "3D Flow Analysis")
+    {
+        Run3DFlow();
         return;
     }
 
@@ -3734,17 +4028,28 @@ void PreviewPanel::UpdateDraftOverlay()
 
     const int  mode = m_debugModeChoice ? m_debugModeChoice->GetSelection() : 0;
     const bool wire = m_debugWireCheck && m_debugWireCheck->GetValue();
+    UpdateSectionControls();
+    // Moving between the 2.5D and 3D result views swaps the timeline (each
+    // starts at its end state), so the frame on show starts there too.
+    if ((Is3DView(mode) != Is3DView(m_lastOverlayMode)) && m_lastOverlayMode >= 0) m_fillFrame = -1;
+    m_lastOverlayMode = mode;
 
     // The on-top line/point overlay (the feed network) belongs to the flow views.
     if (mode < 5 || mode > 16) m_canvas->ClearDebugOverlay();
     // The legend and the fill timeline belong to the heat-map / flow views.
-    if (!(mode == 4 || (mode >= 6 && mode <= 16))) ShowResultsBar(false);
+    if (!(mode == 4 || (mode >= 6 && mode <= 16) || Is3DView(mode))) ShowResultsBar(false);
 
     if (mode <= 0)
     {
         // None: clear, honouring the wireframe toggle.
         m_canvas->ClearShotDebugColoring();
         m_canvas->SetShotDebugWireframe(wire && m_shotHalfIndex >= 0);
+        return;
+    }
+
+    if (Is3DView(mode))   // 3D mesh / 3D fill time / 3D pressure — the 3D Flow Analysis
+    {
+        DrawVolumeMeshView(wire);
         return;
     }
 

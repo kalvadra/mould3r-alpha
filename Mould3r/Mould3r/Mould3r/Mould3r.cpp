@@ -2,6 +2,7 @@
 #include "MainFrame.h"
 #include "AppConfig.h"
 #include "FixtureFile.h"
+#include "MeshWorker.h"   // --mesh-worker: Mould3r relaunched as its own 3D-meshing worker
 #include "wx/wx.h"
 
 wxIMPLEMENT_APP(MyApp);
@@ -16,6 +17,16 @@ wxIMPLEMENT_APP(MyApp);
 //      home surface rather than a modal-over-nothing on launch.
 bool MyApp::OnInit()
 {
+    // Worker mode first, before anything touches config or opens a window:
+    // this process is a meshing worker the app launched (see MeshWorker.h).
+    if (argc >= 4 && argv[1] == kMeshWorkerSwitch)
+    {
+        m_meshWorker = true;
+        m_meshWorkerExitCode = RunMeshWorker(std::filesystem::path(argv[2].ToStdWstring()),
+                                             std::filesystem::path(argv[3].ToStdWstring()));
+        return true;   // OnRun hands the exit code back without an event loop
+    }
+
     const std::string lastFixture = AppConfig::LoadLastFixture();
 
     FixtureDefinition fixture;  // default-constructed == empty / invalid
@@ -36,4 +47,11 @@ bool MyApp::OnInit()
         frame->CallAfter([frame] { frame->PromptForFixtureIfMissing(); });
 
     return true;
+}
+
+int MyApp::OnRun()
+{
+    if (m_meshWorker)
+        return m_meshWorkerExitCode;
+    return wxApp::OnRun();
 }

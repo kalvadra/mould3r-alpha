@@ -1,0 +1,2 @@
+42ee9da2057153b1aef734e8e462c846a33aa805 Fri Oct 27 19:44:15 2023 +0300
+AMGCL 1.4.4 (https://github.com/ddemidov/amgcl), header-only, MIT. Unmodified.

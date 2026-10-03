@@ -5306,6 +5306,7 @@ void GLCanvas::SetShotDebugGroups(int halfIndex,
 
     m_shotDebug.halfIndex = halfIndex;
     m_shotDebug.active = true;
+    m_shotDebug.edges = false;
     Refresh(false);
 }
 
@@ -5313,6 +5314,13 @@ void GLCanvas::ClearShotDebugColoring()
 {
     m_shotDebug.active = false;
     m_shotDebug.halfIndex = -1;
+    Refresh(false);
+}
+
+void GLCanvas::SetShotDebugEdges(bool on, const glm::vec3& color)
+{
+    m_shotDebug.edges = on;
+    m_shotDebug.edgeColor = color;
     Refresh(false);
 }
 
@@ -5373,6 +5381,7 @@ void GLCanvas::SetShotDebugMesh(int halfIndex,
     glBindVertexArray(0);
     m_shotDebug.halfIndex = halfIndex;
     m_shotDebug.active = true;
+    m_shotDebug.edges = false;
     Refresh(false);
 }
 
@@ -5613,6 +5622,14 @@ void GLCanvas::RenderPreview(const glm::mat4& view, const glm::mat4& proj,
                 if (cullWas) glDisable(GL_CULL_FACE);   // show back edges too
                 glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
             }
+            // Element edges: push the fill back so the outline pass below
+            // wins the depth test against its own triangles.
+            const bool edges = m_shotDebug.edges && !wf;
+            if (edges)
+            {
+                glEnable(GL_POLYGON_OFFSET_FILL);
+                glPolygonOffset(1.0f, 1.0f);
+            }
             bool flattened = false;
             for (const DebugGroupGPU& g : m_shotDebug.groups)
             {
@@ -5648,6 +5665,26 @@ void GLCanvas::RenderPreview(const glm::mat4& view, const glm::mat4& proj,
             {
                 glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
                 if (cullWas) glEnable(GL_CULL_FACE);
+            }
+            if (edges)
+            {
+                glPolygonOffset(0.0f, 0.0f);
+                glDisable(GL_POLYGON_OFFSET_FILL);
+                // Outline pass: every group's triangles as lines, flat colour.
+                glUniform1f(locAmb, 1.0f);
+                glUniform1f(locDif, 0.0f);
+                glUniform1f(locSpe, 0.0f);
+                glUniform1f(locEmis, 1.0f);
+                flattened = true;
+                glUniform3fv(locBase, 1, &m_shotDebug.edgeColor[0]);
+                glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
+                for (const DebugGroupGPU& g : m_shotDebug.groups)
+                {
+                    if (g.count <= 0) continue;
+                    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g.ebo);
+                    glDrawElements(GL_TRIANGLES, g.count, GL_UNSIGNED_INT, 0);
+                }
+                glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
             }
             glBindVertexArray(0);
 

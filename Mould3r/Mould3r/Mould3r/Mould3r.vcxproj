@@ -137,6 +137,35 @@
       <AdditionalDependencies>$(CoreLibraryDependencies);%(AdditionalDependencies);</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
+  <!-- ===================================================================
+       3D mesher: m3tetmesh.dll (fTetWild), built by
+       third_party\m3tetmesh\build_windows.bat. OPTIONAL: until
+       out\lib\m3tetmesh.lib exists this block is inactive, Mould3r builds
+       exactly as before, and the mesh worker reports the mesher as not built.
+       Once built: the header path + M3_HAVE_TETMESH, the import library,
+       DELAY-LOADED (only the mesh-worker process ever loads it), and a
+       post-build copy of m3tetmesh.dll next to Mould3r.exe.
+       One Release DLL serves both configurations (plain C interface).
+       =================================================================== -->
+  <PropertyGroup>
+    <M3TetMeshDir>$(ProjectDir)third_party\m3tetmesh\</M3TetMeshDir>
+    <M3TetMeshOut>$(M3TetMeshDir)out\</M3TetMeshOut>
+    <M3HaveTetMesh Condition="Exists('$(M3TetMeshOut)lib\m3tetmesh.lib')">true</M3HaveTetMesh>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Platform)'=='x64' And '$(M3HaveTetMesh)'=='true'">
+    <ClCompile>
+      <AdditionalIncludeDirectories>$(M3TetMeshDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>M3_HAVE_TETMESH;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <Link>
+      <AdditionalDependencies>$(M3TetMeshOut)lib\m3tetmesh.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <DelayLoadDLLs>m3tetmesh.dll;%(DelayLoadDLLs)</DelayLoadDLLs>
+    </Link>
+    <PostBuildEvent>
+      <Command>xcopy /y /d /q "$(M3TetMeshOut)bin\*.dll" "$(OutDir)"</Command>
+      <Message>Copying the 3D mesher DLL next to Mould3r.exe</Message>
+    </PostBuildEvent>
+  </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="AboutDialog.cpp" />
     <ClCompile Include="AppConfig.cpp" />
@@ -155,6 +184,7 @@
     <ClCompile Include="FillDefects.cpp" />
     <ClCompile Include="Warpage.cpp" />
     <ClCompile Include="ResultsDetails.cpp" />
+    <ClCompile Include="PreviewFlow3D.cpp" />
     <ClCompile Include="PreviewResultsDetails.cpp" />
     <ClCompile Include="FileImporter.cpp" />
     <ClCompile Include="FixtureCanvas.cpp" />
@@ -164,6 +194,22 @@
     <ClCompile Include="MaterialLibrary.cpp" />
     <ClCompile Include="MaterialResolve.cpp" />
     <ClCompile Include="MaterialEditorDialog.cpp" />
+    <ClCompile Include="TetMeshJob.cpp" />
+    <ClCompile Include="VolumeBoundary.cpp" />
+    <!-- The 3D fill solver: AMGCL (header-only, third_party\amgcl) with
+         OpenMP. Optimised even in Debug (an unoptimised AMG solve is ~30x
+         slower), which needs /Zi instead of /ZI and no /RTC for this file. -->
+    <ClCompile Include="Flow3DFill.cpp">
+      <AdditionalIncludeDirectories>$(ProjectDir)third_party\amgcl;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalOptions>/bigobj %(AdditionalOptions)</AdditionalOptions>
+      <OpenMPSupport>true</OpenMPSupport>
+      <Optimization Condition="'$(Configuration)'=='Debug'">MaxSpeed</Optimization>
+      <BasicRuntimeChecks Condition="'$(Configuration)'=='Debug'">Default</BasicRuntimeChecks>
+      <DebugInformationFormat Condition="'$(Configuration)'=='Debug'">ProgramDatabase</DebugInformationFormat>
+      <SupportJustMyCode Condition="'$(Configuration)'=='Debug'">false</SupportJustMyCode>
+    </ClCompile>
+    <ClCompile Include="MeshWorker.cpp" />
+    <ClCompile Include="TetMeshRunner.cpp" />
     <ClCompile Include="GLCanvas.cpp" />
     <ClCompile Include="GLLoader.cpp" />
     <ClCompile Include="GridRenderer.cpp" />
@@ -227,6 +273,11 @@
     <ClInclude Include="MaterialLibrary.h" />
     <ClInclude Include="MaterialResolve.h" />
     <ClInclude Include="MaterialEditorDialog.h" />
+    <ClInclude Include="TetMeshJob.h" />
+    <ClInclude Include="VolumeBoundary.h" />
+    <ClInclude Include="Flow3DFill.h" />
+    <ClInclude Include="MeshWorker.h" />
+    <ClInclude Include="TetMeshRunner.h" />
     <ClInclude Include="GLCanvas.h" />
     <ClInclude Include="GLLoader.h" />
     <ClInclude Include="GridRenderer.h" />

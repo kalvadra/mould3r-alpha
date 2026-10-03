@@ -22,6 +22,9 @@
 #include "FixtureFile.h"    // FixtureKind — gates cast generation
 #include "MaterialLibrary.h" // the material library behind the Physical Setup dropdowns
 #include "MaterialResolve.h" // library material -> simulation properties (+ derived / fallback notes)
+#include "TetMeshJob.h"      // TetMesh::Mesh / Stats — the 3D Flow Analysis volume mesh
+#include "VolumeBoundary.h"  // Flow3D::Boundary — its inlet / vent / parting / wall tags
+#include "Flow3DFill.h"      // Flow3D::FillResult — the 3D fill
 
 #include <glm/glm.hpp>      // cached half bounds (perimeter of the cast bases)
 
@@ -29,6 +32,7 @@ class GLCanvas;
 class FlowResultsBar;
 class RoundedButton;
 class wxSpinCtrlDouble;
+class wxSlider;
 namespace MeshBoolean { struct Mesh; }   // travel-volume return type (defined in MeshBoolean.h)
 
 // Bundle of the shot artefacts handed to the preview. All pointers may be null
@@ -129,6 +133,12 @@ public:
     // the Physical Setup dropdowns, keeping the current selections when they
     // still exist. Call after a material has been added to the library.
     void ReloadMaterialLibrary();
+
+    // Test harness for the 3D mesher (Developer menu): tet-mesh the current
+    // shot in the worker process at an edge length you type, report element
+    // count, volume against the shot volume, quality and timing, and keep the
+    // mesh for the Sim Viewer "3D mesh" view (like the 3D Flow Analysis card).
+    void RunTetMeshTest();
 
     // Open the Add Material dialog for `kind` (the "+" buttons and the
     // Materials menu both land here); on save, rescan and select the new
@@ -237,6 +247,57 @@ private:
     // Dispatched from the "Hele-Shaw 2.5D Flow" card.
     void RunFlowCheck();
 
+    // ---- 3D Flow Analysis (PreviewFlow3D.cpp) -------------------------------
+    // Start on the "3D Flow Analysis" card. Stage 1 (this phase): build the
+    // tetrahedral volume mesh in the worker process — of the part cavities
+    // only (the feed system stays a 1D beam network) or, with "Simulate full
+    // shot volume", of the whole shot (sprue, runners and gates as 3D volume).
+    // The edge length comes from the thinnest wall and the card's density
+    // (or its explicit edge length). Reports element count, quality and the
+    // mesh volume against the source, and opens the "3D mesh" view.
+    void Run3DFlow();
+    // "Export Mesh..." on the card: the last volume mesh as .vtu (ParaView,
+    // with the per-element quality) or .msh (Gmsh 2.2).
+    void ExportVolumeMesh();
+    // The 3D views: "3D mesh" (the volume mesh's surface with element edges,
+    // cut by the section plane so the tets inside show on the cut, coloured
+    // plain / by element quality / by boundary condition) and "3D fill time"
+    // / "3D pressure" (the 3D fill on the same cut surface, played back on the
+    // timeline). Called from UpdateDraftOverlay for Is3DView modes.
+    void DrawVolumeMeshView(bool wire);
+    // The fill stage of Run3DFlow: the isothermal 3D fill on the stored,
+    // tagged mesh (worker thread, progress + cancel). False when it couldn't
+    // run or was cancelled (m_fill3d says which).
+    bool RunFill3D(const TestMaterial::CrossWLF& viscosity, const Flow3D::FillSetup::Thermal& thermal,
+                   const Flow3D::FillSetup::Pack& pack, double fillTimeS, double meltC,
+                   double maxPressureMPa, const wxString& title);
+    // Pick up a new 3D fill: restart the timeline, fix the legend ranges.
+    void OnFill3DChanged();
+    // Show the section-plane controls in the results bar only with the 3D
+    // mesh view (and enable them when there is a mesh).
+    void UpdateSectionControls();
+    // Redraw the 3D mesh view once per event-loop pass (the section slider
+    // fires continuously while dragged).
+    void RequestVolumeMeshRedraw();
+    // The closed surface to mesh: the part surfaces (cavity only) or the shot.
+    // `volumeMm3` is the enclosed volume it should come out at. False (with
+    // `why`) when there's nothing to mesh.
+    bool BuildVolumeSurface(bool fullShot, TetMesh::Surface& surface, double& volumeMm3, wxString& why);
+    // A thin-wall thickness of the cavity (fullShot false) or shot: the 5th
+    // percentile, by area, of the dual-domain wall thickness (so a gate or a
+    // tiny feature doesn't set the mesh size for the whole part). Cached per
+    // generation; 0 when no opposing walls pair up.
+    double ThinWallMm(bool fullShot);
+    // Keep a finished mesh (quality, adjacency, bounds) for the view / export.
+    void StoreVolumeMesh(TetMesh::Mesh&& mesh, bool fullShot, double edgeMm, double epsMm,
+                         double wallMm, double sourceVolMm3, size_t surfaceTris,
+                         double meshSeconds, double wallSeconds);
+    // Tag the stored mesh's boundary (m_volMesh.boundary): inlets from the
+    // feed network's cavity entries (gate mouths found where the shot's gate /
+    // sprue solid covers the part) or, for a full-shot mesh, the sprue's entry
+    // cap; vents at the vent mouths; the parting line; walls.
+    void TagVolumeBoundary();
+
     // End-of-run notice shared by the simulations: "<sim> is complete", the
     // verdict in a few words (read off the card's status label, so the two
     // can't disagree) and a pointer to that card's Details button. The icon
@@ -297,8 +358,20 @@ private:
     MeshBoolean::Mesh BuildSideTravelVolume(int side, float startEps, int source) const;
 
     // ---- Results details (the "Details" button on each results card) ------
-    // Card index: 0 Draft Angle Checks, 1 Separation Test, 2 Flow Analysis.
-    enum ResultsCard { CardDraft = 0, CardSeparation = 1, CardFlow = 2, CardCount = 3 };
+    // Card index: 0 Draft Angle Checks, 1 Separation Test, 2 Flow Analysis,
+    // 3 3D Flow Analysis.
+    enum ResultsCard { CardDraft = 0, CardSeparation = 1, CardFlow = 2, CardFlow3D = 3, CardCount = 4 };
+    // Sim Viewer Select indices of the 3D views (after the 2.5D views): the
+    // mesh itself, then the 3D fill's fill time and pressure (timeline).
+    static constexpr int kViewVolumeMesh = 17;
+    static constexpr int kViewFill3DTime = 18;
+    static constexpr int kViewFill3DPressure = 19;
+    static constexpr int kViewFill3DTemp = 20;        // thermal fills
+    static constexpr int kViewFill3DFrontTemp = 21;
+    static constexpr int kViewFill3DFrozen = 22;
+    static constexpr int kViewPack3DShrink = 23;      // packed fills
+    static constexpr int kViewCool3DEject = 24;
+    static bool Is3DView(int mode) { return mode >= kViewVolumeMesh && mode <= kViewCool3DEject; }
     // Store a card's report, enable its Details button, refresh an open window.
     void SetResultsReport(int card, const ResultsDetails::Report& report);
     // Open (or raise) the card's details window.
@@ -355,6 +428,7 @@ private:
     ResultsDetails::Report BuildSeparationReport(const SeparationRun& run,
                                                  const wxString& verdict, const wxColour& colour) const;
     ResultsDetails::Report BuildFlowReport(const FlowRunInputs& in) const;
+    ResultsDetails::Report BuildFlow3DReport(const wxString& verdict, const wxColour& colour) const;
 
     // Apply or clear the Draft Angle Checks overlay per the Debug View dropdown:
     // None (clear, optional wireframe) or "Draft (ray)" (the parting-split
@@ -467,13 +541,74 @@ private:
     wxStaticText* m_draftStatus = nullptr;    // "Draft Angle Checks" verdict
     wxStaticText* m_demouldStatus = nullptr;  // "Separation Test" verdict
     wxStaticText* m_flowStatus = nullptr;     // "Flow Analysis" verdict
+    wxStaticText* m_flow3dStatus = nullptr;   // "3D Flow Analysis" verdict
+
+    // 3D Flow Analysis card: its own process settings (seeded from the
+    // injection material like the 2.5D card's) and the mesh-stage settings.
+    wxTextCtrl* m_flow3dFillTimeCtrl = nullptr;   // fill time (s)
+    wxTextCtrl* m_flow3dMeltTempCtrl = nullptr;   // melt temperature (deg C)
+    wxTextCtrl* m_flow3dMouldTempCtrl = nullptr;  // mould-wall temperature (deg C)
+    wxTextCtrl* m_flow3dMaxPressureCtrl = nullptr; // machine pressure limit (MPa)
+    wxCheckBox* m_flow3dFullShotCheck = nullptr;  // mesh the whole shot (else cavities + beam feed)
+    wxCheckBox* m_flow3dThermalCheck = nullptr;   // thermal fill (frozen layer) vs isothermal
+    wxCheckBox* m_flow3dPackCheck = nullptr;      // pack, hold and cool after the fill (thermal only)
+    wxTextCtrl* m_flow3dPackPressureCtrl = nullptr; // pack pressure, % of the fill's peak machine pressure
+    wxTextCtrl* m_flow3dHoldTimeCtrl = nullptr;   // hold time (s); 0 = until the gates freeze
+    wxChoice*   m_flow3dDensityChoice = nullptr;  // elements across the thinnest wall
+    wxTextCtrl* m_flow3dEdgeCtrl = nullptr;       // explicit edge length (mm), "auto" = from the wall
+    RoundedButton* m_flow3dExportMeshBtn = nullptr;
+
+    // Sim Viewer "3D mesh" section-plane controls (in the results bar, shown
+    // with that view only).
+    wxPanel*    m_sectionGroup = nullptr;
+    wxChoice*   m_sectionAxisChoice = nullptr;    // Off / X / Y / Z
+    wxSlider*   m_sectionSlider = nullptr;        // plane position, 0..1000 of the mesh extent
+    wxCheckBox* m_sectionFlipCheck = nullptr;     // keep the other side
+    wxChoice*   m_meshColourChoice = nullptr;     // Mesh / Quality (min dihedral) / Boundary
+    bool        m_volumeRedrawPending = false;
+    int         m_lastOverlayMode = -1;            // Sim Viewer mode last drawn
+
+    // The last volume (tet) mesh, from the 3D Flow Analysis card (or the
+    // Developer menu's test): the mesh, its stats, per-tet quality and face
+    // adjacency (for the section view), and how it was made.
+    struct VolumeMesh
+    {
+        TetMesh::Mesh        mesh;
+        TetMesh::Stats       stats;
+        std::vector<float>   minDihedral;   // per tet (deg)
+        std::vector<int32_t> neighbours;    // 4 per tet, -1 = boundary
+        double bbMin[3] = { 0, 0, 0 }, bbMax[3] = { 0, 0, 0 };
+        bool   fullShot = false;
+        double edgeMm = 0.0, epsMm = 0.0, wallMm = 0.0;
+        double sourceVolMm3 = 0.0;
+        size_t surfaceTris = 0;
+        double meshSeconds = 0.0, wallSeconds = 0.0;
+        wxString sizeNote;                   // how the element size was chosen, when unusual
+        Flow3D::Boundary boundary;           // boundary-face tags (TagVolumeBoundary)
+        bool ready() const { return !mesh.Empty() && neighbours.size() == 4 * mesh.TetCount(); }
+    };
+    VolumeMesh m_volMesh;
+    double     m_thinWallMm[2] = { -1.0, -1.0 };   // [cavity, shot]; -1 = not measured yet
+
+    // The last 3D fill on m_volMesh (cleared with it), a serial for its
+    // timeline, and the fixed legend range of its pressure view (MPa).
+    Flow3D::FillResult m_fill3d;
+    bool               m_hasFill3d = false;
+    long               m_fill3dSerial = 0;
+    float              m_fill3dPressMax = 1.0f;
+    float              m_fill3dTempLo = 0.0f, m_fill3dTempHi = 1.0f;   // melt temperature views (degC)
+    double             m_fill3dMouldC = 0.0;       // for the report
+    wxString           m_fill3dMaterial;          // for the report
+    double             m_fill3dMeltC = 0.0, m_fill3dTargetS = 0.0, m_fill3dLimitMPa = 0.0;
+    double             m_fill3dMaxShear = 1.0e5;  // the material's shear-rate guideline [1/s]
+    double             m_fill3dPartEjectS = -1.0; // packed: the parts' own ejection time (full shot: without the feed)
 
     // Each results card's report, its "Details" / "Export" buttons and its
     // (modeless, reused) details window, created on first use.
     ResultsDetails::Report m_reports[CardCount];
-    RoundedButton*         m_detailsBtn[CardCount] = { nullptr, nullptr, nullptr };
-    RoundedButton*         m_exportBtn[CardCount] = { nullptr, nullptr, nullptr };
-    ResultsDetailsDialog*  m_detailsDlg[CardCount] = { nullptr, nullptr, nullptr };
+    RoundedButton*         m_detailsBtn[CardCount] = {};
+    RoundedButton*         m_exportBtn[CardCount] = {};
+    ResultsDetailsDialog*  m_detailsDlg[CardCount] = {};
 
     // Debug view controls + whether the separation run has produced an
     // interference solid to show (m_hasSepOverlay gates the separation toggle).

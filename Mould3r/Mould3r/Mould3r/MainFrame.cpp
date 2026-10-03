@@ -557,6 +557,7 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
     Bind(wxEVT_MENU, &MainFrame::OnMaterialAdd, this, ID_MaterialAddMould);
     Bind(wxEVT_MENU, &MainFrame::OnMaterialOpenFolder, this, ID_MaterialOpenFolder);
     Bind(wxEVT_MENU, &MainFrame::OnMaterialReload, this, ID_MaterialReload);
+    Bind(wxEVT_MENU, &MainFrame::OnDevTetMeshTest, this, ID_DevTetMeshTest);
 
     // Mesh quality radio items just persist the chosen preset; the next
     // import picks it up via MeshImportSettings::GetQuality().
@@ -1199,6 +1200,11 @@ void MainFrame::OnMaterialAdd(wxCommandEvent& e)
         e.GetId() == ID_MaterialAddMould ? MaterialKind::Mould : MaterialKind::Injection);
 }
 
+void MainFrame::OnDevTetMeshTest(wxCommandEvent&)
+{
+    if (m_previewPanel) m_previewPanel->RunTetMeshTest();
+}
+
 void MainFrame::OnMaterialOpenFolder(wxCommandEvent&)
 {
     std::string err;
@@ -1238,8 +1244,14 @@ wxMenuBar* MainFrame::BuildPreviewMenuBar()
     auto* fileMenu = new wxMenu();
     fileMenu->Append(wxID_EXIT, "Exit\tAlt+F4");
 
+    // Developer tools for work in progress (3D mesher bring-up).
+    auto* devMenu = new wxMenu();
+    devMenu->Append(ID_DevTetMeshTest, "3D Mesh Test (fTetWild)...",
+                    "Tet-mesh the current shot in the worker process and report count, volume and quality");
+
     auto* menuBar = new wxMenuBar();
     menuBar->Append(fileMenu, "&File");
+    menuBar->Append(devMenu, "&Developer");
     menuBar->Append(BuildMaterialsMenu(), "&Materials");
     menuBar->Append(BuildHelpMenu(), "&Help");
     return menuBar;

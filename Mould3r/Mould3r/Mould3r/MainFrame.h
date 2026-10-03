@@ -299,6 +299,8 @@ private:
     void OnMaterialAdd(wxCommandEvent&);
     void OnMaterialOpenFolder(wxCommandEvent&);
     void OnMaterialReload(wxCommandEvent&);
+    // Developer menu (Preview bar): 3D mesher test harness.
+    void OnDevTetMeshTest(wxCommandEvent&);
     void OnCheckForUpdates(wxCommandEvent&);
     void OnToggleAutoUpdateCheck(wxCommandEvent&);
     void OnPartingNearlyOrphan(wxCommandEvent&);
@@ -699,6 +701,7 @@ private:
         ID_MaterialAddInjection,
         ID_MaterialAddMould,
         ID_MaterialOpenFolder,
-        ID_MaterialReload
+        ID_MaterialReload,
+        ID_DevTetMeshTest
     };
 };

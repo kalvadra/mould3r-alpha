@@ -77,7 +77,7 @@ void PreviewPanel::SetResultsReport(int card, const ResultsDetails::Report& repo
 
 void PreviewPanel::ClearResultsReports()
 {
-    static const char* names[CardCount] = { "Draft Angle Checks", "Separation Test", "Flow Analysis" };
+    static const char* names[CardCount] = { "Draft Angle Checks", "Separation Test", "Flow Analysis", "3D Flow Analysis" };
     for (int c = 0; c < CardCount; ++c)
     {
         RD::Report r;
