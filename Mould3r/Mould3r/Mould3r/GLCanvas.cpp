@@ -1805,7 +1805,7 @@ bool GLCanvas::PickActivateInjectionPoint(int mouseX, int mouseY)
     // injection: a procedural (perimeter-only) fixture has no fixed markers, and
     // the perimeter branch below is the entire point. Only give up when there's
     // nothing at all to hit — no markers and no perimeter injection.
-    if (m_injectionPoints.empty() && !m_allowPerimeterInjection) return false;
+    if (m_injectionPoints.empty() && !m_allowPerimeterInjection && !AllowsTopInjection()) return false;
 
     glm::vec3 rayOrig, rayDir;
     BuildMouseRay(mouseX, mouseY, rayOrig, rayDir);
@@ -1826,8 +1826,44 @@ bool GLCanvas::PickActivateInjectionPoint(int mouseX, int mouseY)
         if (d < bestDist) { bestDist = d; bestIdx = i; }
     }
 
+    // Top-centre point (Top Plane = Centre): a marker like the fixed ones.
+    if (m_topInjection == TopInjection::Centre && m_hasFixtureTopY)
+    {
+        const glm::vec3 centre(0.0f, m_fixtureTopY, 0.0f);
+        if (PointRayDistance(centre, rayOrig, rayDir) < bestDist)
+        {
+            const InjectionPoint ip = MakeTopPlaneInjectionPoint(glm::vec2(0.0f), "Top Centre");
+            SetActiveInjectionPoint(ip);
+            if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+                frame->OnInjectionPointSelected(ip);
+            PlaceSprue();
+            return true;
+        }
+    }
+
     if (bestIdx < 0)
     {
+        // Top Plane = Anywhere: a click that lands on the top face (inside the
+        // fixture outline, seen from above) places a top-plane point there.
+        // Asked before the perimeter: the top face is in front of the parting
+        // line when you look down on it, and a click on a side face misses the
+        // top's outline, so the two don't compete. Ctrl = grid snap.
+        if (m_topInjection == TopInjection::Anywhere && m_hasFixtureTopY)
+        {
+            glm::vec2 xz;
+            if (RayCastToTopPlane(mouseX, mouseY, xz) && InsideFixturePerimeter(xz))
+            {
+                if (wxGetKeyState(WXK_CONTROL))
+                    xz = ClampToFixturePerimeter(SnapToGrid(xz));
+                const InjectionPoint ip = MakeTopPlaneInjectionPoint(xz, "Top Plane");
+                SetActiveInjectionPoint(ip);
+                if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+                    frame->OnInjectionPointSelected(ip);
+                PlaceSprue();
+                return true;
+            }
+        }
+
         // No fixed marker hit. If the fixture permits perimeter injection, let
         // the click land anywhere on the perimeter: snap the cursor's parting-
         // plane hit onto the perimeter polygon and, if reasonably close, place
@@ -2306,6 +2342,65 @@ glm::vec2 GLCanvas::InwardPerimeterNormal(const glm::vec2& ptXZ) const
 }
 
 // ---------------------------------------------------------------------------
+// Top-plane injection helpers
+// ---------------------------------------------------------------------------
+bool GLCanvas::InsideFixturePerimeter(const glm::vec2& xz) const
+{
+    // The perimeter is a convex hull: inside when the point is on the same
+    // side of every edge (either winding).
+    const int n = (int)m_fixturePerimeter.size();
+    if (n < 3) return false;
+    bool anyPos = false, anyNeg = false;
+    for (int i = 0; i < n; ++i)
+    {
+        const glm::vec2& A = m_fixturePerimeter[i];
+        const glm::vec2& B = m_fixturePerimeter[(i + 1) % n];
+        const float cross = (B.x - A.x) * (xz.y - A.y) - (B.y - A.y) * (xz.x - A.x);
+        if (cross > 1e-6f) anyPos = true;
+        else if (cross < -1e-6f) anyNeg = true;
+        if (anyPos && anyNeg) return false;
+    }
+    return true;
+}
+
+glm::vec2 GLCanvas::ClampToFixturePerimeter(const glm::vec2& xz) const
+{
+    if (m_fixturePerimeter.size() < 3 || InsideFixturePerimeter(xz)) return xz;
+    const glm::vec3 p = SnapToFixturePerimeter(glm::vec3(xz.x, 0.0f, xz.y));
+    return glm::vec2(p.x, p.z);
+}
+
+InjectionPoint GLCanvas::MakeTopPlaneInjectionPoint(const glm::vec2& xz, const char* label) const
+{
+    // Stored fixture-local like every injection point (PlaceSprue re-applies
+    // the fixture matrix), so worldPos round-trips onto the top plane.
+    const glm::vec3 local = WorldToFixtureLocal(glm::vec3(xz.x, m_fixtureTopY, xz.y));
+    InjectionPoint ip;
+    ip.label = label ? label : "";
+    ip.x = local.x;
+    ip.y = local.y;
+    ip.z = local.z;
+    ip.type = InjectionType::Axial;   // straight down, whatever the local y reads
+    ip.topPlane = true;
+    return ip;
+}
+
+bool GLCanvas::RayCastToTopPlane(int mouseX, int mouseY, glm::vec2& outXZ)
+{
+    if (!m_hasFixtureTopY) return false;
+    glm::vec3 rayOrig, rayDir;
+    BuildMouseRay(mouseX, mouseY, rayOrig, rayDir);
+    // Only from above: looking up at the top from below would pick it
+    // through the fixture.
+    if (rayOrig.y <= m_fixtureTopY || rayDir.y > -1e-6f) return false;
+    const float t = (m_fixtureTopY - rayOrig.y) / rayDir.y;
+    if (t <= 0.0f) return false;
+    const glm::vec3 p = rayOrig + rayDir * t;
+    outXZ = glm::vec2(p.x, p.z);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // MoveSprueInjectionPoint — drag a PERIMETER injection point along the fixture
 // perimeter (snapping to it) and re-place the sprue from the new location. The
 // endpoint auto-derives radially, so no endpoint override is used. No-op unless
@@ -2316,6 +2411,24 @@ glm::vec2 GLCanvas::InwardPerimeterNormal(const glm::vec2& ptXZ) const
 void GLCanvas::MoveSprueInjectionPoint(int mouseX, int mouseY)
 {
     if (m_transformMode != TransformMode::EditSprue) return;
+
+    // Top-plane point: slide it over the top, kept inside the fixture outline.
+    if (CanMoveTopInjection())
+    {
+        glm::vec2 xz;
+        if (!RayCastToTopPlane(mouseX, mouseY, xz)) return;
+        if (wxGetKeyState(WXK_CONTROL))   // grid snap (read live: runs in the paint pass)
+            xz = SnapToGrid(xz);
+        xz = ClampToFixturePerimeter(xz);
+
+        const InjectionPoint moved = MakeTopPlaneInjectionPoint(xz, "");
+        m_activeInjectionPoint.x = moved.x;   // label / flags stay
+        m_activeInjectionPoint.y = moved.y;
+        m_activeInjectionPoint.z = moved.z;
+        PlaceSprue();   // the axial sprue re-casts straight down from the new point
+        return;
+    }
+
     if (!IsActivePerimeterInjection()) return;
 
     glm::vec3 plane;
@@ -7888,7 +8001,7 @@ void GLCanvas::ClearIndexers()
 // ---------------------------------------------------------------------------
 void GLCanvas::ClearInserts()
 {
-    for (auto& in : m_inserts) in.Destroy();
+    for (auto& in : m_inserts) RetireBody(std::move(in.body));   // parked for undo
     m_inserts.clear();
     Refresh(false);
     NotifySceneMutated();
@@ -8211,7 +8324,7 @@ void GLCanvas::RemoveInsertAtMouse(int mouseX, int mouseY)
     const int bestIdx = PickInsertAtMouse(mouseX, mouseY);
     if (bestIdx < 0) return;
 
-    m_inserts[bestIdx].Destroy();
+    RetireBody(std::move(m_inserts[bestIdx].body));   // parked for undo
     m_inserts.erase(m_inserts.begin() + bestIdx);
 
     // Removing an insert may have dropped the last mesh body (downward-only,
@@ -8358,6 +8471,24 @@ static std::vector<glm::vec2> ConvexHull(std::vector<glm::vec2> pts)
 void GLCanvas::BuildFixturePerimeter()
 {
     m_fixturePerimeter.clear();
+
+    // Top plane for top-plane injection: the highest world y over the fixture
+    // halves (their top face for a box). Only the y row of each matrix is
+    // needed.
+    m_hasFixtureTopY = false;
+    m_fixtureTopY = 0.0f;
+    for (const auto& fix : m_fixtures)
+    {
+        const glm::mat4 m = fix.BuildModelMatrix();
+        for (size_t i = 0; i + 2 < fix.cpuVerts.size(); i += 3)
+        {
+            const float y = m[0][1] * fix.cpuVerts[i] + m[1][1] * fix.cpuVerts[i + 1] +
+                            m[2][1] * fix.cpuVerts[i + 2] + m[3][1];
+            if (!m_hasFixtureTopY || y > m_fixtureTopY) { m_fixtureTopY = y; m_hasFixtureTopY = true; }
+        }
+    }
+    if (m_hasFixtureTopY && m_fixtureTopY <= 1.0e-4f)
+        m_hasFixtureTopY = false;   // nothing above the parting plane: no top to inject into
 
     // Half-thickness of the virtual parting band (world units).
     // Triangles whose Y extent overlaps [-kBand, +kBand] contribute points.
@@ -10296,6 +10427,7 @@ void GLCanvas::InitGLOnce()
 
 void GLCanvas::DestroyGL()
 {
+    DestroyBodyStore();
     for (auto& obj : m_fixtures) obj.mesh.Destroy();
     m_fixtures.clear();
     for (auto& obj : m_objects)  obj.mesh.Destroy();
@@ -11246,6 +11378,69 @@ void GLCanvas::RebuildDynamicFixture()
     if (m_rebuildingDynamicFixture) return;
     m_rebuildingDynamicFixture = true;
 
+    RefitDynamicFixtureBox();
+
+    // Keep the active perimeter injection point on the resized edge: re-project
+    // it along its direction from the origin onto the new perimeter, then
+    // re-place the sprue so it follows. Updated in place (NOT via
+    // SetActiveInjectionPoint, which would clear the placed sprue). A fixed
+    // (non-perimeter) point is left alone.
+    if (m_hasActiveInjectionPoint && m_activeInjectionPoint.perimeter &&
+        m_fixturePerimeter.size() >= 3)
+    {
+        const glm::vec2 dir(m_activeInjectionPoint.x, m_activeInjectionPoint.z);
+        const glm::vec3 world = PerimeterPointInDirection(dir);
+        const glm::vec3 local = WorldToFixtureLocal(world);
+        // Write the point back only when the edge actually moved. The
+        // projection isn't bit-stable (re-projecting a point already on the
+        // edge can shift it by an ulp), so an unconditional write-back made
+        // every scene change nudge the injection point — which undo history
+        // would then record as a step of its own.
+        const float kSamePointMm = 1.0e-4f;
+        const glm::vec3 cur(m_activeInjectionPoint.x, m_activeInjectionPoint.y, m_activeInjectionPoint.z);
+        if (glm::length(local - cur) > kSamePointMm)
+        {
+            m_activeInjectionPoint.x = local.x;
+            m_activeInjectionPoint.y = local.y;
+            m_activeInjectionPoint.z = local.z;
+        }
+        if (m_sprue.hasPoint)
+            PlaceSprue();   // rebuild the sprue against the refit fixture (as before)
+    }
+    else if (m_hasActiveInjectionPoint && m_activeInjectionPoint.topPlane && m_hasFixtureTopY)
+    {
+        // A top-plane point rides the box top up / down as the box refits,
+        // keeping its XZ (pulled inside the outline if the box shrank past it).
+        glm::mat4 fixtureMatrix(1.0f);
+        if (!m_fixtures.empty()) fixtureMatrix = m_fixtures[0].BuildModelMatrix();
+        const glm::vec3 world = glm::vec3(fixtureMatrix * glm::vec4(
+            m_activeInjectionPoint.x, m_activeInjectionPoint.y, m_activeInjectionPoint.z, 1.0f));
+        const glm::vec2 xz = ClampToFixturePerimeter(glm::vec2(world.x, world.z));
+        const InjectionPoint moved = MakeTopPlaneInjectionPoint(xz, "");
+        const glm::vec3 cur(m_activeInjectionPoint.x, m_activeInjectionPoint.y, m_activeInjectionPoint.z);
+        if (glm::length(glm::vec3(moved.x, moved.y, moved.z) - cur) > 1.0e-4f)
+        {
+            m_activeInjectionPoint.x = moved.x;
+            m_activeInjectionPoint.y = moved.y;
+            m_activeInjectionPoint.z = moved.z;
+        }
+        if (m_sprue.hasPoint)
+            PlaceSprue();
+    }
+
+    m_rebuildingDynamicFixture = false;
+    Refresh(false);
+}
+
+// RefitDynamicFixtureBox — the box half of RebuildDynamicFixture: resize the two
+// halves to the scene envelope + clearance and rebuild the perimeter, leaving
+// the injection point and sprue alone. Undo uses it on its own, since a
+// restored injection point / sprue were already consistent with the refit
+// box when they were recorded. Caller checks the fixture is Dynamic.
+void GLCanvas::RefitDynamicFixtureBox()
+{
+    if (m_fixtureKind != FixtureKind::Dynamic || m_fixtures.size() != 2) return;
+
     SetCurrent(*m_context);
     InitGLOnce();
 
@@ -11261,27 +11456,6 @@ void GLCanvas::RebuildDynamicFixture()
     UpdateBoxHalf(m_fixtures[1], botMin, botMax);
 
     BuildFixturePerimeter();
-
-    // Keep the active perimeter injection point on the resized edge: re-project
-    // it along its direction from the origin onto the new perimeter, then
-    // re-place the sprue so it follows. Updated in place (NOT via
-    // SetActiveInjectionPoint, which would clear the placed sprue). A fixed
-    // (non-perimeter) point is left alone.
-    if (m_hasActiveInjectionPoint && m_activeInjectionPoint.perimeter &&
-        m_fixturePerimeter.size() >= 3)
-    {
-        const glm::vec2 dir(m_activeInjectionPoint.x, m_activeInjectionPoint.z);
-        const glm::vec3 world = PerimeterPointInDirection(dir);
-        const glm::vec3 local = WorldToFixtureLocal(world);
-        m_activeInjectionPoint.x = local.x;
-        m_activeInjectionPoint.y = local.y;
-        m_activeInjectionPoint.z = local.z;
-        if (m_sprue.hasPoint)
-            PlaceSprue();   // rebuild the sprue from the moved injection point
-    }
-
-    m_rebuildingDynamicFixture = false;
-    Refresh(false);
 }
 
 // PerimeterPointInDirection — project a ray from the origin along dirXZ onto the
@@ -12469,10 +12643,12 @@ void GLCanvas::OnPaint(wxPaintEvent&)
     //     injection point, dragged along the perimeter. Fixed radial points
     //     have a static start, so they get no injection handle.
     // Each brightens while actively grabbed.
+    //   * a top-plane point the fixture lets move gets the injection handle
+    //     only (at pathStart, on the top) — axial endpoints never move.
     if (m_program && m_sphereVAO && m_sphereIndexCount > 0 &&
         m_transformMode == TransformMode::EditSprue &&
         m_sprueEditTool == SprueEditTool::Move &&
-        IsActiveSprueRadial() && m_sprue.hasPoint)
+        CanMoveSprue())
     {
         glEnable(GL_DEPTH_TEST);
         glUseProgram(m_program);
@@ -12499,12 +12675,13 @@ void GLCanvas::OnPaint(wxPaintEvent&)
             glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
         };
 
-        // Endpoint handle (orange) — always.
-        drawHandle(m_sprue.pathEnd, m_sprueEndpointGrabbed
-            ? glm::vec3(1.00f, 0.75f, 0.20f) : glm::vec3(1.00f, 0.55f, 0.05f));
+        // Endpoint handle (orange) — radial sprues.
+        if (IsActiveSprueRadial())
+            drawHandle(m_sprue.pathEnd, m_sprueEndpointGrabbed
+                ? glm::vec3(1.00f, 0.75f, 0.20f) : glm::vec3(1.00f, 0.55f, 0.05f));
 
-        // Injection handle (teal) — perimeter points only.
-        if (IsActivePerimeterInjection())
+        // Injection handle (teal) — perimeter and movable top-plane points.
+        if (IsActivePerimeterInjection() || CanMoveTopInjection())
             drawHandle(m_sprue.pathStart, m_sprueInjectionGrabbed
                 ? glm::vec3(0.30f, 1.00f, 1.00f) : glm::vec3(0.10f, 0.80f, 0.80f));
 
@@ -12519,7 +12696,8 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         (m_transformMode == TransformMode::SelectInjectionPoint ||
          (m_transformMode == TransformMode::EditSprue &&
           m_sprueEditTool == SprueEditTool::SelectInjectionPoint)) &&
-        !m_injectionPoints.empty())
+        (!m_injectionPoints.empty() ||
+         (m_topInjection == TopInjection::Centre && m_hasFixtureTopY)))
     {
         glEnable(GL_DEPTH_TEST);
         glUseProgram(m_program);
@@ -12546,6 +12724,14 @@ void GLCanvas::OnPaint(wxPaintEvent&)
             glm::vec3 worldPos = glm::vec3(fixtureMatrix *
                 glm::vec4(ip.x, ip.y, ip.z, 1.0f));
             glm::mat4 model = glm::translate(glm::mat4(1.0f), worldPos);
+            model = glm::scale(model, glm::vec3(kVentMarkerRadius * 0.9f));
+            glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &model[0][0]);
+            glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
+        }
+        // Top-centre point (Top Plane = Centre), at world (0, top, 0).
+        if (m_topInjection == TopInjection::Centre && m_hasFixtureTopY)
+        {
+            glm::mat4 model = glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, m_fixtureTopY, 0.0f));
             model = glm::scale(model, glm::vec3(kVentMarkerRadius * 0.9f));
             glUniformMatrix4fv(glGetUniformLocation(m_program, "uModel"), 1, GL_FALSE, &model[0][0]);
             glDrawElements(GL_TRIANGLES, m_sphereIndexCount, GL_UNSIGNED_INT, 0);
@@ -12596,6 +12782,45 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         glBindVertexArray(0);
         glLineWidth(1.0f);
         glEnable(GL_DEPTH_TEST);   // restore for the passes that follow
+        glUseProgram(0);
+    }
+
+    // ---- Top-plane injection highlight (purple outline on the top) ---------
+    // Top Plane = Anywhere: outline the fixture at the top-plane height during
+    // Select Injection Point, so the whole top reads as a clickable target.
+    // Same buffer as the perimeter loop (re-uploaded), same overlay drawing.
+    if (m_flatProgram && m_perimeterVAO &&
+        m_topInjection == TopInjection::Anywhere && m_hasFixtureTopY &&
+        m_fixturePerimeter.size() >= 3 &&
+        (m_transformMode == TransformMode::SelectInjectionPoint ||
+         (m_transformMode == TransformMode::EditSprue &&
+          m_sprueEditTool == SprueEditTool::SelectInjectionPoint)))
+    {
+        std::vector<float> verts;
+        verts.reserve(m_fixturePerimeter.size() * 3);
+        for (const glm::vec2& p : m_fixturePerimeter)
+        {
+            verts.push_back(p.x);
+            verts.push_back(m_fixtureTopY);
+            verts.push_back(p.y);
+        }
+
+        glBindVertexArray(m_perimeterVAO);
+        glBindBuffer(GL_ARRAY_BUFFER, m_perimeterVBO);
+        glBufferData(GL_ARRAY_BUFFER, verts.size() * sizeof(float),
+            verts.data(), GL_DYNAMIC_DRAW);
+
+        glDisable(GL_DEPTH_TEST);
+        glLineWidth(3.0f);
+        glUseProgram(m_flatProgram);
+        const glm::mat4 VP = proj * view;
+        glUniformMatrix4fv(m_flat_uVP, 1, GL_FALSE, &VP[0][0]);
+        const glm::vec4 topColor(0.65f, 0.10f, 0.90f, 1.0f);   // purple, as the markers
+        glUniform4fv(m_flat_uColor, 1, &topColor[0]);
+        glDrawArrays(GL_LINE_LOOP, 0, (GLsizei)m_fixturePerimeter.size());
+        glBindVertexArray(0);
+        glLineWidth(1.0f);
+        glEnable(GL_DEPTH_TEST);
         glUseProgram(0);
     }
     if (m_flatProgram && m_sprue.pathVAO && m_sprue.pathVertexCount > 0)
@@ -13818,17 +14043,21 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
                 //                      point in space and must stay put).
                 // Axial sprues have no movable handle. When both are in range,
                 // grab whichever is nearer to the ray.
+                // A top-plane point (fixture allows anywhere on top) has the
+                // injection handle only: an axial endpoint never moves.
                 m_sprueEndpointGrabbed = false;
                 m_sprueInjectionGrabbed = false;
-                if (IsActiveSprueRadial() && m_sprue.hasPoint)
+                if (CanMoveSprue())
                 {
                     glm::vec3 rayOrig, rayDir;
                     BuildMouseRay(p.x, p.y, rayOrig, rayDir);
                     const float hitRadius = kVentMarkerRadius * 2.5f;
 
-                    const float dEnd = PointRayDistance(m_sprue.pathEnd, rayOrig, rayDir);
+                    float dEnd = std::numeric_limits<float>::max();
+                    if (IsActiveSprueRadial())
+                        dEnd = PointRayDistance(m_sprue.pathEnd, rayOrig, rayDir);
                     float dInj = std::numeric_limits<float>::max();
-                    if (IsActivePerimeterInjection())
+                    if (IsActivePerimeterInjection() || CanMoveTopInjection())
                         dInj = PointRayDistance(m_sprue.pathStart, rayOrig, rayDir);
 
                     if (dInj < hitRadius && dInj <= dEnd)
@@ -14675,17 +14904,19 @@ void GLCanvas::OnKeyDown(wxKeyEvent& evt)
             // Inserts follow the same rule: an insert exists only relative to
             // its parent, so deleting the parent deletes the insert. There is
             // no unparented fallback to demote it to.
-            m_inserts.erase(std::remove_if(m_inserts.begin(), m_inserts.end(),
-                [idx](InsertFeature& in) {
-                if (in.parentIndex == idx) { in.Destroy(); return true; }
-                return false;
-            }), m_inserts.end());
+            // The bodies are parked for undo (RetireBody), not freed.
+            for (int k = (int)m_inserts.size() - 1; k >= 0; --k)
+            {
+                if (m_inserts[k].parentIndex != idx) continue;
+                RetireBody(std::move(m_inserts[k].body));
+                m_inserts.erase(m_inserts.begin() + k);
+            }
             for (auto& vi : m_vents) if (vi.parentIndex > idx) --vi.parentIndex;
             for (auto& gf : m_gates) if (gf.parentIndex > idx) --gf.parentIndex;
             for (auto& in : m_inserts) if (in.parentIndex > idx) --in.parentIndex;
             NotifyInsertsChanged();   // close the Edit dialog if its insert was parent-deleted
 
-            m_objects[idx].mesh.Destroy();
+            RetireBody(std::move(m_objects[idx]));   // parked for undo
             m_objects.erase(m_objects.begin() + idx);
         }
         // Deleting an object (and any child inserts) may have removed the last
@@ -15009,7 +15240,7 @@ void GLCanvas::ClearFixtures()
 {
     SetCurrent(*m_context);
     for (auto& fix : m_fixtures)
-        fix.mesh.Destroy();
+        RetireBody(std::move(fix));   // parked so a fixture change can be undone
     m_fixtures.clear();
     m_fixtureKind = FixtureKind::Library;   // no procedural fixture active now
     m_fixturePerimeter.clear();
@@ -15024,6 +15255,10 @@ void GLCanvas::ClearFixtures()
 void GLCanvas::ClearAll()
 {
     SetCurrent(*m_context);
+
+    // A fresh project starts a fresh history (MainFrame resets it), so the
+    // bodies parked for undo can go.
+    DestroyBodyStore();
 
     // Fixtures
     for (auto& fix : m_fixtures) fix.mesh.Destroy();
@@ -15065,9 +15300,11 @@ void GLCanvas::ClearAll()
     m_inserts.clear();
     NotifyInsertsChanged();
 
-    // Sprue
+    // Sprue. Clear() frees the preview solids. The centreline / cross-section
+    // VAOs are NOT freed: InitGLOnce creates them once per canvas, so freeing
+    // them here (as DestroyGL does) left a sprue placed after New / Open
+    // Project with no centreline or cross-section circle.
     m_sprue.Clear();
-    m_sprue.DestroyGL();
     m_hasActiveInjectionPoint = false;
     m_injectionPoints.clear();
 
@@ -15165,13 +15402,24 @@ void GLCanvas::RestoreSprue(const ProjectSprueData& data)
     m_sprue.draftAngleDeg = data.draftAngleDeg;
     m_sprue.coldSlugDepth = data.coldSlugDepth;
 
-    // Build the swept cylinder preview mesh
+    RebuildSprueSolids();
+}
+
+// RebuildSprueSolids — the sprue cone and its cold-slug well, built from the
+// stored pathStart / pathEnd (same construction as PlaceSprue) without
+// re-deriving the path. Frees whatever solids were there; builds nothing for
+// an unplaced sprue.
+void GLCanvas::RebuildSprueSolids()
+{
     m_sprue.solid.Destroy();
+    m_sprue.coldSlugSolid.Destroy();
+    if (!m_sprue.hasPoint) return;
+
+    // Build the swept cylinder preview mesh
     m_sprue.solid = BuildCylinderMesh(m_sprue.pathStart, m_sprue.pathEnd,
         m_sprue.radius, m_sprue.draftAngleDeg);
 
     // Build cold slug well (same logic as PlaceSprue)
-    m_sprue.coldSlugSolid.Destroy();
     if (!m_sprue.isDirectInjection && m_sprue.coldSlugDepth > 1e-6f)
     {
         const glm::vec3 sprueDir = glm::normalize(m_sprue.pathEnd - m_sprue.pathStart);
@@ -15554,6 +15802,360 @@ void GLCanvas::RebuildAllFeatures()
     RebuildIndexerSolids();
     for (auto& in : m_inserts) ReanchorInsert(in);
     Refresh(false);
+}
+
+// ===========================================================================
+// Undo / redo — scene capture and restore (see SceneHistory.h)
+//
+// A capture copies the authored scene; bodies (fixture halves, objects, insert
+// bodies) are referred to by uid, never copied. A restore matches each body by
+// uid against the live scene first and the body store second, copies the
+// features back, then rebuilds every derived thing — fixture perimeter,
+// Dynamic refit, preview solids, path / cross-section VBOs, insert transforms —
+// through the same rebuild functions a project load uses.
+// ===========================================================================
+
+void GLCanvas::EnsureBodyUids()
+{
+    std::unordered_set<uint64_t> seen;
+    auto ensure = [&](SceneObject& o) {
+        // 0 = never captured; a uid already seen (or parked in the store)
+        // means this body is a copy of another one — give it its own identity.
+        if (o.uid == 0 || seen.count(o.uid) || m_bodyStore.count(o.uid))
+            o.uid = ++m_nextBodyUid;
+        seen.insert(o.uid);
+    };
+    for (SceneObject& f : m_fixtures) ensure(f);
+    for (SceneObject& o : m_objects) ensure(o);
+    for (InsertFeature& in : m_inserts) ensure(in.body);
+}
+
+void GLCanvas::RetireBody(SceneObject&& body)
+{
+    const uint64_t uid = body.uid;
+    if (uid != 0)
+    {
+        // try_emplace leaves `body` untouched when the uid is already parked.
+        if (m_bodyStore.try_emplace(uid, std::move(body)).second)
+        {
+            // The store owns the GPU mesh now; make sure the moved-from shell
+            // can never free it.
+            body.mesh = GPUMesh{};
+            return;
+        }
+    }
+    body.mesh.Destroy();
+}
+
+void GLCanvas::DestroyBodyStore()
+{
+    // Callers make the GL context current (ClearAll, DestroyGL).
+    for (auto& kv : m_bodyStore) kv.second.mesh.Destroy();
+    m_bodyStore.clear();
+}
+
+void GLCanvas::PruneBodyStore(const std::unordered_set<uint64_t>& keep)
+{
+    bool contextSet = false;
+    for (auto it = m_bodyStore.begin(); it != m_bodyStore.end();)
+    {
+        if (keep.count(it->first)) { ++it; continue; }
+        if (!contextSet && m_context) { SetCurrent(*m_context); contextSet = true; }
+        it->second.mesh.Destroy();
+        it = m_bodyStore.erase(it);
+    }
+}
+
+void GLCanvas::RebuildVentSolid(VentInstance& vi)
+{
+    vi.solid.Destroy();
+    if (!vi.path.valid) return;
+
+    // Width / depth from the card (as every vent rebuild does); the overruns
+    // are the ones stored on the path.
+    float ventLength = 5.0f, ventWidth = 2.0f, uiStart = 0.0f, uiEnd = 0.0f;
+    if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+        frame->GetVentDimensions(ventLength, ventWidth, uiStart, uiEnd);
+
+    vi.solid = BuildBoxSweepMesh(vi.path, ventWidth, ventLength,
+        vi.path.overrunStart, vi.path.overrunEnd);
+}
+
+History::SceneState GLCanvas::CaptureSceneState()
+{
+    EnsureBodyUids();
+
+    History::SceneState s;
+    auto ref = [](const SceneObject& o) {
+        History::BodyRef r;
+        r.uid = o.uid;
+        r.pos = o.pos;
+        r.yawDeg = o.yawDeg;
+        r.pitchDeg = o.pitchDeg;
+        r.rollDeg = o.rollDeg;
+        r.scale = o.scale;
+        r.mirrorX = o.mirrorX;
+        r.mirrorZ = o.mirrorZ;
+        return r;
+    };
+
+    // Fixture
+    s.fixtures.reserve(m_fixtures.size());
+    for (const SceneObject& f : m_fixtures) s.fixtures.push_back(ref(f));
+    s.fixtureKind = m_fixtureKind;
+    s.dynamicClearance = m_dynamicClearance;
+    s.injectionPoints = m_injectionPoints;
+    s.activeInjectionPoint = m_activeInjectionPoint;
+    s.hasActiveInjectionPoint = m_hasActiveInjectionPoint;
+    s.allowPerimeterInjection = m_allowPerimeterInjection;
+    s.topInjection = m_topInjection;
+
+    // Bodies
+    s.objects.reserve(m_objects.size());
+    for (const SceneObject& o : m_objects) s.objects.push_back(ref(o));
+    s.inserts.reserve(m_inserts.size());
+    for (const InsertFeature& in : m_inserts)
+    {
+        History::InsertRef r;
+        r.uid = in.body.uid;
+        r.parentIndex = in.parentIndex;
+        r.localOffset = in.localOffset;
+        r.localRotDeg = in.localRotDeg;
+        r.localScale = in.localScale;
+        r.id = in.id;
+        r.worldMatrix = in.worldMatrix;
+        s.inserts.push_back(r);
+    }
+
+    // Features, copied whole with their GPU handles zeroed.
+    s.sprue = m_sprue;          History::StripGL(s.sprue);
+    s.runners = m_runners;      for (auto& f : s.runners)  History::StripGL(f);
+    s.gates = m_gates;          for (auto& f : s.gates)    History::StripGL(f);
+    s.vents = m_vents;          for (auto& f : s.vents)    History::StripGL(f);
+    s.ejectors = m_ejectors;    for (auto& f : s.ejectors) History::StripGL(f);
+    s.indexers = m_indexers;    for (auto& f : s.indexers) History::StripGL(f);
+
+    s.selection = m_selectedIndices;
+    return s;
+}
+
+void GLCanvas::RestoreSceneState(const History::SceneState& s)
+{
+    SetCurrent(*m_context);
+    InitGLOnce();
+
+    // ---- Bodies -----------------------------------------------------------
+    // Pool every live body by uid, then rebuild the three lists in the
+    // snapshot's order from the pool (or the store, for a body that had been
+    // removed). Whatever is left in the pool was added after the snapshot:
+    // it is parked, so a redo can bring it back.
+    EnsureBodyUids();
+    std::unordered_map<uint64_t, SceneObject> pool;
+    auto toPool = [&](SceneObject&& o) {
+        const uint64_t uid = o.uid;
+        if (uid != 0 && pool.try_emplace(uid, std::move(o)).second)
+        {
+            o.mesh = GPUMesh{};   // the pool owns the GPU mesh now
+            return;
+        }
+        RetireBody(std::move(o));
+    };
+    for (SceneObject& f : m_fixtures) toPool(std::move(f));
+    m_fixtures.clear();
+    for (SceneObject& o : m_objects) toPool(std::move(o));
+    m_objects.clear();
+    for (InsertFeature& in : m_inserts) toPool(std::move(in.body));
+    m_inserts.clear();
+
+    int missing = 0;
+    auto take = [&](uint64_t uid, SceneObject& out) -> bool {
+        auto it = pool.find(uid);
+        if (it != pool.end())
+        {
+            out = std::move(it->second);
+            pool.erase(it);
+            return true;
+        }
+        auto jt = m_bodyStore.find(uid);
+        if (jt != m_bodyStore.end())
+        {
+            out = std::move(jt->second);
+            m_bodyStore.erase(jt);
+            return true;
+        }
+        ++missing;
+        return false;
+    };
+    auto pose = [](SceneObject& o, const History::BodyRef& r) {
+        o.pos = r.pos;
+        o.yawDeg = r.yawDeg;
+        o.pitchDeg = r.pitchDeg;
+        o.rollDeg = r.rollDeg;
+        o.scale = r.scale;
+        o.mirrorX = r.mirrorX;
+        o.mirrorZ = r.mirrorZ;
+    };
+
+    for (const History::BodyRef& r : s.fixtures)
+    {
+        SceneObject o;
+        if (!take(r.uid, o)) continue;
+        pose(o, r);
+        m_fixtures.push_back(std::move(o));
+    }
+    // objectIndex[i] = where snapshot object i landed (-1 if its body was
+    // missing — never expected, but parent indices must not silently shift
+    // onto a neighbour if it happens).
+    std::vector<int> objectIndex(s.objects.size(), -1);
+    for (size_t i = 0; i < s.objects.size(); ++i)
+    {
+        SceneObject o;
+        if (!take(s.objects[i].uid, o)) continue;
+        pose(o, s.objects[i]);
+        objectIndex[i] = (int)m_objects.size();
+        m_objects.push_back(std::move(o));
+    }
+    auto remap = [&](int oldIdx) {
+        return (oldIdx >= 0 && oldIdx < (int)objectIndex.size()) ? objectIndex[oldIdx] : -1;
+    };
+    for (const History::InsertRef& r : s.inserts)
+    {
+        const int parent = remap(r.parentIndex);
+        if (parent < 0) { ++missing; continue; }   // an insert needs its parent
+        InsertFeature in;
+        if (!take(r.uid, in.body)) continue;
+        in.parentIndex = parent;
+        in.localOffset = r.localOffset;
+        in.localRotDeg = r.localRotDeg;
+        in.localScale = r.localScale;
+        in.id = r.id;
+        in.worldMatrix = r.worldMatrix;
+        m_nextInsertId = std::max(m_nextInsertId, r.id + 1);   // ids are never reused
+        m_inserts.push_back(std::move(in));
+    }
+    for (auto& kv : pool) RetireBody(std::move(kv.second));
+    pool.clear();
+    if (missing > 0)
+    {
+        wxLogDebug("RestoreSceneState: %d body/bodies missing from the scene and the store", missing);
+        wxFAIL_MSG("Undo / redo: a recorded body was missing from the scene and the body store");
+    }
+
+    // ---- Fixture state ----------------------------------------------------
+    m_fixtureKind = s.fixtureKind;
+    m_dynamicClearance = s.dynamicClearance;
+    m_injectionPoints = s.injectionPoints;
+    m_activeInjectionPoint = s.activeInjectionPoint;
+    m_hasActiveInjectionPoint = s.hasActiveInjectionPoint;
+    m_allowPerimeterInjection = s.allowPerimeterInjection;
+    m_topInjection = s.topInjection;
+
+    // ---- Features ---------------------------------------------------------
+    // List lengths before the copy, so the edited feature is only kept when
+    // its list wasn't added to / removed from (otherwise the index could now
+    // name a different feature).
+    const size_t prevVents = m_vents.size(), prevRunners = m_runners.size(),
+                 prevGates = m_gates.size(), prevEjectors = m_ejectors.size(),
+                 prevIndexers = m_indexers.size();
+
+    // Free the live previews, then copy the snapshot back (its handles are
+    // zero; the rebuild below makes new ones).
+    for (auto& f : m_vents) f.Destroy();
+    m_vents = s.vents;
+    for (auto& f : m_vents) if (f.parentIndex >= 0) f.parentIndex = remap(f.parentIndex);
+    for (auto& f : m_runners) f.Destroy();
+    m_runners = s.runners;
+    for (auto& f : m_gates) f.Destroy();
+    m_gates = s.gates;
+    for (auto& f : m_gates) if (f.parentIndex >= 0) f.parentIndex = remap(f.parentIndex);
+    for (auto& f : m_ejectors) f.Destroy();
+    m_ejectors = s.ejectors;
+    for (auto& f : m_indexers) f.Destroy();
+    m_indexers = s.indexers;
+    {
+        // The sprue's centreline / cross-section VAOs belong to the canvas
+        // (created once in InitGLOnce) — keep them across the copy.
+        const GLuint pathVAO = m_sprue.pathVAO, pathVBO = m_sprue.pathVBO;
+        const GLuint xsecVAO = m_sprue.xsecVAO, xsecVBO = m_sprue.xsecVBO;
+        m_sprue.solid.Destroy();
+        m_sprue.coldSlugSolid.Destroy();
+        m_sprue = s.sprue;
+        m_sprue.pathVAO = pathVAO;
+        m_sprue.pathVBO = pathVBO;
+        m_sprue.xsecVAO = xsecVAO;
+        m_sprue.xsecVBO = xsecVBO;
+    }
+
+    // ---- Selection --------------------------------------------------------
+    m_selectedIndices.clear();
+    for (int sel : s.selection)
+    {
+        const int i = remap(sel);
+        if (i < 0) continue;
+        if (std::find(m_selectedIndices.begin(), m_selectedIndices.end(), i) != m_selectedIndices.end()) continue;
+        m_selectedIndices.push_back(i);
+    }
+
+    // ---- Derived state ----------------------------------------------------
+    RecomputeSceneMeshType(false);
+    BuildFixturePerimeter();
+    // A Dynamic fixture's halves are resized in place, so the parked / live
+    // body may hold a different size than at capture: refit the box around
+    // the restored scene. Box only — the restored injection point and sprue
+    // were recorded against this same refit, and re-placing the sprue would
+    // re-read the card (diameter, length...) instead of the recorded values.
+    // No-op for Library / Parametric fixtures.
+    RefitDynamicFixtureBox();
+    RebuildSprueSolids();
+    for (auto& vi : m_vents) RebuildVentSolid(vi);
+    RebuildAllFeatures();   // sprue / vent / runner / gate VBOs + solids, ejectors, indexers, inserts
+    RebuildGateLineVBO();
+
+    // ---- Tool state -------------------------------------------------------
+    // Stay in the active tool. Keep the edited feature if it still exists;
+    // drop node / handle grabs and Align hover state, which point at
+    // geometry that may have changed.
+    {
+        bool listChanged = false;
+        switch (m_transformMode)
+        {
+        case TransformMode::EditVent:    listChanged = m_vents.size() != prevVents;       break;
+        case TransformMode::EditRunner:  listChanged = m_runners.size() != prevRunners;   break;
+        case TransformMode::EditGate:    listChanged = m_gates.size() != prevGates;       break;
+        case TransformMode::EditEjector: listChanged = m_ejectors.size() != prevEjectors; break;
+        case TransformMode::EditIndexer: listChanged = m_indexers.size() != prevIndexers; break;
+        default: break;
+        }
+        if (listChanged)
+            m_editFeatureIndex = -1;
+    }
+    m_editNeedsUpdate = false;
+    m_editVentNode = -1;
+    m_editRunnerNode = -1;
+    m_editGateNode = -1;
+    m_editNodeGrabbed = false;
+    m_editHandleNode = -1;
+    m_pathNodeGhostActive = false;
+    m_sprueEndpointGrabbed = false;
+    m_sprueInjectionGrabbed = false;
+
+    m_alignHoverObject = -1;
+    m_alignSeedTri = -1;
+    m_alignFaceTris.clear();
+    m_alignHighlightVertexCount = 0;
+    m_midplaneFaceLocked = false;
+    m_midplaneFaceObject = -1;
+    m_midplaneFaceTris.clear();
+    m_midplaneLockedVertexCount = 0;
+    RebuildHandleLineVBO();
+
+    NotifyInsertsChanged();     // an Edit Insert dialog whose insert is gone closes
+    NotifyPathEditChanged();    // path / sprue edit toolbars re-read the scene
+    Refresh(false);
+    // Mark a generated mould stale. The observer directly, not
+    // NotifySceneMutated: that would run the full Dynamic refit again, whose
+    // re-projection re-places the sprue from the card.
+    if (m_onSceneMutated) m_onSceneMutated();
 }
 
 // ===========================================================================

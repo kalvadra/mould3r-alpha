@@ -114,6 +114,8 @@ bool ProjectFile::Save(const std::string& path,
         file << "fixture_clearance_y = " << data.fixtureDynamic.clearanceY << "\n";
         file << "fixture_clearance_z = " << data.fixtureDynamic.clearanceZ << "\n";
     }
+    if (data.fixtureKind != FixtureKind::Library && data.fixtureTopInjection != TopInjection::Off)
+        file << "fixture_top_injection = " << TopInjectionKey(data.fixtureTopInjection) << "\n";
     else if (!data.fixturePath.empty())
     {
         file << "fixture = " << MakeRelative(data.fixturePath, baseDir) << "\n";
@@ -191,6 +193,8 @@ bool ProjectFile::Save(const std::string& path,
         file << "ipZ     = " << sp.injectionPoint.z << "\n";
         if (sp.injectionPoint.perimeter)
             file << "ipPerimeter = true\n";
+        if (sp.injectionPoint.topPlane)
+            file << "ipTopPlane = true\n";
     }
 
     // -- [runner.N] ----------------------------------------------------------
@@ -457,6 +461,7 @@ bool ProjectFile::Load(const std::string& path,
             else if (key == "fixture_clearance_x") out.fixtureDynamic.clearanceX = ParseFloat(val, out.fixtureDynamic.clearanceX);
             else if (key == "fixture_clearance_y") out.fixtureDynamic.clearanceY = ParseFloat(val, out.fixtureDynamic.clearanceY);
             else if (key == "fixture_clearance_z") out.fixtureDynamic.clearanceZ = ParseFloat(val, out.fixtureDynamic.clearanceZ);
+            else if (key == "fixture_top_injection") out.fixtureTopInjection = TopInjectionFromKey(val);
             break;
 
         case Section::Parameters:
@@ -525,6 +530,7 @@ bool ProjectFile::Load(const std::string& path,
             else if (key == "ipY")           sp.injectionPoint.y = ParseFloat(val, 0.0f);
             else if (key == "ipZ")           sp.injectionPoint.z = ParseFloat(val, 0.0f);
             else if (key == "ipPerimeter")   sp.injectionPoint.perimeter = (val == "true" || val == "1" || val == "yes");
+            else if (key == "ipTopPlane")    sp.injectionPoint.topPlane = (val == "true" || val == "1" || val == "yes");
             break;
         }
 
@@ -679,6 +685,8 @@ bool ProjectFile::Load(const std::string& path,
         // radial editing / geometry break.
         if (out.sprue.injectionPoint.perimeter)
             out.sprue.injectionPoint.type = InjectionType::Radial;
+        else if (out.sprue.injectionPoint.topPlane)
+            out.sprue.injectionPoint.type = InjectionType::Axial;   // top-plane points run straight down
         else
             out.sprue.injectionPoint.type =
                 InjectionPoint::TypeFor(out.sprue.injectionPoint.y);

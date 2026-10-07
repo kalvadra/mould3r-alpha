@@ -141,6 +141,9 @@
     <ClCompile Include="VolumeBoundary.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="SceneHistory.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="Flow3DFill.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -329,6 +332,9 @@
     <ClInclude Include="VolumeBoundary.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="SceneHistory.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="Flow3DFill.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -413,4 +419,4 @@
       <Filter>Resource Files</Filter>
     </ResourceCompile>
   </ItemGroup>
-</Project>
+</Project>

@@ -515,6 +515,8 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
         wxDefaultPosition, wxSize(1200, 800))
     , m_fixtureDef(fixture)
 {
+    m_history = std::make_unique<History::Stack>(100);   // undo / redo (see SceneHistory.h)
+
     // ---- Window icon from SVG -----------------------------------------------
     {
         wxBitmapBundle iconBundle = LoadSvgBundle(kAppIconSvg, wxSize(32, 32));
@@ -543,6 +545,19 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
     Bind(wxEVT_MENU, &MainFrame::OnSaveProject, this, ID_SaveProject);
     Bind(wxEVT_MENU, &MainFrame::OnLoadProject, this, ID_LoadProject);
     Bind(wxEVT_MENU, &MainFrame::OnNewProject, this, ID_NewProject);
+
+    // Undo / redo. Ctrl+Z / Ctrl+Y ride on the Edit menu items; Ctrl+Shift+Z
+    // is a frame accelerator (a menu item carries only one shortcut). Steps
+    // are recorded from the idle handler.
+    Bind(wxEVT_MENU, &MainFrame::OnUndo, this, ID_Undo);
+    Bind(wxEVT_MENU, &MainFrame::OnRedo, this, ID_Redo);
+    Bind(wxEVT_IDLE, &MainFrame::OnHistoryIdle, this);
+    {
+        wxAcceleratorEntry redoAlt;
+        redoAlt.Set(wxACCEL_CTRL | wxACCEL_SHIFT, (int)'Z', ID_Redo);
+        SetAcceleratorTable(wxAcceleratorTable(1, &redoAlt));
+    }
+    UpdateUndoMenu();
     Bind(wxEVT_MENU, &MainFrame::OnSetMetric, this, ID_UnitMetric);
     Bind(wxEVT_MENU, &MainFrame::OnSetImperial, this, ID_UnitImperial);
 
@@ -730,6 +745,7 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
         // Set the active injection point (first in the list for now)
         m_canvas->SetInjectionPoints(fixture.injectionPoints);
         m_canvas->SetAllowPerimeterInjection(fixture.allowPerimeterInjection);
+        m_canvas->SetTopInjection(fixture.topInjection);
         if (!fixture.injectionPoints.empty())
             m_canvas->SetActiveInjectionPoint(fixture.injectionPoints[0]);
 
@@ -1074,6 +1090,13 @@ wxMenuBar* MainFrame::BuildPrepareMenuBar()
 
     auto* menuBar = new wxMenuBar();
     menuBar->Append(fileMenu, "&File");
+
+    // Edit menu — undo / redo for the Prepare scene. Prepare-only, like the
+    // history itself; labels ("Undo Move") are kept current by UpdateUndoMenu.
+    auto* editMenu = new wxMenu();
+    m_undoItem = editMenu->Append(ID_Undo, "Undo\tCtrl+Z");
+    m_redoItem = editMenu->Append(ID_Redo, "Redo\tCtrl+Y");
+    menuBar->Append(editMenu, "&Edit");
 
     // Fixture menu — top-level so the two fixture actions surface together
     // rather than hiding under File. Create opens the FixtureEditor (the
@@ -2042,8 +2065,9 @@ void MainFrame::UpdateSprueEditToolbar()
     if (m_canvas->IsEditingSprue())
     {
         m_sprueEditToolbar->Configure(
-            m_canvas->HasSprueForEdit() && m_canvas->IsActiveSprueRadial(),
-            m_canvas->HasInjectionChoices() || m_canvas->AllowsPerimeterInjection(),
+            m_canvas->CanMoveSprue(),
+            m_canvas->HasInjectionChoices() || m_canvas->AllowsPerimeterInjection() ||
+                m_canvas->AllowsTopInjection(),
             m_canvas->GetSprueEditTool());
         if (!m_sprueEditToolbar->IsShown())
             m_sprueEditToolbar->Show();
@@ -2537,7 +2561,7 @@ void MainFrame::OnEditSprue(wxCommandEvent&)
     }
 
     if (!m_canvas->HasSprueForEdit() && !m_canvas->HasInjectionChoices() &&
-        !m_canvas->AllowsPerimeterInjection())
+        !m_canvas->AllowsPerimeterInjection() && !m_canvas->AllowsTopInjection())
         return;   // nothing to edit
 
     SetActiveTool(TransformMode::EditSprue);
@@ -2997,6 +3021,7 @@ void MainFrame::OnChangeFixture(wxCommandEvent&)
 
     m_canvas->SetInjectionPoints(fixture.injectionPoints);
     m_canvas->SetAllowPerimeterInjection(fixture.allowPerimeterInjection);
+    m_canvas->SetTopInjection(fixture.topInjection);
     if (!fixture.injectionPoints.empty())
         m_canvas->SetActiveInjectionPoint(fixture.injectionPoints[0]);
 
@@ -3027,6 +3052,7 @@ void MainFrame::OnEditFixture(wxCommandEvent&)
         m_fixtureDef.parametric = dlg.GetParametric();
     else
         m_fixtureDef.dynamic = dlg.GetDynamic();
+    m_fixtureDef.topInjection = dlg.GetTopInjection();
 
     // Rebuild the fixture at the new size. LoadFixtureIntoScene ->
     // CreateProceduralFixture clears the old fixture (and its vents) and seeds a
@@ -3036,6 +3062,7 @@ void MainFrame::OnEditFixture(wxCommandEvent&)
     LoadFixtureIntoScene(m_fixtureDef);
     m_canvas->SetInjectionPoints(m_fixtureDef.injectionPoints);
     m_canvas->SetAllowPerimeterInjection(m_fixtureDef.allowPerimeterInjection);
+    m_canvas->SetTopInjection(m_fixtureDef.topInjection);
 
     // The blank geometry changed, so any previously-generated mould is stale.
     m_mouldState = MouldState::NeverGenerated;
@@ -3075,10 +3102,14 @@ void MainFrame::PromptForFixtureIfMissing()
 
     m_canvas->SetInjectionPoints(fixture.injectionPoints);
     m_canvas->SetAllowPerimeterInjection(fixture.allowPerimeterInjection);
+    m_canvas->SetTopInjection(fixture.topInjection);
     if (!fixture.injectionPoints.empty())
         m_canvas->SetActiveInjectionPoint(fixture.injectionPoints[0]);
 
     ApplyFixtureDefaults(fixture);
+
+    // The first fixture is the starting point, not an undoable change.
+    ResetHistory();
 }
 
 // ---------------------------------------------------------------------------
@@ -3120,6 +3151,7 @@ void MainFrame::OnNewProject(wxCommandEvent&)
 
     m_canvas->SetInjectionPoints(fixture.injectionPoints);
     m_canvas->SetAllowPerimeterInjection(fixture.allowPerimeterInjection);
+    m_canvas->SetTopInjection(fixture.topInjection);
     if (!fixture.injectionPoints.empty())
         m_canvas->SetActiveInjectionPoint(fixture.injectionPoints[0]);
 
@@ -3135,6 +3167,204 @@ void MainFrame::OnNewProject(wxCommandEvent&)
     // state here so a Generate run is genuinely required before
     // Export will quietly succeed.
     m_mouldState = MouldState::NeverGenerated;
+
+    // A new project starts a new history.
+    ResetHistory();
+}
+
+// ---------------------------------------------------------------------------
+// Undo / redo — see SceneHistory.h for the model. The history records states:
+// OnHistoryIdle captures the scene whenever the app is quiet and records a
+// step when it differs from the last recorded state, so every tool is covered
+// and one gesture (a drag, a dialog, a click) is one step. Undo / redo put a
+// recorded state back through GLCanvas::RestoreSceneState.
+// ---------------------------------------------------------------------------
+namespace
+{
+    // Ctrl+Z / Ctrl+Y while typing in a field belong to that field.
+    wxTextEntry* FocusedTextEntry()
+    {
+        wxWindow* focus = wxWindow::FindFocus();
+        return focus ? dynamic_cast<wxTextEntry*>(focus) : nullptr;
+    }
+}
+
+bool MainFrame::HistoryQuiet() const
+{
+    if (!m_canvas || m_historyApplying || IsBeingDeleted())
+        return false;
+    // A modal dialog (Rotate, Pattern, the fixture picker...) or an app-modal
+    // progress window disables the frame. Its edit is recorded as one step
+    // once it closes.
+    if (!IsEnabled())
+        return false;
+    // Mid-gesture: a drag is in progress, or the canvas has a drag position
+    // the paint pass hasn't applied yet.
+    const wxMouseState ms = wxGetMouseState();
+    if (ms.LeftIsDown() || ms.MiddleIsDown() || ms.RightIsDown())
+        return false;
+    if (m_canvas->IsDeferredEditPending())
+        return false;
+    return true;
+}
+
+History::Entry MainFrame::CaptureHistoryEntry()
+{
+    History::Entry e;
+    e.scene = m_canvas->CaptureSceneState();
+    e.fixture = m_fixtureDef;
+    return e;
+}
+
+void MainFrame::RecordHistory()
+{
+    if (!HistoryQuiet())
+        return;
+    if (m_history->Observe(CaptureHistoryEntry()))
+        AfterHistoryChange();
+}
+
+void MainFrame::OnHistoryIdle(wxIdleEvent& evt)
+{
+    evt.Skip();
+    RecordHistory();
+}
+
+void MainFrame::ResetHistory()
+{
+    m_history->Reset();
+    if (m_canvas)
+        m_canvas->PruneBodyStore({});   // nothing refers to a parked body any more
+    UpdateUndoMenu();
+    // The next idle records the current scene as the new baseline.
+}
+
+void MainFrame::ApplyHistoryEntry(const History::Entry& e)
+{
+    // A fixture swap between the two states (its halves are new bodies)?
+    bool fixtureChanged = e.scene.fixtures.size() != m_history->Current().scene.fixtures.size();
+    for (size_t i = 0; !fixtureChanged && i < e.scene.fixtures.size(); ++i)
+        fixtureChanged = e.scene.fixtures[i].uid != m_history->Current().scene.fixtures[i].uid;
+
+    m_historyApplying = true;
+    m_canvas->RestoreSceneState(e.scene);
+    m_fixtureDef = e.fixture;
+    m_historyApplying = false;
+
+    if (fixtureChanged)
+    {
+        // Same as a fixture change made directly (OnChangeFixture): the Casting
+        // tab follows the fixture kind, and a mould generated against the
+        // other fixture no longer applies.
+        RefreshCastingAvailability();
+        m_mouldState = MouldState::NeverGenerated;
+    }
+}
+
+void MainFrame::AfterHistoryChange()
+{
+    std::unordered_set<uint64_t> keep;
+    m_history->CollectBodyUids(keep);
+    m_canvas->PruneBodyStore(keep);
+    UpdateUndoMenu();
+}
+
+void MainFrame::UpdateUndoMenu()
+{
+    const bool canUndo = m_history->CanUndo();
+    const bool canRedo = m_history->CanRedo();
+    const wxString undoText = (canUndo ? "Undo " + wxString(m_history->UndoLabel()) : wxString("Undo")) + "\tCtrl+Z";
+    const wxString redoText = (canRedo ? "Redo " + wxString(m_history->RedoLabel()) : wxString("Redo")) + "\tCtrl+Y";
+
+    // Only touch the menu when something changed — this runs from idle.
+    // The items are deliberately never DISABLED: wxMSW keeps a disabled
+    // item's accelerator in the table and then swallows the key, so Ctrl+Z
+    // would stop reaching a focused text field whenever the history is empty.
+    // OnUndo / OnRedo simply do nothing when there is nothing to undo.
+    if (m_undoItem && undoText != m_undoItemText)
+    {
+        m_undoItem->SetItemLabel(undoText);
+        m_undoItemText = undoText;
+    }
+    if (m_redoItem && redoText != m_redoItemText)
+    {
+        m_redoItem->SetItemLabel(redoText);
+        m_redoItemText = redoText;
+    }
+}
+
+void MainFrame::CheckHistoryRestore(const History::Entry& target, const char* what)
+{
+#ifndef NDEBUG
+    // Restore fidelity check (Debug builds): the scene captured right after a
+    // restore should match the state that was restored. A difference means a
+    // field isn't carried through capture / restore, or a rebuild re-derived
+    // something differently. (Changing a card setting between the step and
+    // its undo can legitimately show up here for a sprue on a Dynamic
+    // fixture, which re-places the sprue from the card.)
+    std::string diff;
+    if (!History::SameScene(target.scene, m_history->Current().scene, 1.0e-4f, &diff))
+    {
+        wxLogDebug("%s: restored scene differs from the recorded one at %s", what, diff.c_str());
+        if (!m_historyCheckReported)
+        {
+            m_historyCheckReported = true;
+            wxFAIL_MSG(wxString::Format("%s: restored scene differs from the recorded one at %s "
+                                        "(reported once per session)", what, diff));
+        }
+    }
+#else
+    (void)target;
+    (void)what;
+#endif
+}
+
+void MainFrame::OnUndo(wxCommandEvent&)
+{
+    // A field being typed in gets its own undo; with nothing to undo there,
+    // fall through to the scene.
+    if (wxTextEntry* text = FocusedTextEntry(); text && text->CanUndo())
+    {
+        text->Undo();
+        return;
+    }
+    if (m_perspective != Perspective::Prepare || !HistoryQuiet())
+        return;
+
+    // A change the idle handler hasn't seen yet becomes its own step first,
+    // so undo takes back exactly that change.
+    RecordHistory();
+    if (!m_history->CanUndo())
+        return;
+
+    const History::Entry target = m_history->UndoTarget();   // copy: CompleteUndo pops it
+    ApplyHistoryEntry(target);
+    m_history->CompleteUndo(CaptureHistoryEntry());
+    CheckHistoryRestore(target, "Undo");
+    AfterHistoryChange();
+}
+
+void MainFrame::OnRedo(wxCommandEvent&)
+{
+    if (wxTextEntry* text = FocusedTextEntry(); text && text->CanRedo())
+    {
+        text->Redo();
+        return;
+    }
+    if (m_perspective != Perspective::Prepare || !HistoryQuiet())
+        return;
+
+    // Recording first matters here too: a fresh change clears the redo stack,
+    // exactly as it would have at the next idle.
+    RecordHistory();
+    if (!m_history->CanRedo())
+        return;
+
+    const History::Entry target = m_history->RedoTarget();
+    ApplyHistoryEntry(target);
+    m_history->CompleteRedo(CaptureHistoryEntry());
+    CheckHistoryRestore(target, "Redo");
+    AfterHistoryChange();
 }
 
 // ---------------------------------------------------------------------------
@@ -3169,6 +3399,7 @@ void MainFrame::OnSaveProject(wxCommandEvent&)
     data.fixtureKind = m_fixtureDef.kind;
     data.fixtureParametric = m_fixtureDef.parametric;
     data.fixtureDynamic = m_fixtureDef.dynamic;
+    data.fixtureTopInjection = m_fixtureDef.topInjection;
 
     // Objects
     for (const auto& obj : m_canvas->GetObjects())
@@ -3410,6 +3641,7 @@ void MainFrame::OnLoadProject(wxCommandEvent&)
         fixDef.kind = data.fixtureKind;
         fixDef.parametric = data.fixtureParametric;
         fixDef.dynamic = data.fixtureDynamic;
+        fixDef.topInjection = data.fixtureTopInjection;
         fixDef.allowPerimeterInjection = true;   // procedural default (Part 3)
         m_fixtureDef = fixDef;
 
@@ -3421,6 +3653,7 @@ void MainFrame::OnLoadProject(wxCommandEvent&)
             m_canvas->SetActiveInjectionPoint(data.sprue.injectionPoint);
         m_canvas->SetInjectionPoints(fixDef.injectionPoints);
         m_canvas->SetAllowPerimeterInjection(true);
+        m_canvas->SetTopInjection(fixDef.topInjection);
     }
     else if (!data.fixturePath.empty())
     {
@@ -3441,6 +3674,10 @@ void MainFrame::OnLoadProject(wxCommandEvent&)
                 m_canvas->SetActiveInjectionPoint(fixDef.injectionPoints[0]);
 
             m_canvas->SetInjectionPoints(fixDef.injectionPoints);
+            // The fixture's injection options (these weren't re-applied on a
+            // project load before, so the previous fixture's carried over).
+            m_canvas->SetAllowPerimeterInjection(fixDef.allowPerimeterInjection);
+            m_canvas->SetTopInjection(fixDef.topInjection);
 
             // Apply fixture's per-feature defaults FIRST, so that any UI
             // fields the project hasn't customised pick up the fixture's
@@ -3609,6 +3846,9 @@ void MainFrame::OnLoadProject(wxCommandEvent&)
     // The various Restore* paths may have fired NotifySceneMutated
     // during load already; this explicit set locks the final state.
     m_mouldState = MouldState::NeverGenerated;
+
+    // The loaded project is the new baseline: nothing before it is undoable.
+    ResetHistory();
 }
 
 // ---------------------------------------------------------------------------
@@ -4417,7 +4657,7 @@ wxPanel* MainFrame::CreateVentsContent(wxWindow* parent)
         dimsSizer->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
     };
 
-    addDimRow("Length:", m_ventLength, "1.0");
+    addDimRow("Length:", m_ventLength, "0.2");
     addDimRow("Width:", m_ventWidth, "2.0");
     addDimRow("Overrun (start):", m_ventOverrunStart, "0.5");
     addDimRow("Overrun (end):", m_ventOverrunEnd, "0.5");
@@ -5811,4 +6051,4 @@ wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
 
     outer->SetSizer(outerSizer);
     return outer;
-}
+}

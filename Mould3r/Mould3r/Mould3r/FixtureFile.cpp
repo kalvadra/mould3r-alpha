@@ -224,6 +224,8 @@ bool FixtureFile::Load(const std::string& path,
             else if (key == "allow_perimeter_injection")
                 out.allowPerimeterInjection =
                     (value == "true" || value == "1" || value == "yes");
+            else if (key == "top_injection")
+                out.topInjection = TopInjectionFromKey(value);
         }
         else if (currentSection == Section::InjectionPoint && hasPending)
         {
@@ -363,6 +365,8 @@ bool FixtureFile::Save(const std::string& path,
     file << "modelB = " << relB << "\n";
     if (def.allowPerimeterInjection)
         file << "allow_perimeter_injection = true\n";
+    if (def.topInjection != TopInjection::Off)
+        file << "top_injection = " << TopInjectionKey(def.topInjection) << "\n";
 
     // Write each injection point as its own numbered section
     for (int i = 0; i < (int)def.injectionPoints.size(); ++i)

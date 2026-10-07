@@ -196,6 +196,7 @@
     <ClCompile Include="MaterialEditorDialog.cpp" />
     <ClCompile Include="TetMeshJob.cpp" />
     <ClCompile Include="VolumeBoundary.cpp" />
+    <ClCompile Include="SceneHistory.cpp" />
     <!-- The 3D fill solver: AMGCL (header-only, third_party\amgcl) with
          OpenMP. Optimised even in Debug (an unoptimised AMG solve is ~30x
          slower), which needs /Zi instead of /ZI and no /RTC for this file. -->
@@ -275,6 +276,7 @@
     <ClInclude Include="MaterialEditorDialog.h" />
     <ClInclude Include="TetMeshJob.h" />
     <ClInclude Include="VolumeBoundary.h" />
+    <ClInclude Include="SceneHistory.h" />
     <ClInclude Include="Flow3DFill.h" />
     <ClInclude Include="MeshWorker.h" />
     <ClInclude Include="TetMeshRunner.h" />
@@ -324,4 +326,4 @@
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
-</Project>
+</Project>

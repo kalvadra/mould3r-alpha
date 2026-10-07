@@ -48,6 +48,24 @@ ProceduralFixtureDialog::ProceduralFixtureDialog(wxWindow* parent,
     addRow(dyn ? "Clearance Y:" : "Height (Y):", m_ctrlY, iy);
     addRow(dyn ? "Clearance Z:" : "Depth (Z):", m_ctrlZ, iz);
 
+    // Top-plane injection: whether the box's top face offers injection
+    // points (see TopInjection). Order matches the enum.
+    {
+        auto* row = new wxBoxSizer(wxHORIZONTAL);
+        auto* lbl = new wxStaticText(this, wxID_ANY, "Top injection:",
+            wxDefaultPosition, wxSize(90, -1));
+        m_topInjection = new wxChoice(this, wxID_ANY,
+            wxDefaultPosition, wxSize(150, -1));
+        m_topInjection->Append("Off");
+        m_topInjection->Append("Centre point (0, 0)");
+        m_topInjection->Append("Anywhere on top");
+        m_topInjection->SetSelection(def.topInjection == TopInjection::Centre   ? 1
+                                   : def.topInjection == TopInjection::Anywhere ? 2 : 0);
+        row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 6);
+        row->Add(m_topInjection, 0, wxALIGN_CENTER_VERTICAL);
+        main->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 14);
+    }
+
     main->AddSpacer(10);
     main->Add(CreateButtonSizer(wxOK | wxCANCEL), 0,
         wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 14);
@@ -99,6 +117,14 @@ ParametricFixtureParams ProceduralFixtureDialog::GetParametric() const
     p.sizeY = ParseField(m_ctrlY, p.sizeY);
     p.sizeZ = ParseField(m_ctrlZ, p.sizeZ);
     return p;
+}
+
+TopInjection ProceduralFixtureDialog::GetTopInjection() const
+{
+    const int sel = m_topInjection ? m_topInjection->GetSelection() : 0;
+    if (sel == 1) return TopInjection::Centre;
+    if (sel == 2) return TopInjection::Anywhere;
+    return TopInjection::Off;
 }
 
 DynamicFixtureParams ProceduralFixtureDialog::GetDynamic() const

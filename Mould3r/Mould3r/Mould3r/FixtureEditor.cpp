@@ -963,6 +963,14 @@ wxPanel* FixtureEditor::CreateInjectionPointsContent(wxWindow* parent)
     m_allowPerimeterInjection->SetForegroundColour(Style::TextPrimary);
     sizer->Add(m_allowPerimeterInjection, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
 
+    // "Top plane" injection option — whether the top face of the fixture
+    // offers injection points: Off, just the centre (world 0, 0), or anywhere
+    // on the top. Choice order matches TopInjection (Off, Centre, Anywhere);
+    // read into FixtureDefinition::topInjection at save time.
+    AddTypeRow(card, sizer, "Top Plane",
+        { "Off", "Centre (0, 0)", "Anywhere" }, m_topInjection);
+    sizer->AddSpacer(10);
+
     // Render the (empty) initial state. RebuildInjectionList draws a
     // muted "No injection points" placeholder when the vector is empty,
     // so the card doesn't collapse to a thin sliver before the user adds
@@ -2085,6 +2093,13 @@ void FixtureEditor::OnGenerateFixture(wxCommandEvent&)
     def.injectionPoints = m_injectionPoints;
     def.allowPerimeterInjection =
         m_allowPerimeterInjection && m_allowPerimeterInjection->GetValue();
+    def.topInjection = TopInjection::Off;
+    if (m_topInjection)
+    {
+        const int sel = m_topInjection->GetSelection();
+        if (sel == 1)      def.topInjection = TopInjection::Centre;
+        else if (sel == 2) def.topInjection = TopInjection::Anywhere;
+    }
 
     // ---- Write ------------------------------------------------------------
     std::string error;

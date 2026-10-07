@@ -16,7 +16,8 @@
 // same dialog serves both first-time creation (from the picker) and later
 // editing (re-opened with the current values). After a wxID_OK result, read
 // the edited values back with GetParametric() or GetDynamic() — whichever
-// matches the kind. The OK button validates that all three values are positive;
+// matches the kind — and GetTopInjection() for the top-plane injection choice
+// (Off / centre point / anywhere on top). The OK button validates that all three values are positive;
 // a zero or negative extent would make a null OCC box.
 class ProceduralFixtureDialog : public wxDialog
 {
@@ -26,6 +27,9 @@ public:
     ParametricFixtureParams GetParametric() const;
     DynamicFixtureParams    GetDynamic() const;
 
+    // The "Top plane injection" choice (Off / Centre / Anywhere).
+    TopInjection            GetTopInjection() const;
+
 private:
     void  OnOK(wxCommandEvent& evt);
     float ParseField(wxTextCtrl* ctrl, float fallback) const;
@@ -34,4 +38,5 @@ private:
     wxTextCtrl* m_ctrlX = nullptr;
     wxTextCtrl* m_ctrlY = nullptr;
     wxTextCtrl* m_ctrlZ = nullptr;
+    wxChoice*   m_topInjection = nullptr;
 };

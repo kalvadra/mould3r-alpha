@@ -18,6 +18,9 @@
 #include <unordered_map>
 
 class GLCanvas;
+namespace History { class Stack; struct Entry; }   // SceneHistory.h — kept out of
+// this header (it pulls in the feature / GL headers) since the lightweight
+// toolbar headers include MainFrame.h.
 class RoundedButton;   // forward decl — m_btnGenerate pointer below; full def
 // is included from MainFrame.cpp where it's used.
 class SplitButton;     // forward decl — m_btnExport pointer below; full def
@@ -218,6 +221,22 @@ private:
     void OnSaveProject(wxCommandEvent&);
     void OnLoadProject(wxCommandEvent&);
     void OnNewProject(wxCommandEvent&);
+
+    // ---- Undo / redo (Edit menu; see SceneHistory.h) ------------------------
+    // Steps are recorded by observation: on every idle event the live scene is
+    // captured and compared with the last recorded state, but only while the
+    // app is quiet (HistoryQuiet) so one user gesture becomes one step.
+    void OnUndo(wxCommandEvent&);
+    void OnRedo(wxCommandEvent&);
+    void OnHistoryIdle(wxIdleEvent& evt);
+    bool HistoryQuiet() const;          // no button held, no modal, no deferred drag
+    void RecordHistory();               // capture now; records a step if the scene changed
+    void ResetHistory();                // forget all steps (new / open project, first fixture)
+    History::Entry CaptureHistoryEntry();
+    void ApplyHistoryEntry(const History::Entry& e);
+    void AfterHistoryChange();          // prune parked bodies, refresh the Edit menu
+    void UpdateUndoMenu();
+    void CheckHistoryRestore(const History::Entry& target, const char* what);   // Debug builds
 
     // Ribbon tool handlers
     void OnToolSelect(wxCommandEvent& evt);
@@ -612,6 +631,14 @@ private:
     enum class MouldState { NeverGenerated, Clean, Dirty };
     MouldState m_mouldState = MouldState::NeverGenerated;
 
+    // ---- Undo / redo state ---------------------------------------------------
+    std::unique_ptr<History::Stack> m_history;  // created first thing in the constructor
+    bool           m_historyApplying = false;   // a restore is in progress
+    bool           m_historyCheckReported = false;
+    wxMenuItem*    m_undoItem = nullptr;        // on the Prepare menu bar
+    wxMenuItem*    m_redoItem = nullptr;
+    wxString       m_undoItemText, m_redoItemText;
+
     void OnBrowseExport(wxCommandEvent&);
     // Action-zone click on the export split button: dispatches to the current
     // mode's exporter (DoExportMould / DoExportShotBody).
@@ -686,6 +713,8 @@ private:
         ID_SaveProject,
         ID_LoadProject,
         ID_NewProject,
+        ID_Undo,
+        ID_Redo,
         ID_UnitMetric,
         ID_UnitImperial,
         ID_GridSettings,

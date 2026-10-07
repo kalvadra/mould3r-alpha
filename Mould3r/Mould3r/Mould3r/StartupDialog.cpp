@@ -482,6 +482,7 @@ void StartupDialog::AcceptSelection()
             m_fixture.parametric = dlg.GetParametric();
         else
             m_fixture.dynamic = dlg.GetDynamic();
+        m_fixture.topInjection = dlg.GetTopInjection();
 
         // Procedural fixtures allow perimeter injection by default — that's the
         // feature these box fixtures are meant to make usable.

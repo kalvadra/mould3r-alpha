@@ -5,6 +5,8 @@
 #include <vector>
 #include <array>
 #include <functional>   // std::function for scene-mutation callback
+#include <unordered_map>
+#include <unordered_set>
 
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
@@ -34,6 +36,7 @@
 #include "ProjectFile.h"
 #include "FeedNetwork.h"    // Flow::FeedNetwork — the 1D feed-system snapshot
 #include "Midplane.h"       // Flow::PartSurface — part surfaces for the midplane
+#include "SceneHistory.h"   // History::SceneState — undo / redo snapshots
 
 struct GPUMesh
 {
@@ -63,6 +66,13 @@ enum class SourceFormat { Brep, Mesh };
 struct SceneObject
 {
     GPUMesh    mesh;
+
+    // Body identity for undo / redo (see SceneHistory.h). 0 = not yet
+    // assigned; GLCanvas::EnsureBodyUids hands out fresh ones before every
+    // capture, and gives a duplicate (a copied object) a new one, so a uid
+    // always names exactly one body. History snapshots refer to a body by
+    // this uid instead of copying its mesh / shape.
+    uint64_t   uid = 0;
     ObjectRole role = ObjectRole::Imported;
     // Lineage of this body's source file. Defaults to Brep so STEP objects and
     // any non-imported body (e.g. a fixture) read as BREP without extra work;
@@ -734,9 +744,10 @@ public:
     // Unlike the path-edit modes above, the sprue has no node model — its edit
     // environment offers a Move sub-tool (drag a RADIAL sprue's endpoint on the
     // parting plane) and a Select Injection Point sub-tool (re-pick the feeding
-    // injection point). Driven by the floating SprueEditToolbar. Axial sprues
-    // are NOT movable (moving the endpoint would compromise demolding), so Move
-    // is gated on IsActiveSprueRadial().
+    // injection point). Driven by the floating SprueEditToolbar. Axial sprue
+    // ENDPOINTS are NOT movable (moving one would compromise demolding); Move
+    // is gated on CanMoveSprue(): a radial sprue, or a top-plane injection
+    // point the fixture lets move over its top.
     bool IsEditingSprue() const { return m_transformMode == TransformMode::EditSprue; }
     bool HasSprueForEdit() const { return m_sprue.hasPoint; }
     bool IsActiveSprueRadial() const
@@ -762,6 +773,32 @@ public:
         return m_hasActiveInjectionPoint && m_activeInjectionPoint.perimeter;
     }
 
+    // "Top plane" injection (see FixtureDefinition::topInjection): the
+    // fixture's top face offers the top-centre point (world 0, 0) or any
+    // point inside the fixture outline. Set from the fixture on load. The top
+    // is the highest point of the fixture halves (BuildFixturePerimeter).
+    void SetTopInjection(TopInjection t) { m_topInjection = t; Refresh(false); }
+    TopInjection GetTopInjection() const { return m_topInjection; }
+    bool AllowsTopInjection() const { return m_topInjection != TopInjection::Off; }
+    // True when the ACTIVE injection point sits on the top plane.
+    bool IsActiveTopPlaneInjection() const
+    {
+        return m_hasActiveInjectionPoint && m_activeInjectionPoint.topPlane;
+    }
+    // A top-plane point can be dragged over the top (Edit Sprue > Move) only
+    // when the fixture allows anywhere on top; the centre point stays put.
+    bool CanMoveTopInjection() const
+    {
+        return IsActiveTopPlaneInjection() && m_topInjection == TopInjection::Anywhere;
+    }
+    // Edit Sprue > Move has something to drag: a radial sprue's endpoint (and
+    // perimeter point), or a top-plane point that may move. An axial sprue's
+    // endpoint is never movable.
+    bool CanMoveSprue() const
+    {
+        return m_sprue.hasPoint && (IsActiveSprueRadial() || CanMoveTopInjection());
+    }
+
     SprueEditTool GetSprueEditTool() const { return m_sprueEditTool; }
     void SetSprueEditTool(SprueEditTool t);
 
@@ -771,9 +808,11 @@ public:
     // hook itself — the mouse-up in EditSprue does, once per drag gesture.
     void MoveSprueEndpoint(int mouseX, int mouseY);
 
-    // Drag a PERIMETER injection point along the fixture perimeter (snapping to
-    // it) and re-place the sprue from the new location. No-op unless the active
-    // injection point is a perimeter one. Like MoveSprueEndpoint, leaves the
+    // Drag the active injection point and re-place the sprue from the new
+    // location: a PERIMETER point slides along the fixture perimeter
+    // (snapping to it); a TOP-PLANE point (fixture allows anywhere on top)
+    // moves over the top, kept inside the fixture outline, Ctrl = grid snap.
+    // No-op for any other point. Like MoveSprueEndpoint, leaves the
     // scene-mutation notify to the mouse-up.
     void MoveSprueInjectionPoint(int mouseX, int mouseY);
 
@@ -960,6 +999,27 @@ public:
 
     // Clear everything (fixtures, objects, features) for a fresh load
     void ClearAll();
+
+    // ---- Undo / redo (see SceneHistory.h) -----------------------------------
+    // Capture the authored scene: fixture, objects and inserts by body uid +
+    // pose, every feature copied whole (GPU handles zeroed), the selection.
+    // Non-const only because it assigns body uids on first sight.
+    History::SceneState CaptureSceneState();
+
+    // Put a captured scene back verbatim: bodies are matched by uid (from the
+    // live scene or the body store), features are copied back, and every
+    // preview mesh / VBO is rebuilt from the restored data. The active tool
+    // stays; a feature selection that no longer exists, node / handle grabs
+    // and Align hover state are dropped. Fires NotifySceneMutated.
+    void RestoreSceneState(const History::SceneState& s);
+
+    // Free every parked body (removed from the scene, kept for undo) whose uid
+    // is not in `keep` — called after the history changes.
+    void PruneBodyStore(const std::unordered_set<uint64_t>& keep);
+
+    // True while an edit drag has been applied by the mouse but not yet by the
+    // paint pass — the scene is mid-gesture, so history must not record yet.
+    bool IsDeferredEditPending() const { return m_editNeedsUpdate; }
 
 private:
     void OnPaint(wxPaintEvent& evt);
@@ -1253,6 +1313,17 @@ private:
     // ptXZ, oriented toward the origin — the default sprue direction for a
     // perimeter injection point (into the mould).
     glm::vec2 InwardPerimeterNormal(const glm::vec2& ptXZ) const;
+
+    // ---- Top-plane injection helpers ---------------------------------------
+    // Is world XZ inside the fixture outline (the convex parting perimeter)?
+    bool      InsideFixturePerimeter(const glm::vec2& xz) const;
+    // World XZ pulled onto the outline when it lies outside it.
+    glm::vec2 ClampToFixturePerimeter(const glm::vec2& xz) const;
+    // A top-plane injection point at world XZ (y = the fixture top), in
+    // fixture-local coordinates like every injection point. Axial, topPlane.
+    InjectionPoint MakeTopPlaneInjectionPoint(const glm::vec2& xz, const char* label) const;
+    // The mouse ray's hit on the top plane, when the camera is above it.
+    bool      RayCastToTopPlane(int mouseX, int mouseY, glm::vec2& outXZ);
 
     // ---- Part 7 / R5b: runner node authoring (parallels the vent methods) ----
     // The runner deltas: node[0] is PINNED to the sprue feed point (not
@@ -1825,6 +1896,11 @@ private:
     bool          m_sprueEndpointGrabbed = false;         // radial endpoint held (Move drag)
     bool          m_sprueInjectionGrabbed = false;        // perimeter injection point held (Move drag)
     bool          m_allowPerimeterInjection = false;      // fixture permits perimeter injection
+    TopInjection  m_topInjection = TopInjection::Off;      // fixture's top-plane injection option
+    // Height of the fixture's top plane (highest world y of the fixture halves),
+    // refreshed with the perimeter by BuildFixturePerimeter.
+    float         m_fixtureTopY = 0.0f;
+    bool          m_hasFixtureTopY = false;
 
     // m_edit*Node doubles as "selected node" (it survives the mouse release so
     // the toolbar and the enlarged marker can act on it) AND as "node the next
@@ -1909,6 +1985,38 @@ private:
         RebuildDynamicFixture();
         if (m_onSceneMutated) m_onSceneMutated();
     }
+
+    // ---- Undo / redo body store ---------------------------------------------
+    // Bodies removed from the scene (deleted objects, removed inserts, swapped
+    // fixture halves), keyed by uid and kept intact — GPU mesh included — so
+    // undoing the removal puts the very same body back without re-importing.
+    // Pruned (PruneBodyStore) once no history entry refers to a uid.
+    std::unordered_map<uint64_t, SceneObject> m_bodyStore;
+    uint64_t m_nextBodyUid = 0;
+
+    // Give every body in the scene a unique, non-zero uid (also unique against
+    // the store, so a copy of a since-deleted body can't be mistaken for it).
+    void EnsureBodyUids();
+
+    // Remove-from-scene path for a body: park it in m_bodyStore under its uid
+    // (a body never captured — uid 0 — just has its GPU mesh freed).
+    void RetireBody(SceneObject&& body);
+
+    // Free every parked body (project load / new, teardown).
+    void DestroyBodyStore();
+
+    // Rebuild the sprue's preview solids (cone + cold slug) from m_sprue's
+    // stored path, without re-deriving the path. Shared by RestoreSprue and
+    // RestoreSceneState.
+    void RebuildSprueSolids();
+
+    // Rebuild one vent's preview solid from its stored path (no re-derive).
+    void RebuildVentSolid(VentInstance& vi);
+
+    // The box half of RebuildDynamicFixture: refit a Dynamic fixture's halves
+    // to the scene and rebuild the perimeter, without re-projecting the
+    // injection point or re-placing the sprue. No-op unless Dynamic.
+    void RefitDynamicFixtureBox();
 
     // ---- Scene mesh-type tracking ------------------------------------------
     // True when at least one mesh-format (STL/OBJ) body is in the scene. See
