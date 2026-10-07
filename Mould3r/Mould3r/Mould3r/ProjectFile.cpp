@@ -116,6 +116,8 @@ bool ProjectFile::Save(const std::string& path,
     }
     if (data.fixtureKind != FixtureKind::Library && data.fixtureTopInjection != TopInjection::Off)
         file << "fixture_top_injection = " << TopInjectionKey(data.fixtureTopInjection) << "\n";
+    if (data.fixtureKind != FixtureKind::Library && !data.fixturePerimeterInjection)
+        file << "fixture_perimeter_injection = false\n";
     else if (!data.fixturePath.empty())
     {
         file << "fixture = " << MakeRelative(data.fixturePath, baseDir) << "\n";
@@ -462,6 +464,7 @@ bool ProjectFile::Load(const std::string& path,
             else if (key == "fixture_clearance_y") out.fixtureDynamic.clearanceY = ParseFloat(val, out.fixtureDynamic.clearanceY);
             else if (key == "fixture_clearance_z") out.fixtureDynamic.clearanceZ = ParseFloat(val, out.fixtureDynamic.clearanceZ);
             else if (key == "fixture_top_injection") out.fixtureTopInjection = TopInjectionFromKey(val);
+            else if (key == "fixture_perimeter_injection") out.fixturePerimeterInjection = !(val == "false" || val == "0" || val == "no");
             break;
 
         case Section::Parameters:

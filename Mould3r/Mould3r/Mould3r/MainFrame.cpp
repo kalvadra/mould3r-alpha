@@ -3053,6 +3053,7 @@ void MainFrame::OnEditFixture(wxCommandEvent&)
     else
         m_fixtureDef.dynamic = dlg.GetDynamic();
     m_fixtureDef.topInjection = dlg.GetTopInjection();
+    m_fixtureDef.allowPerimeterInjection = dlg.GetAllowPerimeterInjection();
 
     // Rebuild the fixture at the new size. LoadFixtureIntoScene ->
     // CreateProceduralFixture clears the old fixture (and its vents) and seeds a
@@ -3400,6 +3401,7 @@ void MainFrame::OnSaveProject(wxCommandEvent&)
     data.fixtureParametric = m_fixtureDef.parametric;
     data.fixtureDynamic = m_fixtureDef.dynamic;
     data.fixtureTopInjection = m_fixtureDef.topInjection;
+    data.fixturePerimeterInjection = m_fixtureDef.allowPerimeterInjection;
 
     // Objects
     for (const auto& obj : m_canvas->GetObjects())
@@ -3642,17 +3644,17 @@ void MainFrame::OnLoadProject(wxCommandEvent&)
         fixDef.parametric = data.fixtureParametric;
         fixDef.dynamic = data.fixtureDynamic;
         fixDef.topInjection = data.fixtureTopInjection;
-        fixDef.allowPerimeterInjection = true;   // procedural default (Part 3)
+        fixDef.allowPerimeterInjection = data.fixturePerimeterInjection;
         m_fixtureDef = fixDef;
 
         LoadFixtureIntoScene(fixDef);
 
         // Procedural fixtures carry no injection points of their own; a saved
-        // sprue still restores its active point, and perimeter injection is on.
+        // sprue still restores its active point.
         if (data.sprue.placed)
             m_canvas->SetActiveInjectionPoint(data.sprue.injectionPoint);
         m_canvas->SetInjectionPoints(fixDef.injectionPoints);
-        m_canvas->SetAllowPerimeterInjection(true);
+        m_canvas->SetAllowPerimeterInjection(fixDef.allowPerimeterInjection);
         m_canvas->SetTopInjection(fixDef.topInjection);
     }
     else if (!data.fixturePath.empty())
@@ -6051,4 +6053,4 @@ wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
 
     outer->SetSizer(outerSizer);
     return outer;
-}
+}

@@ -11313,9 +11313,15 @@ void GLCanvas::CreateProceduralFixture(const FixtureDefinition& def)
     buildHalf(botMin, botMax, "<procedural fixture: bottom>");
 
     BuildFixturePerimeter();
-    // Activate a default perimeter injection point so the sprue tools work
-    // immediately — a procedural fixture has no fixed points to auto-activate.
-    SeedPerimeterInjectionPoint();
+    // Activate a default injection point so the sprue tools work immediately —
+    // a procedural fixture has no fixed points to auto-activate. Side
+    // injection on: front-centre of the perimeter (as before). Otherwise the
+    // top centre, when the top offers injection.
+    if (def.allowPerimeterInjection)
+        SeedPerimeterInjectionPoint();
+    else if (def.topInjection != TopInjection::Off && m_hasFixtureTopY)
+        SetActiveInjectionPoint(MakeTopPlaneInjectionPoint(
+            ClampToFixturePerimeter(glm::vec2(0.0f)), "Top Centre"));
     Refresh(false);
 }
 

@@ -48,6 +48,14 @@ ProceduralFixtureDialog::ProceduralFixtureDialog(wxWindow* parent,
     addRow(dyn ? "Clearance Y:" : "Height (Y):", m_ctrlY, iy);
     addRow(dyn ? "Clearance Z:" : "Depth (Z):", m_ctrlZ, iz);
 
+    // Side injection: the injection point may sit anywhere on the box's
+    // perimeter (FixtureDefinition::allowPerimeterInjection). Seeded from the
+    // definition — the picker turns it on for a new box fixture.
+    main->AddSpacer(6);
+    m_sideInjection = new wxCheckBox(this, wxID_ANY, "Side injection (anywhere on the perimeter)");
+    m_sideInjection->SetValue(def.allowPerimeterInjection);
+    main->Add(m_sideInjection, 0, wxLEFT | wxRIGHT | wxTOP, 14);
+
     // Top-plane injection: whether the box's top face offers injection
     // points (see TopInjection). Order matches the enum.
     {
@@ -107,6 +115,16 @@ void ProceduralFixtureDialog::OnOK(wxCommandEvent&)
             "Invalid value", wxOK | wxICON_WARNING, this);
         return;   // not skipped → the dialog stays open for correction
     }
+
+    // A box fixture has no fixed injection points, so with both options off
+    // there would be nowhere to put the sprue.
+    if (!GetAllowPerimeterInjection() && GetTopInjection() == TopInjection::Off)
+    {
+        wxMessageBox("Turn on side injection or choose a top injection option, "
+            "so the sprue has somewhere to go.",
+            "No injection point", wxOK | wxICON_WARNING, this);
+        return;
+    }
     EndModal(wxID_OK);
 }
 
@@ -117,6 +135,11 @@ ParametricFixtureParams ProceduralFixtureDialog::GetParametric() const
     p.sizeY = ParseField(m_ctrlY, p.sizeY);
     p.sizeZ = ParseField(m_ctrlZ, p.sizeZ);
     return p;
+}
+
+bool ProceduralFixtureDialog::GetAllowPerimeterInjection() const
+{
+    return m_sideInjection && m_sideInjection->GetValue();
 }
 
 TopInjection ProceduralFixtureDialog::GetTopInjection() const

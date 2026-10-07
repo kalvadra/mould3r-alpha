@@ -235,8 +235,9 @@ public:
     // Build a procedural (Parametric or Dynamic) fixture's two box halves
     // directly into m_fixtures — the fileless counterpart to
     // ImportFileAsFixture. Clears any existing fixtures first, gives each half
-    // a cached OCC blank (sourceShape) + preview mesh, enables perimeter
-    // injection, and rebuilds the parting perimeter. For a Dynamic fixture the
+    // a cached OCC blank (sourceShape) + preview mesh, rebuilds the parting
+    // perimeter and activates a default injection point (front of the
+    // perimeter with side injection on, else the top centre). For a Dynamic fixture the
     // box is sized to envelope the current scene; for Parametric it is the
     // fixed authored dimensions. Reads def.kind + def.parametric / def.dynamic;
     // a FixtureKind::Library def is ignored (that path uses ImportFileAsFixture).
