@@ -72,6 +72,9 @@
     <ClCompile Include="ResultsDetails.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="PreviewFlow3D.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="PreviewResultsDetails.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -118,6 +121,36 @@
       <Filter>Source Files\TransformHandlers</Filter>
     </ClCompile>
     <ClCompile Include="FixtureFile.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="MaterialFile.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="MaterialLibrary.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="MaterialResolve.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="MaterialEditorDialog.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="TetMeshJob.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="VolumeBoundary.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="SceneHistory.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Flow3DFill.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="MeshWorker.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="TetMeshRunner.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="AppConfig.cpp">
@@ -281,6 +314,36 @@
     <ClInclude Include="FixtureFile.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="MaterialFile.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="MaterialLibrary.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="MaterialResolve.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="MaterialEditorDialog.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="TetMeshJob.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="VolumeBoundary.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="SceneHistory.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Flow3DFill.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="MeshWorker.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="TetMeshRunner.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="AppConfig.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -356,4 +419,4 @@
       <Filter>Resource Files</Filter>
     </ResourceCompile>
   </ItemGroup>
-</Project>
+</Project>

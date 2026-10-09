@@ -195,6 +195,12 @@ struct ProjectData
     FixtureKind             fixtureKind = FixtureKind::Library;
     ParametricFixtureParams fixtureParametric;
     DynamicFixtureParams    fixtureDynamic;
+    // Top-plane injection option of a procedural fixture (a library fixture's
+    // comes from its .fixture file). Absent key = Off.
+    TopInjection            fixtureTopInjection = TopInjection::Off;
+    // Side (perimeter) injection of a procedural fixture. Absent key = on,
+    // which is what every box fixture had before it became optional.
+    bool                    fixturePerimeterInjection = true;
 
     std::vector<ProjectObjectData> objects;
 

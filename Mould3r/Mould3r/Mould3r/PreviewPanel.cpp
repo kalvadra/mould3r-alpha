@@ -6,6 +6,12 @@
 #include "style.h"
 #include "DesignChecks.h"
 #include "TestMaterial.h"   // material data for the Hele-Shaw flow scaffold
+#include "MaterialLibrary.h" // Physical Setup dropdowns
+#include "MaterialResolve.h" // library material -> solver properties + derived / fallback notes
+#include "MaterialEditorDialog.h" // "+" buttons: add a material to the library
+#include "TetMeshJob.h"      // 3D mesher: surface weld, stats
+#include "TetMeshRunner.h"   // 3D mesher: worker process
+#include <wx/textdlg.h>
 #include "RoundedButton.h"
 #include "FlowResultsBar.h"
 #include "MouldCastDialog.h"
@@ -569,13 +575,22 @@ PreviewPanel::PreviewPanel(wxWindow* parent)
         modes.Add("Cooling: time to eject");
         modes.Add("Warp: deflection");
         modes.Add("Warp: shape change");
+        modes.Add("3D mesh");                        // kViewVolumeMesh
+        modes.Add("3D fill time");                   // kViewFill3DTime
+        modes.Add("3D pressure");                    // kViewFill3DPressure
+        modes.Add("3D melt temperature");            // kViewFill3DTemp
+        modes.Add("3D front temperature");           // kViewFill3DFrontTemp
+        modes.Add("3D frozen layer");                // kViewFill3DFrozen
+        modes.Add("3D pack: shrinkage");             // kViewPack3DShrink
+        modes.Add("3D cooling: time to eject");      // kViewCool3DEject
         m_debugModeChoice = new wxChoice(host, wxID_ANY, wxDefaultPosition,
             wxDefaultSize, modes);
         m_debugModeChoice->SetSelection(0);
         m_debugModeChoice->SetToolTip(
             "What the view shows: the analysis overlays (draft, travel volumes, "
             "wall thickness) and the flow results. Flow views need a Hele-Shaw "
-            "2.5D Flow run; the fill views play back with the timeline.");
+            "2.5D Flow run; the fill views play back with the timeline. \"3D mesh\" "
+            "shows the 3D Flow Analysis volume mesh with a section plane.");
         m_debugModeChoice->Bind(wxEVT_CHOICE,
             [this](wxCommandEvent&) { UpdateDraftOverlay(); });
         m_resultsBar->AddControl(m_debugModeChoice, wxALIGN_CENTER_VERTICAL | wxRIGHT, 10);
@@ -590,6 +605,58 @@ PreviewPanel::PreviewPanel(wxWindow* parent)
         m_debugWireCheck->Bind(wxEVT_CHECKBOX,
             [this](wxCommandEvent&) { UpdateDraftOverlay(); });
         m_resultsBar->AddControl(m_debugWireCheck, wxALIGN_CENTER_VERTICAL, 0);
+
+        // Section plane for the "3D mesh" view (shown with that view only):
+        // axis, position along the mesh's extent, which side to keep, and
+        // quality colouring.
+        m_sectionGroup = new wxPanel(host, wxID_ANY);
+        m_sectionGroup->SetBackgroundColour(Style::CardBg);
+        auto* sg = new wxBoxSizer(wxHORIZONTAL);
+        auto* secLbl = new wxStaticText(m_sectionGroup, wxID_ANY, "Section:");
+        secLbl->SetForegroundColour(Style::TextMuted);
+        secLbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+        sg->Add(secLbl, 0, wxALIGN_CENTER_VERTICAL | wxLEFT | wxRIGHT, 6);
+        wxArrayString axes;
+        axes.Add("Off"); axes.Add("X"); axes.Add("Y"); axes.Add("Z");
+        m_sectionAxisChoice = new wxChoice(m_sectionGroup, wxID_ANY, wxDefaultPosition, wxDefaultSize, axes);
+        m_sectionAxisChoice->SetSelection(1);
+        m_sectionAxisChoice->SetToolTip("Cut the mesh with a plane across this axis to see the elements inside.");
+        sg->Add(m_sectionAxisChoice, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 6);
+        m_sectionSlider = new wxSlider(m_sectionGroup, wxID_ANY, 500, 0, 1000,
+            wxDefaultPosition, wxSize(FromDIP(120), -1), wxSL_HORIZONTAL);
+        m_sectionSlider->SetBackgroundColour(Style::CardBg);
+        m_sectionSlider->SetToolTip("Where the section plane sits along the mesh.");
+        sg->Add(m_sectionSlider, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
+        m_sectionFlipCheck = new wxCheckBox(m_sectionGroup, wxID_ANY, "Flip");
+        m_sectionFlipCheck->SetForegroundColour(Style::TextPrimary);
+        m_sectionFlipCheck->SetBackgroundColour(Style::CardBg);
+        m_sectionFlipCheck->SetToolTip("Keep the other side of the section plane.");
+        sg->Add(m_sectionFlipCheck, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
+        auto* colLbl = new wxStaticText(m_sectionGroup, wxID_ANY, "Colour:");
+        colLbl->SetForegroundColour(Style::TextMuted);
+        colLbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+        sg->Add(colLbl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 6);
+        wxArrayString cols;
+        cols.Add("Mesh"); cols.Add("Quality"); cols.Add("Boundary");
+        m_meshColourChoice = new wxChoice(m_sectionGroup, wxID_ANY, wxDefaultPosition, wxDefaultSize, cols);
+        m_meshColourChoice->SetSelection(0);
+        m_meshColourChoice->SetToolTip(wxString::FromUTF8(
+            "Mesh: the surface and the section.\n"
+            "Quality: each element by its smallest dihedral angle - blue is well shaped "
+            "(a regular tetrahedron has 70.5\xc2\xb0), red is a sliver (under ~10\xc2\xb0).\n"
+            "Boundary: the boundary conditions - inlets (gate mouths / sprue entry), vents, "
+            "the parting line and the walls."));
+        sg->Add(m_meshColourChoice, 0, wxALIGN_CENTER_VERTICAL);
+        m_sectionGroup->SetSizer(sg);
+        m_resultsBar->AddControl(m_sectionGroup, wxALIGN_CENTER_VERTICAL | wxLEFT, 6);
+        m_sectionGroup->Hide();
+
+        m_sectionAxisChoice->Bind(wxEVT_CHOICE, [this](wxCommandEvent&) { UpdateSectionControls(); RequestVolumeMeshRedraw(); });
+        m_sectionSlider->Bind(wxEVT_SLIDER, [this](wxCommandEvent&) { RequestVolumeMeshRedraw(); });
+        m_sectionFlipCheck->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent&) { RequestVolumeMeshRedraw(); });
+        m_meshColourChoice->Bind(wxEVT_CHOICE, [this](wxCommandEvent&) { RequestVolumeMeshRedraw(); });
     }
     middle->Add(centre, 1, wxEXPAND);
 
@@ -605,9 +672,9 @@ PreviewPanel::PreviewPanel(wxWindow* parent)
 
 // ---------------------------------------------------------------------------
 // Physical Setup bar — a thin toolbar across the top of the centre column with
-// the material selections shared across simulations. Groundwork: the dropdowns
-// are stored (m_injMaterialChoice / m_mouldMaterialChoice) for future sims to
-// read, but nothing consumes them yet.
+// the material selections shared across simulations. The dropdowns list the
+// material library (built-ins + Materials/ folders, see MaterialLibrary.h);
+// the flow check resolves the selected entries (MaterialResolve.h).
 // ---------------------------------------------------------------------------
 wxPanel* PreviewPanel::BuildPhysicalSetupBar(wxWindow* parent)
 {
@@ -640,11 +707,34 @@ wxPanel* PreviewPanel::BuildPhysicalSetupBar(wxWindow* parent)
         return choice;
     };
 
-    wxArrayString injOpts;   injOpts.Add("Generic Polypropylene");
-    m_injMaterialChoice = addChoice("Injection Material:", injOpts);
+    // Small "+" to the right of a dropdown: add a material of that kind.
+    auto addPlus = [&](MaterialKind kind, const wxString& tip)
+    {
+        auto* plus = new RoundedButton(bar, wxID_ANY, "+", wxDefaultPosition, wxSize(22, 22), wxBORDER_NONE);
+        plus->SetBackgroundColour(Style::BtnSecondary);
+        plus->SetForegroundColour(*wxWHITE);
+        plus->SetFont(wxFont(10, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_BOLD, false, "Segoe UI"));
+        plus->SetToolTip(tip);
+        plus->Bind(wxEVT_BUTTON, [this, kind](wxCommandEvent&) { AddMaterialToLibrary(kind); });
+        row->Add(plus, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
+    };
 
-    wxArrayString mouldOpts; mouldOpts.Add("Steel"); mouldOpts.Add("Aluminum");
-    m_mouldMaterialChoice = addChoice("Mould Material:", mouldOpts);
+    // Filled from the material library below (ReloadMaterialLibrary).
+    m_injMaterialChoice = addChoice("Injection Material:", wxArrayString());
+    addPlus(MaterialKind::Injection, "Add an injection material to the library...");
+    m_mouldMaterialChoice = addChoice("Mould Material:", wxArrayString());
+    addPlus(MaterialKind::Mould, "Add a mould material to the library...");
+
+    // Amber marker, shown only when library files were skipped at the last
+    // scan (unreadable / wrong kind); its tooltip lists them.
+    m_libraryIssues = new wxStaticText(bar, wxID_ANY, wxString::FromUTF8("\xe2\x9a\xa0 Library"));
+    m_libraryIssues->SetForegroundColour(wxColour(0xE0, 0x9B, 0x20));
+    m_libraryIssues->SetBackgroundColour(Style::CardBg);
+    m_libraryIssues->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+    row->Add(m_libraryIssues, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 10);
+    m_libraryIssues->Hide();
 
     row->AddStretchSpacer(1);
 
@@ -658,7 +748,253 @@ wxPanel* PreviewPanel::BuildPhysicalSetupBar(wxWindow* parent)
     outer->Add(divider, 0, wxEXPAND);
 
     bar->SetSizer(outer);
+
+    // Picking an injection material seeds the Flow card's melt / mould
+    // temperatures with its recommended values.
+    m_injMaterialChoice->Bind(wxEVT_CHOICE,
+        [this](wxCommandEvent&) { ApplyInjectionProcessDefaults(); });
+    ReloadMaterialLibrary();
     return bar;
+}
+
+// ---------------------------------------------------------------------------
+// Material library <-> Physical Setup dropdowns.
+// ---------------------------------------------------------------------------
+void PreviewPanel::ReloadMaterialLibrary()
+{
+    // Remember the current selections by key: indices shift when files come
+    // and go between scans.
+    auto keyAt = [](const auto& entries, wxChoice* ch)
+    {
+        const int i = ch ? ch->GetSelection() : -1;
+        return (i >= 0 && (size_t)i < entries.size()) ? entries[(size_t)i].Key() : std::string();
+    };
+    const std::string injKey = keyAt(m_materialLib.Injection(), m_injMaterialChoice);
+    const std::string mouldKey = keyAt(m_materialLib.Mould(), m_mouldMaterialChoice);
+
+    m_materialLib.Reload();
+    RefreshMaterialChoices(injKey, mouldKey);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 0 harness: mesh the shot with fTetWild in the worker process.
+// ---------------------------------------------------------------------------
+void PreviewPanel::RunTetMeshTest()
+{
+    wxWindow* top = wxGetTopLevelParent(this);
+    const wxString title = "3D Mesh Test (fTetWild)";
+    if (!m_hasShot || m_shotMesh.posNorm.empty() || m_shotMesh.indices.empty())
+    {
+        wxMessageBox("There is no shot to mesh. Generate the mould first.", title, wxOK | wxICON_INFORMATION, top);
+        return;
+    }
+
+    // The shot's display buffer is flat-shaded (split per face); weld it into
+    // a shared-vertex surface for the mesher.
+    const TetMesh::Surface surf = TetMesh::WeldSurface(m_shotMesh.posNorm.data(), m_shotMesh.posNorm.size() / 6, 6,
+                                                       m_shotMesh.indices.data(), m_shotMesh.indices.size());
+    double mn[3] = { 1e300, 1e300, 1e300 }, mx[3] = { -1e300, -1e300, -1e300 };
+    for (size_t i = 0; i < surf.VertexCount(); ++i)
+        for (int k = 0; k < 3; ++k)
+        {
+            mn[k] = std::min(mn[k], surf.verts[3 * i + k]);
+            mx[k] = std::max(mx[k], surf.verts[3 * i + k]);
+        }
+    const double diag = std::sqrt((mx[0] - mn[0]) * (mx[0] - mn[0]) + (mx[1] - mn[1]) * (mx[1] - mn[1]) +
+                                  (mx[2] - mn[2]) * (mx[2] - mn[2]));
+    if (surf.TriangleCount() < 4 || !(diag > 0.0))
+    {
+        wxMessageBox("The shot surface is empty.", title, wxOK | wxICON_WARNING, top);
+        return;
+    }
+
+    // Target edge length: default bbox diagonal / 40 (coarse enough to be quick).
+    wxTextEntryDialog ask(top,
+        wxString::Format("Target tetrahedron edge length (mm).\n\nThe shot is %.1f mm across (bounding-box diagonal). "
+                         "Halving the edge length multiplies the element count by about 8 and the time by more.",
+                         diag),
+        title, wxString::Format("%.3g", diag / 40.0));
+    if (ask.ShowModal() != wxID_OK) return;
+    double edge = 0.0;
+    if (!ask.GetValue().ToDouble(&edge) || !(edge > 0.0))
+    {
+        wxMessageBox("Enter a positive edge length in mm.", title, wxOK | wxICON_WARNING, top);
+        return;
+    }
+
+    TetMesh::Params prm;
+    prm.edgeLength = edge;   // envelope: fTetWild default (bounding-box diagonal / 1000)
+    TetMeshOutcome o = RunTetMeshJobModal(top, surf, prm, title);
+
+    switch (o.kind)
+    {
+    case TetMeshOutcome::Kind::Cancelled:
+        return;
+    case TetMeshOutcome::Kind::LaunchFailed:
+    case TetMeshOutcome::Kind::Crashed:
+    case TetMeshOutcome::Kind::Failed:
+        wxMessageBox(o.detail.empty() ? wxString("Meshing failed.") : o.detail, title, wxOK | wxICON_ERROR, top);
+        return;
+    case TetMeshOutcome::Kind::Ok:
+        break;
+    }
+
+    const TetMesh::Stats st = TetMesh::ComputeStats(o.result.mesh);
+    const double surfVol = std::fabs(TetMesh::SurfaceVolume(surf));
+    auto U = [](const char* s) { return wxString::FromUTF8(s); };
+    auto pct = [](double a, double b) { return b > 0.0 ? 100.0 * (a / b - 1.0) : 0.0; };
+    wxString msg;
+    msg << wxString::Format("%zu tetrahedra, %zu vertices, %zu boundary faces\n", st.tets, st.verts, st.boundaryFaces);
+    msg << wxString::Format("Mean edge %.3g mm (target %.3g mm)\n\n", st.meanEdgeMm, edge);
+    msg << U("Volume: ") << wxString::Format("%.2f", st.volumeMm3) << U(" mm\xc2\xb3\n");
+    msg << U("  shot surface: ") << wxString::Format("%.2f", surfVol) << U(" mm\xc2\xb3 (")
+        << wxString::Format("%+.3f%%", pct(st.volumeMm3, surfVol)) << ")\n";
+    if (m_shotVolumeMm3 > 0.0)
+        msg << U("  shot at Generate Mould: ") << wxString::Format("%.2f", m_shotVolumeMm3) << U(" mm\xc2\xb3 (")
+            << wxString::Format("%+.3f%%", pct(st.volumeMm3, m_shotVolumeMm3)) << ")\n";
+    msg << U("\nQuality: dihedral angles ") << wxString::Format("%.1f", st.minDihedralDeg) << U("\xc2\xb0\xe2\x80\x93")
+        << wxString::Format("%.1f", st.maxDihedralDeg) << U("\xc2\xb0, ") << st.slivers
+        << U(" sliver(s) under 5\xc2\xb0");
+    if (st.nonPositive > 0) msg << wxString::Format(", %zu inverted (!)", st.nonPositive);
+    msg << "\n\n";
+    msg << wxString::Format("Input surface: %zu triangles, %zu vertices after welding\n", surf.TriangleCount(), surf.VertexCount());
+    msg << wxString::Format("Time: %.1f s meshing, %.1f s total (worker start, file I/O)", o.result.workerSeconds, o.wallSeconds);
+    msg << "\n\nSim Viewer: \"3D mesh\" shows it (section plane in the bar below the view).";
+
+    // Keep it for the 3D mesh view / Export Mesh (whole shot, default envelope).
+    StoreVolumeMesh(std::move(o.result.mesh), /*fullShot=*/true, edge, diag / 1000.0, 0.0, surfVol,
+                    surf.TriangleCount(), o.result.workerSeconds, o.wallSeconds);
+    TagVolumeBoundary();
+    wxMessageBox(msg, title, wxOK | wxICON_INFORMATION, top);
+    ShowOnlyShot();
+    if (m_debugModeChoice) m_debugModeChoice->SetSelection(kViewVolumeMesh);
+    UpdateDraftOverlay();
+}
+
+void PreviewPanel::AddMaterialToLibrary(MaterialKind kind)
+{
+    // Parent on the top-level frame: this panel may be on a hidden book page
+    // (the Materials menu works from every perspective).
+    MaterialEditorDialog dlg(wxGetTopLevelParent(this), kind);
+    if (dlg.ShowModal() != wxID_OK) return;
+
+    // Rescan (keeping the other dropdown's selection), then select the new
+    // material by its file.
+    ReloadMaterialLibrary();
+    const std::string key = "file:" + dlg.SavedPath();
+    if (kind == MaterialKind::Injection)
+    {
+        const int i = m_materialLib.FindInjection(key);
+        if (i >= 0 && m_injMaterialChoice)
+        {
+            m_injMaterialChoice->SetSelection(i);
+            ApplyInjectionProcessDefaults();
+        }
+    }
+    else
+    {
+        const int i = m_materialLib.FindMould(key);
+        if (i >= 0 && m_mouldMaterialChoice) m_mouldMaterialChoice->SetSelection(i);
+    }
+}
+
+void PreviewPanel::RefreshMaterialChoices(const std::string& injKey, const std::string& mouldKey)
+{
+    if (!m_injMaterialChoice || !m_mouldMaterialChoice) return;
+
+    auto fill = [](wxChoice* ch, const auto& entries, int sel)
+    {
+        ch->Freeze();
+        ch->Clear();
+        for (const auto& e : entries)
+            ch->Append(wxString::FromUTF8(e.displayName.c_str()));
+        ch->SetSelection(entries.empty() ? wxNOT_FOUND : std::max(0, sel));
+        ch->Thaw();
+        // Size to the longest name (the choice was created empty).
+        ch->InvalidateBestSize();
+        ch->SetMinSize(wxSize(std::max(150, ch->GetBestSize().x), -1));
+    };
+    fill(m_injMaterialChoice, m_materialLib.Injection(), m_materialLib.FindInjection(injKey));
+    fill(m_mouldMaterialChoice, m_materialLib.Mould(), m_materialLib.FindMould(mouldKey));
+    // Where the files come from (it's next to the executable, not the project).
+    m_injMaterialChoice->SetToolTip("Built-in materials plus the files in\n" +
+        wxString(MaterialFile::LibraryFolder(MaterialKind::Injection)));
+    m_mouldMaterialChoice->SetToolTip("Built-in materials plus the files in\n" +
+        wxString(MaterialFile::LibraryFolder(MaterialKind::Mould)));
+
+    if (m_libraryIssues)
+    {
+        const std::vector<std::string>& probs = m_materialLib.ScanProblems();
+        wxString tip = wxString::Format("%d material library file(s) couldn't be listed:\n", (int)probs.size());
+        for (const std::string& p : probs) tip << "\n" << wxString(p);   // paths: native encoding
+        m_libraryIssues->SetToolTip(probs.empty() ? wxString() : tip);
+        m_libraryIssues->Show(!probs.empty());
+    }
+    if (wxWindow* bar = m_injMaterialChoice->GetParent()) bar->Layout();
+
+    ApplyInjectionProcessDefaults();   // no-op unless the injection selection changed
+}
+
+void PreviewPanel::ApplyInjectionProcessDefaults(bool force)
+{
+    const std::vector<InjectionLibraryEntry>& lib = m_materialLib.Injection();
+    const int sel = m_injMaterialChoice ? m_injMaterialChoice->GetSelection() : -1;
+    if (sel < 0 || (size_t)sel >= lib.size() || !m_flowMeltTempCtrl || !m_flowMouldTempCtrl) return;
+    const std::string key = lib[(size_t)sel].Key();
+    if (!force && key == m_appliedInjKey) return;
+    m_appliedInjKey = key;
+
+    // Scan-time data is enough for the defaults (the run re-reads the file).
+    const ResolvedInjectionMaterial r = ResolveInjectionMaterial(lib[(size_t)sel].data);
+    m_flowMeltTempCtrl->ChangeValue(wxString::Format("%g", r.props.recMeltTempC));
+    m_flowMouldTempCtrl->ChangeValue(wxString::Format("%g", r.props.recMouldTempC));
+    // The 3D card keeps its own process settings, seeded the same way.
+    if (m_flow3dMeltTempCtrl)  m_flow3dMeltTempCtrl->ChangeValue(wxString::Format("%g", r.props.recMeltTempC));
+    if (m_flow3dMouldTempCtrl) m_flow3dMouldTempCtrl->ChangeValue(wxString::Format("%g", r.props.recMouldTempC));
+}
+
+bool PreviewPanel::ResolveSelectedMaterials(ResolvedInjectionMaterial& inj, ResolvedMouldMaterial& mould,
+                                            std::vector<wxString>& fileWarnings)
+{
+    const std::vector<InjectionLibraryEntry>& il = m_materialLib.Injection();
+    const std::vector<MouldLibraryEntry>& ml = m_materialLib.Mould();
+    if (il.empty() || ml.empty()) return false;   // never: the built-ins are always listed
+    auto pick = [](wxChoice* ch, size_t n)
+    {
+        const int i = ch ? ch->GetSelection() : 0;
+        return (size_t)std::clamp(i, 0, (int)n - 1);
+    };
+    const InjectionLibraryEntry& ie = il[pick(m_injMaterialChoice, il.size())];
+    const MouldLibraryEntry& me = ml[pick(m_mouldMaterialChoice, ml.size())];
+
+    auto fail = [this](const char* what, const std::string& name, const std::string& err)
+    {
+        wxMessageBox(wxString("Couldn't read the ") + what + " material \"" + wxString::FromUTF8(name.c_str()) +
+                     "\":\n\n" + wxString(err) +
+                     "\n\nIt may have been moved, renamed or deleted. Pick another material, "
+                     "or put the file back and generate again to rescan the library.",
+                     "Materials", wxOK | wxICON_ERROR, this);
+        return false;
+    };
+
+    std::string err;
+    std::vector<std::string> w;
+    InjectionMaterialData id;
+    if (!MaterialLibrary::Fetch(ie, id, err, &w)) return fail("injection", ie.displayName, err);
+    for (const std::string& s : w)
+        fileWarnings.push_back(wxString::FromUTF8(ie.displayName.c_str()) + ": " + wxString::FromUTF8(s.c_str()));
+
+    w.clear();
+    MouldMaterialData md;
+    if (!MaterialLibrary::Fetch(me, md, err, &w)) return fail("mould", me.displayName, err);
+    for (const std::string& s : w)
+        fileWarnings.push_back(wxString::FromUTF8(me.displayName.c_str()) + ": " + wxString::FromUTF8(s.c_str()));
+
+    inj = ResolveInjectionMaterial(id);
+    mould = ResolveMouldMaterial(md);
+    inj.name = ie.displayName;     // the (unique) name the dropdown shows
+    mould.name = me.displayName;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -668,6 +1004,10 @@ void PreviewPanel::SetData(const std::vector<FileImporter::MeshData>& halves,
     const ShotPreviewInput& shot,
     const std::vector<FileImporter::MeshData>& inserts)
 {
+    // Rescan the material library on every generation, so files added to the
+    // Materials folders since the last one show up (selections are kept).
+    ReloadMaterialLibrary();
+
     // Stash the new data, replacing whatever the previous generation left.
     m_pendingHalves = halves;
     m_pendingInserts = inserts;
@@ -711,6 +1051,11 @@ void PreviewPanel::SetData(const std::vector<FileImporter::MeshData>& halves,
     m_fill = Flow::CoupledFillResult{};
     m_hasFill = false;
     OnFillChanged();
+    m_volMesh = VolumeMesh{};
+    m_thinWallMm[0] = m_thinWallMm[1] = -1.0;
+    m_fill3d = Flow3D::FillResult{};
+    m_hasFill3d = false;
+    if (m_flow3dExportMeshBtn) m_flow3dExportMeshBtn->Enable(false);
     m_hasShot = false;
     m_shotVolumeMm3 = 0.0;
     m_castShotMesh = FileImporter::MeshData();
@@ -850,6 +1195,11 @@ void PreviewPanel::ClearData()
     m_fill = Flow::CoupledFillResult{};
     m_hasFill = false;
     OnFillChanged();
+    m_volMesh = VolumeMesh{};
+    m_thinWallMm[0] = m_thinWallMm[1] = -1.0;
+    m_fill3d = Flow3D::FillResult{};
+    m_hasFill3d = false;
+    if (m_flow3dExportMeshBtn) m_flow3dExportMeshBtn->Enable(false);
     m_hasShot = false;
     m_shotVolumeMm3 = 0.0;
     m_castShotMesh = FileImporter::MeshData();
@@ -1235,6 +1585,117 @@ wxPanel* PreviewPanel::BuildSimPanel(wxWindow* parent)
         addStart(body, bs, "Hele-Shaw 2.5D Flow");
     });
 
+    // ---- 3D Flow Analysis ---------------------------------------------------
+    // Full 3D (tetrahedral) filling analysis, its own card with its own process
+    // settings. Stage 1: the volume mesh (fTetWild, in the worker process) of
+    // the part cavities — the feed system then stays a 1D beam network like
+    // the 2.5D analysis — or, with "Simulate full shot volume", of the whole
+    // shot with the melt entering at the sprue. The element size follows the
+    // thinnest wall so the melt sees several elements across it.
+    makeCard("3D Flow Analysis", [this, &addStart](wxWindow* body, wxBoxSizer* bs)
+    {
+        const wxString degC = wxString::FromUTF8("\xC2\xB0""C");
+        m_flow3dFillTimeCtrl  = AddFieldRow(body, bs, "Fill time:", "1.0", "s");
+        m_flow3dFillTimeCtrl->SetToolTip(
+            "Target time to fill the meshed volume (the cavities, or the whole shot with "
+            "\"Simulate full shot volume\"): the injection rate is that volume over this time.");
+        m_flow3dMeltTempCtrl  = AddFieldRow(body, bs, "Melt temp:", "230", degC);
+        m_flow3dMeltTempCtrl->SetToolTip("The melt's temperature: sets its viscosity (held constant through the fill for now).");
+        m_flow3dMouldTempCtrl = AddFieldRow(body, bs, "Mould temp:", "40", degC);
+        m_flow3dMouldTempCtrl->SetToolTip("Mould temperature. With the mould material it sets the wall temperature the melt sees (thermal fill).");
+        m_flow3dMaxPressureCtrl = AddFieldRow(body, bs, "Max inj. pressure:", "150", "MPa");
+        m_flow3dMaxPressureCtrl->SetToolTip(
+            "The machine's injection-pressure limit. If the fill needs more, the machine holds "
+            "this pressure and the fill slows.");
+
+        m_flow3dFullShotCheck = new wxCheckBox(body, wxID_ANY, "Simulate full shot volume");
+        m_flow3dFullShotCheck->SetForegroundColour(Style::TextPrimary);
+        m_flow3dFullShotCheck->SetBackgroundColour(Style::CardBg);
+        m_flow3dFullShotCheck->SetToolTip(
+            "On: mesh the whole shot - sprue, runners, gates and parts - as one 3D volume, "
+            "with the melt entering where the sprue meets the injection point. Most "
+            "faithful at the gates, but many more elements.\n"
+            "Off: mesh only the part cavities in 3D; the sprue, runners and gates are "
+            "solved as a 1D beam network (as in the 2.5D analysis) feeding the gates.");
+        bs->Add(m_flow3dFullShotCheck, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
+
+        m_flow3dThermalCheck = new wxCheckBox(body, wxID_ANY, "Thermal (frozen layer)");
+        m_flow3dThermalCheck->SetValue(true);
+        m_flow3dThermalCheck->SetForegroundColour(Style::TextPrimary);
+        m_flow3dThermalCheck->SetBackgroundColour(Style::CardBg);
+        m_flow3dThermalCheck->SetToolTip(
+            "Track the melt temperature: carried with the flow, conducted, heated by shear and "
+            "cooled into the mould, with the frozen skin that grows on the walls and narrows the "
+            "flow. Off = isothermal (melt temperature everywhere; faster but optimistic).");
+        bs->Add(m_flow3dThermalCheck, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
+
+        m_flow3dPackCheck = new wxCheckBox(body, wxID_ANY, "Pack and cool");
+        m_flow3dPackCheck->SetValue(true);
+        m_flow3dPackCheck->SetForegroundColour(Style::TextPrimary);
+        m_flow3dPackCheck->SetBackgroundColour(Style::CardBg);
+        m_flow3dPackCheck->SetToolTip(
+            "After the fill, hold the pack pressure until the gates freeze, then cool to the "
+            "ejection temperature: gate freeze, time to eject, part mass and volumetric "
+            "shrinkage. Needs Thermal.");
+        bs->Add(m_flow3dPackCheck, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
+        m_flow3dPackPressureCtrl = AddFieldRow(body, bs, "Pack pressure:", "80", "%");
+        m_flow3dPackPressureCtrl->SetToolTip(
+            "Pack / hold pressure as a percentage of the fill's peak machine pressure "
+            "(typically 50-80%).");
+        m_flow3dHoldTimeCtrl = AddFieldRow(body, bs, "Hold time:", "0", "s");
+        m_flow3dHoldTimeCtrl->SetToolTip(
+            "How long the pack pressure is held after the fill. 0 = until the gates have "
+            "frozen.");
+
+        auto* denLbl = new wxStaticText(body, wxID_ANY, "Mesh density:");
+        denLbl->SetForegroundColour(Style::TextMuted);
+        denLbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+        bs->Add(denLbl, 0, wxLEFT | wxRIGHT | wxTOP, 10);
+        wxArrayString dens;
+        dens.Add("Coarse (2 across the wall)");
+        dens.Add("Standard (3 across)");
+        dens.Add("Fine (4 across)");
+        dens.Add("Very fine (6 across)");
+        m_flow3dDensityChoice = new wxChoice(body, wxID_ANY, wxDefaultPosition, wxDefaultSize, dens);
+        m_flow3dDensityChoice->SetSelection(1);
+        m_flow3dDensityChoice->SetToolTip(
+            "How many elements span the thinnest wall. The element edge length is the "
+            "thin-wall thickness divided by this. Each step finer multiplies the element "
+            "count (and the run time) by roughly 2-3x.");
+        bs->Add(m_flow3dDensityChoice, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 8);
+        m_flow3dEdgeCtrl = AddFieldRow(body, bs, "Edge length:", "auto", "mm");
+        m_flow3dEdgeCtrl->SetToolTip(
+            "\"auto\" sizes the elements from the thinnest wall and the density above. "
+            "Enter a length (mm) to set it yourself.");
+
+        auto* note = new wxStaticText(body, wxID_ANY,
+            "Start meshes (or reuses the mesh if its\n"
+            "settings haven't changed), then fills it\n"
+            "(Sim Viewer: the 3D ... views).");
+        note->SetForegroundColour(Style::TextMuted);
+        note->SetBackgroundColour(Style::CardBg);
+        note->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+        bs->Add(note, 0, wxLEFT | wxRIGHT | wxTOP, 10);
+
+        addStart(body, bs, "3D Flow Analysis");
+
+        m_flow3dExportMeshBtn = new RoundedButton(body, wxID_ANY, "Export Mesh...",
+            wxDefaultPosition, wxSize(-1, 26), wxBORDER_NONE);
+        m_flow3dExportMeshBtn->SetBackgroundColour(Style::BtnSmall);
+        m_flow3dExportMeshBtn->SetForegroundColour(Style::TextPrimary);
+        m_flow3dExportMeshBtn->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
+        m_flow3dExportMeshBtn->SetToolTip(
+            "Save the last 3D mesh as .vtu (opens in ParaView, with the element quality and "
+            "the boundary faces tagged by condition) or .msh (Gmsh, boundary faces as "
+            "named physical groups).");
+        m_flow3dExportMeshBtn->Enable(false);
+        m_flow3dExportMeshBtn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { ExportVolumeMesh(); });
+        bs->Add(m_flow3dExportMeshBtn, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
+    });
+
     sizer->AddSpacer(12);
     scrollWin->SetSizer(sizer);
     colSizer->Add(scrollWin, 1, wxEXPAND);
@@ -1387,6 +1848,7 @@ wxPanel* PreviewPanel::BuildInfoPanel(wxWindow* parent)
     m_draftStatus = makeVerdictCard("Draft Angle Checks", CardDraft);
     m_demouldStatus = makeVerdictCard("Separation Test", CardSeparation);
     m_flowStatus = makeVerdictCard("Flow Analysis", CardFlow);
+    m_flow3dStatus = makeVerdictCard("3D Flow Analysis", CardFlow3D);
 
     column->SetSizer(colSizer);
     outerSizer->Add(column, 1, wxEXPAND);
@@ -1449,6 +1911,11 @@ void PreviewPanel::UpdateInfoPanel()
         m_flowStatus->SetLabel("Not run");
         m_flowStatus->SetForegroundColour(Style::TextMuted);
     }
+    if (m_flow3dStatus)
+    {
+        m_flow3dStatus->SetLabel("Not run");
+        m_flow3dStatus->SetForegroundColour(Style::TextMuted);
+    }
     ClearResultsReports();   // the Details windows follow the cards
 
     if (m_infoPanel) m_infoPanel->Layout();
@@ -1474,6 +1941,11 @@ void PreviewPanel::OnStartSimulation(const wxString& simName)
     if (simName == "Hele-Shaw 2.5D Flow")
     {
         RunFlowCheck();
+        return;
+    }
+    if (simName == "3D Flow Analysis")
+    {
+        Run3DFlow();
         return;
     }
 
@@ -2362,15 +2834,15 @@ void PreviewPanel::RunFaceDraftCheck()
     m_lastFaceDraftStats.fallbackCount = own.fallback;
 
     // Verdict card.
-    wxString verdict; wxColour col; long icon = wxICON_INFORMATION;
+    wxString verdict; wxColour col;
     switch (m_lastFaceDraftStats.overall)
     {
     case DesignChecks::Severity::Pass:
-        verdict = "PASS";    col = wxColour(0x26, 0xAB, 0x36); icon = wxICON_INFORMATION; break;
+        verdict = "PASS";    col = wxColour(0x26, 0xAB, 0x36); break;
     case DesignChecks::Severity::Warning:
-        verdict = "WARNING"; col = wxColour(0xE0, 0x9B, 0x20); icon = wxICON_WARNING;     break;
+        verdict = "WARNING"; col = wxColour(0xE0, 0x9B, 0x20); break;
     case DesignChecks::Severity::Fail:
-        verdict = "FAIL";    col = wxColour(0xD0, 0x46, 0x46); icon = wxICON_ERROR;       break;
+        verdict = "FAIL";    col = wxColour(0xD0, 0x46, 0x46); break;
     }
     if (m_draftStatus)
     {
@@ -2384,50 +2856,8 @@ void PreviewPanel::RunFaceDraftCheck()
     if (m_debugModeChoice && m_debugModeChoice->GetSelection() <= 0) m_debugModeChoice->SetSelection(1);
     UpdateDraftOverlay();
 
-    const wxString deg = wxString::FromUTF8("\xC2\xB0");
-    const wxString mm2 = wxString::FromUTF8(" mm\xC2\xB2");
-    const DesignChecks::FaceDraftStats& st = m_lastFaceDraftStats;
-    wxString msg;
-    msg << "Draft Angle Checks: " << verdict << "\n";
-    msg << "Per-facet draft vs the half that forms each face "
-        << "(ray-assigned ownership).\n";
-    msg << "Mesh: " << (source == SourceCavity ? "cavity only (part model meshes)"
-                                               : "whole shot (parts + feed system)") << "\n\n";
-    msg << "Facets: " << st.totalFaces << "\n";
-    msg << "  Pass: " << st.passCount << "\n";
-    msg << "  Warn: " << st.warnCount
-        << "   (< " << wxString::Format("%.1f", params.warnDraftDeg) << deg << ",  "
-        << wxString::Format("%.3f", st.warnAreaMm2) << mm2 << ")\n";
-    msg << "  Fail: " << st.failCount
-        << "   (< " << wxString::Format("%.1f", params.failDraftDeg) << deg << ",  "
-        << wxString::Format("%.3f", st.failAreaMm2) << mm2 << ")\n";
-    msg << "  Back-draft: " << st.backdraftCount
-        << "   (< -" << wxString::Format("%.2g", params.backdraftEpsDeg) << deg << ")\n\n";
-    msg << "Min draft: " << wxString::Format("%.2f", st.minDraftDeg) << deg << "\n";
-
-    // Significance gate (when enabled): report the threshold and any suppression.
-    if (params.significanceValue > 0.0f)
-    {
-        msg << "\nSignificance gate: ";
-        if (params.significanceByPercent)
-            msg << wxString::Format("%.3g", params.significanceValue) << "% of surface = "
-                << wxString::Format("%.3f", st.significanceMm2) << mm2 << "\n";
-        else
-            msg << wxString::Format("%.3f", st.significanceMm2) << mm2 << "\n";
-        if (st.failSuppressed)
-            msg << "  Failing area below the gate \xe2\x80\x94 not counted as a fail.\n";
-        if (st.warnSuppressed)
-            msg << "  Warning area below the gate \xe2\x80\x94 not counted as a warning.\n";
-    }
-
-    if (st.fallbackCount > 0)
-        msg << "\n" << st.fallbackCount
-            << " facet(s) hit no half; assigned by parting-plane side.";
-    msg << "\n\nDetails (on the results card) lists the draft distribution, each "
-           "half, and where the failing areas are.";
-
     SetResultsReport(CardDraft, BuildDraftReport(params, source, verdict, col));
-    wxMessageBox(msg, "Draft Angle Checks", wxOK | icon, this);
+    ShowSimCompleteNotice("Draft Angle Checks", "Draft Angle Checks", m_draftStatus);
 }
 
 // ---------------------------------------------------------------------------
@@ -2504,8 +2934,6 @@ void PreviewPanel::RunSeparationCheck()
     // slivers while a continuous overlap still counts.
     double perSideVol[2]  = { 0.0, 0.0 };   // summed SIGNIFICANT overlap per side
     int    perSideStat[2] = { 0, 0 };       // 0 clear, 1 collision, 2 not evaluable
-    int    sigRegions  = 0;                 // regions kept (>= floor)
-    int    tinyRegions = 0;                 // regions discarded (< floor)
     MeshBoolean::Mesh overlapViz;
     std::string err;
 
@@ -2563,8 +2991,8 @@ void PreviewPanel::RunSeparationCheck()
             for (const MeshBoolean::Mesh& comp : comps)
             {
                 const double v = MeshBoolean::Volume(comp);
-                if (v >= (double)minOverlap) { keepRegion(comp, side, v); ++sigRegions; }
-                else if (v > 0.0)            { ++tinyRegions; run.sideTiny[side] += 1; }
+                if (v >= (double)minOverlap) { keepRegion(comp, side, v); }
+                else if (v > 0.0)            { run.sideTiny[side] += 1; }
             }
         }
         if (perSideVol[side] > 0.0) perSideStat[side] = 1;
@@ -2572,10 +3000,8 @@ void PreviewPanel::RunSeparationCheck()
         else                        perSideStat[side] = 0;
     }
 
-    const double totalVol = perSideVol[0] + perSideVol[1];
     const int collided = (perSideStat[0]==1?1:0) + (perSideStat[1]==1?1:0);
     const int notEval  = (perSideStat[0]==2?1:0) + (perSideStat[1]==2?1:0);
-    const int tested   = (sideSurf[0]?1:0) + (sideSurf[1]?1:0);
 
     // Overlay (red): sew the accumulated overlap mesh into a shape. Its
     // visibility follows this card's "Show mould overlay" checkbox.
@@ -2591,15 +3017,15 @@ void PreviewPanel::RunSeparationCheck()
     else if (notEval  > 0) overall = DesignChecks::Severity::Warning;
     else                   overall = DesignChecks::Severity::Pass;
 
-    wxString verdict; wxColour verdictColour; long iconFlag = wxICON_INFORMATION;
+    wxString verdict; wxColour verdictColour;
     switch (overall)
     {
     case DesignChecks::Severity::Pass:
-        verdict = "PASS"; verdictColour = wxColour(0x26,0xAB,0x36); iconFlag = wxICON_INFORMATION; break;
+        verdict = "PASS"; verdictColour = wxColour(0x26,0xAB,0x36); break;
     case DesignChecks::Severity::Warning:
-        verdict = "INCONCLUSIVE"; verdictColour = wxColour(0xE0,0x9B,0x20); iconFlag = wxICON_WARNING; break;
+        verdict = "INCONCLUSIVE"; verdictColour = wxColour(0xE0,0x9B,0x20); break;
     case DesignChecks::Severity::Fail:
-        verdict = "FAIL"; verdictColour = wxColour(0xD0,0x46,0x46); iconFlag = wxICON_ERROR; break;
+        verdict = "FAIL"; verdictColour = wxColour(0xD0,0x46,0x46); break;
     }
     if (m_demouldStatus)
     {
@@ -2607,39 +3033,6 @@ void PreviewPanel::RunSeparationCheck()
         m_demouldStatus->SetForegroundColour(verdictColour);
         if (m_infoPanel) m_infoPanel->Layout();
     }
-
-    const wxString mm3 = wxString::FromUTF8(" mm\xC2\xB3");
-    const wxString mm  = " mm";
-    wxString msg;
-    msg << "Separation Test: " << verdict << "\n";
-    msg << "Each half's owned surface swept toward the parting plane, tested "
-        << "for overlap with that half's steel.\n";
-    msg << "Mesh: " << (source == SourceCavity ? "cavity only (part model meshes)"
-                                               : "whole shot (parts + feed system)") << "\n\n";
-    msg << "Sides tested: " << tested << "\n";
-    msg << "Sides collided: " << collided << "\n";
-    if (notEval > 0)
-        msg << "Sides not evaluable: " << notEval << " (mesh boolean failed)\n";
-    msg << "Overlap regions kept: " << sigRegions;
-    if (tinyRegions > 0) msg << "   (" << tinyRegions << " below floor, discarded)";
-    msg << "\n";
-    msg << "Significant overlap: " << wxString::Format("%.3f", totalVol) << mm3 << "\n";
-    msg << "Start \xce\xb5: " << wxString::Format("%.3g", startEps) << mm
-        << ",  noise floor: " << wxString::Format("%.3g", minOverlap) << mm3 << "\n\n";
-
-    const char* sideName[2] = { "A (+draw)", "B (-draw)" };
-    for (int side = 0; side < 2; ++side)
-    {
-        if (!sideSurf[side]) continue;
-        const char* s = perSideStat[side]==1 ? "COLLISION"
-            : perSideStat[side]==2 ? "not evaluable" : "clear";
-        msg << "  Half " << sideName[side] << ": " << s
-            << wxString::Format("  (overlap %.3f", perSideVol[side]) << mm3 << ")\n";
-    }
-
-    if (collided > 0)
-        msg << "\nEnable \"Show mould overlay\" to see the interference region "
-               "(red); hide the Shot toggle to view it clearly.";
 
     for (int side = 0; side < 2; ++side)
     {
@@ -2649,7 +3042,7 @@ void PreviewPanel::RunSeparationCheck()
     }
     m_lastSeparation = run;
     SetResultsReport(CardSeparation, BuildSeparationReport(run, verdict, verdictColour));
-    wxMessageBox(msg, "Separation Test", wxOK | iconFlag, this);
+    ShowSimCompleteNotice("Separation Test", "Separation Test", m_demouldStatus);
 }
 
 // ---------------------------------------------------------------------------
@@ -2676,13 +3069,17 @@ void PreviewPanel::RunFlowCheck()
     }
     const Flow::FeedNetwork& net = m_feedNetwork;
 
-    // Materials from the Physical Setup bar. Only Generic Polypropylene is
-    // offered for injection today; the mould toggle picks steel / aluminium.
-    const TestMaterial::PolymerMaterial& poly = TestMaterial::kGenericPolypropylene;
-    const bool mouldIsAlu =
-        m_mouldMaterialChoice && m_mouldMaterialChoice->GetSelection() == 1;
-    const TestMaterial::MouldMaterial& mould =
-        mouldIsAlu ? TestMaterial::kMouldAluminum : TestMaterial::kMouldSteel;
+    // Materials from the Physical Setup bar, resolved from the library: every
+    // value is given, derived from the datasheet values, or a generic fallback
+    // (MaterialResolve.h). Library files are re-read, so hand edits count.
+    ResolvedInjectionMaterial injMat;
+    ResolvedMouldMaterial mouldMat;
+    std::vector<wxString> materialFileWarnings;
+    if (!ResolveSelectedMaterials(injMat, mouldMat, materialFileWarnings)) return;
+    const TestMaterial::PolymerMaterial& poly = injMat.props;
+    const TestMaterial::MouldMaterial& mould = mouldMat.props;
+    const wxString injName = wxString::FromUTF8(injMat.name.c_str());
+    const wxString mouldName = wxString::FromUTF8(mouldMat.name.c_str());
 
     // Process fields, defaulting to the material's recommended window.
     const double fillTime = std::max(0.01, ParseField(m_flowFillTimeCtrl, 1.0));
@@ -2698,6 +3095,50 @@ void PreviewPanel::RunFlowCheck()
     const bool   packOn = thermalOn && (!m_flowPackCheck || m_flowPackCheck->GetValue());
     const double packPct = std::clamp(ParseField(m_flowPackPressureCtrl, 80.0), 5.0, 150.0);
     const double holdS = std::clamp(ParseField(m_flowHoldTimeCtrl, 0.0), 0.0, 120.0);
+
+    // Material values THIS run consumes that were derived or fell back (an
+    // isothermal fill doesn't care about a missing conductivity). Fallbacks
+    // are warned about up front, with the option not to run.
+    const unsigned matUses = MatUseFill | (thermalOn ? MatUseThermal : 0u) |
+                             (packOn ? (MatUsePack | MatUseWarp) : 0u);
+    std::vector<FlowRunInputs::MaterialNoteRow> matNotes;
+    int matFallbacks = 0;
+    auto collectNotes = [&](const wxString& matName, const std::vector<MaterialNote>& notes)
+    {
+        for (const MaterialNote* n : MaterialNotesFor(notes, matUses))
+        {
+            const bool fb = n->level == MaterialNote::Level::Fallback;
+            matNotes.push_back({ matName, wxString::FromUTF8(n->quantity.c_str()),
+                                 wxString::FromUTF8(n->message.c_str()), fb });
+            if (fb) ++matFallbacks;
+        }
+    };
+    collectNotes(injName, injMat.notes);
+    collectNotes(mouldName, mouldMat.notes);
+    if (matFallbacks > 0 || !materialFileWarnings.empty())
+    {
+        auto Ux = [](const char* utf8) { return wxString::FromUTF8(utf8); };
+        wxString w;
+        if (matFallbacks > 0)
+        {
+            w << "Some values this simulation needs aren't in the selected material data and can't "
+                 "be derived from it, so generic fallback values will be used:\n\n";
+            for (const FlowRunInputs::MaterialNoteRow& r : matNotes)
+                if (r.fallback)
+                    w << Ux("\xe2\x80\xa2 ") << r.material << Ux(" \xe2\x80\x94 ") << r.quantity << ": " << r.text << "\n";
+        }
+        if (!materialFileWarnings.empty())
+        {
+            w << (matFallbacks > 0 ? "\n" : "") << "Problems reading the material files (those values were skipped):\n\n";
+            for (const wxString& s : materialFileWarnings) w << Ux("\xe2\x80\xa2 ") << s << "\n";
+        }
+        w << "\nResults that depend on these values are less reliable. Run the simulation anyway?";
+        wxMessageDialog dlg(this, w, Ux("Hele-Shaw 2.5D Flow \xe2\x80\x94 material data"),
+                            wxYES_NO | wxNO_DEFAULT | wxICON_WARNING);
+        dlg.SetYesNoLabels("Run anyway", "Cancel");
+        if (dlg.ShowModal() != wxID_YES) return;
+    }
+
     // Wall temperature the melt sees: contact temperature of melt and mould
     // from their effusivities sqrt(k rho c) (the fill solver uses the same).
     const double eMelt = std::sqrt(poly.thermalConductivity * poly.densityMelt * poly.specificHeat);
@@ -2757,14 +3198,18 @@ void PreviewPanel::RunFlowCheck()
 
     const wxString deg = wxString::FromUTF8("\xC2\xB0""C");
     auto U = [](const char* utf8) { return wxString::FromUTF8(utf8); };  // non-ASCII literals
+    // Run log. No longer shown at the end of the run (ShowSimCompleteNotice
+    // points to the card's Details instead, which carries these numbers and,
+    // as of the notice change, the cautions gathered below). Still assembled
+    // because the cautions are computed alongside it; candidate for removal.
     wxString msg;
     msg << U("Hele-Shaw 2.5D Flow \xe2\x80\x94 ") << (thermalOn ? "thermal" : "isothermal")
         << " fill (1D feed + 2.5D part midplanes).\n\n";
 
-    msg << "Injection material: " << poly.name << U("  (\xce\xb7""0 @ ")
+    msg << "Injection material: " << injName << U("  (\xce\xb7""0 @ ")
         << wxString::Format("%.0f", meltC) << deg << ": "
         << wxString::Format("%.0f", eta0) << U(" Pa\xc2\xb7s)\n");
-    msg << "Mould material: " << mould.name
+    msg << "Mould material: " << mouldName
         << (thermalOn ? wxString::Format("  (wall contact temperature %.1f", wallC) + deg + ")\n"
                       : wxString("  (not used: isothermal run)\n"));
     msg << "Process: fill " << wxString::Format("%.2f", fillTime) << " s, melt "
@@ -2777,6 +3222,15 @@ void PreviewPanel::RunFlowCheck()
             << U(" cm\xc2\xb3 / fill time)\n\n");
     else
         msg << "Injection rate: unknown (no shot volume from the last generation)\n\n";
+
+    if (!matNotes.empty())
+    {
+        msg << "Material data this run used that wasn't given directly:\n";
+        for (const FlowRunInputs::MaterialNoteRow& r : matNotes)
+            msg << (r.fallback ? U("  \xe2\x9a\xa0 FALLBACK ") : U("  \xe2\x80\xa2 derived ")) << r.material
+                << U(" \xe2\x80\x94 ") << r.quantity << ": " << r.text << "\n";
+        msg << "\n";
+    }
 
     using EK = Flow::FeedEdgeKind;
     const int nSub = net.countEdges(EK::SubRunner);
@@ -2952,6 +3406,7 @@ void PreviewPanel::RunFlowCheck()
     }
     const Flow::CoupledFillResult& fr = m_fill;
     int fillCautions = 0;
+    std::vector<wxString> runCautions;   // for the Details "Cautions" table
     if (fillRan)
     {
         msg << U("Fill \xe2\x80\x94 feed + part midplanes together (Cross-WLF")
@@ -3000,7 +3455,7 @@ void PreviewPanel::RunFlowCheck()
             if (fr.thermal)
             {
                 msg << "  thermal: wall " << wxString::Format("%.1f", fr.wallTempC) << deg
-                    << " (melt / " << mould.name << " contact), melt front "
+                    << " (melt / " << mouldName << " contact), melt front "
                     << wxString::Format("%.0f", fr.minFrontTempC) << U("\xe2\x80\x93")
                     << wxString::Format("%.0f", fr.maxFrontTempC) << deg << " (melt in at "
                     << wxString::Format("%.0f", meltC) << deg << ")\n";
@@ -3179,6 +3634,8 @@ void PreviewPanel::RunFlowCheck()
                        "bending from unequal mould-half temperatures and buckling aren't modelled yet)\n";
             }
             fillCautions = (int)cautions.size();
+            runCautions = cautions;
+            for (const std::string& w : fr.warnings) runCautions.push_back(wxString::FromUTF8(w.c_str()));
             for (const wxString& c : cautions)
                 msg << U("  \xe2\x9a\xa0 ") << c << "\n";
             for (const std::string& w : fr.warnings)
@@ -3201,13 +3658,19 @@ void PreviewPanel::RunFlowCheck()
             float tFirst = 1e30f, tLast = -1.0f;
             for (const Flow::PartFillResult& pr : fr.parts)
                 if (pr.fed && pr.fillEndS >= 0.0f) { tFirst = std::min(tFirst, pr.fillEndS); tLast = std::max(tLast, pr.fillEndS); }
-            if (tLast >= 0.0f && tLast - tFirst > 0.05f * fr.fillTimeS) spreadOK = false;
+            if (tLast >= 0.0f && tLast - tFirst > 0.05f * fr.fillTimeS)
+            {
+                spreadOK = false;
+                runCautions.push_back(wxString::Format("The parts finish %.3f s apart (%.0f%% of the fill)",
+                                                       tLast - tFirst, 100.0f * (tLast - tFirst) / fr.fillTimeS) +
+                    U(" \xe2\x80\x94 unbalanced: the early parts are over-packed while the rest fill."));
+            }
             // One result per line (the fill time is an input, so not repeated here).
             wxString verdict = wxString::Format("PRESSURE %.1f MPa", fr.peakInletPressureMPa);
             if (fr.pack.ran && fr.pack.ejectReached) verdict << wxString::Format("\nEJECT %.1f s", fr.pack.ejectS);
             m_flowStatus->SetLabel(verdict);
             const bool clean = spreadOK && fr.warnings.empty() && net.warnings.empty() && !fr.pressureLimited &&
-                               fillCautions == 0;
+                               fillCautions == 0 && matFallbacks == 0;   // fallback material data -> amber
             m_flowStatus->SetForegroundColour(clean ? wxColour(0x26, 0xAB, 0x36) : wxColour(0xE0, 0x9B, 0x20));
         }
         else if (fr.cancelled)
@@ -3241,6 +3704,8 @@ void PreviewPanel::RunFlowCheck()
         msg << "\n";
     }
 
+    for (const std::string& w : net.warnings)
+        runCautions.push_back("Feed network: " + wxString::FromUTF8(w.c_str()));
     if (!net.warnings.empty())
     {
         msg << "Network warnings:\n";
@@ -3279,8 +3744,10 @@ void PreviewPanel::RunFlowCheck()
     // The numbers behind the card, for its Details window.
     {
         FlowRunInputs in;
-        in.material = wxString::FromUTF8(poly.name);
-        in.mould = wxString::FromUTF8(mould.name);
+        in.material = injName;
+        in.mould = mouldName;
+        in.materialNotes = matNotes;
+        in.cautions = runCautions;
         in.fillTimeS = fillTime;
         in.meltC = meltC;
         in.mouldC = mouldC;
@@ -3301,7 +3768,28 @@ void PreviewPanel::RunFlowCheck()
         SetResultsReport(CardFlow, BuildFlowReport(in));
     }
 
-    wxMessageBox(msg, "Hele-Shaw 2.5D Flow", wxOK | wxICON_INFORMATION, this);
+    ShowSimCompleteNotice("Hele-Shaw 2.5D Flow", "Flow Analysis", m_flowStatus);
+}
+
+// ---------------------------------------------------------------------------
+// End-of-run notice: complete + the card's verdict + where the details are.
+// ---------------------------------------------------------------------------
+void PreviewPanel::ShowSimCompleteNotice(const wxString& simName, const wxString& cardTitle,
+                                         const wxStaticText* status)
+{
+    wxString verdict = status ? status->GetLabel() : wxString();
+    verdict.Replace("\n", ", ");   // the card shows one result per line
+    long icon = wxICON_INFORMATION;
+    if (status)
+    {
+        const wxColour c = status->GetForegroundColour();
+        if (c == wxColour(0xD0, 0x46, 0x46)) icon = wxICON_ERROR;           // red verdicts
+        else if (c == wxColour(0xE0, 0x9B, 0x20)) icon = wxICON_WARNING;    // amber verdicts
+    }
+    wxString msg = simName + " is complete.";
+    if (!verdict.empty()) msg << "\n\nResult: " << verdict;
+    msg << "\n\nFor the full results, click Details on the " << cardTitle << " card.";
+    wxMessageBox(msg, simName, wxOK | icon, this);
 }
 
 // ---------------------------------------------------------------------------
@@ -3540,17 +4028,28 @@ void PreviewPanel::UpdateDraftOverlay()
 
     const int  mode = m_debugModeChoice ? m_debugModeChoice->GetSelection() : 0;
     const bool wire = m_debugWireCheck && m_debugWireCheck->GetValue();
+    UpdateSectionControls();
+    // Moving between the 2.5D and 3D result views swaps the timeline (each
+    // starts at its end state), so the frame on show starts there too.
+    if ((Is3DView(mode) != Is3DView(m_lastOverlayMode)) && m_lastOverlayMode >= 0) m_fillFrame = -1;
+    m_lastOverlayMode = mode;
 
     // The on-top line/point overlay (the feed network) belongs to the flow views.
     if (mode < 5 || mode > 16) m_canvas->ClearDebugOverlay();
     // The legend and the fill timeline belong to the heat-map / flow views.
-    if (!(mode == 4 || (mode >= 6 && mode <= 16))) ShowResultsBar(false);
+    if (!(mode == 4 || (mode >= 6 && mode <= 16) || Is3DView(mode))) ShowResultsBar(false);
 
     if (mode <= 0)
     {
         // None: clear, honouring the wireframe toggle.
         m_canvas->ClearShotDebugColoring();
         m_canvas->SetShotDebugWireframe(wire && m_shotHalfIndex >= 0);
+        return;
+    }
+
+    if (Is3DView(mode))   // 3D mesh / 3D fill time / 3D pressure — the 3D Flow Analysis
+    {
+        DrawVolumeMeshView(wire);
         return;
     }
 

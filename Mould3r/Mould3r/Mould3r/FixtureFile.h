@@ -14,6 +14,35 @@
 // ---------------------------------------------------------------------------
 enum class InjectionType { Radial, Axial };
 
+// ---------------------------------------------------------------------------
+// TopInjection — whether the fixture's TOP plane (the top face of half A,
+// at the fixture's highest point) offers injection points, in addition to any
+// fixed points and the perimeter option:
+//   Off      — no (the default; older fixture files load as Off);
+//   Centre   — one point, at world (0, 0) on the top plane;
+//   Anywhere — anywhere inside the fixture outline on the top plane, placed
+//              by clicking it and draggable with Edit Sprue > Move.
+// Top-plane points are always Axial: the sprue runs straight down.
+// ---------------------------------------------------------------------------
+enum class TopInjection { Off, Centre, Anywhere };
+
+// File / UI spelling: "off", "centre", "anywhere".
+inline const char* TopInjectionKey(TopInjection t)
+{
+    switch (t)
+    {
+    case TopInjection::Centre:   return "centre";
+    case TopInjection::Anywhere: return "anywhere";
+    default:                     return "off";
+    }
+}
+inline TopInjection TopInjectionFromKey(const std::string& s)
+{
+    if (s == "centre" || s == "center") return TopInjection::Centre;
+    if (s == "anywhere")                return TopInjection::Anywhere;
+    return TopInjection::Off;
+}
+
 struct InjectionPoint
 {
     std::string   label;
@@ -31,6 +60,14 @@ struct InjectionPoint
     // immutable and Move instead drags the sprue endpoint. Fixed points loaded
     // from a fixture always leave this false.
     bool          perimeter = false;
+
+    // "Top plane" injection point (see FixtureDefinition::topInjection).
+    // When true this point was placed at runtime on the fixture's top plane
+    // (the top face of half A) — either the top-centre point or, when the
+    // fixture allows it, anywhere on the top — rather than authored in the
+    // fixture. Always Axial (the sprue runs straight down). Under "anywhere"
+    // its location is draggable over the top (Edit Sprue > Move).
+    bool          topPlane = false;
 
     // Derive the injection type from a Y coordinate. The rule is fixed:
     // points sitting exactly on the parting plane (y = 0) are Radial —
@@ -252,6 +289,12 @@ struct FixtureDefinition
     // GLCanvas::PickActivateInjectionPoint / MoveSprueInjectionPoint. Authored
     // via a checkbox on the FixtureEditor injection-points card.
     bool allowPerimeterInjection = false;
+
+    // "Top plane" injection option (see TopInjection): Off, the top-centre
+    // point only, or anywhere on the top. Authored with a choice on the
+    // FixtureEditor injection-points card (library fixtures) or the box
+    // fixture dialog (Parametric / Dynamic, saved with the project).
+    TopInjection topInjection = TopInjection::Off;
 
     // Optional per-feature defaults. All fields default-construct to empty
     // optionals — i.e. "no override". MainFrame::ApplyFixtureDefaults walks

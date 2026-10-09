@@ -474,6 +474,9 @@ void StartupDialog::AcceptSelection()
     // A cancel here leaves the picker open so the user can choose again.
     if (m_fixture.kind != FixtureKind::Library)
     {
+        // Side injection starts ticked for a new box fixture (it used to be
+        // always on); the dialog's checkbox can turn it off.
+        m_fixture.allowPerimeterInjection = true;
         ProceduralFixtureDialog dlg(this, m_fixture);
         if (dlg.ShowModal() != wxID_OK)
             return;
@@ -482,10 +485,8 @@ void StartupDialog::AcceptSelection()
             m_fixture.parametric = dlg.GetParametric();
         else
             m_fixture.dynamic = dlg.GetDynamic();
-
-        // Procedural fixtures allow perimeter injection by default — that's the
-        // feature these box fixtures are meant to make usable.
-        m_fixture.allowPerimeterInjection = true;
+        m_fixture.topInjection = dlg.GetTopInjection();
+        m_fixture.allowPerimeterInjection = dlg.GetAllowPerimeterInjection();
     }
 
     EndModal(wxID_OK);

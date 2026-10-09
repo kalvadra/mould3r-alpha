@@ -77,7 +77,7 @@ void PreviewPanel::SetResultsReport(int card, const ResultsDetails::Report& repo
 
 void PreviewPanel::ClearResultsReports()
 {
-    static const char* names[CardCount] = { "Draft Angle Checks", "Separation Test", "Flow Analysis" };
+    static const char* names[CardCount] = { "Draft Angle Checks", "Separation Test", "Flow Analysis", "3D Flow Analysis" };
     for (int c = 0; c < CardCount; ++c)
     {
         RD::Report r;
@@ -456,6 +456,15 @@ ResultsDetails::Report PreviewPanel::BuildFlowReport(const FlowRunInputs& in) co
         sum.Add({ "Feed pressure (steady)", F(fs.inletPressureMPa, 2) + " MPa" });
     R.tables.push_back(sum);
 
+    // What turned the verdict amber, right under the summary.
+    if (!in.cautions.empty())
+    {
+        RD::Table ct("Summary", { "Caution" });
+        ct.title = "Cautions";
+        for (const wxString& c : in.cautions) ct.Add({ c }, Status::Warn);
+        R.tables.push_back(ct);
+    }
+
     // ---- Process --------------------------------------------------------------------
     RD::Table proc("Process");
     proc.Add({ "Injection material", in.material });
@@ -705,5 +714,18 @@ ResultsDetails::Report PreviewPanel::BuildFlowReport(const FlowRunInputs& in) co
         R.tables.push_back(sv);
     }
     R.tables.push_back(proc);   // inputs last
+
+    // Material values the run didn't have directly: derived from datasheet
+    // values (info) or generic fallbacks (warning).
+    if (!in.materialNotes.empty())
+    {
+        RD::Table mt("Materials", { "Material", "Value", "Source" });
+        mt.title = "Derived and fallback material values";
+        for (const FlowRunInputs::MaterialNoteRow& r : in.materialNotes)
+            mt.Add({ r.material, r.quantity, (r.fallback ? wxString("FALLBACK: ") : wxString("Derived: ")) + r.text },
+                   r.fallback ? Status::Warn : Status::Info);
+        mt.note = "Add the missing values to the material file (or its additional values) to replace these.";
+        R.tables.push_back(mt);
+    }
     return R;
 }

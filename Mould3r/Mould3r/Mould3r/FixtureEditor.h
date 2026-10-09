@@ -333,6 +333,7 @@ private:
     // wxWidgets parent-child hierarchy.
     wxPanel* m_injectionListPanel = nullptr;
     wxCheckBox* m_allowPerimeterInjection = nullptr;  // "Fixture Perimeter" option
+    wxChoice*   m_topInjection = nullptr;             // "Top Plane": Off / Centre / Anywhere
 
     enum
     {

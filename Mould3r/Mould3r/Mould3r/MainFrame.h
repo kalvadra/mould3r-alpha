@@ -18,6 +18,9 @@
 #include <unordered_map>
 
 class GLCanvas;
+namespace History { class Stack; struct Entry; }   // SceneHistory.h — kept out of
+// this header (it pulls in the feature / GL headers) since the lightweight
+// toolbar headers include MainFrame.h.
 class RoundedButton;   // forward decl — m_btnGenerate pointer below; full def
 // is included from MainFrame.cpp where it's used.
 class SplitButton;     // forward decl — m_btnExport pointer below; full def
@@ -219,6 +222,22 @@ private:
     void OnLoadProject(wxCommandEvent&);
     void OnNewProject(wxCommandEvent&);
 
+    // ---- Undo / redo (Edit menu; see SceneHistory.h) ------------------------
+    // Steps are recorded by observation: on every idle event the live scene is
+    // captured and compared with the last recorded state, but only while the
+    // app is quiet (HistoryQuiet) so one user gesture becomes one step.
+    void OnUndo(wxCommandEvent&);
+    void OnRedo(wxCommandEvent&);
+    void OnHistoryIdle(wxIdleEvent& evt);
+    bool HistoryQuiet() const;          // no button held, no modal, no deferred drag
+    void RecordHistory();               // capture now; records a step if the scene changed
+    void ResetHistory();                // forget all steps (new / open project, first fixture)
+    History::Entry CaptureHistoryEntry();
+    void ApplyHistoryEntry(const History::Entry& e);
+    void AfterHistoryChange();          // prune parked bodies, refresh the Edit menu
+    void UpdateUndoMenu();
+    void CheckHistoryRestore(const History::Entry& target, const char* what);   // Debug builds
+
     // Ribbon tool handlers
     void OnToolSelect(wxCommandEvent& evt);
     void OnToolTranslate(wxCommandEvent& evt);
@@ -294,6 +313,13 @@ private:
     // the canvas so the rendered grid updates.
     void OnGridSettings(wxCommandEvent&);
     void OnAbout(wxCommandEvent&);
+    // Materials menu (every perspective's bar): add to a library, open the
+    // library folder, rescan it. The library itself lives in PreviewPanel.
+    void OnMaterialAdd(wxCommandEvent&);
+    void OnMaterialOpenFolder(wxCommandEvent&);
+    void OnMaterialReload(wxCommandEvent&);
+    // Developer menu (Preview bar): 3D mesher test harness.
+    void OnDevTetMeshTest(wxCommandEvent&);
     void OnCheckForUpdates(wxCommandEvent&);
     void OnToggleAutoUpdateCheck(wxCommandEvent&);
     void OnPartingNearlyOrphan(wxCommandEvent&);
@@ -324,6 +350,7 @@ private:
     // reflecting the current m_gridSettings in the shape radio state.
     wxMenu* BuildGridMenu();
     wxMenu* BuildHelpMenu();
+    wxMenu* BuildMaterialsMenu();   // fresh instance per menu bar, like BuildHelpMenu
 
     // Drive the ribbon perspective tabs so the active one reads as selected.
     // Safe to call before the tabs exist (no-ops).
@@ -604,6 +631,14 @@ private:
     enum class MouldState { NeverGenerated, Clean, Dirty };
     MouldState m_mouldState = MouldState::NeverGenerated;
 
+    // ---- Undo / redo state ---------------------------------------------------
+    std::unique_ptr<History::Stack> m_history;  // created first thing in the constructor
+    bool           m_historyApplying = false;   // a restore is in progress
+    bool           m_historyCheckReported = false;
+    wxMenuItem*    m_undoItem = nullptr;        // on the Prepare menu bar
+    wxMenuItem*    m_redoItem = nullptr;
+    wxString       m_undoItemText, m_redoItemText;
+
     void OnBrowseExport(wxCommandEvent&);
     // Action-zone click on the export split button: dispatches to the current
     // mode's exporter (DoExportMould / DoExportShotBody).
@@ -678,6 +713,8 @@ private:
         ID_SaveProject,
         ID_LoadProject,
         ID_NewProject,
+        ID_Undo,
+        ID_Redo,
         ID_UnitMetric,
         ID_UnitImperial,
         ID_GridSettings,
@@ -689,6 +726,11 @@ private:
         ID_MeshQualityHigh,
         ID_CheckForUpdates,
         ID_AutoUpdateCheck,
-        ID_StartupUpdateTimer
+        ID_StartupUpdateTimer,
+        ID_MaterialAddInjection,
+        ID_MaterialAddMould,
+        ID_MaterialOpenFolder,
+        ID_MaterialReload,
+        ID_DevTetMeshTest
     };
 };
