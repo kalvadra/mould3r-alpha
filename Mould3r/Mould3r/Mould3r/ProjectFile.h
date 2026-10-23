@@ -165,9 +165,34 @@ struct ProjectParameters
     float runnerDiameter = 5.0f;
     float runnerColdPlugDist = 5.0f;
 
+    // Runner / sub-runner profile (dropdown labels: "Cylindrical" / "Cylinder",
+    // "Parabolic", "Trapezoidal", and "Match Runner" for the sub-runner) and the
+    // one-sided profile fields. Older files have none of these keys and load as
+    // round channels with the defaults below.
+    std::string runnerType = "Cylindrical";
+    float runnerWidth = 5.0f;          // mm, Trapezoidal (at the parting plane)
+    float runnerHeight = 3.5f;         // mm, Trapezoidal
+    float runnerDraftAngle = 10.0f;    // degrees, Parabolic / Trapezoidal
+    std::string runnerSide = "B side"; // GateSideLabel
+    std::string subRunnerType = "Cylinder";
+    float subRunnerWidth = 5.0f;
+    float subRunnerHeight = 3.5f;
+    float subRunnerDraftAngle = 10.0f;
+    std::string subRunnerSide = "B side";
+
     float gateDiameter = 3.0f;
     float gateDraftAngle = 1.0f;
     float gateOverrun = 0.0f;          // mm extension backward into the model
+
+    // Gate type (GateTypeLabel: "Tapered Cylinder" / "Tab" / "Fan") and the
+    // Tab / Fan dimensions. Older files have none of these keys and load as a
+    // Tapered Cylinder with the defaults below.
+    std::string gateType = "Tapered Cylinder";
+    float gateWidth = 4.0f;            // mm, at the part side
+    float gateHeight = 1.0f;           // mm
+    float gateLength = 3.0f;           // mm
+    float gateTaperAngle = 15.0f;      // degrees per side (Fan)
+    std::string gateSide = "Both";     // GateSideLabel: "Both" / "A side" / "B side"
 
     // "Auto-embed" toggles (Vent / Gate cards). Default ON, so older project
     // files without the keys load with the feature enabled.

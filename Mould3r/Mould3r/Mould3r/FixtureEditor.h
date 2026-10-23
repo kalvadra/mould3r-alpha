@@ -137,6 +137,13 @@ private:
     wxPanel* CreateInjectionPointsContent(wxWindow* parent);
     wxPanel* CreateSpruesContent(wxWindow* parent);
     wxPanel* CreateRunnersContent(wxWindow* parent);
+    // Diameter / Width+Height / Draft+Cut-side row groups shared by the runner
+    // and sub-runner cards (see the .cpp).
+    void BuildChannelRows(wxPanel* parent, wxBoxSizer* parentSz,
+        const wxString& defDiameter,
+        wxPanel*& diaPanel, wxTextCtrl*& diameter,
+        wxPanel*& trapPanel, wxTextCtrl*& width, wxTextCtrl*& height,
+        wxPanel*& oneSidedPanel, wxTextCtrl*& draft, wxChoice*& side);
     wxPanel* CreateGatesContent(wxWindow* parent);
     wxPanel* CreateVentsContent(wxWindow* parent);
     wxPanel* CreateEjectorsContent(wxWindow* parent);
@@ -283,6 +290,15 @@ private:
 
     // Runner
     wxChoice* m_runnerTypeChoice = nullptr;
+    // Parabolic / Trapezoidal rows, grouped so the type choice can show the
+    // matching ones (diameter / width+height / draft+side).
+    wxPanel* m_runnerDiaPanel = nullptr;
+    wxPanel* m_runnerTrapPanel = nullptr;
+    wxPanel* m_runnerOneSidedPanel = nullptr;
+    wxTextCtrl* m_runnerWidth = nullptr;
+    wxTextCtrl* m_runnerHeight = nullptr;
+    wxTextCtrl* m_runnerDraftAngle = nullptr;
+    wxChoice* m_runnerSideChoice = nullptr;
     wxPanel* m_runnerDimsPanel = nullptr;   // shown/hidden by type choice
     wxTextCtrl* m_runnerDiameter = nullptr;
     wxTextCtrl* m_runnerColdSlugDepth = nullptr;
@@ -290,9 +306,24 @@ private:
     // Gate (+ sub-runner — same card per MainFrame's convention)
     wxChoice* m_gateTypeChoice = nullptr;
     wxPanel* m_gateDimsPanel = nullptr;      // shown/hidden by type choice
+    wxPanel* m_gateCylPanel = nullptr;       // Tapered Cylinder rows
+    wxPanel* m_gateBlockPanel = nullptr;     // Tab / Fan rows
+    wxPanel* m_gateTaperPanel = nullptr;     // Fan taper row
     wxTextCtrl* m_gateDiameter = nullptr;
     wxTextCtrl* m_gateDraftAngle = nullptr;
+    wxTextCtrl* m_gateWidth = nullptr;
+    wxTextCtrl* m_gateHeight = nullptr;
+    wxTextCtrl* m_gateLength = nullptr;
+    wxTextCtrl* m_gateTaperAngle = nullptr;
+    wxChoice*   m_gateSideChoice = nullptr;  // Tab / Fan cut side
     wxChoice* m_subRunnerTypeChoice = nullptr;
+    wxPanel* m_subRunnerDiaPanel = nullptr;
+    wxPanel* m_subRunnerTrapPanel = nullptr;
+    wxPanel* m_subRunnerOneSidedPanel = nullptr;
+    wxTextCtrl* m_subRunnerWidth = nullptr;
+    wxTextCtrl* m_subRunnerHeight = nullptr;
+    wxTextCtrl* m_subRunnerDraftAngle = nullptr;
+    wxChoice* m_subRunnerSideChoice = nullptr;
     wxPanel* m_subRunnerDimsPanel = nullptr; // shown/hidden by type choice
     wxTextCtrl* m_subRunnerDiameter = nullptr;
 

@@ -10,6 +10,7 @@
 #include <array>
 #include <algorithm>
 #include <cmath>
+#include <string>
 #include <vector>
 
 // ---------------------------------------------------------------------------
@@ -865,4 +866,639 @@ SolidMesh BuildTubeSweepMesh(const FeaturePath& path, float radius, int segments
     solid.indexCount = (GLsizei)idx.size();
     solid.valid = true;
     return solid;
+}
+
+// ===========================================================================
+// Gate types — Tab / Fan gate block (see MouldFeature.h)
+// ===========================================================================
+const char* GateTypeLabel(GateType t)
+{
+    switch (t)
+    {
+    case GateType::Tab: return "Tab";
+    case GateType::Fan: return "Fan";
+    case GateType::TaperedCylinder:
+    default:            return "Tapered Cylinder";
+    }
+}
+
+GateType GateTypeFromLabel(const char* label)
+{
+    if (!label) return GateType::TaperedCylinder;
+    const std::string s(label);
+    if (s == "Tab") return GateType::Tab;
+    if (s == "Fan") return GateType::Fan;
+    return GateType::TaperedCylinder;
+}
+
+const char* GateSideLabel(GateSide s)
+{
+    switch (s)
+    {
+    case GateSide::A: return "A side";
+    case GateSide::B: return "B side";
+    case GateSide::Both:
+    default:          return "Both";
+    }
+}
+
+GateSide GateSideFromLabel(const char* label)
+{
+    if (!label) return GateSide::Both;
+    const std::string s(label);
+    if (s == "A side") return GateSide::A;
+    if (s == "B side") return GateSide::B;
+    return GateSide::Both;
+}
+
+void GateBlockVertical(GateSide side, float height, float crossEps,
+                       float& outHeight, float& outUpOffset)
+{
+    crossEps = std::max(crossEps, 0.0f);
+    switch (side)
+    {
+    case GateSide::A:   // spans [-crossEps, +height] along up
+        outHeight   = height + crossEps;
+        outUpOffset = 0.5f * (height - crossEps);
+        break;
+    case GateSide::B:   // spans [-height, +crossEps]
+        outHeight   = height + crossEps;
+        outUpOffset = -0.5f * (height - crossEps);
+        break;
+    case GateSide::Both:
+    default:
+        outHeight   = height;
+        outUpOffset = 0.0f;
+        break;
+    }
+}
+
+float GateFanSlope(float width, float length, float taperDeg)
+{
+    if (!(taperDeg > 0.0f) || !(length > 1e-6f)) return 0.0f;
+    const float wanted = std::tan(glm::radians(std::min(taperDeg, 80.0f)));
+    // Largest slope that still leaves kGateFanMinFrontWidth at the far end.
+    const float allowed = (width - kGateFanMinFrontWidth) / (2.0f * length);
+    if (!(allowed > 0.0f)) return 0.0f;
+    return std::min(wanted, allowed);
+}
+
+void GateBlockAxes(const glm::vec3& dir, glm::vec3& sideAxis, glm::vec3& upAxis)
+{
+    const glm::vec3 worldUp(0.0f, 1.0f, 0.0f);
+    glm::vec3 up = worldUp - glm::dot(worldUp, dir) * dir;
+    if (glm::length(up) < 1e-4f)
+    {
+        // A (near-)vertical leg has no "up" — fall back to world X.
+        const glm::vec3 x(1.0f, 0.0f, 0.0f);
+        up = x - glm::dot(x, dir) * dir;
+    }
+    upAxis = glm::normalize(up);
+    // cross(dir, up): for a level leg this is (-d.z, 0, d.x), the same side
+    // axis BuildVentCrossSection uses.
+    sideAxis = glm::normalize(glm::cross(dir, upAxis));
+}
+
+GateBlock MakeGateBlock(const glm::vec3& origin, const glm::vec3& dir,
+    float width, float height, float slope, float backExt, float frontLen,
+    float upOffset)
+{
+    GateBlock b;
+    const float dLen = glm::length(dir);
+    if (dLen < 1e-6f || !(width > 1e-6f) || !(height > 1e-6f)) return b;
+    if (!(backExt + frontLen > 1e-6f)) return b;
+
+    b.dir = dir / dLen;
+    GateBlockAxes(b.dir, b.sideAxis, b.upAxis);
+
+    const float hh  = 0.5f * height;
+    const float hwB = 0.5f * width + slope * backExt;
+    // GateFanSlope keeps the nominal far end >= kGateFanMinFrontWidth; the
+    // floor here only guards callers that pass their own slope.
+    const float hwF = std::max(0.5f * width - slope * frontLen,
+                               0.5f * kGateFanMinFrontWidth);
+
+    const glm::vec3 lift = b.upAxis * upOffset;
+    const glm::vec3 cB = origin - b.dir * backExt + lift;
+    const glm::vec3 cF = origin + b.dir * frontLen + lift;
+    auto rect = [&](const glm::vec3& c, float hw, glm::vec3* out)
+    {
+        out[0] = c - b.sideAxis * hw - b.upAxis * hh;   // BL
+        out[1] = c + b.sideAxis * hw - b.upAxis * hh;   // BR
+        out[2] = c + b.sideAxis * hw + b.upAxis * hh;   // TR
+        out[3] = c - b.sideAxis * hw + b.upAxis * hh;   // TL
+    };
+    rect(cB, hwB, b.back);
+    rect(cF, hwF, b.front);
+
+    b.backWidth  = 2.0f * hwB;
+    b.frontWidth = 2.0f * hwF;
+    b.height     = height;
+    b.axialLen   = backExt + frontLen;
+    b.valid      = true;
+    return b;
+}
+
+// ---------------------------------------------------------------------------
+// BuildGateBlockMesh — six flat-shaded quads (4 unshared vertices each so the
+// edges stay crisp). Each quad's winding is checked against the outward
+// direction from the block centre, so the result is outward-facing whatever
+// handedness the side / up axes came out with.
+// ---------------------------------------------------------------------------
+SolidMesh BuildGateBlockMesh(const GateBlock& block)
+{
+    SolidMesh solid;
+    solid.valid = false;
+    if (!block.valid) return solid;
+
+    const glm::vec3* B = block.back;
+    const glm::vec3* F = block.front;
+    glm::vec3 centre(0.0f);
+    for (int i = 0; i < 4; ++i) centre += B[i] + F[i];
+    centre /= 8.0f;
+
+    std::vector<float>    verts;
+    std::vector<uint32_t> idx;
+    verts.reserve(6 * 4 * 6);
+    idx.reserve(6 * 6);
+
+    auto quad = [&](const glm::vec3& a, const glm::vec3& b,
+                    const glm::vec3& c, const glm::vec3& d)
+    {
+        glm::vec3 n = glm::cross(b - a, c - a);
+        if (glm::length(n) < 1e-12f) n = glm::cross(c - a, d - a);
+        if (glm::length(n) < 1e-12f) return;   // collapsed face
+        n = glm::normalize(n);
+        const glm::vec3 faceC = 0.25f * (a + b + c + d);
+        const bool flip = glm::dot(n, faceC - centre) < 0.0f;
+        if (flip) n = -n;
+
+        const uint32_t base = (uint32_t)(verts.size() / 6);
+        for (const glm::vec3* p : { &a, &b, &c, &d })
+        {
+            verts.push_back(p->x); verts.push_back(p->y); verts.push_back(p->z);
+            verts.push_back(n.x);  verts.push_back(n.y);  verts.push_back(n.z);
+        }
+        if (!flip)
+        {
+            idx.push_back(base); idx.push_back(base + 1); idx.push_back(base + 2);
+            idx.push_back(base); idx.push_back(base + 2); idx.push_back(base + 3);
+        }
+        else
+        {
+            idx.push_back(base); idx.push_back(base + 2); idx.push_back(base + 1);
+            idx.push_back(base); idx.push_back(base + 3); idx.push_back(base + 2);
+        }
+    };
+
+    quad(B[0], B[1], B[2], B[3]);                 // back (part side)
+    quad(F[0], F[1], F[2], F[3]);                 // front (sub-runner side)
+    for (int i = 0; i < 4; ++i)                   // bottom, right, top, left
+    {
+        const int j = (i + 1) % 4;
+        quad(B[i], B[j], F[j], F[i]);
+    }
+    if (idx.empty()) return solid;
+
+    glGenVertexArrays(1, &solid.vao);
+    glGenBuffers(1, &solid.vbo);
+    glGenBuffers(1, &solid.ebo);
+
+    glBindVertexArray(solid.vao);
+    glBindBuffer(GL_ARRAY_BUFFER, solid.vbo);
+    glBufferData(GL_ARRAY_BUFFER,
+        (GLsizeiptr)(verts.size() * sizeof(float)),
+        verts.data(), GL_STATIC_DRAW);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, solid.ebo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+        (GLsizeiptr)(idx.size() * sizeof(uint32_t)),
+        idx.data(), GL_STATIC_DRAW);
+
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float),
+        (void*)(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+
+    glBindVertexArray(0);
+
+    solid.indexCount = (GLsizei)idx.size();
+    solid.valid = true;
+    return solid;
+}
+
+// ===========================================================================
+// Channel profiles — runner / sub-runner cross-sections (see MouldFeature.h)
+// ===========================================================================
+namespace
+{
+    constexpr float kChannelMaxDraftDeg = 60.0f;
+    constexpr float kChannelMinHalfFloor = 0.05f;   // trapezoid floor half-width floor
+
+    // Uploads [pos, normal] triangles as a SolidMesh (same attribute layout as
+    // every other builder in this file).
+    SolidMesh UploadSolidMesh(const std::vector<float>& verts,
+                              const std::vector<uint32_t>& idx)
+    {
+        SolidMesh solid;
+        solid.valid = false;
+        if (verts.empty() || idx.empty()) return solid;
+
+        glGenVertexArrays(1, &solid.vao);
+        glGenBuffers(1, &solid.vbo);
+        glGenBuffers(1, &solid.ebo);
+
+        glBindVertexArray(solid.vao);
+        glBindBuffer(GL_ARRAY_BUFFER, solid.vbo);
+        glBufferData(GL_ARRAY_BUFFER,
+            (GLsizeiptr)(verts.size() * sizeof(float)),
+            verts.data(), GL_STATIC_DRAW);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, solid.ebo);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+            (GLsizeiptr)(idx.size() * sizeof(uint32_t)),
+            idx.data(), GL_STATIC_DRAW);
+
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)0);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float),
+            (void*)(3 * sizeof(float)));
+        glEnableVertexAttribArray(1);
+
+        glBindVertexArray(0);
+
+        solid.indexCount = (GLsizei)idx.size();
+        solid.valid = true;
+        return solid;
+    }
+
+    float ChannelDraftRad(const ChannelProfile& p)
+    {
+        return glm::radians(glm::clamp(p.draftDeg, 0.0f, kChannelMaxDraftDeg));
+    }
+
+    // Circumcentre of three 2D points (the arc's centre).
+    glm::vec2 Circumcentre(const glm::vec2& a, const glm::vec2& b, const glm::vec2& c)
+    {
+        const float d = 2.0f * (a.x * (b.y - c.y) + b.x * (c.y - a.y) + c.x * (a.y - b.y));
+        if (std::abs(d) < 1e-12f) return 0.5f * (a + c);
+        const float a2 = glm::dot(a, a), b2 = glm::dot(b, b), c2 = glm::dot(c, c);
+        return glm::vec2((a2 * (b.y - c.y) + b2 * (c.y - a.y) + c2 * (a.y - b.y)) / d,
+                         (a2 * (c.x - b.x) + b2 * (a.x - c.x) + c2 * (b.x - a.x)) / d);
+    }
+
+    // Tessellated outline for the mesh: one entry per straight piece, each
+    // with its own end normals (so corners stay crisp and the arc shades
+    // round). Normals point out of the section.
+    struct MeshEdge { glm::vec2 a, b, na, nb; };
+
+    std::vector<MeshEdge> TessellateOutline(const std::vector<ChannelSeg>& segs, int arcSegs)
+    {
+        std::vector<MeshEdge> out;
+        for (const ChannelSeg& sg : segs)
+        {
+            if (!sg.arc)
+            {
+                const glm::vec2 d = sg.b - sg.a;
+                const float l = glm::length(d);
+                if (l < 1e-7f) continue;
+                const glm::vec2 n(d.y / l, -d.x / l);   // right-hand normal: outward for CCW
+                out.push_back({ sg.a, sg.b, n, n });
+                continue;
+            }
+            const glm::vec2 c = Circumcentre(sg.a, sg.mid, sg.b);
+            const float r = glm::length(sg.a - c);
+            const float t0 = std::atan2(sg.a.y - c.y, sg.a.x - c.x);
+            const float tm = std::atan2(sg.mid.y - c.y, sg.mid.x - c.x);
+            const float t1 = std::atan2(sg.b.y - c.y, sg.b.x - c.x);
+            auto wrap = [](float x) { const float tp = glm::two_pi<float>();
+                                      while (x < 0.0f) x += tp; while (x >= tp) x -= tp; return x; };
+            // Counter-clockwise sweep a->b; take the clockwise one instead when
+            // the mid point isn't on the CCW side.
+            float sweep = wrap(t1 - t0);
+            if (wrap(tm - t0) > sweep) sweep -= glm::two_pi<float>();
+            const int n = std::max(2, arcSegs);
+            for (int k = 0; k < n; ++k)
+            {
+                const float u0 = t0 + sweep * float(k) / float(n);
+                const float u1 = t0 + sweep * float(k + 1) / float(n);
+                const glm::vec2 n0(std::cos(u0), std::sin(u0)), n1(std::cos(u1), std::sin(u1));
+                const glm::vec2 p0 = (k == 0) ? sg.a : c + r * n0;
+                const glm::vec2 p1 = (k == n - 1) ? sg.b : c + r * n1;
+                out.push_back({ p0, p1, n0, n1 });
+            }
+        }
+        return out;
+    }
+}
+
+ChannelType ChannelTypeFromLabel(const char* label)
+{
+    if (!label) return ChannelType::Cylinder;
+    const std::string s(label);
+    if (s == "Parabolic")   return ChannelType::Parabolic;
+    if (s == "Trapezoidal") return ChannelType::Trapezoidal;
+    return ChannelType::Cylinder;   // "Cylinder", "Cylindrical", unknown
+}
+
+float ChannelHalfWidth(const ChannelProfile& p)
+{
+    switch (p.type)
+    {
+    case ChannelType::Parabolic:
+    {
+        const float a = ChannelDraftRad(p);
+        return 0.5f * p.diameter * (1.0f + std::sin(a)) / std::cos(a);
+    }
+    case ChannelType::Trapezoidal: return 0.5f * p.width;
+    case ChannelType::Cylinder:
+    default:                       return 0.5f * p.diameter;
+    }
+}
+
+float ChannelConeRadius(const ChannelProfile& p)
+{
+    switch (p.type)
+    {
+    case ChannelType::Trapezoidal: return 0.5f * p.height;
+    case ChannelType::Parabolic:
+    case ChannelType::Cylinder:
+    default:                       return 0.5f * p.diameter;
+    }
+}
+
+void ChannelAreaPerimeter(const ChannelProfile& p, double& area, double& perimeter)
+{
+    const double pi = glm::pi<double>();
+    switch (p.type)
+    {
+    case ChannelType::Parabolic:
+    {
+        const double R = 0.5 * std::max(0.0f, p.diameter);
+        const double a = ChannelDraftRad(p), s = std::sin(a), c = std::cos(a);
+        const double w0 = R * (1.0 + s) / c;        // half-width at the plane
+        const double uT = R * (1.0 + s);            // wall tangent height
+        // Trapezoid up to the tangent points + the circular cap above them.
+        area = (w0 + R * c) * uT + R * R * (0.5 * pi - a - s * c);
+        const double wall = std::sqrt((w0 - R * c) * (w0 - R * c) + uT * uT);
+        perimeter = 2.0 * w0 + 2.0 * wall + R * (pi - 2.0 * a);
+        return;
+    }
+    case ChannelType::Trapezoidal:
+    {
+        const double hw = 0.5 * std::max(0.0f, p.width);
+        const double H  = std::max(0.0f, p.height);
+        const double hf = std::max((double)kChannelMinHalfFloor,
+                                   hw - H * std::tan(ChannelDraftRad(p)));
+        area = (hw + hf) * H;
+        perimeter = 2.0 * hw + 2.0 * hf + 2.0 * std::sqrt((hw - hf) * (hw - hf) + H * H);
+        return;
+    }
+    case ChannelType::Cylinder:
+    default:
+    {
+        const double R = 0.5 * std::max(0.0f, p.diameter);
+        area = pi * R * R;
+        perimeter = 2.0 * pi * R;
+        return;
+    }
+    }
+}
+
+std::vector<ChannelSeg> ChannelExactOutline(const ChannelProfile& p, float crossEps)
+{
+    std::vector<ChannelSeg> out;
+    const float e = std::max(0.0f, crossEps);
+    const float a = ChannelDraftRad(p);
+    const float t = std::tan(a);
+    auto line = [&](const glm::vec2& p0, const glm::vec2& p1)
+    {
+        ChannelSeg sg; sg.a = p0; sg.b = p1; out.push_back(sg);
+    };
+
+    if (p.type == ChannelType::Parabolic)
+    {
+        const float R = 0.5f * p.diameter;
+        if (!(R > 1e-6f)) return out;
+        const float s = std::sin(a), c = std::cos(a);
+        const float wB = R * (1.0f + s) / c + e * t;          // base half-width at u = -e
+        const glm::vec2 Tr( R * c, R * (1.0f + s));            // right wall tangent point
+        const glm::vec2 Tl(-R * c, R * (1.0f + s));
+        line(glm::vec2(-wB, -e), glm::vec2(wB, -e));            // base
+        line(glm::vec2(wB, -e), Tr);                            // right wall
+        ChannelSeg arc; arc.arc = true; arc.a = Tr; arc.mid = glm::vec2(0.0f, 2.0f * R); arc.b = Tl;
+        out.push_back(arc);                                     // top of the circle
+        line(Tl, glm::vec2(-wB, -e));                           // left wall
+        return out;
+    }
+    if (p.type == ChannelType::Trapezoidal)
+    {
+        const float hw = 0.5f * p.width, H = p.height;
+        if (!(hw > 1e-6f) || !(H > 1e-6f)) return out;
+        const float hB = hw + e * t;
+        const float hF = std::max(kChannelMinHalfFloor, hw - H * t);
+        line(glm::vec2(-hB, -e), glm::vec2(hB, -e));            // base
+        line(glm::vec2(hB, -e), glm::vec2(hF, H));              // right wall
+        line(glm::vec2(hF, H), glm::vec2(-hF, H));              // floor
+        line(glm::vec2(-hF, H), glm::vec2(-hB, -e));            // left wall
+        return out;
+    }
+    return out;   // Cylinder: no one-sided outline
+}
+
+ChannelJointShape ChannelJoint(const ChannelProfile& p, float crossEps)
+{
+    ChannelJointShape j;
+    const float e = std::max(0.0f, crossEps);
+    const float a = ChannelDraftRad(p);
+    const float t = std::tan(a);
+    if (p.type == ChannelType::Parabolic)
+    {
+        const float R = 0.5f * p.diameter;
+        const float s = std::sin(a), c = std::cos(a);
+        j.u0 = -e;                j.r0 = R * (1.0f + s) / c + e * t;
+        j.u1 = R * (1.0f + s);    j.r1 = R * c;
+        j.sphere = true;          j.sphereU = R;  j.sphereR = R;
+    }
+    else if (p.type == ChannelType::Trapezoidal)
+    {
+        const float hw = 0.5f * p.width;
+        j.u0 = -e;                j.r0 = hw + e * t;
+        j.u1 = p.height;          j.r1 = std::max(kChannelMinHalfFloor, hw - p.height * t);
+    }
+    return j;
+}
+
+void ChannelSweepGeometry(const FeaturePath& path, const ChannelProfile& profile,
+    bool jointAtStart, bool jointAtEnd,
+    std::vector<float>& verts, std::vector<uint32_t>& idx)
+{
+    if (!path.valid || profile.IsRound()) return;
+    const std::vector<ChannelSeg> segs = ChannelExactOutline(profile, 0.0f);
+    if (segs.empty()) return;
+    const std::vector<MeshEdge> edges = TessellateOutline(segs, 24);
+    if (edges.empty()) return;
+
+    const std::vector<PathStation> stations = SamplePath(path);
+    if (stations.size() < 2) return;
+
+    const glm::vec3 Y(0.0f, 1.0f, 0.0f);
+    const float sign = profile.SideSign();
+
+    auto pv = [&](const glm::vec3& p, const glm::vec3& n)
+    {
+        verts.push_back(p.x); verts.push_back(p.y); verts.push_back(p.z);
+        verts.push_back(n.x); verts.push_back(n.y); verts.push_back(n.z);
+    };
+    auto toWorld = [&](const PathStation& st, const glm::vec2& q)
+    {
+        return st.pos + st.sideAxis * q.x + Y * (sign * q.y);
+    };
+    auto dirWorld = [&](const PathStation& st, const glm::vec2& n)
+    {
+        return glm::normalize(st.sideAxis * n.x + Y * (sign * n.y));
+    };
+
+    // Section centroid (vertex average) for the end-cap fans.
+    glm::vec2 centroid(0.0f);
+    for (const MeshEdge& me : edges) centroid += me.a;
+    centroid /= float(edges.size());
+
+    // Ring: two verts per edge (its own end normals).
+    auto pushRing = [&](const PathStation& st) -> uint32_t
+    {
+        const uint32_t base = (uint32_t)(verts.size() / 6);
+        for (const MeshEdge& me : edges)
+        {
+            pv(toWorld(st, me.a), dirWorld(st, me.na));
+            pv(toWorld(st, me.b), dirWorld(st, me.nb));
+        }
+        return base;
+    };
+    auto connectRings = [&](uint32_t r0, uint32_t r1)
+    {
+        for (uint32_t k = 0; k < (uint32_t)edges.size(); ++k)
+        {
+            const uint32_t a0 = r0 + 2 * k, b0 = a0 + 1;
+            const uint32_t a1 = r1 + 2 * k, b1 = a1 + 1;
+            idx.push_back(a0); idx.push_back(b0); idx.push_back(b1);
+            idx.push_back(a0); idx.push_back(b1); idx.push_back(a1);
+        }
+    };
+    auto addCap = [&](const PathStation& st, const glm::vec3& n)
+    {
+        const uint32_t c = (uint32_t)(verts.size() / 6);
+        pv(toWorld(st, centroid), n);
+        const uint32_t rim = (uint32_t)(verts.size() / 6);
+        for (const MeshEdge& me : edges) pv(toWorld(st, me.a), n);
+        const uint32_t E = (uint32_t)edges.size();
+        for (uint32_t k = 0; k < E; ++k)
+        {
+            idx.push_back(c); idx.push_back(rim + k); idx.push_back(rim + (k + 1) % E);
+        }
+    };
+
+    // Revolved joint about the vertical axis through `centre` (ChannelJoint):
+    // a cone frustum with both end discs, plus the profile's circle as a
+    // sphere for a Parabolic channel.
+    const ChannelJointShape J = ChannelJoint(profile, 0.0f);
+    const int kRev = 32;
+    auto addJoint = [&](const glm::vec3& centre)
+    {
+        auto at = [&](float r, float u, float phi)
+        {
+            return centre + glm::vec3(std::cos(phi) * r, sign * u, std::sin(phi) * r);
+        };
+        // Frustum wall: outward normal tilts by the wall slope.
+        const float dr = J.r1 - J.r0, du = J.u1 - J.u0;
+        const float wl = std::sqrt(dr * dr + du * du);
+        const float nr = (wl > 1e-9f) ? du / wl : 1.0f;     // radial component
+        const float nu = (wl > 1e-9f) ? -dr / wl : 0.0f;    // axial component
+        const uint32_t wall = (uint32_t)(verts.size() / 6);
+        for (int ring = 0; ring < 2; ++ring)
+            for (int k = 0; k < kRev; ++k)
+            {
+                const float phi = glm::two_pi<float>() * float(k) / float(kRev);
+                const glm::vec3 n = glm::normalize(glm::vec3(std::cos(phi) * nr, sign * nu,
+                                                             std::sin(phi) * nr));
+                pv(ring == 0 ? at(J.r0, J.u0, phi) : at(J.r1, J.u1, phi), n);
+            }
+        for (int k = 0; k < kRev; ++k)
+        {
+            const uint32_t a0 = wall + k, a1 = wall + (k + 1) % kRev;
+            const uint32_t b0 = a0 + kRev, b1 = a1 + kRev;
+            idx.push_back(a0); idx.push_back(b0); idx.push_back(b1);
+            idx.push_back(a0); idx.push_back(b1); idx.push_back(a1);
+        }
+        // End discs (the base at the parting plane, the floor / top).
+        for (int disc = 0; disc < 2; ++disc)
+        {
+            const float r = disc == 0 ? J.r0 : J.r1;
+            const float u = disc == 0 ? J.u0 : J.u1;
+            const glm::vec3 n(0.0f, disc == 0 ? -sign : sign, 0.0f);
+            const uint32_t c = (uint32_t)(verts.size() / 6);
+            pv(centre + glm::vec3(0.0f, sign * u, 0.0f), n);
+            for (int k = 0; k < kRev; ++k)
+                pv(at(r, u, glm::two_pi<float>() * float(k) / float(kRev)), n);
+            for (int k = 0; k < kRev; ++k)
+            {
+                idx.push_back(c); idx.push_back(c + 1 + k); idx.push_back(c + 1 + (k + 1) % kRev);
+            }
+        }
+        if (J.sphere && J.sphereR > 1e-6f)
+        {
+            const glm::vec3 sc = centre + glm::vec3(0.0f, sign * J.sphereU, 0.0f);
+            const int lon = kRev, lat = kRev / 2;
+            const uint32_t base = (uint32_t)(verts.size() / 6);
+            for (int i = 0; i <= lat; ++i)
+            {
+                const float ph = glm::pi<float>() * float(i) / float(lat);
+                for (int k = 0; k <= lon; ++k)
+                {
+                    const float th = glm::two_pi<float>() * float(k) / float(lon);
+                    const glm::vec3 n(std::sin(ph) * std::cos(th), std::cos(ph),
+                                      std::sin(ph) * std::sin(th));
+                    pv(sc + J.sphereR * n, n);
+                }
+            }
+            const int stride = lon + 1;
+            for (int i = 0; i < lat; ++i)
+                for (int k = 0; k < lon; ++k)
+                {
+                    const uint32_t a = base + i * stride + k, b = a + stride;
+                    idx.push_back(a); idx.push_back(b); idx.push_back(a + 1);
+                    idx.push_back(a + 1); idx.push_back(b); idx.push_back(b + 1);
+                }
+        }
+    };
+
+    // Same run walk as BuildTubeSweepMesh: rings at every station, sides
+    // within a run, caps at run ends, a joint at every interior node.
+    const size_t N = stations.size();
+    std::vector<uint32_t> ring(N);
+    for (size_t i = 0; i < N; ++i) ring[i] = pushRing(stations[i]);
+    for (size_t i = 0; i + 1 < N; ++i)
+        if (!stations[i + 1].startsRun) connectRings(ring[i], ring[i + 1]);
+    for (size_t i = 0; i < N; ++i)
+    {
+        const bool runStart = (i == 0) || stations[i].startsRun;
+        const bool runEnd   = (i + 1 >= N) || stations[i + 1].startsRun;
+        if (runStart) addCap(stations[i], -stations[i].tangent);
+        if (runEnd)   addCap(stations[i], +stations[i].tangent);
+        if (runEnd && (i + 1 < N)) addJoint(stations[i].pos);
+    }
+    if (jointAtStart) addJoint(stations.front().pos);
+    if (jointAtEnd)   addJoint(stations.back().pos);
+}
+
+SolidMesh BuildChannelSweepMesh(const FeaturePath& path, const ChannelProfile& profile,
+    bool jointAtStart, bool jointAtEnd)
+{
+    if (profile.IsRound())
+        return BuildTubeSweepMesh(path, 0.5f * profile.diameter, /*segments=*/32,
+            /*overrunStart=*/0.0f, /*overrunEnd=*/0.0f, jointAtStart, jointAtEnd);
+
+    std::vector<float>    verts;
+    std::vector<uint32_t> idx;
+    ChannelSweepGeometry(path, profile, jointAtStart, jointAtEnd, verts, idx);
+    return UploadSolidMesh(verts, idx);
 }

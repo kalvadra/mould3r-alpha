@@ -281,17 +281,30 @@ bool FixtureFile::Load(const std::string& path,
             if (key == "type")             out.runnerDefaults.type = value;
             else if (key == "diameter")         parseOptFloat(value, out.runnerDefaults.diameter);
             else if (key == "cold_slug_length") parseOptFloat(value, out.runnerDefaults.coldSlugLength);
+            else if (key == "width")            parseOptFloat(value, out.runnerDefaults.width);
+            else if (key == "height")           parseOptFloat(value, out.runnerDefaults.height);
+            else if (key == "draft_angle")      parseOptFloat(value, out.runnerDefaults.draftAngle);
+            else if (key == "side")             out.runnerDefaults.side = value;
         }
         else if (currentSection == Section::GateDefaults)
         {
             if (key == "type")        out.gateDefaults.type = value;
             else if (key == "diameter")    parseOptFloat(value, out.gateDefaults.diameter);
             else if (key == "draft_angle") parseOptFloat(value, out.gateDefaults.draftAngle);
+            else if (key == "width")       parseOptFloat(value, out.gateDefaults.width);
+            else if (key == "height")      parseOptFloat(value, out.gateDefaults.height);
+            else if (key == "length")      parseOptFloat(value, out.gateDefaults.length);
+            else if (key == "taper_angle") parseOptFloat(value, out.gateDefaults.taperAngle);
+            else if (key == "side")        out.gateDefaults.side = value;
         }
         else if (currentSection == Section::SubRunnerDefaults)
         {
             if (key == "type")     out.subRunnerDefaults.type = value;
             else if (key == "diameter") parseOptFloat(value, out.subRunnerDefaults.diameter);
+            else if (key == "width")       parseOptFloat(value, out.subRunnerDefaults.width);
+            else if (key == "height")      parseOptFloat(value, out.subRunnerDefaults.height);
+            else if (key == "draft_angle") parseOptFloat(value, out.subRunnerDefaults.draftAngle);
+            else if (key == "side")        out.subRunnerDefaults.side = value;
         }
         else if (currentSection == Section::EjectorDefaults)
         {
@@ -427,31 +440,46 @@ bool FixtureFile::Save(const std::string& path,
     }
     {
         const RunnerDefaults& d = def.runnerDefaults;
-        if (d.type || d.diameter || d.coldSlugLength)
+        if (d.type || d.diameter || d.coldSlugLength ||
+            d.width || d.height || d.draftAngle || d.side)
         {
             file << "\n[runner_defaults]\n";
             writeKey("type", d.type);
             writeKeyF("diameter", d.diameter);
             writeKeyF("cold_slug_length", d.coldSlugLength);
+            writeKeyF("width", d.width);
+            writeKeyF("height", d.height);
+            writeKeyF("draft_angle", d.draftAngle);
+            writeKey("side", d.side);
         }
     }
     {
         const GateDefaults& d = def.gateDefaults;
-        if (d.type || d.diameter || d.draftAngle)
+        if (d.type || d.diameter || d.draftAngle ||
+            d.width || d.height || d.length || d.taperAngle || d.side)
         {
             file << "\n[gate_defaults]\n";
             writeKey("type", d.type);
             writeKeyF("diameter", d.diameter);
             writeKeyF("draft_angle", d.draftAngle);
+            writeKeyF("width", d.width);
+            writeKeyF("height", d.height);
+            writeKeyF("length", d.length);
+            writeKeyF("taper_angle", d.taperAngle);
+            writeKey("side", d.side);
         }
     }
     {
         const SubRunnerDefaults& d = def.subRunnerDefaults;
-        if (d.type || d.diameter)
+        if (d.type || d.diameter || d.width || d.height || d.draftAngle || d.side)
         {
             file << "\n[sub_runner_defaults]\n";
             writeKey("type", d.type);
             writeKeyF("diameter", d.diameter);
+            writeKeyF("width", d.width);
+            writeKeyF("height", d.height);
+            writeKeyF("draft_angle", d.draftAngle);
+            writeKey("side", d.side);
         }
     }
     {

@@ -123,22 +123,35 @@ struct SprueDefaults
 
 struct RunnerDefaults
 {
-    std::optional<std::string> type;
-    std::optional<float>       diameter;
+    std::optional<std::string> type;        // "Cylindrical" / "Parabolic" / "Trapezoidal"
+    std::optional<float>       diameter;    // Cylindrical / Parabolic
     std::optional<float>       coldSlugLength;
+    std::optional<float>       width;       // Trapezoidal (mm, at the parting plane)
+    std::optional<float>       height;      // Trapezoidal
+    std::optional<float>       draftAngle;  // Parabolic / Trapezoidal (degrees)
+    std::optional<std::string> side;        // "A side" / "B side"
 };
 
 struct GateDefaults
 {
-    std::optional<std::string> type;
-    std::optional<float>       diameter;
+    std::optional<std::string> type;        // "Tapered Cylinder" / "Tab" / "Fan"
+    std::optional<float>       diameter;    // Tapered Cylinder
     std::optional<float>       draftAngle;
+    std::optional<float>       width;       // Tab / Fan (mm, at the part side)
+    std::optional<float>       height;
+    std::optional<float>       length;
+    std::optional<float>       taperAngle;  // Fan (degrees per side)
+    std::optional<std::string> side;        // Tab / Fan: "Both" / "A side" / "B side"
 };
 
 struct SubRunnerDefaults
 {
-    std::optional<std::string> type;
+    std::optional<std::string> type;        // + "Match Runner"
     std::optional<float>       diameter;
+    std::optional<float>       width;
+    std::optional<float>       height;
+    std::optional<float>       draftAngle;
+    std::optional<std::string> side;
 };
 
 struct EjectorDefaults

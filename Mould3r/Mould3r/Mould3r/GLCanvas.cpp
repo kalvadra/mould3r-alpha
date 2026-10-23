@@ -57,6 +57,9 @@
 #include <opencascade/BRepBuilderAPI_MakeSolid.hxx>
 #include <opencascade/BRepBuilderAPI_MakePolygon.hxx>
 #include <opencascade/TopoDS_Shell.hxx>
+#include <opencascade/BRepLib.hxx>   // OrientClosedSolid — Fan gate block
+#include <opencascade/GC_MakeArcOfCircle.hxx>   // Parabolic channel profile arc
+#include <opencascade/Geom_TrimmedCurve.hxx>
 #include <wx/richmsgdlg.h>
 #include <opencascade/gp_Circ.hxx>
 #include <opencascade/gp_Ax2.hxx>
@@ -1283,10 +1286,12 @@ void GLCanvas::RebuildRunnerSolids()
     // Read the current runner dimensions from the UI
     float runnerRadius = 2.5f;
     float coldPlugDist = 5.0f;
+    ChannelProfile prof;   // runner cross-section (Cylinder by default)
     if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
     {
         runnerRadius = frame->GetRunnerDiameter() * 0.5f;
         coldPlugDist = frame->GetRunnerColdPlugDist();
+        prof = frame->GetRunnerProfile();
     }
 
     for (RunnerFeature& rf : m_runners)
@@ -1298,15 +1303,35 @@ void GLCanvas::RebuildRunnerSolids()
         // BuildCylinderMesh — but once a Complex route is authored the same
         // call renders the bent, sphere-jointed tube with no further change
         // here.  Runners are un-drafted, so no draft argument.
-        rf.solid = BuildTubeSweepMesh(rf.path, runnerRadius, /*segments=*/32);
+        //
+        // Parabolic / Trapezoidal runners sweep their one-sided profile along
+        // the same stations (BuildChannelSweepMesh); a Cylinder runner goes
+        // through the original call untouched.
+        if (prof.IsRound())
+            rf.solid = BuildTubeSweepMesh(rf.path, runnerRadius, /*segments=*/32);
+        else
+            rf.solid = BuildChannelSweepMesh(rf.path, prof);
 
         if (coldPlugDist > 1e-6f)
         {
             // Cold plug continues past the endpoint along the last-leg heading.
             const glm::vec3 runnerDir = RunnerColdPlugDir(rf.path, rf.point, m_sprue.partingPos);
             const glm::vec3 plugEnd = rf.point + runnerDir * coldPlugDist;
-            rf.coldPlugSolid = BuildCylinderMesh(rf.point, plugEnd, runnerRadius,
-                /*draftAngleDeg=*/0.0f);
+            if (prof.IsRound())
+            {
+                rf.coldPlugSolid = BuildCylinderMesh(rf.point, plugEnd, runnerRadius,
+                    /*draftAngleDeg=*/0.0f);
+            }
+            else
+            {
+                // The runner's own profile, extruded straight past the end.
+                FeaturePath plug;
+                plug.kind = PathKind::Simple;
+                plug.start = rf.point;
+                plug.end = plugEnd;
+                plug.valid = true;
+                rf.coldPlugSolid = BuildChannelSweepMesh(plug, prof);
+            }
         }
     }
 }
@@ -1425,6 +1450,65 @@ void GLCanvas::ComputeGatePath(GateFeature& gf) const
 static FeaturePath GateSubRunnerCutPath(const FeaturePath& subPath,
                                         const glm::vec3& transitionPt);
 
+// Tab / Fan layout on the sub-runner route: where the gate block ends and
+// whether a sub-runner follows. Shared by the preview below, both OCC sites,
+// auto-embed and the feed network (see "Tab / Fan gates" further down).
+namespace
+{
+    struct GateBlockLayout
+    {
+        bool      valid = false;
+        glm::vec3 dir{ 0.0f };        // first-leg direction (origin -> feed)
+        float     frontLen = 0.0f;    // origin -> far face, along dir
+        bool      fillsPath = false;  // no sub-runner after the block
+        glm::vec3 transitionPt{ 0.0f };
+    };
+
+    GateBlockLayout LayoutGateBlock(const GateFeature& gf, float length)
+    {
+        GateBlockLayout L;
+        if (!gf.subPath.valid) return L;
+
+        const glm::vec3 origin = gf.point.worldPos;
+        glm::vec3 firstVec;
+        if (gf.subPath.kind == PathKind::Complex && gf.subPath.nodes.size() >= 2)
+            firstVec = gf.subPath.nodes[1].pos - gf.subPath.nodes[0].pos;
+        else
+            firstVec = gf.subPath.end - gf.subPath.start;
+        const float firstLegLen = glm::length(firstVec);
+        if (firstLegLen < 1e-6f) return L;
+
+        const float totalLen = glm::length(gf.subPath.end - origin);
+        L.dir       = firstVec / firstLegLen;
+        L.fillsPath = gf.subPath.nodes.size() <= 2 && length >= totalLen;
+        L.frontLen  = L.fillsPath ? totalLen : std::min(std::max(length, 0.0f), firstLegLen);
+        L.transitionPt = origin + L.dir * L.frontLen;
+        L.valid = true;
+        return L;
+    }
+}
+
+
+GLCanvas::GateDims GLCanvas::ReadGateDims() const
+{
+    GateDims d;
+    if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(const_cast<GLCanvas*>(this))))
+    {
+        d.type            = frame->GetGateType();
+        d.radius          = frame->GetGateDiameter() * 0.5f;
+        d.draftDeg        = frame->GetGateDraftAngle();
+        d.width           = frame->GetGateWidth();
+        d.height          = frame->GetGateHeight();
+        d.length          = frame->GetGateLength();
+        d.taperDeg        = frame->GetGateTaperAngle();
+        d.side            = frame->GetGateSide();
+        d.subRunner       = frame->GetSubRunnerProfile();
+        d.subRunnerRadius = ChannelConeRadius(d.subRunner);
+        d.overrun         = frame->GetGateOverrun();
+    }
+    return d;
+}
+
 void GLCanvas::RebuildGateSolids()
 {
     // Gate step G1: keep every gate's stored sub-runner path in sync before
@@ -1437,20 +1521,48 @@ void GLCanvas::RebuildGateSolids()
     for (auto& gf : m_gates) { gf.solid.Destroy(); gf.subRunnerSolid.Destroy(); }
     if (m_gates.empty()) return;
 
-    float gateRadius = 1.5f;
-    float draftAngle = 1.0f;
-    float subRunnerRadius = 2.5f;
-    float overrun = 0.0f;
-    if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
-    {
-        gateRadius = frame->GetGateDiameter() * 0.5f;
-        draftAngle = frame->GetGateDraftAngle();
-        subRunnerRadius = frame->GetSubRunnerDiameter() * 0.5f;
-        overrun = frame->GetGateOverrun();
-    }
+    const GateDims dims = ReadGateDims();
+    const float gateRadius      = dims.radius;
+    const float draftAngle      = dims.draftDeg;
+    const float subRunnerRadius = dims.subRunnerRadius;
+    const float overrun         = dims.overrun;
 
     const float draftRad = glm::radians(glm::clamp(draftAngle, 0.0f, 45.0f));
     const float tanDraft = std::tan(draftRad);
+
+    // ---- Tab / Fan: rectangular block on the first leg + sub-runner --------
+    // Same layout the OCC cut uses (LayoutGateBlock); the preview shows the
+    // block pushed back by the user's Overrun only — like the cone, the cut's
+    // kCutEps and the auto-embed extension (measured at Generate) aren't drawn.
+    if (dims.IsBlock())
+    {
+        const float slope = dims.BlockSlope();
+        for (GateFeature& gf : m_gates)
+        {
+            const GateBlockLayout L = LayoutGateBlock(gf, dims.length);
+            if (!L.valid) continue;
+
+            float h = dims.height, upOffset = 0.0f;
+            GateBlockVertical(dims.side, dims.height, /*crossEps=*/0.0f, h, upOffset);
+            const GateBlock block = MakeGateBlock(gf.point.worldPos, L.dir,
+                dims.width, h, slope, overrun, L.frontLen, upOffset);
+            gf.solid = BuildGateBlockMesh(block);
+
+            // Sub-runner from the block's far face, starting in a sphere (see
+            // BuildGateBlockPieces) — the mesh builder honours sphereAtStart on
+            // every path kind.
+            if (!L.fillsPath)
+            {
+                const FeaturePath subTubePath =
+                    GateSubRunnerCutPath(gf.subPath, L.transitionPt);
+                gf.subRunnerSolid = BuildChannelSweepMesh(subTubePath, dims.subRunner,
+                    /*jointAtStart=*/true,
+                    /*jointAtEnd=*/gf.subPath.nodes.size() > 2);
+            }
+        }
+        RebuildGateLineVBO();
+        return;
+    }
 
     for (GateFeature& gf : m_gates)
     {
@@ -1555,10 +1667,12 @@ void GLCanvas::RebuildGateSolids()
             // CAN curve, and gets no spheres.
             const FeaturePath subTubePath =
                 GateSubRunnerCutPath(gf.subPath, transitionPt);
-            gf.subRunnerSolid = BuildTubeSweepMesh(subTubePath, subRunnerRadius,
-                /*segments=*/32, /*overrunStart=*/0.0f, /*overrunEnd=*/0.0f,
-                /*sphereAtStart=*/gf.subPath.nodes.size() > 2,
-                /*sphereAtEnd=*/gf.subPath.nodes.size() > 2);
+            // (BuildChannelSweepMesh: a Cylinder sub-runner is the same
+            // BuildTubeSweepMesh call as before; a one-sided one sweeps its
+            // profile, with revolved joints in place of the spheres.)
+            gf.subRunnerSolid = BuildChannelSweepMesh(subTubePath, dims.subRunner,
+                /*jointAtStart=*/gf.subPath.nodes.size() > 2,
+                /*jointAtEnd=*/gf.subPath.nodes.size() > 2);
         }
     }
 
@@ -2807,6 +2921,207 @@ static bool BuildRunnerCutPieces(const FeaturePath& path, float radius,
     return !outPieces.empty();
 }
 
+// ===========================================================================
+// One-sided channels (Parabolic / Trapezoidal runners and sub-runners)
+//
+// The OCC counterparts of ChannelSweepGeometry (MouldFeature.cpp), built from
+// the same SamplePath stations and the same exact outline (ChannelExactOutline),
+// so the cut follows the preview:
+//
+//   Straight legs  : the profile face at the leg start, MakePrism'd along the
+//                    leg (kCutEps past both ends, like the round runner).
+//   Smooth path    : one ruled ThruSections loft over the profile wires.
+//   Joints         : the profile revolved about the vertical axis through the
+//                    node (ChannelJoint): a cone frustum, plus a sphere for a
+//                    Parabolic channel. Every piece is independent.
+//
+// Round (Cylinder) channels are routed straight to BuildRunnerCutPieces /
+// MakeSphere / MakeCylinder so they stay exactly as before.
+//
+// A one-sided channel is cut from ITS OWN half only (ChannelCutsHalf); there
+// it reaches `crossEps` past the parting plane so the tool's base face is
+// never coplanar with the half's parting face. The shot model passes 0.
+// ===========================================================================
+static bool ChannelCutsHalf(const ChannelProfile& p, bool fixtureIsA)
+{
+    return p.IsRound() || ((p.side == GateSide::A) == fixtureIsA);
+}
+
+// The profile as a closed OCC wire in the section plane at `pos`, whose
+// in-plane horizontal axis is `side` (u maps to world Y on the profile's side).
+static bool ChannelWire(const ChannelProfile& prof, float crossEps,
+                        const glm::vec3& pos, const glm::vec3& side, TopoDS_Wire& out)
+{
+    const std::vector<ChannelSeg> segs = ChannelExactOutline(prof, crossEps);
+    if (segs.empty()) return false;
+    const float sign = prof.SideSign();
+    auto P = [&](const glm::vec2& q)
+    {
+        const glm::vec3 w = pos + side * q.x + glm::vec3(0.0f, sign * q.y, 0.0f);
+        return gp_Pnt(w.x, w.y, w.z);
+    };
+
+    BRepBuilderAPI_MakeWire wire;
+    for (const ChannelSeg& sg : segs)
+    {
+        if (sg.arc)
+        {
+            GC_MakeArcOfCircle arc(P(sg.a), P(sg.mid), P(sg.b));
+            if (!arc.IsDone()) return false;
+            BRepBuilderAPI_MakeEdge e(arc.Value());
+            if (!e.IsDone()) return false;
+            wire.Add(e.Edge());
+        }
+        else
+        {
+            BRepBuilderAPI_MakeEdge e(P(sg.a), P(sg.b));
+            if (!e.IsDone()) return false;
+            wire.Add(e.Edge());
+        }
+    }
+    if (!wire.IsDone()) return false;
+    out = wire.Wire();
+    return true;
+}
+
+// Revolved joint at `c` (see ChannelJoint). Round: the tube-radius sphere.
+static void AddChannelJointPiece(const glm::vec3& c, const ChannelProfile& prof,
+                                 float crossEps, std::vector<TopoDS_Shape>& out)
+{
+    if (prof.IsRound())
+    {
+        BRepPrimAPI_MakeSphere sph(gp_Pnt(c.x, c.y, c.z), 0.5f * prof.diameter);
+        sph.Build();
+        if (sph.IsDone() && !sph.Shape().IsNull()) out.push_back(sph.Shape());
+        return;
+    }
+    const ChannelJointShape J = ChannelJoint(prof, crossEps);
+    const float sign = prof.SideSign();
+    const float h = J.u1 - J.u0;
+    if (h > 1e-6f && J.r0 > 1e-6f && J.r1 > 1e-6f)
+    {
+        const gp_Ax2 ax(gp_Pnt(c.x, c.y + sign * J.u0, c.z), gp_Dir(0.0, sign, 0.0));
+        if (std::abs(J.r0 - J.r1) > 1e-6f)
+        {
+            BRepPrimAPI_MakeCone cone(ax, J.r0, J.r1, h);
+            cone.Build();
+            if (cone.IsDone() && !cone.Shape().IsNull()) out.push_back(cone.Shape());
+        }
+        else
+        {
+            BRepPrimAPI_MakeCylinder cyl(ax, J.r0, h);
+            cyl.Build();
+            if (cyl.IsDone() && !cyl.Shape().IsNull()) out.push_back(cyl.Shape());
+        }
+    }
+    if (J.sphere && J.sphereR > 1e-6f)
+    {
+        BRepPrimAPI_MakeSphere sph(gp_Pnt(c.x, c.y + sign * J.sphereU, c.z), J.sphereR);
+        sph.Build();
+        if (sph.IsDone() && !sph.Shape().IsNull()) out.push_back(sph.Shape());
+    }
+}
+
+// Straight prism of the profile from `a` along `dir` for `len` (no extension).
+static TopoDS_Shape ChannelPrism(const ChannelProfile& prof, float crossEps,
+                                 const glm::vec3& a, const glm::vec3& side,
+                                 const glm::vec3& dir, float len)
+{
+    if (!(len > 1e-6f)) return TopoDS_Shape();
+    TopoDS_Wire w;
+    if (!ChannelWire(prof, crossEps, a, side, w)) return TopoDS_Shape();
+    BRepBuilderAPI_MakeFace face(w, /*onlyPlane=*/true);
+    if (!face.IsDone()) return TopoDS_Shape();
+    const glm::vec3 v = dir * len;
+    BRepPrimAPI_MakePrism prism(face.Face(), gp_Vec(v.x, v.y, v.z));
+    if (!prism.IsDone() || prism.Shape().IsNull()) return TopoDS_Shape();
+    return prism.Shape();
+}
+
+// Every profile's counterpart of BuildRunnerCutPieces. Round -> exactly
+// BuildRunnerCutPieces (so cylinders are unchanged, including its Simple-path
+// behaviour). One-sided: joints at the start / end are honoured on any path.
+static bool BuildChannelCutPieces(const FeaturePath& path, const ChannelProfile& prof,
+                                  float crossEps, std::vector<TopoDS_Shape>& outPieces,
+                                  bool jointAtStart = false, bool jointAtEnd = false)
+{
+    if (prof.IsRound())
+        return BuildRunnerCutPieces(path, 0.5f * prof.diameter, outPieces,
+                                    jointAtStart, jointAtEnd);
+
+    outPieces.clear();
+    if (!path.valid) return false;
+    static constexpr float kCutEps = 0.1f;
+
+    const std::vector<PathStation> stations = SamplePath(path);
+    if (stations.size() < 2) return false;
+
+    if (jointAtStart) AddChannelJointPiece(stations.front().pos, prof, crossEps, outPieces);
+    if (jointAtEnd)   AddChannelJointPiece(stations.back().pos,  prof, crossEps, outPieces);
+
+    if (path.kind == PathKind::Complex && path.smooth)
+    {
+        std::vector<TopoDS_Wire> wires;
+        bool havePrev = false; glm::vec3 prevPos(0.0f);
+        for (const PathStation& st : stations)
+        {
+            if (havePrev && glm::length(st.pos - prevPos) < 1e-5f) continue;
+            TopoDS_Wire w;
+            if (!ChannelWire(prof, crossEps, st.pos, st.sideAxis, w)) continue;
+            wires.push_back(w);
+            havePrev = true; prevPos = st.pos;
+        }
+        if (wires.size() >= 2)
+        {
+            BRepOffsetAPI_ThruSections gen(true /*isSolid*/, true /*ruled*/);
+            for (const TopoDS_Wire& w : wires) gen.AddWire(w);
+            gen.Build();
+            if (gen.IsDone() && !gen.Shape().IsNull()) outPieces.push_back(gen.Shape());
+        }
+        return !outPieces.empty();
+    }
+
+    // Straight legs (Simple = one leg) + a joint at every interior node.
+    const size_t N = stations.size();
+    size_t i = 0;
+    while (i < N)
+    {
+        size_t j = i + 1;
+        while (j < N && !stations[j].startsRun) ++j;   // run = [i, j)
+        const glm::vec3 a = stations[i].pos, b = stations[j - 1].pos;
+        const float len = glm::length(b - a);
+        if (len > 1e-6f)
+        {
+            const glm::vec3 dir = (b - a) / len;
+            const TopoDS_Shape leg = ChannelPrism(prof, crossEps, a - dir * kCutEps,
+                stations[i].sideAxis, dir, len + 2.0f * kCutEps);
+            if (!leg.IsNull()) outPieces.push_back(leg);
+        }
+        if (j < N) AddChannelJointPiece(b, prof, crossEps, outPieces);
+        i = j;
+    }
+    return !outPieces.empty();
+}
+
+// Runner cold plug past `p` along `dir`: the round runner's plain cylinder, or
+// the one-sided profile extruded the same distance.
+static TopoDS_Shape ChannelPlugPiece(const glm::vec3& p, const glm::vec3& dir, float len,
+                                     const ChannelProfile& prof, float crossEps)
+{
+    if (!(len > 1e-6f)) return TopoDS_Shape();
+    if (prof.IsRound())
+    {
+        if (!(prof.diameter > 1e-6f)) return TopoDS_Shape();
+        gp_Ax2 ax(gp_Pnt(p.x, p.y, p.z), gp_Dir(dir.x, dir.y, dir.z));
+        BRepPrimAPI_MakeCylinder cyl(ax, 0.5f * prof.diameter, len);
+        cyl.Build();
+        return (cyl.IsDone() && !cyl.Shape().IsNull()) ? cyl.Shape() : TopoDS_Shape();
+    }
+    glm::vec3 side(dir.z, 0.0f, -dir.x);   // SamplePath's side-axis convention
+    if (glm::length(side) < 1e-6f) side = glm::vec3(1.0f, 0.0f, 0.0f);
+    return ChannelPrism(prof, crossEps, p, glm::normalize(side), dir, len);
+}
+
 // ---------------------------------------------------------------------------
 // GateSubRunnerCutPath — the sub-runner FeaturePath trimmed so it BEGINS at the
 // gate's transition point (where the frustum cone ends).  The frustum covers
@@ -2855,6 +3170,153 @@ static FeaturePath GateSubRunnerCutPath(const FeaturePath& subPath,
         p.valid  = glm::length(p.end - p.start) > 1e-6f;
     }
     return p;
+}
+
+// ===========================================================================
+// Tab / Fan gates
+//
+// The gate body is a GateBlock (MouldFeature.h): a rectangular block (Tab) or a
+// block whose width narrows from the part side toward the sub-runner (Fan),
+// laid on the FIRST leg of the sub-runner route exactly where the cone sits for
+// a Tapered Cylinder gate. Its far face is the transition point; the sub-runner
+// tube runs from there to the feed through GateSubRunnerCutPath, unchanged.
+//
+//   * Length is clamped to the first leg (decision 3), like the cone's taper.
+//   * A straight (<= 2 node) route no longer than Length is filled by the block
+//     outright with no sub-runner — the cone's "gate fills the whole path"
+//     degenerate.
+//   * The back-extension (kCutEps + max(Overrun, auto-embed)) pushes the back
+//     face into the part along -dir; a Fan keeps widening at the same slope,
+//     so the side walls stay single planes.
+//
+// LayoutGateBlock (defined above RebuildGateSolids) is the one place that
+// decides the above; the preview, both OCC sites, auto-embed and the feed
+// network all call it.
+// ===========================================================================
+
+// OCC solid for a GateBlock: a prism of the back face for a Tab (constant
+// section), six sewn planar faces for a Fan. Every face is a true plane, so the
+// result is exact geometry. Null on failure.
+static TopoDS_Shape GateBlockShape(const GateBlock& b)
+{
+    if (!b.valid) return TopoDS_Shape();
+
+    auto rectWire = [](const glm::vec3* c, TopoDS_Wire& out) -> bool
+    {
+        BRepBuilderAPI_MakePolygon poly;
+        for (int i = 0; i < 4; ++i) poly.Add(gp_Pnt(c[i].x, c[i].y, c[i].z));
+        poly.Close();
+        if (!poly.IsDone()) return false;
+        out = poly.Wire();
+        return true;
+    };
+
+    TopoDS_Wire backW;
+    if (!rectWire(b.back, backW)) return TopoDS_Shape();
+
+    if (std::abs(b.backWidth - b.frontWidth) < 1e-6f)
+    {
+        BRepBuilderAPI_MakeFace face(backW, /*onlyPlane=*/true);
+        if (!face.IsDone()) return TopoDS_Shape();
+        const glm::vec3 sweep = b.dir * b.axialLen;
+        BRepPrimAPI_MakePrism prism(face.Face(), gp_Vec(sweep.x, sweep.y, sweep.z));
+        if (!prism.IsDone() || prism.Shape().IsNull()) return TopoDS_Shape();
+        return prism.Shape();
+    }
+
+    // Fan: six planar faces sewn into a closed shell. (A ruled ThruSections
+    // loft gives the same volume but represents the flared side walls as
+    // ruled B-spline surfaces rather than planes.)
+    auto quadFace = [](const glm::vec3& a, const glm::vec3& b2,
+                       const glm::vec3& c, const glm::vec3& d, TopoDS_Face& out) -> bool
+    {
+        BRepBuilderAPI_MakePolygon poly(gp_Pnt(a.x, a.y, a.z), gp_Pnt(b2.x, b2.y, b2.z),
+                                        gp_Pnt(c.x, c.y, c.z), gp_Pnt(d.x, d.y, d.z),
+                                        /*Close=*/true);
+        if (!poly.IsDone()) return false;
+        BRepBuilderAPI_MakeFace face(poly.Wire(), /*onlyPlane=*/true);
+        if (!face.IsDone()) return false;
+        out = face.Face();
+        return true;
+    };
+
+    BRepBuilderAPI_Sewing sew(1.0e-6);
+    const glm::vec3* B = b.back;
+    const glm::vec3* F = b.front;
+    TopoDS_Face f;
+    if (!quadFace(B[0], B[1], B[2], B[3], f)) return TopoDS_Shape();
+    sew.Add(f);
+    if (!quadFace(F[0], F[1], F[2], F[3], f)) return TopoDS_Shape();
+    sew.Add(f);
+    for (int i = 0; i < 4; ++i)
+    {
+        const int j = (i + 1) % 4;
+        if (!quadFace(B[i], B[j], F[j], F[i], f)) return TopoDS_Shape();
+        sew.Add(f);
+    }
+    sew.Perform();
+    const TopoDS_Shape sewn = sew.SewedShape();
+    if (sewn.IsNull() || sewn.ShapeType() != TopAbs_SHELL) return TopoDS_Shape();
+
+    BRepBuilderAPI_MakeSolid solid(TopoDS::Shell(sewn));
+    if (!solid.IsDone()) return TopoDS_Shape();
+    TopoDS_Solid out = solid.Solid();
+    // Faces were added in arbitrary orientation; make the shell face outward
+    // so the cut removes the inside.
+    BRepLib::OrientClosedSolid(out);
+    return out;
+}
+
+// Tab / Fan pieces shared by GenerateMould (subtracted from the blank) and
+// BuildShotModel (fused into the positive shot): the block back-extended by
+// `backExt`, then the sub-runner pieces from the block's far face. Returns
+// false when the gate has no usable route / dimensions.
+//
+// `side` / `crossEps` place the block vertically (GateBlockVertical); pass
+// `wantBlock = false` to get only the sub-runner (the mould cut does this for
+// the half a one-sided gate isn't in), and `wantSub = false` to leave out a
+// one-sided sub-runner on the half it isn't in. `subCrossEps` is the
+// sub-runner's own parting-plane overlap (0 for a Cylinder or for the shot).
+//
+// The sub-runner always STARTS in a sphere of its own radius centred on the
+// transition point (the block's far face), so the block runs into a round
+// runner end instead of butting against the flat end of a cylinder. It is added
+// here rather than through BuildRunnerCutPieces' sphereAtStart because that
+// flag is ignored on a Simple path; sphereAtEnd keeps the bent-route rule.
+static bool BuildGateBlockPieces(const GateFeature& gf, float width, float height,
+                                 float length, float slope,
+                                 const ChannelProfile& subProf, float subCrossEps,
+                                 bool wantSub, float backExt, GateSide side,
+                                 float crossEps, bool wantBlock,
+                                 TopoDS_Shape& outBlock,
+                                 std::vector<TopoDS_Shape>& outSub)
+{
+    outBlock = TopoDS_Shape();
+    outSub.clear();
+    const GateBlockLayout L = LayoutGateBlock(gf, length);
+    if (!L.valid) return false;
+
+    if (wantBlock)
+    {
+        float h = height, upOffset = 0.0f;
+        GateBlockVertical(side, height, crossEps, h, upOffset);
+        const GateBlock block = MakeGateBlock(gf.point.worldPos, L.dir, width, h,
+                                              slope, backExt, L.frontLen, upOffset);
+        outBlock = GateBlockShape(block);
+    }
+
+    if (wantSub && !L.fillsPath && ChannelHalfWidth(subProf) > 1e-6f)
+    {
+        const FeaturePath subCutPath = GateSubRunnerCutPath(gf.subPath, L.transitionPt);
+        BuildChannelCutPieces(subCutPath, subProf, subCrossEps, outSub,
+            /*jointAtStart=*/false,
+            /*jointAtEnd=*/gf.subPath.nodes.size() > 2);
+
+        // The round end the sub-runner starts in: the sphere for a Cylinder
+        // sub-runner, the revolved profile (ChannelJoint) for a one-sided one.
+        AddChannelJointPiece(L.transitionPt, subProf, subCrossEps, outSub);
+    }
+    return !outBlock.IsNull() || !outSub.empty();
 }
 
 // Forward decl — defined later alongside the other mesh-toolpath helpers.
@@ -2937,6 +3399,7 @@ void GLCanvas::RunAutoEmbedAnalysis()
         gateRadius = frame->GetGateDiameter() * 0.5f;
         draftAngle = frame->GetGateDraftAngle();
     }
+    const GateDims gateDims = ReadGateDims();
     if ((!ventOn || m_vents.empty()) && (!gateOn || m_gates.empty())) return;
 
     // The cavity is the union of every moulded object. Cache each one's
@@ -2977,16 +3440,23 @@ void GLCanvas::RunAutoEmbedAnalysis()
     };
 
     // Analyse one mouth. Returns the extension to apply (0 = unresolved or
-    // nothing needed) and records a flag + marker when unresolved.
+    // nothing needed) and records a flag + marker when unresolved. `spreads`
+    // is empty for a constant section (vents, cone, Tab); a Fan passes its
+    // per-line spreads so the lines follow the widening end rectangle.
     auto analyse = [&](bool isGate, int index, const glm::vec3& origin,
                        const glm::vec3& intoPart, const std::vector<glm::vec3>& offsets,
+                       const std::vector<glm::vec3>& spreads,
                        const FeatureEmbed::Params& params, float markerRadius) -> float
     {
         float bundleR = 0.0f;
         for (const glm::vec3& o : offsets) bundleR = std::max(bundleR, glm::length(o));
+        // A diverging bundle is wider at the extension limit.
+        float maxSpread = 0.0f;
+        for (const glm::vec3& sp : spreads) maxSpread = std::max(maxSpread, glm::length(sp));
+        bundleR += params.maxExtension * maxSpread;
 
         const FeatureEmbed::Result r = FeatureEmbed::Analyze(origin, intoPart, offsets,
-            bodiesNear(origin, intoPart, bundleR), params);
+            spreads, bodiesNear(origin, intoPart, bundleR), params);
 
         // Resolved = every line that could be traced reaches the part within
         // the limit. (Unreliable lines — an open mesh right at the mouth —
@@ -3053,13 +3523,60 @@ void GLCanvas::RunAutoEmbedAnalysis()
 
             const std::vector<glm::vec3> offsets =
                 FeatureEmbed::RectSamples(side, up, hw, hd);
-            vent.embedExtension = analyse(false, i, origin, -tangent, offsets, vp,
+            vent.embedExtension = analyse(false, i, origin, -tangent, offsets, {}, vp,
                 std::sqrt(hw * hw + hd * hd) * 1.6f + 1.0f);
         }
     }
 
-    // ---- Gates ----------------------------------------------------------
-    if (gateOn && gateRadius > 1e-6f)
+    // ---- Tab / Fan gates ------------------------------------------------
+    // The mouth is the block's Width x Height rectangle at the placed point,
+    // on the axis the block is cut along (LayoutGateBlock's first-leg dir,
+    // pointing INTO the part = -dir). A Tab's section is constant, so its lines
+    // run parallel like a vent's. A Fan keeps widening as it is pushed back, so
+    // each line drifts sideways at the fan slope: "every line inside at depth
+    // L" is then "the whole end rectangle at depth L is inside the part" —
+    // the fan keeps fanning until its end face is fully embedded, or the gate
+    // is flagged when that never happens within the limit (e.g. a fan wider
+    // than the part edge it meets). Unlike the cone, the block doesn't narrow
+    // as it is extended, so only the 10 mm cap applies; kCutEps rides on top
+    // in the cut, along the same diverging lines, so no extra margin.
+    if (gateOn && gateDims.IsBlock())
+    {
+        if (gateDims.width > 1e-6f && gateDims.height > 1e-6f)
+        {
+            FeatureEmbed::Params gp;
+            gp.maxExtension   = kAutoEmbedMaxMm;
+            gp.margin         = 0.0f;
+            gp.respectCeiling = false;
+
+            const float hw = 0.5f * gateDims.width;
+            const float hh = 0.5f * gateDims.height;
+            const float slope = gateDims.BlockSlope();
+
+            for (int i = 0; i < (int)m_gates.size(); ++i)
+            {
+                GateFeature& gf = m_gates[i];
+                const GateBlockLayout L = LayoutGateBlock(gf, gateDims.length);
+                if (!L.valid) continue;
+
+                glm::vec3 side, up;
+                GateBlockAxes(L.dir, side, up);
+                // A one-sided gate's mouth is the rectangle sitting in its half.
+                float hUsed = gateDims.height, upOffset = 0.0f;
+                GateBlockVertical(gateDims.side, gateDims.height, 0.0f, hUsed, upOffset);
+                std::vector<glm::vec3> offsets =
+                    FeatureEmbed::RectSamples(side, up, hw, hh);
+                for (glm::vec3& o : offsets) o += up * upOffset;
+                const std::vector<glm::vec3> spreads =
+                    FeatureEmbed::RectSpreads(offsets, side, hw, slope);
+                gf.embedExtension = analyse(true, i, gf.point.worldPos, -L.dir,
+                    offsets, spreads, gp,
+                    std::sqrt(hw * hw + (hh + std::abs(upOffset)) * (hh + std::abs(upOffset))) * 1.6f + 1.0f);
+            }
+        }
+    }
+    // ---- Gates (Tapered Cylinder) ---------------------------------------
+    else if (gateOn && gateRadius > 1e-6f)
     {
         // The gate cone narrows by tan(draft) per mm as it is pushed back; past
         // (radius - floor) / tan(draft) the cut clamps the back radius to the
@@ -3096,7 +3613,7 @@ void GLCanvas::RunAutoEmbedAnalysis()
             // it reach a convex surface sooner, so this errs deep, not short.
             const std::vector<glm::vec3> offsets =
                 FeatureEmbed::DiscSamples(pathDir, gateRadius);
-            gf.embedExtension = analyse(true, i, gf.point.worldPos, -pathDir, offsets, gp,
+            gf.embedExtension = analyse(true, i, gf.point.worldPos, -pathDir, offsets, {}, gp,
                 gateRadius * 1.6f + 1.0f);
         }
     }
@@ -3126,6 +3643,14 @@ wxString GLCanvas::BuildEmbedWarningText() const
 
     text += "\nThese were cut with their normal overrun and are marked with a red "
             "sphere in Preview. Try reducing the gate / vent size or moving it.";
+
+    // A Fan keeps widening as it is pushed back, so its own taper can be what
+    // stops the end face from ever fitting inside the part.
+    bool fanFlagged = false;
+    for (const EmbedFlag& f : m_lastEmbedFlags) fanFlagged = fanFlagged || f.isGate;
+    if (fanFlagged && ReadGateDims().type == GateType::Fan)
+        text += " A Fan gate keeps widening as it is extended into the part, so a "
+                "smaller Taper angle or Width can also let it seat.";
     return text;
 }
 
@@ -4359,6 +4884,22 @@ bool GLCanvas::GenerateMould()
         BRepBuilderAPI_Transform fixXform(fixtureShape, fixTrsf, true);
         TopoDS_Shape result = fixXform.Shape();
 
+        // Which mould half this fixture is — A is the top (+Y) half, B the
+        // bottom — for the one-sided features (A/B Tab / Fan gates, Parabolic /
+        // Trapezoidal runners and sub-runners), which are cut from their own
+        // half only.
+        bool fixtureIsA = true;
+        {
+            Bnd_Box fb;
+            BRepBndLib::Add(result, fb);
+            if (!fb.IsVoid())
+            {
+                double x0, y0, z0, x1, y1, z1;
+                fb.Get(x0, y0, z0, x1, y1, z1);
+                fixtureIsA = 0.5 * (y0 + y1) > 0.0;
+            }
+        }
+
         // Steps: subtract each object
         for (int oi = 0; oi < (int)m_objects.size(); ++oi)
         {
@@ -4503,11 +5044,18 @@ bool GLCanvas::GenerateMould()
             // Read runner dimensions from UI (same source as the preview solids)
             float runnerRadius = 2.5f;
             float coldPlugDist = 5.0f;
+            ChannelProfile runnerProf;
             if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
             {
                 runnerRadius = frame->GetRunnerDiameter() * 0.5f;
                 coldPlugDist = frame->GetRunnerColdPlugDist();
+                runnerProf = frame->GetRunnerProfile();
             }
+            // A Parabolic / Trapezoidal runner lives in one half: skip it (and
+            // its cold plug) on the other, and let it reach 0.1 mm past the
+            // parting plane on its own.
+            const bool  runnerHere = ChannelCutsHalf(runnerProf, fixtureIsA);
+            const float runnerEps  = runnerProf.IsRound() ? 0.0f : 0.1f;
 
             for (int ri = 0; ri < (int)m_runners.size(); ++ri)
             {
@@ -4517,6 +5065,7 @@ bool GLCanvas::GenerateMould()
                     std::to_string((int)m_runners.size()) + "...");
 
                 const RunnerFeature& rf = m_runners[ri];
+                if (!runnerHere) continue;
 
                 // Body: per-leg cylinders + sphere joints (a Simple runner is a
                 // single straight cylinder), each subtracted from the blank
@@ -4524,7 +5073,9 @@ bool GLCanvas::GenerateMould()
                 // cut, so a bent runner cuts as reliably as a straight one.  A
                 // failed leg/joint is skipped, never dropping the rest.
                 std::vector<TopoDS_Shape> runnerPieces;
-                if (BuildRunnerCutPieces(rf.path, runnerRadius, runnerPieces))
+                if (runnerProf.IsRound()
+                        ? BuildRunnerCutPieces(rf.path, runnerRadius, runnerPieces)
+                        : BuildChannelCutPieces(rf.path, runnerProf, runnerEps, runnerPieces))
                 {
                     bool anyRunnerCut = false;
                     for (const TopoDS_Shape& piece : runnerPieces)
@@ -4545,7 +5096,25 @@ bool GLCanvas::GenerateMould()
                 // Cold plug well — extends past the runner endpoint along the
                 // last-leg direction (feed->point for a Simple runner).  Not part
                 // of the runner path so future sub-runners won't reuse the space.
-                if (coldPlugDist > 1e-6f)
+                if (coldPlugDist > 1e-6f && !runnerProf.IsRound())
+                {
+                    // One-sided runner: its own profile extruded past the end.
+                    const glm::vec3 runnerDir =
+                        RunnerColdPlugDir(rf.path, rf.point, m_sprue.partingPos);
+                    const TopoDS_Shape plug = ChannelPlugPiece(rf.point, runnerDir,
+                        coldPlugDist, runnerProf, runnerEps);
+                    if (!plug.IsNull())
+                    {
+                        BRepAlgoAPI_Cut plugCut(result, plug);
+                        plugCut.Build();
+                        if (plugCut.IsDone() && !plugCut.Shape().IsNull())
+                            result = plugCut.Shape();
+                        else
+                            wxMessageBox("Cold plug cut failed for runner " + std::to_string(ri + 1),
+                                "Generate Mould", wxOK | wxICON_WARNING, this);
+                    }
+                }
+                else if (coldPlugDist > 1e-6f)
                 {
                     if (runnerRadius > 1e-6f)
                     {
@@ -4578,7 +5147,65 @@ bool GLCanvas::GenerateMould()
             step += (int)m_runners.size();
         }
 
+        // Steps: subtract each Tab / Fan gate block and its sub-runner. Same
+        // back-extension rule as the cone below: kCutEps through the parting
+        // surface plus max(Overrun, auto-embed). A Fan keeps fanning over that
+        // extension, so a gate whose auto-embed depth was measured on the grown
+        // end rectangle gets exactly that rectangle as its back face.
+        const GateDims gateDims = ReadGateDims();
+        if (gateDims.IsBlock())
+        {
+            static constexpr float kCutEps = 0.1f;
+            const float slope = gateDims.BlockSlope();
+
+            // A one-sided (A / B) block is cut from its own half only, so it can
+            // reach kCutEps past the parting surface (no coplanar face against
+            // the half's parting face) without grooving the other half. Which
+            // half this fixture is: A is the top (+Y) half, B the bottom.
+            const bool cutBlockHere = gateDims.side == GateSide::Both ||
+                fixtureIsA == (gateDims.side == GateSide::A);
+            const float crossEps = gateDims.side == GateSide::Both ? 0.0f : kCutEps;
+            // Same rule for a one-sided (Parabolic / Trapezoidal) sub-runner.
+            const bool  subHere = ChannelCutsHalf(gateDims.subRunner, fixtureIsA);
+            const float subEps  = gateDims.subRunner.IsRound() ? 0.0f : kCutEps;
+
+            auto cutPiece = [&](const TopoDS_Shape& piece, const std::string& what, int gi)
+            {
+                BRepAlgoAPI_Cut cut(result, piece);
+                cut.Build();
+                if (cut.IsDone() && !cut.Shape().IsNull())
+                    result = cut.Shape();
+                else
+                    wxMessageBox(what + " cut failed for gate " + std::to_string(gi + 1),
+                        "Generate Mould", wxOK | wxICON_WARNING, this);
+            };
+
+            for (int gi = 0; gi < (int)m_gates.size(); ++gi)
+            {
+                progress.Update(step++,
+                    fixLabel + ": cutting gate " +
+                    std::to_string(gi + 1) + " of " +
+                    std::to_string((int)m_gates.size()) + "...");
+
+                const GateFeature& gf = m_gates[gi];
+                const float backExt = kCutEps + std::max(gateDims.overrun, gf.embedExtension);
+
+                TopoDS_Shape blockShape;
+                std::vector<TopoDS_Shape> subPieces;
+                if (!BuildGateBlockPieces(gf, gateDims.width, gateDims.height,
+                        gateDims.length, slope, gateDims.subRunner, subEps, subHere,
+                        backExt, gateDims.side, crossEps, cutBlockHere,
+                        blockShape, subPieces))
+                    continue;
+
+                if (!blockShape.IsNull())
+                    cutPiece(blockShape, gateDims.type == GateType::Fan ? "Fan gate" : "Tab gate", gi);
+                for (const TopoDS_Shape& piece : subPieces)
+                    cutPiece(piece, "Sub-runner", gi);
+            }
+        }
         // Steps: subtract each gate (tapered frustum) and its sub-runner cylinder
+        else
         {
             float gateRadius = 1.5f;
             float draftAngle = 1.0f;
@@ -4588,9 +5215,13 @@ bool GLCanvas::GenerateMould()
             {
                 gateRadius = frame->GetGateDiameter() * 0.5f;
                 draftAngle = frame->GetGateDraftAngle();
-                subRunnerRadius = frame->GetSubRunnerDiameter() * 0.5f;
                 overrun = frame->GetGateOverrun();
             }
+            // Cone hand-over radius + sub-runner cross-section (a Cylinder
+            // sub-runner: its radius, exactly as before).
+            subRunnerRadius = gateDims.subRunnerRadius;
+            const bool  subHere = ChannelCutsHalf(gateDims.subRunner, fixtureIsA);
+            const float subEps  = gateDims.subRunner.IsRound() ? 0.0f : 0.1f;
 
             const float draftRad = glm::radians(glm::clamp(draftAngle, 0.0f, 45.0f));
             const float tanDraft = std::tan(draftRad);
@@ -4741,7 +5372,7 @@ bool GLCanvas::GenerateMould()
                             GateSubRunnerCutPath(gf.subPath, transitionPt);
 
                         std::vector<TopoDS_Shape> subPieces;
-                        if (BuildRunnerCutPieces(subCutPath, subRunnerRadius, subPieces, /*sphereAtStart=*/gf.subPath.nodes.size() > 2, /*sphereAtEnd=*/gf.subPath.nodes.size() > 2))
+                        if (subHere && BuildChannelCutPieces(subCutPath, gateDims.subRunner, subEps, subPieces, /*jointAtStart=*/gf.subPath.nodes.size() > 2, /*jointAtEnd=*/gf.subPath.nodes.size() > 2))
                         {
                             for (const TopoDS_Shape& piece : subPieces)
                             {
@@ -6110,23 +6741,37 @@ bool GLCanvas::BuildShotModel(TopoDS_Shape& out,
         subRunnerRadius = frame->GetSubRunnerDiameter() * 0.5f;
         overrun = frame->GetGateOverrun();
     }
+    ChannelProfile runnerProf;
+    if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
+        runnerProf = frame->GetRunnerProfile();
 
     // ---- Runner cylinders + cold plugs ------------------------------------
-    if (m_sprue.hasPartingPoint && runnerRadius > 1e-6f)
+    if (m_sprue.hasPartingPoint && ChannelHalfWidth(runnerProf) > 1e-6f)
     {
         for (const RunnerFeature& rf : m_runners)
         {
             // Body: same per-leg cylinders + sphere joints the mould cut uses,
             // so the positive shot follows a bent runner exactly (Simple = one
             // straight cylinder).  Pieces are fused with the rest of the shot.
+            // A one-sided runner contributes its exact profile (no overlap).
             std::vector<TopoDS_Shape> runnerPieces;
-            if (BuildRunnerCutPieces(rf.path, runnerRadius, runnerPieces))
+            if (runnerProf.IsRound()
+                    ? BuildRunnerCutPieces(rf.path, runnerRadius, runnerPieces)
+                    : BuildChannelCutPieces(rf.path, runnerProf, 0.0f, runnerPieces))
                 for (const TopoDS_Shape& piece : runnerPieces)
                     shapes.push_back(piece);
 
             // Cold plug past the endpoint along the last-leg direction
             // (feed->point for a Simple runner).
-            if (coldPlugDist > 1e-6f)
+            if (coldPlugDist > 1e-6f && !runnerProf.IsRound())
+            {
+                const glm::vec3 runnerDir =
+                    RunnerColdPlugDir(rf.path, rf.point, m_sprue.partingPos);
+                const TopoDS_Shape plug = ChannelPlugPiece(rf.point, runnerDir,
+                    coldPlugDist, runnerProf, 0.0f);
+                if (!plug.IsNull()) shapes.push_back(plug);
+            }
+            else if (coldPlugDist > 1e-6f)
             {
                 if (runnerRadius > 1e-6f)
                 {
@@ -6144,7 +6789,31 @@ bool GLCanvas::BuildShotModel(TopoDS_Shape& out,
         }
     }
 
+    // ---- Tab / Fan gate blocks + sub-runners -------------------------------
+    // The same pieces GenerateMould removes (BuildGateBlockPieces, same
+    // back-extension rule), fused into the positive shot.
+    const GateDims gateDims = ReadGateDims();
+    subRunnerRadius = gateDims.subRunnerRadius;   // cone hand-over radius (see GateDims)
+    if (gateDims.IsBlock())
+    {
+        const float slope = gateDims.BlockSlope();
+        for (const GateFeature& gf : m_gates)
+        {
+            const float backExt = kCutEps + std::max(gateDims.overrun, gf.embedExtension);
+            TopoDS_Shape blockShape;
+            std::vector<TopoDS_Shape> subPieces;
+            // Exact block (crossEps 0): the shot is the cavity side of the cut.
+            if (!BuildGateBlockPieces(gf, gateDims.width, gateDims.height,
+                    gateDims.length, slope, gateDims.subRunner, /*subCrossEps=*/0.0f,
+                    /*wantSub=*/true, backExt, gateDims.side, /*crossEps=*/0.0f,
+                    /*wantBlock=*/true, blockShape, subPieces))
+                continue;
+            if (!blockShape.IsNull()) shapes.push_back(blockShape);
+            for (const TopoDS_Shape& piece : subPieces) shapes.push_back(piece);
+        }
+    }
     // ---- Gate frustums + sub-runners --------------------------------------
+    else
     {
         const float draftRad = glm::radians(glm::clamp(draftAngle, 0.0f, 45.0f));
         const float tanDraft = std::tan(draftRad);
@@ -6222,7 +6891,7 @@ bool GLCanvas::BuildShotModel(TopoDS_Shape& out,
                     GateSubRunnerCutPath(gf.subPath, transitionPt);
 
                 std::vector<TopoDS_Shape> subPieces;
-                if (BuildRunnerCutPieces(subCutPath, subRunnerRadius, subPieces, /*sphereAtStart=*/gf.subPath.nodes.size() > 2, /*sphereAtEnd=*/gf.subPath.nodes.size() > 2))
+                if (BuildChannelCutPieces(subCutPath, gateDims.subRunner, /*crossEps=*/0.0f, subPieces, /*jointAtStart=*/gf.subPath.nodes.size() > 2, /*jointAtEnd=*/gf.subPath.nodes.size() > 2))
                     for (const TopoDS_Shape& piece : subPieces)
                         shapes.push_back(piece);
             }
@@ -7863,8 +8532,10 @@ bool GLCanvas::RayCastEjectorGridSnap(int mouseX, int mouseY, glm::vec3& outPos)
     float subR = 2.5f;
     if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
     {
-        runnerR = frame->GetRunnerDiameter() * 0.5f;
-        subR = frame->GetSubRunnerDiameter() * 0.5f;
+        // Half the open width at the parting plane (the radius for a
+        // Cylinder channel) — where an ejector grid point is on the channel.
+        runnerR = ChannelHalfWidth(frame->GetRunnerProfile());
+        subR = ChannelHalfWidth(frame->GetSubRunnerProfile());
     }
 
     // Closest point on segment AB to an arbitrary point P (not to the ray).
@@ -16184,6 +16855,29 @@ void GLCanvas::RestoreSceneState(const History::SceneState& s)
 // cold slug and runner cold plugs are dead ends that carry no steady flow and
 // are left out for now.
 // ===========================================================================
+// Feed-network section for a runner / sub-runner profile. The network only
+// models circular and rectangular sections, so the one-sided profiles map onto
+// the nearer of those: a Trapezoidal channel becomes the rectangle of the same
+// area and depth (its mean width x height); a Parabolic channel becomes the
+// circle of the same hydraulic diameter (4A / P), the usual stand-in for a
+// non-circular runner's flow resistance. A Cylinder is its own circle.
+static Flow::FeedSection ChannelFeedSection(const ChannelProfile& p)
+{
+    if (p.type == ChannelType::Trapezoidal && p.height > 1e-6f)
+    {
+        double A = 0.0, P = 0.0;
+        ChannelAreaPerimeter(p, A, P);
+        return Flow::MakeRectSection((float)(A / p.height), p.height);
+    }
+    if (p.type == ChannelType::Parabolic)
+    {
+        double A = 0.0, P = 0.0;
+        ChannelAreaPerimeter(p, A, P);
+        return Flow::MakeCircleSection(P > 0.0 ? (float)(4.0 * A / P) : 0.0f);
+    }
+    return Flow::MakeCircleSection(p.diameter);
+}
+
 Flow::FeedNetwork GLCanvas::BuildFeedNetwork() const
 {
     using namespace Flow;
@@ -16201,6 +16895,15 @@ Flow::FeedNetwork GLCanvas::BuildFeedNetwork() const
         gateDraft = frame->GetGateDraftAngle();
         subD      = frame->GetSubRunnerDiameter();
         frame->GetVentDimensions(ventDepth, ventW, ventOvS, ventOvE);
+    }
+    // Runner / sub-runner cross-sections (Cylinder: diameter == runnerD / subD).
+    ChannelProfile runnerProf, subProf;
+    runnerProf.diameter = runnerD;
+    subProf.diameter = subD;
+    if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(const_cast<GLCanvas*>(this))))
+    {
+        runnerProf = frame->GetRunnerProfile();
+        subProf    = frame->GetSubRunnerProfile();
     }
 
     // ---- Part nodes -------------------------------------------------------
@@ -16369,7 +17072,7 @@ Flow::FeedNetwork GLCanvas::BuildFeedNetwork() const
         if (attach[g].ok && attach[g].onSprue) gateFeedNode[g] = partingNode;
 
     // ---- Runner edges, split at gate attach points ------------------------
-    const FeedSection runnerSec = MakeCircleSection(runnerD);
+    const FeedSection runnerSec = ChannelFeedSection(runnerProf);
     for (size_t r = 0; r < runners.size(); ++r)
     {
         const RunnerInfo& ri = runners[r];
@@ -16410,10 +17113,16 @@ Flow::FeedNetwork GLCanvas::BuildFeedNetwork() const
     }
 
     // ---- Gates: feed -> sub-runner -> transition -> gate -> mouth -> part --
-    const float gateR = 0.5f * gateD, subR = 0.5f * subD;
+    const float gateR = 0.5f * gateD, subR = ChannelConeRadius(subProf);
     const float tanDraft = std::tan(glm::radians(glm::clamp(gateDraft, 0.0f, 45.0f)));
     const FeedSection gateSec = MakeCircleSection(gateD);
-    const FeedSection subSec  = MakeCircleSection(subD);
+    const FeedSection subSec  = ChannelFeedSection(subProf);
+    // Tab / Fan: the gate edge is the block (Length along the first leg, from
+    // LayoutGateBlock) with a Width x Height rectangular section. A Fan's width
+    // varies along the edge; its section uses the MEAN width over the length
+    // actually laid down — a single-section edge can't carry the taper itself.
+    const GateDims gdims = ReadGateDims();
+    const float    gslope = gdims.BlockSlope();
     for (size_t g = 0; g < m_gates.size(); ++g)
     {
         const GateFeature& gf = m_gates[g];
@@ -16434,6 +17143,15 @@ Flow::FeedNetwork GLCanvas::BuildFeedNetwork() const
 
         float taperLen = std::numeric_limits<float>::max();
         if (tanDraft > 1e-6f && subR > gateR) taperLen = (subR - gateR) / tanDraft;
+        FeedSection edgeSec = gateSec;
+        if (gdims.IsBlock())
+        {
+            const GateBlockLayout L = LayoutGateBlock(gf, gdims.length);
+            taperLen = std::max(gdims.length, 0.0f);
+            const float laid = L.valid ? L.frontLen : 0.0f;
+            const float meanW = std::max(gdims.width - gslope * laid, kGateFanMinFrontWidth);
+            edgeSec = MakeRectSection(meanW, gdims.height);
+        }
         const bool simpleFull = gf.subPath.nodes.size() <= 2 && taperLen >= totalLen;
 
         const int mouth = net.addNode(origin, FeedNodeKind::GateOrigin, gf.parentIndex, 0.0f,
@@ -16460,7 +17178,7 @@ Flow::FeedNetwork GLCanvas::BuildFeedNetwork() const
 
         if (simpleFull)
         {
-            net.addEdge(feed, mouth, FeedEdgeKind::Gate, totalLen, gateSec, (int)g, gl);
+            net.addEdge(feed, mouth, FeedEdgeKind::Gate, totalLen, edgeSec, (int)g, gl);
         }
         else
         {
@@ -16468,7 +17186,7 @@ Flow::FeedNetwork GLCanvas::BuildFeedNetwork() const
             const glm::vec3 transitionPt = origin + pathDir * taperOnLeg;
             const int trans = net.addNode(transitionPt, FeedNodeKind::GateTransition, -1, 0.0f,
                                           gl + " transition");
-            net.addEdge(trans, mouth, FeedEdgeKind::Gate, taperOnLeg, gateSec, (int)g, gl);
+            net.addEdge(trans, mouth, FeedEdgeKind::Gate, taperOnLeg, edgeSec, (int)g, gl);
 
             const FeaturePath sub = GateSubRunnerCutPath(gf.subPath, transitionPt);
             std::vector<glm::vec3> poly;

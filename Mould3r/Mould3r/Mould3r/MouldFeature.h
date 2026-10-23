@@ -4,6 +4,7 @@
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
+#include <cstdint>
 #include <vector>
 
 // ---------------------------------------------------------------------------
@@ -212,6 +213,196 @@ SolidMesh BuildBoxSweepMesh(const FeaturePath& path, float width, float depth,
 SolidMesh BuildTubeSweepMesh(const FeaturePath& path, float radius,
     int segments = 32, float overrunStart = 0.0f, float overrunEnd = 0.0f,
     bool sphereAtStart = false, bool sphereAtEnd = false);
+
+// ---------------------------------------------------------------------------
+// Gate types (Gates card "Gate type" dropdown).
+//
+//   TaperedCylinder — the original drafted cone (Diameter / Draft angle).
+//   Tab             — a rectangular block, Width x Height x Length, from the
+//                     gate point toward the feed; the sub-runner starts at its
+//                     far end.
+//   Fan             — the Tab with a per-side Taper angle on its width: Width is
+//                     measured at the PART side (the placed point, like the
+//                     cone's Diameter) and the block narrows toward the
+//                     sub-runner. Height is constant.
+//
+// The underlying type is fixed so MainFrame.h can forward-declare it.
+// ---------------------------------------------------------------------------
+enum class GateType : int { TaperedCylinder = 0, Tab = 1, Fan = 2 };
+
+// Dropdown / file label <-> type. Unknown labels read as TaperedCylinder so
+// older files and fixtures keep their historical gate.
+const char* GateTypeLabel(GateType t);
+GateType    GateTypeFromLabel(const char* label);
+
+// Which mould half a Tab / Fan gate is cut into. A is the top half (+Y), B the
+// bottom (-Y). Both = the block straddles the parting surface, Height split
+// evenly (like a vent); A / B = the whole Height sits in that one half, its
+// near face on the parting surface. The sub-runner stays full-round either way.
+enum class GateSide : int { Both = 0, A = 1, B = 2 };
+const char* GateSideLabel(GateSide s);          // "Both", "A side", "B side"
+GateSide    GateSideFromLabel(const char* label); // unknown -> Both
+
+// Vertical extent of the block for a cut side: the height to build and the
+// offset of its centre along upAxis (+ = toward A). `crossEps` lets a one-sided
+// block reach that far past the parting surface into the OTHER half, so the cut
+// never leaves the block's face coplanar with the half's own parting face; it
+// is only safe because the mould cut applies a one-sided block to its own half
+// alone. The preview, shot and auto-embed pass 0 (the exact block).
+void GateBlockVertical(GateSide side, float height, float crossEps,
+                       float& outHeight, float& outUpOffset);
+
+// Narrowest the Fan's sub-runner end may get (mm). A taper steep enough to
+// close the fan before Length is flattened to land here instead.
+constexpr float kGateFanMinFrontWidth = 0.1f;
+
+// Per-side width change of a Fan, in mm of HALF-width per mm along the gate
+// axis (= tan(taperDeg)), reduced if needed so the sub-runner end never gets
+// narrower than kGateFanMinFrontWidth. 0 for a zero angle. The back-extension
+// (overrun / auto-embed) continues at this same slope, so the side walls stay
+// single planes from the extended back face to the sub-runner end.
+float GateFanSlope(float width, float length, float taperDeg);
+
+// The two axes perpendicular to a gate's first-leg direction: sideAxis (the
+// Width direction, horizontal) and upAxis (the Height direction, as close to
+// world Y as the leg allows — a gate sitting just off the parting plane can
+// tilt its first leg slightly). The block is centred on the parting surface
+// like the vent cross-section: Height splits evenly between the two halves.
+void GateBlockAxes(const glm::vec3& dir, glm::vec3& sideAxis, glm::vec3& upAxis);
+
+// ---------------------------------------------------------------------------
+// GateBlock — the Tab / Fan gate body: a ruled solid between two rectangles
+// perpendicular to the gate axis. All six faces are planar (Height is
+// constant and the width changes symmetrically), so it cuts as exact
+// geometry.
+//
+//   back[]  — the part-side face, pushed `backExt` behind the placed point
+//             along -dir (overrun / auto-embed / cut epsilon). On a Fan it is
+//             wider than Width: the fan keeps fanning back into the part.
+//   front[] — the sub-runner face, `frontLen` along +dir from the placed point.
+//   Corner order BL, BR, TR, TL (B/T along upAxis, L/R along sideAxis), the
+//   same as VentCrossSection.
+// ---------------------------------------------------------------------------
+struct GateBlock
+{
+    bool      valid = false;
+    glm::vec3 back[4] = {};
+    glm::vec3 front[4] = {};
+    glm::vec3 dir{ 0.0f }, sideAxis{ 0.0f }, upAxis{ 0.0f };
+    float     backWidth = 0.0f, frontWidth = 0.0f, height = 0.0f;
+    float     axialLen = 0.0f;   // backExt + frontLen
+};
+
+// `width` is the width AT `origin`; `slope` from GateFanSlope (0 for a Tab);
+// `upOffset` shifts the block's centre along upAxis (GateBlockVertical).
+// Invalid when height / width <= 0 or the total axial length is ~0.
+GateBlock MakeGateBlock(const glm::vec3& origin, const glm::vec3& dir,
+    float width, float height, float slope, float backExt, float frontLen,
+    float upOffset = 0.0f);
+
+// Preview mesh of a GateBlock (flat-shaded box / frustum-prism).
+SolidMesh BuildGateBlockMesh(const GateBlock& block);
+
+// ===========================================================================
+// Channel profiles — runner / sub-runner cross-sections.
+//
+//   Cylinder    — full-round, centred on the parting surface (the original
+//                 runner; still built by BuildTubeSweepMesh /
+//                 BuildRunnerCutPieces, so its geometry is unchanged).
+//   Parabolic   — cut into ONE half: a circle of `diameter` touching the
+//                 parting plane at a single point, on the cut side, plus two
+//                 straight walls tangent to it, leaning out at `draftDeg` off
+//                 the parting direction until they reach the parting plane.
+//                 Open width at the plane = D (1 + sin a) / cos a; depth = D.
+//   Trapezoidal — cut into ONE half: `width` at the parting plane, `height`
+//                 deep, side walls at `draftDeg` (so the floor is narrower).
+//
+// Profiles are described in 2D section coordinates: s along the station's
+// side axis, u perpendicular to the parting plane INTO the cut half (u >= 0).
+// The world mapping is pos + sideAxis * s + Y * (sign * u), sign = +1 for the
+// A half (top, +Y), -1 for B.
+// ===========================================================================
+enum class ChannelType : int { Cylinder = 0, Parabolic = 1, Trapezoidal = 2 };
+
+// "Cylinder" / "Cylindrical" (both historical spellings) / "Parabolic" /
+// "Trapezoidal"; anything else reads as Cylinder.
+ChannelType ChannelTypeFromLabel(const char* label);
+
+constexpr float kChannelDefaultDraftDeg = 10.0f;
+
+struct ChannelProfile
+{
+    ChannelType type = ChannelType::Cylinder;
+    float diameter = 5.0f;              // Cylinder, Parabolic
+    float width = 5.0f;                 // Trapezoidal: at the parting plane
+    float height = 3.5f;                // Trapezoidal: depth into the half
+    float draftDeg = kChannelDefaultDraftDeg;  // Parabolic, Trapezoidal
+    GateSide side = GateSide::B;        // Parabolic, Trapezoidal: A or B only
+
+    bool  IsRound() const { return type == ChannelType::Cylinder; }
+    // +1 when cut into A (+Y), -1 into B. (Both is never offered; read as B.)
+    float SideSign() const { return side == GateSide::A ? 1.0f : -1.0f; }
+};
+
+// Half the open width where the channel meets the parting plane (round: the
+// radius). Used as the "is this point on the channel" tolerance.
+float ChannelHalfWidth(const ChannelProfile& p);
+
+// Radius a Tapered Cylinder gate cone grows to before handing over to this
+// channel as its sub-runner. Round: the radius (unchanged behaviour);
+// Parabolic: D/2; Trapezoidal: height/2. The cone stays centred on the parting
+// surface, so a one-sided sub-runner meets it with a step — they overlap
+// between the plane and the cone's rim on the cut side.
+float ChannelConeRadius(const ChannelProfile& p);
+
+// Exact cross-section area and perimeter (crossEps = 0), mm^2 / mm.
+void ChannelAreaPerimeter(const ChannelProfile& p, double& area, double& perimeter);
+
+// One edge of a profile outline, exact: a straight line a->b, or a circular
+// arc a->mid->b. Outlines are closed, convex and counter-clockwise in (s, u).
+struct ChannelSeg
+{
+    bool      arc = false;
+    glm::vec2 a{ 0.0f }, b{ 0.0f }, mid{ 0.0f };
+};
+
+// Exact outline of a one-sided profile. `crossEps` (>= 0) pushes the base edge
+// that far past the parting plane (u = -crossEps) along the side walls, so a
+// cut tool never has a face coplanar with the half's parting face — only safe
+// because a one-sided channel is cut from its own half alone. Parabolic: base,
+// right wall, top arc, left wall. Trapezoidal: base, right wall, floor, left
+// wall. Empty for Cylinder.
+std::vector<ChannelSeg> ChannelExactOutline(const ChannelProfile& p, float crossEps);
+
+// Solid of revolution used as a channel JOINT (bends, and the round end a
+// sub-runner starts in behind a Tab / Fan gate): the half-profile revolved
+// about the vertical axis through the node, which meets every adjoining leg
+// flush at any angle. Parabolic = cone frustum (base -> wall tangent points)
+// + the sphere of the profile circle; Trapezoidal = one cone frustum. Values
+// are along u from the parting plane (u0 = -crossEps).
+struct ChannelJointShape
+{
+    float u0 = 0.0f, r0 = 0.0f;     // frustum base (at the parting plane side)
+    float u1 = 0.0f, r1 = 0.0f;     // frustum top
+    bool  sphere = false;           // Parabolic: plus a sphere ...
+    float sphereU = 0.0f, sphereR = 0.0f;   // ... centred at u = sphereU
+};
+ChannelJointShape ChannelJoint(const ChannelProfile& p, float crossEps);
+
+// Preview sweep of a channel along a path, the counterpart of
+// BuildTubeSweepMesh for every profile. Round profiles go straight to
+// BuildTubeSweepMesh (radius D/2) so they are unchanged. One-sided profiles:
+// one swept run per leg (or one continuous run when smooth), flat end caps,
+// a revolved joint (ChannelJoint) at every interior node, and optionally at
+// the first / last station.
+SolidMesh BuildChannelSweepMesh(const FeaturePath& path, const ChannelProfile& profile,
+    bool jointAtStart = false, bool jointAtEnd = false);
+
+// CPU half of BuildChannelSweepMesh for one-sided profiles (no GL): appends
+// [pos, normal] vertices and triangle indices. Exposed for testing.
+void ChannelSweepGeometry(const FeaturePath& path, const ChannelProfile& profile,
+    bool jointAtStart, bool jointAtEnd,
+    std::vector<float>& verts, std::vector<uint32_t>& idx);
 
 // ---------------------------------------------------------------------------
 // VentPoint  — a user-placed point on the parting surface of an object.

@@ -18,6 +18,9 @@
 #include <unordered_map>
 
 class GLCanvas;
+enum class GateType : int;   // MouldFeature.h — Gates card "Gate type"
+enum class GateSide : int;   // MouldFeature.h — Tab / Fan "Cut side"
+struct ChannelProfile;       // MouldFeature.h — runner / sub-runner cross-section
 namespace History { class Stack; struct Entry; }   // SceneHistory.h — kept out of
 // this header (it pulls in the feature / GL headers) since the lightweight
 // toolbar headers include MainFrame.h.
@@ -103,9 +106,27 @@ public:
 
     float GetRunnerDiameter() const;
 
+    // Runner / sub-runner cross-sections from the Runner card and the Gates
+    // card's sub-runner section (mm / degrees). The sub-runner's "Match Runner"
+    // type is resolved here: it returns the runner's profile.
+    ChannelProfile GetRunnerProfile() const;
+    ChannelProfile GetSubRunnerProfile() const;
+
     float GetGateDiameter() const;
     float GetGateDraftAngle() const;
     float GetGateOverrun() const;
+
+    // Gate type + the Tab / Fan dimensions (mm, taper in degrees per side).
+    // Width is measured at the part side; for a Fan the block narrows toward
+    // the sub-runner by the taper angle on each side.
+    GateType GetGateType() const;
+    float GetGateWidth() const;
+    float GetGateHeight() const;
+    float GetGateLength() const;
+    float GetGateTaperAngle() const;
+    // Which half a Tab / Fan gate is cut into (Both = split across the
+    // parting surface).
+    GateSide GetGateSide() const;
 
     // "Auto-embed" checkboxes (Vent / Gate cards, both on by default). When on,
     // Generate Mould measures how far each vent / gate mouth sits outside its
@@ -416,6 +437,15 @@ private:
     wxChoice* m_runnerTypeChoice = nullptr;
     wxTextCtrl* m_runnerDiameter = nullptr;
     wxTextCtrl* m_runnerColdSlugDepth = nullptr;
+    // Parabolic / Trapezoidal runner fields + the panels holding each group of
+    // rows, shown per type by SyncChannelPanels.
+    wxTextCtrl* m_runnerWidth = nullptr;        // Trapezoidal, at the parting plane
+    wxTextCtrl* m_runnerHeight = nullptr;       // Trapezoidal depth
+    wxTextCtrl* m_runnerDraftAngle = nullptr;   // Parabolic / Trapezoidal
+    wxChoice*   m_runnerSideChoice = nullptr;   // A side / B side
+    wxPanel*    m_runnerDiaPanel = nullptr;     // Cylindrical / Parabolic
+    wxPanel*    m_runnerTrapPanel = nullptr;    // Trapezoidal
+    wxPanel*    m_runnerOneSidedPanel = nullptr;// draft + side (Parabolic / Trapezoidal)
 
     // Gate field members
     wxChoice* m_gateTypeChoice = nullptr;
@@ -423,10 +453,39 @@ private:
     wxTextCtrl* m_gateDraftAngle = nullptr;
     wxTextCtrl* m_gateOverrun = nullptr;     // mm extension into the model
     wxCheckBox* m_gateAutoEmbed = nullptr;   // "Auto-embed" (default on)
+    // Tab / Fan dimensions (the "block" panel), shown for those two types.
+    wxTextCtrl* m_gateWidth = nullptr;       // mm, at the part side
+    wxTextCtrl* m_gateHeight = nullptr;      // mm
+    wxTextCtrl* m_gateLength = nullptr;      // mm, gate point -> sub-runner
+    wxTextCtrl* m_gateTaperAngle = nullptr;  // degrees per side (Fan only)
+    wxChoice*   m_gateSideChoice = nullptr;  // Both / A side / B side (Tab / Fan)
+    // Shows the dimension panels matching the gate type dropdown and relays
+    // out the card. Called by the dropdown and whenever the type is set from
+    // a project / fixture so the card never shows the wrong fields.
+    void SyncGateTypePanels();
+    wxPanel* m_gateCylDims = nullptr;        // Diameter / Draft angle
+    wxPanel* m_gateBlockDims = nullptr;      // Width / Height / Length
+    wxPanel* m_gateTaperDims = nullptr;      // Taper angle (Fan)
 
     // Sub-runner field members (within the Gates section)
     wxChoice* m_subRunnerTypeChoice = nullptr;
     wxTextCtrl* m_subRunnerDiameter = nullptr;
+    wxTextCtrl* m_subRunnerWidth = nullptr;
+    wxTextCtrl* m_subRunnerHeight = nullptr;
+    wxTextCtrl* m_subRunnerDraftAngle = nullptr;
+    wxChoice*   m_subRunnerSideChoice = nullptr;
+    wxPanel*    m_subRunnerDiaPanel = nullptr;
+    wxPanel*    m_subRunnerTrapPanel = nullptr;
+    wxPanel*    m_subRunnerOneSidedPanel = nullptr;
+
+    // Shows the runner / sub-runner rows matching each type dropdown (all
+    // hidden for "Match Runner") and relays out the cards.
+    void SyncChannelPanels();
+    // "Cut side:" row (A side / B side, default B) for a one-sided channel.
+    wxChoice* MakeChannelSideChoice(wxWindow* parent, wxSizer* sizer);
+    // Rebuild placed runners / gates after a type or side change so the
+    // preview shows the new section straight away.
+    void RefreshChannelPreview();
 
     // Ejector field members. Type dropdown drives which dimension panel is
     // visible — same pattern as the Gate "Tapered Cylinder" branch. Currently

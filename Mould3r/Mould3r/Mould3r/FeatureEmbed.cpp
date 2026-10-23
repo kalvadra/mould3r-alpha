@@ -47,19 +47,23 @@ namespace
         return true;
     }
 
-    // Inside intervals of one body along the line p(t) = worldPt + t*intoPart.
-    // Returns false when the crossing count is odd (open / non-manifold mesh
-    // on this line) — the caller nudges and retries.
+    // Inside intervals of one body along the line p(t) = worldPt + t*worldDir.
+    // worldDir is intoPart for a parallel bundle, or intoPart + spread for a
+    // diverging (fan) line; t stays the axial depth either way. Returns false
+    // when the crossing count is odd (open / non-manifold mesh on this line) —
+    // the caller nudges and retries.
     bool BodyIntervals(const LocalBody& body, const dvec3& worldPt,
-                       double mergeTol, std::vector<Interval>& out)
+                       const dvec3& worldDir, double mergeTol,
+                       std::vector<Interval>& out)
     {
-        const dvec3 o = dvec3(body.inv * glm::dvec4(worldPt, 1.0));
+        const dvec3 o   = dvec3(body.inv * glm::dvec4(worldPt, 1.0));
+        const dvec3 dir = glm::dmat3(body.inv) * worldDir;
 
         std::vector<double> hits;
         for (size_t i = 0; i + 2 < body.tri.size(); i += 3)
         {
             double t;
-            if (LineTriangle(o, body.axis, body.tri[i], body.tri[i + 1],
+            if (LineTriangle(o, dir, body.tri[i], body.tri[i + 1],
                              body.tri[i + 2], t))
                 hits.push_back(t);
         }
@@ -77,8 +81,13 @@ namespace
         return true;
     }
 
+    // maxSpread: largest |spread| over the bundle (0 = parallel lines). A
+    // diverging line is up to bundleRadius + |t| * maxSpread from the axis at
+    // axial depth t — on BOTH sides of the mouth, since parity needs the whole
+    // infinite line — so the keep-radius grows with distance from the origin.
     LocalBody PrepareBody(const BodyMesh& bm, const dvec3& origin,
-                          const dvec3& intoPart, double bundleRadius)
+                          const dvec3& intoPart, double bundleRadius,
+                          double maxSpread)
     {
         LocalBody lb;
         if (!bm.verts || !bm.indices) return lb;
@@ -102,6 +111,13 @@ namespace
         const dvec3  aHat = lb.axis / aLen;
         const double rL   = bundleRadius * stretch;
 
+        // Forward stretch of the model's linear part: object distance ->
+        // upper bound on world distance (and so on |t|).
+        const glm::dmat3 Mf(glm::dmat4(bm.model));
+        const double fwd = std::max({ glm::length(Mf[0]),
+                                      glm::length(Mf[1]),
+                                      glm::length(Mf[2]) });
+
         const size_t vcount = V.size() / 3;
         for (size_t i = 0; i + 2 < I.size(); i += 3)
         {
@@ -117,7 +133,14 @@ namespace
                                                    glm::dot(v1 - c, v1 - c),
                                                    glm::dot(v2 - c, v2 - c) }));
             const double d  = glm::length(glm::cross(c - oL, aHat));
-            if (d > rL + rb) continue;
+            double keep = rL;
+            if (maxSpread > 0.0)
+            {
+                // |t| <= world distance from the origin <= (|c-o| + rb) * fwd.
+                const double tMax = (glm::length(c - oL) + rb) * fwd;
+                keep += tMax * maxSpread * stretch;
+            }
+            if (d > keep + rb) continue;
 
             lb.tri.push_back(v0);
             lb.tri.push_back(v1);
@@ -158,6 +181,16 @@ Result Analyze(const glm::vec3& origin,
                const std::vector<BodyMesh>& bodies,
                const Params& params)
 {
+    return Analyze(origin, intoPart, offsets, std::vector<glm::vec3>(), bodies, params);
+}
+
+Result Analyze(const glm::vec3& origin,
+               const glm::vec3& intoPart,
+               const std::vector<glm::vec3>& offsets,
+               const std::vector<glm::vec3>& spreads,
+               const std::vector<BodyMesh>& bodies,
+               const Params& params)
+{
     Result res;
     if (offsets.empty() || bodies.empty()) return res;
     const float axLen = glm::length(intoPart);
@@ -178,11 +211,18 @@ Result Analyze(const glm::vec3& origin,
     for (const glm::vec3& o : offsets) bundleR = std::max(bundleR, glm::length(o));
     bundleR += 2.0f * kNudge + 1.0e-3f;
 
+    // Per-line spreads (diverging bundle) — only when there is one per offset.
+    const bool  diverging = spreads.size() == offsets.size();
+    float maxSpread = 0.0f;
+    if (diverging)
+        for (const glm::vec3& sp : spreads) maxSpread = std::max(maxSpread, glm::length(sp));
+
     std::vector<LocalBody> local;
     local.reserve(bodies.size());
     for (const BodyMesh& bm : bodies)
     {
-        LocalBody lb = PrepareBody(bm, dvec3(origin), dvec3(axis), bundleR);
+        LocalBody lb = PrepareBody(bm, dvec3(origin), dvec3(axis), bundleR,
+                                   (double)maxSpread);
         if (!lb.tri.empty()) local.push_back(std::move(lb));
     }
 
@@ -195,8 +235,11 @@ Result Analyze(const glm::vec3& origin,
     double minExit  = std::numeric_limits<double>::max();
     bool   anyReach = false;
 
-    for (const glm::vec3& off : offsets)
+    for (size_t li = 0; li < offsets.size(); ++li)
     {
+        const glm::vec3& off = offsets[li];
+        const dvec3 lineDir = dvec3(axis) + (diverging ? dvec3(spreads[li]) : dvec3(0.0));
+
         LineResult lr;
         lr.offset = off;
 
@@ -209,7 +252,7 @@ Result Analyze(const glm::vec3& origin,
             ok = true;
             const dvec3 p = dvec3(origin + off + nudge);
             for (const LocalBody& lb : local)
-                if (!BodyIntervals(lb, p, params.mergeTol, iv)) { ok = false; break; }
+                if (!BodyIntervals(lb, p, lineDir, params.mergeTol, iv)) { ok = false; break; }
             if (ok) break;
         }
 
@@ -307,6 +350,22 @@ std::vector<glm::vec3> RectSamples(const glm::vec3& sideAxis,
             out.push_back(sideAxis * (s * halfWidth) + upAxis * (t * halfDepth));
         }
     }
+    return out;
+}
+
+std::vector<glm::vec3> RectSpreads(const std::vector<glm::vec3>& offsets,
+                                   const glm::vec3& sideAxis,
+                                   float halfWidth, float slope)
+{
+    std::vector<glm::vec3> out(offsets.size(), glm::vec3(0.0f));
+    if (!(halfWidth > 1e-6f) || slope == 0.0f) return out;
+    const float len = glm::length(sideAxis);
+    if (len < 1e-6f) return out;
+    const glm::vec3 s = sideAxis / len;
+    // A sample at fraction f = (offset . side) / halfWidth of the half-width
+    // keeps that fraction as the half-width grows by `slope` per mm.
+    for (size_t i = 0; i < offsets.size(); ++i)
+        out[i] = s * (glm::dot(offsets[i], s) / halfWidth * slope);
     return out;
 }
 

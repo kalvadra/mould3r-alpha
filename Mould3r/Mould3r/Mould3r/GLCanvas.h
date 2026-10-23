@@ -1425,6 +1425,39 @@ private:
     // Gate and sub-runner solid geometry
     void RebuildGateSolids();
 
+    // Every gate-card value the gate geometry reads, in mm / degrees, taken
+    // from the MainFrame UI at call time (defaults when there is no frame).
+    // One reader so the preview, the mould cut, the shot model, auto-embed and
+    // the feed network can never disagree on the gate's shape.
+    struct GateDims
+    {
+        GateType type = GateType::TaperedCylinder;
+        // Tapered Cylinder
+        float radius = 1.5f;
+        float draftDeg = 1.0f;
+        // Tab / Fan (width is at the part side for a Fan)
+        float width = 4.0f;
+        float height = 1.0f;
+        float length = 3.0f;
+        float taperDeg = 15.0f;
+        GateSide side = GateSide::Both;   // which half a Tab / Fan is cut into
+        // Shared
+        // Sub-runner cross-section (Match Runner already resolved) and the
+        // radius a Tapered Cylinder cone grows to before handing over to it
+        // (ChannelConeRadius — the plain radius for a Cylinder sub-runner).
+        ChannelProfile subRunner;
+        float subRunnerRadius = 2.5f;
+        float overrun = 0.0f;
+
+        bool  IsBlock() const { return type == GateType::Tab || type == GateType::Fan; }
+        // Per-side half-width change along the axis (0 for a Tab).
+        float BlockSlope() const
+        {
+            return type == GateType::Fan ? GateFanSlope(width, length, taperDeg) : 0.0f;
+        }
+    };
+    GateDims ReadGateDims() const;
+
     // Cylinder/frustum mesh is now built via free function BuildCylinderMesh() in MouldFeature.h
 
     // Build a world-space ray from mouse coordinates (shared by remove modes)

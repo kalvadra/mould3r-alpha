@@ -1245,6 +1245,47 @@ wxPanel* FixtureEditor::CreateSpruesContent(wxWindow* parent)
     return card;
 }
 
+// Rows shared by the runner and sub-runner cards: a Diameter group
+// (Cylindrical / Parabolic), a Width + Height group (Trapezoidal) and a
+// Draft angle + Cut side group (the one-sided profiles). Each group is its own
+// panel so the type choice can show just the matching ones.
+void FixtureEditor::BuildChannelRows(wxPanel* parent, wxBoxSizer* parentSz,
+    const wxString& defDiameter,
+    wxPanel*& diaPanel, wxTextCtrl*& diameter,
+    wxPanel*& trapPanel, wxTextCtrl*& width, wxTextCtrl*& height,
+    wxPanel*& oneSidedPanel, wxTextCtrl*& draft, wxChoice*& side)
+{
+    auto group = [&](wxPanel*& out) -> wxBoxSizer*
+    {
+        out = new wxPanel(parent, wxID_ANY);
+        out->SetBackgroundColour(Style::CardBg);
+        auto* sz = new wxBoxSizer(wxVERTICAL);
+        out->SetSizer(sz);
+        parentSz->Add(out, 0, wxEXPAND);
+        return sz;
+    };
+    auto mm = [&](wxPanel* p, wxBoxSizer* sz, const wxString& label,
+                  wxTextCtrl*& ctrl, const wxString& def)
+    {
+        wxStaticText* ul = nullptr;
+        AddDimRow(p, sz, label, ctrl, def, "mm", &ul);
+        m_mmFields.push_back(ctrl); m_mmUnitLabels.push_back(ul);
+    };
+
+    wxBoxSizer* d = group(diaPanel);
+    mm(diaPanel, d, "Diameter:", diameter, defDiameter);
+
+    wxBoxSizer* t = group(trapPanel);
+    mm(trapPanel, t, "Width:", width, "5.0");
+    mm(trapPanel, t, "Height:", height, "3.5");
+
+    wxBoxSizer* o = group(oneSidedPanel);
+    AddDimRow(oneSidedPanel, o, "Draft angle:", draft, "10", DegSym());   // kChannelDefaultDraftDeg
+    // Labels are GateSideLabel's; B (the ejector half) by default.
+    AddTypeRow(oneSidedPanel, o, "Cut side:", { "A side", "B side" }, side);
+    side->SetSelection(1);
+}
+
 wxPanel* FixtureEditor::CreateRunnersContent(wxWindow* parent)
 {
     wxSizer* sizer = nullptr;
@@ -1253,18 +1294,17 @@ wxPanel* FixtureEditor::CreateRunnersContent(wxWindow* parent)
     // "No Override" is index 0 and the default selection. When active, all
     // dimension fields are hidden and nothing is written to the fixture file.
     AddTypeRow(card, sizer, "Runner type:",
-        { "No Override", "Cylindrical" }, m_runnerTypeChoice);
+        { "No Override", "Cylindrical", "Parabolic", "Trapezoidal" }, m_runnerTypeChoice);
 
     // Sub-panel wrapping all dim rows so they can be shown/hidden as a unit.
     m_runnerDimsPanel = new wxPanel(card, wxID_ANY);
     m_runnerDimsPanel->SetBackgroundColour(Style::CardBg);
     auto* dimSizer = new wxBoxSizer(wxVERTICAL);
 
-    {
-        wxStaticText* ul = nullptr;
-        AddDimRow(m_runnerDimsPanel, dimSizer, "Diameter:", m_runnerDiameter, "4.0", "mm", &ul);
-        m_mmFields.push_back(m_runnerDiameter); m_mmUnitLabels.push_back(ul);
-    }
+    BuildChannelRows(m_runnerDimsPanel, dimSizer, "4.0",
+        m_runnerDiaPanel, m_runnerDiameter,
+        m_runnerTrapPanel, m_runnerWidth, m_runnerHeight,
+        m_runnerOneSidedPanel, m_runnerDraftAngle, m_runnerSideChoice);
     {
         wxStaticText* ul = nullptr;
         AddDimRow(m_runnerDimsPanel, dimSizer, "Cold slug length:", m_runnerColdSlugDepth, "5.0", "mm", &ul);
@@ -1279,9 +1319,14 @@ wxPanel* FixtureEditor::CreateRunnersContent(wxWindow* parent)
     // Show/hide the dims panel whenever the type choice changes.
     m_runnerTypeChoice->Bind(wxEVT_CHOICE, [this](wxCommandEvent&)
         {
-            const bool noOverride =
-                m_runnerTypeChoice->GetSelection() == 0;   // "No Override"
+            const int  sel = m_runnerTypeChoice->GetSelection();
+            const bool noOverride = sel == 0;   // "No Override"
             m_runnerDimsPanel->Show(!noOverride);
+            // 1 Cylindrical, 2 Parabolic, 3 Trapezoidal
+            m_runnerDiaPanel->Show(sel == 1 || sel == 2);
+            m_runnerTrapPanel->Show(sel == 3);
+            m_runnerOneSidedPanel->Show(sel == 2 || sel == 3);
+            m_runnerDimsPanel->Layout();
             for (wxWindow* w = m_runnerDimsPanel->GetParent(); w; w = w->GetParent())
             {
                 w->Layout();
@@ -1309,19 +1354,47 @@ wxPanel* FixtureEditor::CreateGatesContent(wxWindow* parent)
 
     // ---- Gate half ----------------------------------------------------
     // "No Override" is index 0. When selected, gate dim fields are hidden.
+    // Type labels after "No Override" are GateTypeLabel's (MouldFeature.h) —
+    // they are what [gate_defaults] type = ... stores and MainFrame matches.
     AddTypeRow(card, sizer, "Gate type:",
-        { "No Override", "Tapered Cylinder" }, m_gateTypeChoice);
+        { "No Override", "Tapered Cylinder", "Tab", "Fan" }, m_gateTypeChoice);
 
     m_gateDimsPanel = new wxPanel(card, wxID_ANY);
     m_gateDimsPanel->SetBackgroundColour(Style::CardBg);
     auto* gateDimSizer = new wxBoxSizer(wxVERTICAL);
 
+    // One sub-panel per type's rows; the type handler below shows the right ones.
+    auto makeSub = [&](wxPanel*& out) -> wxBoxSizer*
+    {
+        out = new wxPanel(m_gateDimsPanel, wxID_ANY);
+        out->SetBackgroundColour(Style::CardBg);
+        auto* sz = new wxBoxSizer(wxVERTICAL);
+        out->SetSizer(sz);
+        gateDimSizer->Add(out, 0, wxEXPAND);
+        return sz;
+    };
+    auto addMM = [&](wxPanel* p, wxBoxSizer* sz, const wxString& label,
+                     wxTextCtrl*& ctrl, const wxString& def)
     {
         wxStaticText* ul = nullptr;
-        AddDimRow(m_gateDimsPanel, gateDimSizer, "Diameter:", m_gateDiameter, "3.0", "mm", &ul);
-        m_mmFields.push_back(m_gateDiameter); m_mmUnitLabels.push_back(ul);
-    }
-    AddDimRow(m_gateDimsPanel, gateDimSizer, "Draft angle:", m_gateDraftAngle, "1.0", DegSym());
+        AddDimRow(p, sz, label, ctrl, def, "mm", &ul);
+        m_mmFields.push_back(ctrl); m_mmUnitLabels.push_back(ul);
+    };
+
+    wxBoxSizer* cylSz = makeSub(m_gateCylPanel);
+    addMM(m_gateCylPanel, cylSz, "Diameter:", m_gateDiameter, "3.0");
+    AddDimRow(m_gateCylPanel, cylSz, "Draft angle:", m_gateDraftAngle, "1.0", DegSym());
+
+    wxBoxSizer* blockSz = makeSub(m_gateBlockPanel);
+    addMM(m_gateBlockPanel, blockSz, "Width:", m_gateWidth, "4.0");
+    addMM(m_gateBlockPanel, blockSz, "Height:", m_gateHeight, "1.0");
+    addMM(m_gateBlockPanel, blockSz, "Length:", m_gateLength, "3.0");
+    // Labels are GateSideLabel's (MouldFeature.h).
+    AddTypeRow(m_gateBlockPanel, blockSz, "Cut side:",
+        { "Both", "A side", "B side" }, m_gateSideChoice);
+
+    wxBoxSizer* taperSz = makeSub(m_gateTaperPanel);
+    AddDimRow(m_gateTaperPanel, taperSz, "Taper angle:", m_gateTaperAngle, "15.0", DegSym());
     gateDimSizer->AddSpacer(4);
 
     m_gateDimsPanel->SetSizer(gateDimSizer);
@@ -1330,9 +1403,13 @@ wxPanel* FixtureEditor::CreateGatesContent(wxWindow* parent)
 
     m_gateTypeChoice->Bind(wxEVT_CHOICE, [this](wxCommandEvent&)
         {
-            const bool noOverride =
-                m_gateTypeChoice->GetSelection() == 0;   // "No Override"
+            const int  sel = m_gateTypeChoice->GetSelection();
+            const bool noOverride = sel == 0;   // "No Override"
             m_gateDimsPanel->Show(!noOverride);
+            m_gateCylPanel->Show(sel == 1);              // Tapered Cylinder
+            m_gateBlockPanel->Show(sel == 2 || sel == 3); // Tab / Fan
+            m_gateTaperPanel->Show(sel == 3);            // Fan
+            m_gateDimsPanel->Layout();
             for (wxWindow* w = m_gateDimsPanel->GetParent(); w; w = w->GetParent())
             {
                 w->Layout();
@@ -1352,17 +1429,17 @@ wxPanel* FixtureEditor::CreateGatesContent(wxWindow* parent)
 
     // ---- Sub-runner half ----------------------------------------------
     AddTypeRow(card, sizer, "Sub-runner type:",
-        { "No Override", "Cylinder" }, m_subRunnerTypeChoice);
+        { "No Override", "Cylinder", "Parabolic", "Trapezoidal", "Match Runner" },
+        m_subRunnerTypeChoice);
 
     m_subRunnerDimsPanel = new wxPanel(card, wxID_ANY);
     m_subRunnerDimsPanel->SetBackgroundColour(Style::CardBg);
     auto* subDimSizer = new wxBoxSizer(wxVERTICAL);
 
-    {
-        wxStaticText* ul = nullptr;
-        AddDimRow(m_subRunnerDimsPanel, subDimSizer, "Diameter:", m_subRunnerDiameter, "5.0", "mm", &ul);
-        m_mmFields.push_back(m_subRunnerDiameter); m_mmUnitLabels.push_back(ul);
-    }
+    BuildChannelRows(m_subRunnerDimsPanel, subDimSizer, "5.0",
+        m_subRunnerDiaPanel, m_subRunnerDiameter,
+        m_subRunnerTrapPanel, m_subRunnerWidth, m_subRunnerHeight,
+        m_subRunnerOneSidedPanel, m_subRunnerDraftAngle, m_subRunnerSideChoice);
     subDimSizer->AddSpacer(4);
 
     m_subRunnerDimsPanel->SetSizer(subDimSizer);
@@ -1371,9 +1448,15 @@ wxPanel* FixtureEditor::CreateGatesContent(wxWindow* parent)
 
     m_subRunnerTypeChoice->Bind(wxEVT_CHOICE, [this](wxCommandEvent&)
         {
-            const bool noOverride =
-                m_subRunnerTypeChoice->GetSelection() == 0;   // "No Override"
+            const int  sel = m_subRunnerTypeChoice->GetSelection();
+            // "No Override" (0) and "Match Runner" (4) have no rows of their own.
+            const bool noOverride = sel == 0 || sel == 4;
             m_subRunnerDimsPanel->Show(!noOverride);
+            // 1 Cylinder, 2 Parabolic, 3 Trapezoidal
+            m_subRunnerDiaPanel->Show(sel == 1 || sel == 2);
+            m_subRunnerTrapPanel->Show(sel == 3);
+            m_subRunnerOneSidedPanel->Show(sel == 2 || sel == 3);
+            m_subRunnerDimsPanel->Layout();
             for (wxWindow* w = m_subRunnerDimsPanel->GetParent(); w; w = w->GetParent())
             {
                 w->Layout();
@@ -2034,8 +2117,21 @@ void FixtureEditor::OnGenerateFixture(wxCommandEvent&)
     // Runners — skipped entirely when type is "No Override" (index 0).
     if (m_runnerTypeChoice && m_runnerTypeChoice->GetSelection() != 0)
     {
+        // Only the chosen type's rows are written (1 Cylindrical, 2 Parabolic,
+        // 3 Trapezoidal); the cold slug applies to every type.
         readChoice(m_runnerTypeChoice, def.runnerDefaults.type);
-        readFieldMM(m_runnerDiameter, def.runnerDefaults.diameter);
+        const int sel = m_runnerTypeChoice->GetSelection();
+        if (sel == 1 || sel == 2) readFieldMM(m_runnerDiameter, def.runnerDefaults.diameter);
+        if (sel == 3)
+        {
+            readFieldMM(m_runnerWidth, def.runnerDefaults.width);
+            readFieldMM(m_runnerHeight, def.runnerDefaults.height);
+        }
+        if (sel == 2 || sel == 3)
+        {
+            readField(m_runnerDraftAngle, def.runnerDefaults.draftAngle);
+            readChoice(m_runnerSideChoice, def.runnerDefaults.side);
+        }
         readFieldMM(m_runnerColdSlugDepth, def.runnerDefaults.coldSlugLength);
     }
 
@@ -2043,14 +2139,40 @@ void FixtureEditor::OnGenerateFixture(wxCommandEvent&)
     // Each half is skipped independently when its type is "No Override".
     if (m_gateTypeChoice && m_gateTypeChoice->GetSelection() != 0)
     {
+        // Only the selected type's dimensions are written, so a Tab fixture
+        // doesn't also pin the cone's diameter (and vice versa).
         readChoice(m_gateTypeChoice, def.gateDefaults.type);
-        readFieldMM(m_gateDiameter, def.gateDefaults.diameter);
-        readField(m_gateDraftAngle, def.gateDefaults.draftAngle);
+        const int sel = m_gateTypeChoice->GetSelection();
+        if (sel == 1)
+        {
+            readFieldMM(m_gateDiameter, def.gateDefaults.diameter);
+            readField(m_gateDraftAngle, def.gateDefaults.draftAngle);
+        }
+        else
+        {
+            readFieldMM(m_gateWidth, def.gateDefaults.width);
+            readFieldMM(m_gateHeight, def.gateDefaults.height);
+            readFieldMM(m_gateLength, def.gateDefaults.length);
+            readChoice(m_gateSideChoice, def.gateDefaults.side);
+            if (sel == 3) readField(m_gateTaperAngle, def.gateDefaults.taperAngle);
+        }
     }
     if (m_subRunnerTypeChoice && m_subRunnerTypeChoice->GetSelection() != 0)
     {
+        // Same per-type rule; "Match Runner" (4) stores the type alone.
         readChoice(m_subRunnerTypeChoice, def.subRunnerDefaults.type);
-        readFieldMM(m_subRunnerDiameter, def.subRunnerDefaults.diameter);
+        const int sel = m_subRunnerTypeChoice->GetSelection();
+        if (sel == 1 || sel == 2) readFieldMM(m_subRunnerDiameter, def.subRunnerDefaults.diameter);
+        if (sel == 3)
+        {
+            readFieldMM(m_subRunnerWidth, def.subRunnerDefaults.width);
+            readFieldMM(m_subRunnerHeight, def.subRunnerDefaults.height);
+        }
+        if (sel == 2 || sel == 3)
+        {
+            readField(m_subRunnerDraftAngle, def.subRunnerDefaults.draftAngle);
+            readChoice(m_subRunnerSideChoice, def.subRunnerDefaults.side);
+        }
     }
 
     // Vents — skipped entirely when type is "No Override" (index 0).

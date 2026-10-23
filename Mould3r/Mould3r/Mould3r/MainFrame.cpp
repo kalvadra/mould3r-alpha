@@ -12,6 +12,7 @@
 #include <wx/statline.h>   // wxStaticLine — section separators in the insert editor
 #include <wx/textdlg.h>    // wxTextEntryDialog — Set Minimum Region Volume popup
 #include <wx/radiobox.h>   // wxRadioBox — units toggle in the near-orphan setup
+#include <algorithm>   // std::clamp — gate taper angle
 #include <memory>
 
 #ifdef __WXMSW__
@@ -2607,7 +2608,9 @@ void MainFrame::OnSetMetric(wxCommandEvent&)
         m_ventLength, m_ventWidth, m_ventOverrunStart, m_ventOverrunEnd,
         m_sprueDiameter, m_sprueColdSlugDepth, m_sprueLength, m_sprueOverrun,
         m_runnerDiameter, m_runnerColdSlugDepth,
-        m_gateDiameter, m_subRunnerDiameter
+        m_gateDiameter, m_subRunnerDiameter,
+        m_gateOverrun, m_gateWidth, m_gateHeight, m_gateLength,
+        m_runnerWidth, m_runnerHeight, m_subRunnerWidth, m_subRunnerHeight
     };
     for (auto* ctrl : mmFields)
     {
@@ -2633,7 +2636,9 @@ void MainFrame::OnSetImperial(wxCommandEvent&)
         m_ventLength, m_ventWidth, m_ventOverrunStart, m_ventOverrunEnd,
         m_sprueDiameter, m_sprueColdSlugDepth, m_sprueLength, m_sprueOverrun,
         m_runnerDiameter, m_runnerColdSlugDepth,
-        m_gateDiameter, m_subRunnerDiameter
+        m_gateDiameter, m_subRunnerDiameter,
+        m_gateOverrun, m_gateWidth, m_gateHeight, m_gateLength,
+        m_runnerWidth, m_runnerHeight, m_subRunnerWidth, m_subRunnerHeight
     };
     for (auto* ctrl : mmFields)
     {
@@ -2806,6 +2811,61 @@ float MainFrame::GetGateOverrun() const
     return static_cast<float>(v) * (m_imperial ? 25.4f : 1.0f);
 }
 
+GateType MainFrame::GetGateType() const
+{
+    if (!m_gateTypeChoice) return GateType::TaperedCylinder;
+    return GateTypeFromLabel(m_gateTypeChoice->GetStringSelection().utf8_str());
+}
+
+// Tab / Fan dimensions — mm regardless of the unit system, like the other
+// length accessors. Negative input clamps to 0 (the geometry then skips the
+// block, as a zero cone diameter skips the cone).
+static float ReadGateLenField(const wxTextCtrl* ctrl, double def, bool imperial)
+{
+    if (!ctrl) return static_cast<float>(def);
+    double v = def;
+    if (!ctrl->GetValue().ToDouble(&v)) return static_cast<float>(def);
+    if (v < 0.0) v = 0.0;
+    return static_cast<float>(v) * (imperial ? 25.4f : 1.0f);
+}
+
+float MainFrame::GetGateWidth() const  { return ReadGateLenField(m_gateWidth,  4.0, m_imperial); }
+float MainFrame::GetGateHeight() const { return ReadGateLenField(m_gateHeight, 1.0, m_imperial); }
+float MainFrame::GetGateLength() const { return ReadGateLenField(m_gateLength, 3.0, m_imperial); }
+
+// Fan taper, degrees per side. Clamped to [0, 80) — past that the side walls
+// are near-parallel to the parting face and the geometry is meaningless.
+float MainFrame::GetGateTaperAngle() const
+{
+    if (!m_gateTaperAngle) return 15.0f;
+    double v = 15.0;
+    if (!m_gateTaperAngle->GetValue().ToDouble(&v)) return 15.0f;
+    v = std::clamp(v, 0.0, 80.0);
+    return static_cast<float>(v);   // degrees — no unit conversion
+}
+
+GateSide MainFrame::GetGateSide() const
+{
+    if (!m_gateSideChoice) return GateSide::Both;
+    return GateSideFromLabel(m_gateSideChoice->GetStringSelection().utf8_str());
+}
+
+void MainFrame::SyncGateTypePanels()
+{
+    if (!m_gateTypeChoice || !m_gateCylDims || !m_gateBlockDims || !m_gateTaperDims) return;
+    const GateType t = GetGateType();
+    m_gateCylDims->Show(t == GateType::TaperedCylinder);
+    m_gateBlockDims->Show(t == GateType::Tab || t == GateType::Fan);
+    m_gateTaperDims->Show(t == GateType::Fan);
+
+    // Re-layout up the card chain (dims panel -> settings panel -> card -> list).
+    for (wxWindow* w = m_gateCylDims->GetParent(); w; w = w->GetParent())
+    {
+        w->Layout();
+        if (w->IsTopLevel()) break;
+    }
+}
+
 // Auto-embed toggles (default on; a missing control reads as on).
 bool MainFrame::IsVentAutoEmbed() const
 {
@@ -2842,6 +2902,117 @@ float MainFrame::GetSubRunnerDiameter() const
     if (!m_subRunnerDiameter->GetValue().ToDouble(&v)) return 5.0f;
     if (v <= 0.0) v = 5.0;
     return static_cast<float>(v) * (m_imperial ? 25.4f : 1.0f);
+}
+
+// ---------------------------------------------------------------------------
+// Runner / sub-runner profiles (Cylinder / Parabolic / Trapezoidal)
+// ---------------------------------------------------------------------------
+namespace
+{
+    // A positive length field in mm (display units converted); `def` on a bad
+    // or non-positive entry, matching GetRunnerDiameter.
+    float ReadPositiveMM(const wxTextCtrl* ctrl, float def, bool imperial)
+    {
+        if (!ctrl) return def;
+        double v = def;
+        if (!ctrl->GetValue().ToDouble(&v) || v <= 0.0) return def;
+        return static_cast<float>(v) * (imperial ? 25.4f : 1.0f);
+    }
+    float ReadDraftDeg(const wxTextCtrl* ctrl)
+    {
+        if (!ctrl) return kChannelDefaultDraftDeg;
+        double v = kChannelDefaultDraftDeg;
+        if (!ctrl->GetValue().ToDouble(&v)) return kChannelDefaultDraftDeg;
+        return static_cast<float>(std::clamp(v, 0.0, 60.0));   // degrees
+    }
+    GateSide ReadChannelSide(const wxChoice* ch)
+    {
+        // Only "A side" / "B side" are offered; anything else is B.
+        if (ch && GateSideFromLabel(ch->GetStringSelection().utf8_str()) == GateSide::A)
+            return GateSide::A;
+        return GateSide::B;
+    }
+}
+
+wxChoice* MainFrame::MakeChannelSideChoice(wxWindow* parent, wxSizer* sizer)
+{
+    auto* row = new wxBoxSizer(wxHORIZONTAL);
+    auto* lbl = new wxStaticText(parent, wxID_ANY, "Cut side:");
+    lbl->SetForegroundColour(Style::TextMuted);
+    lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+    auto* ch = new wxChoice(parent, wxID_ANY, wxDefaultPosition, wxSize(kCtrlColWidth, -1));
+    ch->SetBackgroundColour(Style::BtnSmall);
+    ch->SetForegroundColour(Style::TextMuted);
+    ch->Append(GateSideLabel(GateSide::A));
+    ch->Append(GateSideLabel(GateSide::B));
+    ch->SetSelection(1);   // B — the moving half, where the ejectors push from
+    ch->SetToolTip("The mould half the channel is cut into (A is the top half). "
+        "Parabolic and Trapezoidal channels sit entirely in one half.");
+    row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL);
+    row->AddStretchSpacer(1);
+    row->Add(ch, 0, wxALIGN_CENTER_VERTICAL);
+    sizer->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
+    return ch;
+}
+
+ChannelProfile MainFrame::GetRunnerProfile() const
+{
+    ChannelProfile p;
+    p.type     = m_runnerTypeChoice
+        ? ChannelTypeFromLabel(m_runnerTypeChoice->GetStringSelection().utf8_str())
+        : ChannelType::Cylinder;
+    p.diameter = GetRunnerDiameter();
+    p.width    = ReadPositiveMM(m_runnerWidth, 5.0f, m_imperial);
+    p.height   = ReadPositiveMM(m_runnerHeight, 3.5f, m_imperial);
+    p.draftDeg = ReadDraftDeg(m_runnerDraftAngle);
+    p.side     = ReadChannelSide(m_runnerSideChoice);
+    return p;
+}
+
+ChannelProfile MainFrame::GetSubRunnerProfile() const
+{
+    if (m_subRunnerTypeChoice &&
+        m_subRunnerTypeChoice->GetStringSelection() == "Match Runner")
+        return GetRunnerProfile();
+
+    ChannelProfile p;
+    p.type     = m_subRunnerTypeChoice
+        ? ChannelTypeFromLabel(m_subRunnerTypeChoice->GetStringSelection().utf8_str())
+        : ChannelType::Cylinder;
+    p.diameter = GetSubRunnerDiameter();
+    p.width    = ReadPositiveMM(m_subRunnerWidth, 5.0f, m_imperial);
+    p.height   = ReadPositiveMM(m_subRunnerHeight, 3.5f, m_imperial);
+    p.draftDeg = ReadDraftDeg(m_subRunnerDraftAngle);
+    p.side     = ReadChannelSide(m_subRunnerSideChoice);
+    return p;
+}
+
+void MainFrame::SyncChannelPanels()
+{
+    auto sync = [](wxChoice* ch, wxPanel* dia, wxPanel* trap, wxPanel* oneSided)
+    {
+        if (!ch || !dia || !trap || !oneSided) return;
+        const wxString sel = ch->GetStringSelection();
+        const bool match = sel == "Match Runner";
+        const ChannelType t = ChannelTypeFromLabel(sel.utf8_str());
+        dia->Show(!match && t != ChannelType::Trapezoidal);
+        trap->Show(!match && t == ChannelType::Trapezoidal);
+        oneSided->Show(!match && t != ChannelType::Cylinder);
+        for (wxWindow* w = dia->GetParent(); w; w = w->GetParent())
+        {
+            w->Layout();
+            if (w->IsTopLevel()) break;
+        }
+    };
+    sync(m_runnerTypeChoice, m_runnerDiaPanel, m_runnerTrapPanel, m_runnerOneSidedPanel);
+    sync(m_subRunnerTypeChoice, m_subRunnerDiaPanel, m_subRunnerTrapPanel, m_subRunnerOneSidedPanel);
+}
+
+void MainFrame::RefreshChannelPreview()
+{
+    if (m_canvas && (!m_canvas->GetRunners().empty() || !m_canvas->GetGates().empty()))
+        m_canvas->RebuildAllFeatures();
 }
 
 // Ejector dimension accessors. Returns mm regardless of the active unit
@@ -3434,9 +3605,32 @@ void MainFrame::OnSaveProject(wxCommandEvent&)
         p.sprueOverrun = GetSprueOverrun();
         p.runnerDiameter = GetRunnerDiameter();
         p.runnerColdPlugDist = GetRunnerColdPlugDist();
+        {
+            // Raw field values (a Match Runner sub-runner keeps its own rows).
+            const ChannelProfile rp = GetRunnerProfile();
+            p.runnerType       = m_runnerTypeChoice
+                ? m_runnerTypeChoice->GetStringSelection().ToStdString() : "Cylindrical";
+            p.runnerWidth      = rp.width;
+            p.runnerHeight     = rp.height;
+            p.runnerDraftAngle = rp.draftDeg;
+            p.runnerSide       = GateSideLabel(rp.side);
+
+            p.subRunnerType       = m_subRunnerTypeChoice
+                ? m_subRunnerTypeChoice->GetStringSelection().ToStdString() : "Cylinder";
+            p.subRunnerWidth      = ReadPositiveMM(m_subRunnerWidth, 5.0f, m_imperial);
+            p.subRunnerHeight     = ReadPositiveMM(m_subRunnerHeight, 3.5f, m_imperial);
+            p.subRunnerDraftAngle = ReadDraftDeg(m_subRunnerDraftAngle);
+            p.subRunnerSide       = GateSideLabel(ReadChannelSide(m_subRunnerSideChoice));
+        }
         p.gateDiameter = GetGateDiameter();
         p.gateDraftAngle = GetGateDraftAngle();
         p.gateOverrun = GetGateOverrun();
+        p.gateType = GateTypeLabel(GetGateType());
+        p.gateWidth = GetGateWidth();
+        p.gateHeight = GetGateHeight();
+        p.gateLength = GetGateLength();
+        p.gateTaperAngle = GetGateTaperAngle();
+        p.gateSide = GateSideLabel(GetGateSide());
         p.ventAutoEmbed = IsVentAutoEmbed();
         p.gateAutoEmbed = IsGateAutoEmbed();
         p.subRunnerDiameter = GetSubRunnerDiameter();
@@ -3878,9 +4072,49 @@ void MainFrame::SetParameterFields(const ProjectParameters& p)
     setField(m_sprueOverrun, p.sprueOverrun * conv);
     setField(m_runnerDiameter, p.runnerDiameter * conv);
     setField(m_runnerColdSlugDepth, p.runnerColdPlugDist * conv);
+    setField(m_runnerWidth, p.runnerWidth * conv);
+    setField(m_runnerHeight, p.runnerHeight * conv);
+    setField(m_runnerDraftAngle, p.runnerDraftAngle);       // degrees — no conversion
+    setField(m_subRunnerWidth, p.subRunnerWidth * conv);
+    setField(m_subRunnerHeight, p.subRunnerHeight * conv);
+    setField(m_subRunnerDraftAngle, p.subRunnerDraftAngle); // degrees — no conversion
+    {
+        // Choices by label; an unknown / missing label (older files) keeps
+        // the first entry (Cylindrical / Cylinder) and B side.
+        auto pick = [](wxChoice* ch, const std::string& label, int fallback)
+        {
+            if (!ch) return;
+            const int idx = ch->FindString(wxString::FromUTF8(label.c_str()));
+            ch->SetSelection(idx != wxNOT_FOUND ? idx : fallback);
+        };
+        pick(m_runnerTypeChoice, p.runnerType, 0);
+        pick(m_subRunnerTypeChoice, p.subRunnerType, 0);
+        pick(m_runnerSideChoice, p.runnerSide, 1);
+        pick(m_subRunnerSideChoice, p.subRunnerSide, 1);
+        SyncChannelPanels();
+    }
     setField(m_gateDiameter, p.gateDiameter * conv);
     setField(m_gateDraftAngle, p.gateDraftAngle);           // degrees — no conversion
     setField(m_gateOverrun, p.gateOverrun * conv);
+    setField(m_gateWidth, p.gateWidth * conv);
+    setField(m_gateHeight, p.gateHeight * conv);
+    setField(m_gateLength, p.gateLength * conv);
+    setField(m_gateTaperAngle, p.gateTaperAngle);           // degrees — no conversion
+    if (m_gateTypeChoice)
+    {
+        // Labels are GateTypeLabel's; an unknown / missing type (older files)
+        // reads as Tapered Cylinder — the only type those files could have had.
+        const GateType t = GateTypeFromLabel(p.gateType.c_str());
+        const int idx = m_gateTypeChoice->FindString(GateTypeLabel(t));
+        if (idx != wxNOT_FOUND) m_gateTypeChoice->SetSelection(idx);
+        SyncGateTypePanels();
+    }
+    if (m_gateSideChoice)
+    {
+        const int idx = m_gateSideChoice->FindString(
+            GateSideLabel(GateSideFromLabel(p.gateSide.c_str())));
+        if (idx != wxNOT_FOUND) m_gateSideChoice->SetSelection(idx);
+    }
     if (m_ventAutoEmbed) m_ventAutoEmbed->SetValue(p.ventAutoEmbed);
     if (m_gateAutoEmbed) m_gateAutoEmbed->SetValue(p.gateAutoEmbed);
     setField(m_subRunnerDiameter, p.subRunnerDiameter * conv);
@@ -3963,15 +4197,28 @@ void MainFrame::ApplyFixtureDefaults(const FixtureDefinition& def)
     setChoice(m_runnerTypeChoice, def.runnerDefaults.type);
     setLen(m_runnerDiameter, def.runnerDefaults.diameter);
     setLen(m_runnerColdSlugDepth, def.runnerDefaults.coldSlugLength);
+    setLen(m_runnerWidth, def.runnerDefaults.width);
+    setLen(m_runnerHeight, def.runnerDefaults.height);
+    setDeg(m_runnerDraftAngle, def.runnerDefaults.draftAngle);
+    setChoice(m_runnerSideChoice, def.runnerDefaults.side);
 
     // ---- Gate ---------------------------------------------------------------
     setChoice(m_gateTypeChoice, def.gateDefaults.type);
     setLen(m_gateDiameter, def.gateDefaults.diameter);
     setDeg(m_gateDraftAngle, def.gateDefaults.draftAngle);
+    setLen(m_gateWidth, def.gateDefaults.width);
+    setLen(m_gateHeight, def.gateDefaults.height);
+    setLen(m_gateLength, def.gateDefaults.length);
+    setDeg(m_gateTaperAngle, def.gateDefaults.taperAngle);
+    setChoice(m_gateSideChoice, def.gateDefaults.side);
 
     // ---- Sub-runner ---------------------------------------------------------
     setChoice(m_subRunnerTypeChoice, def.subRunnerDefaults.type);
     setLen(m_subRunnerDiameter, def.subRunnerDefaults.diameter);
+    setLen(m_subRunnerWidth, def.subRunnerDefaults.width);
+    setLen(m_subRunnerHeight, def.subRunnerDefaults.height);
+    setDeg(m_subRunnerDraftAngle, def.subRunnerDefaults.draftAngle);
+    setChoice(m_subRunnerSideChoice, def.subRunnerDefaults.side);
 
     // ---- Ejector ------------------------------------------------------------
     setChoice(m_ejectorTypeChoice, def.ejectorDefaults.type);
@@ -4925,45 +5172,85 @@ wxPanel* MainFrame::CreateRunnersContent(wxWindow* parent)
         wxDefaultPosition, wxSize(kCtrlColWidth, -1));
     m_runnerTypeChoice->SetBackgroundColour(Style::BtnSmall);
     m_runnerTypeChoice->SetForegroundColour(Style::TextMuted);
+    // "Cylindrical" keeps its historical spelling (fixture files store it).
     m_runnerTypeChoice->Append("Cylindrical");
+    m_runnerTypeChoice->Append("Parabolic");
+    m_runnerTypeChoice->Append("Trapezoidal");
     m_runnerTypeChoice->SetSelection(0);
     typeRow->Add(typeLabel, 0, wxALIGN_CENTER_VERTICAL);
     typeRow->AddStretchSpacer(1);
     typeRow->Add(m_runnerTypeChoice, 0, wxALIGN_CENTER_VERTICAL);
     settingsSizer->Add(typeRow, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
 
-    // ---- Dimensions panel (shown for Cylindrical) ---------------------------
+    // ---- Dimensions panel ----------------------------------------------------
+    // Rows are grouped into sub-panels that SyncChannelPanels shows per type:
+    //   Diameter            — Cylindrical, Parabolic
+    //   Width / Height      — Trapezoidal (Width at the parting plane)
+    //   Draft angle / side  — Parabolic, Trapezoidal (one-sided profiles)
+    //   Cold slug length    — every type
     auto* dimsPanel = new wxPanel(settingsPanel, wxID_ANY);
     dimsPanel->SetBackgroundColour(Style::CardBg);
 
     auto* dimsSizer = new wxBoxSizer(wxVERTICAL);
 
-    // Diameter row
+    auto makeGroup = [&](wxPanel*& out) -> wxBoxSizer*
+    {
+        out = new wxPanel(dimsPanel, wxID_ANY);
+        out->SetBackgroundColour(Style::CardBg);
+        auto* sz = new wxBoxSizer(wxVERTICAL);
+        out->SetSizer(sz);
+        dimsSizer->Add(out, 0, wxEXPAND);
+        return sz;
+    };
+    // Same look as the existing rows below.
+    auto fieldRow = [&](wxWindow* parent_, wxSizer* sz, const wxString& label,
+                        wxTextCtrl*& ctrl, const wxString& defVal, const wxString& unitStr)
     {
         auto* row = new wxBoxSizer(wxHORIZONTAL);
-
-        auto* lbl = new wxStaticText(dimsPanel, wxID_ANY, "Diameter:");
+        auto* lbl = new wxStaticText(parent_, wxID_ANY, label);
         lbl->SetForegroundColour(Style::TextMuted);
         lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
             wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
-
-        m_runnerDiameter = new wxTextCtrl(dimsPanel, wxID_ANY, "4.0",
+        ctrl = new wxTextCtrl(parent_, wxID_ANY, defVal,
             wxDefaultPosition, wxSize(kFieldWidth, 22));
-        m_runnerDiameter->SetBackgroundColour(Style::BtnSmall);
-        m_runnerDiameter->SetForegroundColour(kTextDefault);
-
-        auto* unit = new wxStaticText(dimsPanel, wxID_ANY, "mm");
-        m_mmUnitLabels.push_back(unit);
+        ctrl->SetBackgroundColour(Style::BtnSmall);
+        ctrl->SetForegroundColour(kTextDefault);
+        auto* unit = new wxStaticText(parent_, wxID_ANY, unitStr);
+        if (unitStr == "mm") m_mmUnitLabels.push_back(unit);
         unit->SetForegroundColour(Style::TextSubtle);
         unit->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
             wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
         unit->SetMinSize(wxSize(kUnitWidth, -1));
-
         row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL);
         row->AddStretchSpacer(1);
-        row->Add(m_runnerDiameter, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, kFieldGap);
+        row->Add(ctrl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, kFieldGap);
         row->Add(unit, 0, wxALIGN_CENTER_VERTICAL);
-        dimsSizer->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
+        sz->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
+    };
+    const wxString deg = wxString::FromUTF8("\xC2\xB0");
+
+    // Diameter row (Cylindrical / Parabolic)
+    {
+        wxBoxSizer* g = makeGroup(m_runnerDiaPanel);
+        fieldRow(m_runnerDiaPanel, g, "Diameter:", m_runnerDiameter, "4.0", "mm");
+    }
+    // Width / Height (Trapezoidal)
+    {
+        wxBoxSizer* g = makeGroup(m_runnerTrapPanel);
+        fieldRow(m_runnerTrapPanel, g, "Width:", m_runnerWidth, "5.0", "mm");
+        fieldRow(m_runnerTrapPanel, g, "Height:", m_runnerHeight, "3.5", "mm");
+        m_runnerWidth->SetToolTip("Width where the runner meets the parting plane "
+            "(its widest point); the floor is narrower by the draft.");
+        m_runnerHeight->SetToolTip("Depth into the mould half it is cut in.");
+    }
+    // Draft angle + Cut side (Parabolic / Trapezoidal)
+    {
+        wxBoxSizer* g = makeGroup(m_runnerOneSidedPanel);
+        fieldRow(m_runnerOneSidedPanel, g, "Draft angle:", m_runnerDraftAngle,
+            wxString::Format("%.0f", kChannelDefaultDraftDeg), deg);
+        m_runnerDraftAngle->SetToolTip("Side-wall angle off the mould opening "
+            "direction (per side).");
+        m_runnerSideChoice = MakeChannelSideChoice(m_runnerOneSidedPanel, g);
     }
 
     // Cold Slug Well Row
@@ -5001,14 +5288,15 @@ wxPanel* MainFrame::CreateRunnersContent(wxWindow* parent)
     settingsPanel->Show(false);
     sizer->Add(settingsPanel, 0, wxEXPAND);
 
-    // Show/hide dims based on type selection (future-proofed for more types)
-    m_runnerTypeChoice->Bind(wxEVT_CHOICE, [dimsPanel, this](wxCommandEvent&)
+    // Show the rows for the chosen type, and redraw placed runners / gates
+    // (Match Runner sub-runners follow the runner) in the new section.
+    m_runnerTypeChoice->Bind(wxEVT_CHOICE, [this](wxCommandEvent&)
     {
-        dimsPanel->Show(m_runnerTypeChoice->GetStringSelection() == "Cylindrical");
-        dimsPanel->GetParent()->Layout();
-        dimsPanel->GetParent()->GetParent()->Layout();
-        dimsPanel->GetParent()->GetParent()->GetParent()->Layout();
+        SyncChannelPanels();
+        RefreshChannelPreview();
     });
+    m_runnerSideChoice->Bind(wxEVT_CHOICE, [this](wxCommandEvent&) { RefreshChannelPreview(); });
+    SyncChannelPanels();
 
     // Toggle the Settings sub-section (debounced — 200ms cooldown)
     settingsBtn->Bind(wxEVT_TOGGLEBUTTON, [settingsBtn, settingsPanel, panel](wxCommandEvent&)
@@ -5129,19 +5417,85 @@ wxPanel* MainFrame::CreateGatesContent(wxWindow* parent)
         wxDefaultPosition, wxSize(kCtrlColWidth, -1));
     m_gateTypeChoice->SetBackgroundColour(Style::BtnSmall);
     m_gateTypeChoice->SetForegroundColour(Style::TextMuted);
-    m_gateTypeChoice->Append("Tapered Cylinder");
+    // Order must match GateType (0 = Tapered Cylinder, 1 = Tab, 2 = Fan); the
+    // labels are GateTypeLabel's, which is also what projects / fixtures store.
+    m_gateTypeChoice->Append(GateTypeLabel(GateType::TaperedCylinder));
+    m_gateTypeChoice->Append(GateTypeLabel(GateType::Tab));
+    m_gateTypeChoice->Append(GateTypeLabel(GateType::Fan));
     m_gateTypeChoice->SetSelection(0);
     typeRow->Add(typeLabel, 0, wxALIGN_CENTER_VERTICAL);
     typeRow->AddStretchSpacer(1);
     typeRow->Add(m_gateTypeChoice, 0, wxALIGN_CENTER_VERTICAL);
     settingsSizer->Add(typeRow, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
 
-    // Gate dimensions
+    // Gate dimensions. Three type panels (only the matching ones shown — see
+    // SyncGateTypePanels) followed by the rows every type shares.
     auto* dimsPanel = new wxPanel(settingsPanel, wxID_ANY);
     dimsPanel->SetBackgroundColour(Style::CardBg);
     auto* dimsSizer = new wxBoxSizer(wxVERTICAL);
-    addRow(dimsPanel, dimsSizer, "Diameter:", m_gateDiameter, "3.0", "mm");
-    addRow(dimsPanel, dimsSizer, "Draft angle:", m_gateDraftAngle, "1.0", wxString::FromUTF8("\xC2\xB0"));
+
+    auto makeTypePanel = [&](wxPanel*& out) -> wxBoxSizer*
+    {
+        out = new wxPanel(dimsPanel, wxID_ANY);
+        out->SetBackgroundColour(Style::CardBg);
+        auto* sz = new wxBoxSizer(wxVERTICAL);
+        out->SetSizer(sz);
+        dimsSizer->Add(out, 0, wxEXPAND);
+        return sz;
+    };
+
+    // Tapered Cylinder
+    wxBoxSizer* cylSizer = makeTypePanel(m_gateCylDims);
+    addRow(m_gateCylDims, cylSizer, "Diameter:", m_gateDiameter, "3.0", "mm");
+    addRow(m_gateCylDims, cylSizer, "Draft angle:", m_gateDraftAngle, "1.0", wxString::FromUTF8("\xC2\xB0"));
+
+    // Tab / Fan: a rectangular block from the gate point toward the feed;
+    // the sub-runner starts at its far end. Width is at the part side.
+    wxBoxSizer* blockSizer = makeTypePanel(m_gateBlockDims);
+    addRow(m_gateBlockDims, blockSizer, "Width:", m_gateWidth, "4.0", "mm");
+    addRow(m_gateBlockDims, blockSizer, "Height:", m_gateHeight, "1.0", "mm");
+    addRow(m_gateBlockDims, blockSizer, "Length:", m_gateLength, "3.0", "mm");
+    m_gateWidth->SetToolTip("Gate width at the part (the placed point). A Fan "
+        "narrows from here toward the sub-runner.");
+    m_gateHeight->SetToolTip("Gate thickness, centred on the parting surface.");
+    m_gateLength->SetToolTip("From the gate point to the centre of the sphere "
+        "the sub-runner starts in.");
+
+    // Cut side: which mould half the block goes into. Same inline label +
+    // dropdown row as "Gate type".
+    {
+        auto* sideRow = new wxBoxSizer(wxHORIZONTAL);
+        auto* sideLabel = new wxStaticText(m_gateBlockDims, wxID_ANY, "Cut side:");
+        sideLabel->SetForegroundColour(Style::TextMuted);
+        sideLabel->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
+        m_gateSideChoice = new wxChoice(m_gateBlockDims, wxID_ANY,
+            wxDefaultPosition, wxSize(kCtrlColWidth, -1));
+        m_gateSideChoice->SetBackgroundColour(Style::BtnSmall);
+        m_gateSideChoice->SetForegroundColour(Style::TextMuted);
+        // Order must match GateSide (0 = Both, 1 = A, 2 = B).
+        m_gateSideChoice->Append(GateSideLabel(GateSide::Both));
+        m_gateSideChoice->Append(GateSideLabel(GateSide::A));
+        m_gateSideChoice->Append(GateSideLabel(GateSide::B));
+        m_gateSideChoice->SetSelection(0);
+        m_gateSideChoice->SetToolTip("Both: the gate straddles the parting surface. "
+            "A side / B side: the whole Height is cut into that half only (A is the "
+            "top half). The sub-runner stays full-round.");
+        sideRow->Add(sideLabel, 0, wxALIGN_CENTER_VERTICAL);
+        sideRow->AddStretchSpacer(1);
+        sideRow->Add(m_gateSideChoice, 0, wxALIGN_CENTER_VERTICAL);
+        blockSizer->Add(sideRow, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
+        m_gateSideChoice->Bind(wxEVT_CHOICE, [this](wxCommandEvent&) {
+            if (m_canvas && !m_canvas->GetGates().empty()) m_canvas->RebuildAllFeatures();
+        });
+    }
+
+    // Fan only
+    wxBoxSizer* taperSizer = makeTypePanel(m_gateTaperDims);
+    addRow(m_gateTaperDims, taperSizer, "Taper angle:", m_gateTaperAngle, "15.0", wxString::FromUTF8("\xC2\xB0"));
+    m_gateTaperAngle->SetToolTip("Angle of EACH side wall off the gate axis. The "
+        "fan is widest at the part and narrowest at the sub-runner; Auto-embed "
+        "keeps fanning until the whole end face is inside the part.");
     // Overrun extends the gate cylinder backward into the model along the
     // path direction, so the cut clears irregular geometry near the
     // parting-line entry. Default 0 = current behaviour (gate starts at
@@ -5172,7 +5526,12 @@ wxPanel* MainFrame::CreateGatesContent(wxWindow* parent)
         wxDefaultPosition, wxSize(kCtrlColWidth, -1));
     m_subRunnerTypeChoice->SetBackgroundColour(Style::BtnSmall);
     m_subRunnerTypeChoice->SetForegroundColour(Style::TextMuted);
+    // Order: the profile types, then "Match Runner" (use the Runner card's
+    // type and dimensions — no rows of its own).
     m_subRunnerTypeChoice->Append("Cylinder");
+    m_subRunnerTypeChoice->Append("Parabolic");
+    m_subRunnerTypeChoice->Append("Trapezoidal");
+    m_subRunnerTypeChoice->Append("Match Runner");
     m_subRunnerTypeChoice->SetSelection(0);
     subTypeRow->Add(subTypeLabel, 0, wxALIGN_CENTER_VERTICAL);
     subTypeRow->AddStretchSpacer(1);
@@ -5183,7 +5542,32 @@ wxPanel* MainFrame::CreateGatesContent(wxWindow* parent)
     auto* subDimsPanel = new wxPanel(settingsPanel, wxID_ANY);
     subDimsPanel->SetBackgroundColour(Style::CardBg);
     auto* subDimsSizer = new wxBoxSizer(wxVERTICAL);
-    addRow(subDimsPanel, subDimsSizer, "Diameter:", m_subRunnerDiameter, "5.0", "mm");
+    auto makeSubGroup = [&](wxPanel*& out) -> wxBoxSizer*
+    {
+        out = new wxPanel(subDimsPanel, wxID_ANY);
+        out->SetBackgroundColour(Style::CardBg);
+        auto* sz = new wxBoxSizer(wxVERTICAL);
+        out->SetSizer(sz);
+        subDimsSizer->Add(out, 0, wxEXPAND);
+        return sz;
+    };
+    {
+        wxBoxSizer* g = makeSubGroup(m_subRunnerDiaPanel);        // Cylinder / Parabolic
+        addRow(m_subRunnerDiaPanel, g, "Diameter:", m_subRunnerDiameter, "5.0", "mm");
+    }
+    {
+        wxBoxSizer* g = makeSubGroup(m_subRunnerTrapPanel);       // Trapezoidal
+        addRow(m_subRunnerTrapPanel, g, "Width:", m_subRunnerWidth, "5.0", "mm");
+        addRow(m_subRunnerTrapPanel, g, "Height:", m_subRunnerHeight, "3.5", "mm");
+        m_subRunnerWidth->SetToolTip("Width where the sub-runner meets the parting "
+            "plane (its widest point); the floor is narrower by the draft.");
+    }
+    {
+        wxBoxSizer* g = makeSubGroup(m_subRunnerOneSidedPanel);   // Parabolic / Trapezoidal
+        addRow(m_subRunnerOneSidedPanel, g, "Draft angle:", m_subRunnerDraftAngle,
+            wxString::Format("%.0f", kChannelDefaultDraftDeg), wxString::FromUTF8("\xC2\xB0"));
+        m_subRunnerSideChoice = MakeChannelSideChoice(m_subRunnerOneSidedPanel, g);
+    }
     subDimsPanel->SetSizer(subDimsSizer);
     settingsSizer->Add(subDimsPanel, 0, wxEXPAND | wxBOTTOM, 10);
 
@@ -5191,10 +5575,21 @@ wxPanel* MainFrame::CreateGatesContent(wxWindow* parent)
     settingsPanel->Show(false);
     sizer->Add(settingsPanel, 0, wxEXPAND);
 
-    m_gateTypeChoice->Bind(wxEVT_CHOICE, [dimsPanel, this](wxCommandEvent&) {
-        dimsPanel->Show(m_gateTypeChoice->GetStringSelection() == "Tapered Cylinder");
-        dimsPanel->GetParent()->Layout(); dimsPanel->GetParent()->GetParent()->Layout();
-        dimsPanel->GetParent()->GetParent()->GetParent()->Layout();
+    SyncChannelPanels();
+    m_subRunnerTypeChoice->Bind(wxEVT_CHOICE, [this](wxCommandEvent&) {
+        SyncChannelPanels();
+        RefreshChannelPreview();
+    });
+    m_subRunnerSideChoice->Bind(wxEVT_CHOICE, [this](wxCommandEvent&) { RefreshChannelPreview(); });
+
+    SyncGateTypePanels();
+    m_gateTypeChoice->Bind(wxEVT_CHOICE, [this](wxCommandEvent&) {
+        SyncGateTypePanels();
+        // The gate's shape changes outright, so refresh the placed gates' preview
+        // now rather than leaving the old shape on screen until the next edit.
+        // (Skipped with no gates placed — nothing to redraw, and it keeps a
+        // fixture-defaults load from touching GL before anything exists.)
+        if (m_canvas && !m_canvas->GetGates().empty()) m_canvas->RebuildAllFeatures();
     });
 
     settingsBtn->Bind(wxEVT_TOGGLEBUTTON, [settingsBtn, settingsPanel, panel](wxCommandEvent&) {

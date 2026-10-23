@@ -163,7 +163,31 @@ namespace FeatureEmbed
                    const std::vector<BodyMesh>& bodies,
                    const Params& params = Params());
 
-    // Rectangular section (vents): an n x m grid spanning +-halfWidth along
+    // Same, for a mouth whose cross-section GROWS as it is pushed back into
+    // the part (the Fan gate keeps fanning). Line i is
+    //     p(t) = origin + offsets[i] + t * (unit(intoPart) + spreads[i])
+    // with each spreads[i] perpendicular to intoPart, so t is still the axial
+    // depth behind the mouth plane and the point at depth t is exactly where
+    // that sample sits on the extended block's end face. "Every line inside
+    // the part at depth L" then means the WHOLE grown end rectangle at depth L
+    // is inside the part. An empty `spreads` (or a size mismatch) is the
+    // parallel bundle of the overload above.
+    Result Analyze(const glm::vec3& origin,
+                   const glm::vec3& intoPart,
+                   const std::vector<glm::vec3>& offsets,
+                   const std::vector<glm::vec3>& spreads,
+                   const std::vector<BodyMesh>& bodies,
+                   const Params& params = Params());
+
+    // Spreads for a rectangle from RectSamples whose half-width along
+    // sideAxis grows by `slope` mm per mm of depth (height unchanged): each
+    // sample drifts sideways in proportion to how far out it sits, so the
+    // corners follow the flaring side walls and the centre line stays put.
+    std::vector<glm::vec3> RectSpreads(const std::vector<glm::vec3>& offsets,
+                                       const glm::vec3& sideAxis,
+                                       float halfWidth, float slope);
+
+    // Rectangular section (vents, Tab / Fan gates): an n x m grid spanning +-halfWidth along
     // sideAxis and +-halfDepth along upAxis, corners and edges included.
     std::vector<glm::vec3> RectSamples(const glm::vec3& sideAxis,
                                        const glm::vec3& upAxis,
