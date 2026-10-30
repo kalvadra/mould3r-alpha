@@ -1,3 +1,4 @@
+#include "AppPaths.h"
 #include "CastingPanel.h"
 #include "GLCanvas.h"
 #include "MainFrame.h"        // GetIndexerRadius / GetIndexerExtraTolerance
@@ -43,8 +44,7 @@ static wxBitmapBundle LoadSvgBundle(const wxString& svgPath,
     wxFileName fn(svgPath);
     if (fn.IsRelative())
     {
-        wxFileName exeDir(wxStandardPaths::Get().GetExecutablePath());
-        fn.MakeAbsolute(exeDir.GetPath());
+        fn.MakeAbsolute(wxString::FromUTF8(AppPaths::Resources().string()));
     }
 
     wxFile file(fn.GetFullPath());
@@ -411,7 +411,7 @@ static wxStaticText* ToolLabel(wxWindow* parent, const wxString& text)
     auto* l = new wxStaticText(parent, wxID_ANY, text,
         wxDefaultPosition, wxSize(kToolLabelW, -1));
     l->SetForegroundColour(Style::TextMuted);
-    l->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+    l->SetFont(wxFont(Style::Ui(8), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
     return l;
 }
@@ -449,7 +449,7 @@ static wxChoice* ToolUnit(wxWindow* parent, bool inchesSel)
 wxPanel* CastingPanel::BuildToolPanel(wxWindow* parent)
 {
     auto* outer = new wxPanel(parent, wxID_ANY,
-        wxDefaultPosition, wxSize(280, -1));
+        wxDefaultPosition, wxSize(Style::Ui(280), -1));
     outer->SetBackgroundColour(Style::AppBg);
     auto* outerSizer = new wxBoxSizer(wxHORIZONTAL);
 
@@ -460,7 +460,7 @@ wxPanel* CastingPanel::BuildToolPanel(wxWindow* parent)
     // Section title (matches the Prepare panel's "MOULD TOOL SETTINGS").
     auto* title = new wxStaticText(column, wxID_ANY, "CAST TOOL SETTINGS");
     title->SetForegroundColour(Style::TextPrimary);
-    title->SetFont(wxFont(7, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+    title->SetFont(wxFont(Style::Ui(7), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_BOLD, false, "Segoe UI"));
     colSizer->Add(title, 0, wxLEFT | wxTOP, 12);
     colSizer->AddSpacer(8);
@@ -500,7 +500,7 @@ wxPanel* CastingPanel::BuildToolPanel(wxWindow* parent)
     // ---- Cast Bodies (visibility) -----------------------------------------
     auto* visTitle = new wxStaticText(scroll, wxID_ANY, "CAST BODIES");
     visTitle->SetForegroundColour(Style::TextPrimary);
-    visTitle->SetFont(wxFont(7, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+    visTitle->SetFont(wxFont(Style::Ui(7), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_BOLD, false, "Segoe UI"));
     sSizer->Add(visTitle, 0, wxLEFT | wxTOP, 12);
     sSizer->AddSpacer(6);
@@ -511,7 +511,7 @@ wxPanel* CastingPanel::BuildToolPanel(wxWindow* parent)
 
     m_visEmptyLabel = new wxStaticText(m_visPanel, wxID_ANY, "No bodies generated");
     m_visEmptyLabel->SetForegroundColour(Style::TextMuted);
-    m_visEmptyLabel->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_ITALIC,
+    m_visEmptyLabel->SetFont(wxFont(Style::Ui(9), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_ITALIC,
         wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
     visSizer->Add(m_visEmptyLabel, 0, wxALL, 10);
 
@@ -562,7 +562,7 @@ wxPanel* CastingPanel::BuildPartCard(wxWindow* parent, const wxString& title,
     // Title — plain heading, matching the Mould Tool Settings cards.
     auto* titleLabel = new wxStaticText(card, wxID_ANY, title);
     titleLabel->SetForegroundColour(*wxWHITE);
-    titleLabel->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+    titleLabel->SetFont(wxFont(Style::Ui(9), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_BOLD, false, "Segoe UI"));
     cardSizer->Add(titleLabel, 0, wxLEFT | wxTOP, 12);
     cardSizer->AddSpacer(6);
@@ -578,11 +578,11 @@ wxPanel* CastingPanel::BuildPartCard(wxWindow* parent, const wxString& title,
     // Collapsible Settings — same chevron / debounce pattern as the Mould
     // Tool Settings cards.
     auto* settingsBtn = new wxToggleButton(card, wxID_ANY, "Settings",
-        wxDefaultPosition, wxSize(-1, 22), wxBU_LEFT | wxBORDER_NONE);
+        wxDefaultPosition, wxSize(-1, Style::Ui(22)), wxBU_LEFT | wxBORDER_NONE);
     settingsBtn->SetValue(false);
     settingsBtn->SetBackgroundColour(Style::CardBg);
     settingsBtn->SetForegroundColour(Style::TextSubtle);
-    settingsBtn->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+    settingsBtn->SetFont(wxFont(Style::Ui(9), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
     settingsBtn->SetBitmap(LoadSvgBundle(kChevronRightSvg, wxSize(12, 12), true));
     settingsBtn->SetBitmapPosition(wxRIGHT);

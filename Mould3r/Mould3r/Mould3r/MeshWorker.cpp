@@ -142,8 +142,8 @@ int RunMeshWorker(const std::filesystem::path& inPath, const std::filesystem::pa
         RunMesher(s, p, r);
 #else
         r.status = TetMesh::StatusMesherMissing;
-        r.message = "This build of Mould3r doesn't include the 3D mesher: run "
-                    "third_party/m3tetmesh/build_windows.bat, then rebuild Mould3r.";
+        r.message = "This build does not include the optional 3D tetrahedral mesher. "
+                    "See the build documentation to enable m3tetmesh.";
 #endif
     }
 

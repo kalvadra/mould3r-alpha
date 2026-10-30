@@ -1,3 +1,4 @@
+#include "AppPaths.h"
 // AboutDialog.cpp
 #include "AboutDialog.h"
 
@@ -19,13 +20,13 @@ namespace
     // the ribbon buttons in MainFrame and the actions in StartupDialog.
     wxFont DialogBtnFont()
     {
-        return wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        return wxFont(Style::Ui(9), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
             wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI");
     }
 
     wxFont UIFont(int pt, wxFontWeight weight = wxFONTWEIGHT_NORMAL)
     {
-        return wxFont(pt, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        return wxFont(Style::Ui(pt), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
             weight, false, "Segoe UI");
     }
 
@@ -42,8 +43,7 @@ namespace
         wxFileName fn(svgPath);
         if (fn.IsRelative())
         {
-            wxFileName exeDir(wxStandardPaths::Get().GetExecutablePath());
-            fn.MakeAbsolute(exeDir.GetPath());
+            fn.MakeAbsolute(wxString::FromUTF8(AppPaths::Resources().string()));
         }
 
         wxFile file(fn.GetFullPath());

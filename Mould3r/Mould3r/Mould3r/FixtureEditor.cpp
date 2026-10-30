@@ -1,3 +1,4 @@
+#include "AppPaths.h"
 #include "FixtureEditor.h"
 
 #include <wx/bmpbndl.h>
@@ -40,7 +41,7 @@ namespace
     const wxColour& kTextActive = Style::TextActive;
     const wxColour& kTextDefault = Style::TextPrimary;
 
-    static const wxFont kToolBtnFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+    static const wxFont kToolBtnFont(Style::Ui(9), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_BOLD, false, "Segoe UI");
 
     // Sidebar layout constants — kept in lock-step with MainFrame.cpp's
@@ -57,11 +58,11 @@ namespace
 
     // Card-internal fonts — pulled out so every CreateXxxContent helper
     // hits the same sizes without duplicating wxFont constructors.
-    static const wxFont kCardTitleFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+    static const wxFont kCardTitleFont(Style::Ui(9), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_BOLD, false, "Segoe UI");
-    static const wxFont kFieldLabelFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+    static const wxFont kFieldLabelFont(Style::Ui(8), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_NORMAL, false, "Segoe UI");
-    static const wxFont kSectionHeaderFont(7, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+    static const wxFont kSectionHeaderFont(Style::Ui(7), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_BOLD, false, "Segoe UI");
 
     // Degree symbol — wxString from UTF-8 encoded "°" so this file stays
@@ -93,8 +94,7 @@ namespace
         wxFileName fn(svgPath);
         if (fn.IsRelative())
         {
-            wxFileName exeDir(wxStandardPaths::Get().GetExecutablePath());
-            fn.MakeAbsolute(exeDir.GetPath());
+            fn.MakeAbsolute(wxString::FromUTF8(AppPaths::Resources().string()));
         }
 
         wxFile file(fn.GetFullPath());
@@ -327,13 +327,13 @@ wxWindow* FixtureEditor::BuildTopRibbon(wxWindow* parent)
     // the label is short and bold so legibility holds. Field stays at 9pt
     // because the path is what the user reads; Select button keeps its
     // 9pt semibold to match the rest of the app's primary actions.
-    static const wxFont kLabelFont(7, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+    static const wxFont kLabelFont(Style::Ui(7), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI");
-    static const wxFont kFieldFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+    static const wxFont kFieldFont(Style::Ui(9), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_NORMAL, false, "Segoe UI");
-    static const wxFont kSelectFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+    static const wxFont kSelectFont(Style::Ui(9), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI");
-    static const wxFont kHideFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+    static const wxFont kHideFont(Style::Ui(8), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_NORMAL, false, "Segoe UI");
 
     // Builds one vertical cell:
@@ -417,7 +417,7 @@ wxWindow* FixtureEditor::BuildTopRibbon(wxWindow* parent)
         "Save Fixture", wxDefaultPosition, wxSize(160, 32), wxBORDER_NONE);
     btnGenerate->SetBackgroundColour(Style::BtnGenerate);
     btnGenerate->SetForegroundColour(*wxWHITE);
-    btnGenerate->SetFont(wxFont(10, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+    btnGenerate->SetFont(wxFont(Style::Ui(10), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_BOLD, false, "Segoe UI"));
     btnWrap->Add(btnGenerate, 0, wxTOP, 5);
     btnWrap->AddSpacer(10);
@@ -444,7 +444,7 @@ wxWindow* FixtureEditor::BuildToolbar(wxWindow* parent)
     // Section header — matches the "MODEL TOOLS" label style in MainFrame.
     auto* header = new wxStaticText(toolbar, wxID_ANY, "FIXTURE TOOLS");
     header->SetForegroundColour(Style::TextPrimary);
-    header->SetFont(wxFont(7, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+    header->SetFont(wxFont(Style::Ui(7), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_BOLD, false, "Segoe UI"));
     sizer->Add(header, 0, wxLEFT | wxTOP, 12);
     sizer->AddSpacer(8);
@@ -637,7 +637,7 @@ wxWindow* FixtureEditor::BuildToolbar(wxWindow* parent)
 
     auto* alignHeader = new wxStaticText(toolbar, wxID_ANY, "FIXTURE ALIGNMENT");
     alignHeader->SetForegroundColour(Style::TextPrimary);
-    alignHeader->SetFont(wxFont(7, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+    alignHeader->SetFont(wxFont(Style::Ui(7), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_BOLD, false, "Segoe UI"));
     sizer->Add(alignHeader, 0, wxLEFT | wxTOP, 12);
     sizer->AddSpacer(8);
@@ -712,7 +712,7 @@ wxWindow* FixtureEditor::BuildCanvasArea(wxWindow* parent)
     auto* titleLbl = new wxStaticText(titleBar, wxID_ANY, "FIXTURE EDITOR",
         wxDefaultPosition, wxDefaultSize, wxALIGN_CENTER_HORIZONTAL);
     titleLbl->SetForegroundColour(*wxWHITE);
-    titleLbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+    titleLbl->SetFont(wxFont(Style::Ui(8), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_BOLD, false, "Segoe UI"));
     titleSizer->AddStretchSpacer(1);
     titleSizer->Add(titleLbl, 0, wxALIGN_CENTER_VERTICAL);
@@ -2014,8 +2014,7 @@ void FixtureEditor::OnGenerateFixture(wxCommandEvent&)
     // walks back from the running executable, matching how StartupDialog
     // computes its m_fixturesFolder.
     namespace fs = std::filesystem;
-    const std::string defaultDir = (fs::path(wxStandardPaths::Get()
-        .GetExecutablePath().ToStdString()).parent_path() / "fixtures").string();
+    const std::string defaultDir = AppPaths::Fixtures().string();
 
     // wxString implicit conversion from std::string uses the current locale,
     // which matches how StartupDialog feeds m_fixturesFolder into wxControls.
