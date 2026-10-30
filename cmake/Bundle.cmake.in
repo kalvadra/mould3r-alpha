@@ -1,0 +1,2 @@
+include(BundleUtilities)
+fixup_bundle("${CMAKE_INSTALL_PREFIX}/Mould3r.app" "" "@MOULD3R_BUNDLE_SEARCH_DIRS@")

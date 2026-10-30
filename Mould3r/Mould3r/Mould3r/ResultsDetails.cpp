@@ -135,7 +135,7 @@ namespace
 {
     wxFont UiFont(int pt, wxFontWeight w = wxFONTWEIGHT_NORMAL)
     {
-        return wxFont(pt, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, w, false, "Segoe UI");
+        return wxFont(Style::Ui(pt), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, w, false, "Segoe UI");
     }
 }
 

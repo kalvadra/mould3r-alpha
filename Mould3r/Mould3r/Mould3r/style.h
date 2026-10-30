@@ -11,6 +11,17 @@
 
 namespace Style
 {
+    // Windows-authored 7–9 pt labels are too small on macOS. Keep the
+    // Windows layout unchanged and use a shared 120% macOS UI scale.
+    constexpr int Ui(int value)
+    {
+#ifdef __APPLE__
+        return value > 0 ? (value * 6 + 2) / 5 : value;
+#else
+        return value;
+#endif
+    }
+
 
 	// ---- Backgrounds -----------------------------------------------------------
 	inline const wxColour AppBg(0x36, 0x40, 0x53);   // main app / ribbon background
