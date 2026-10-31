@@ -38,6 +38,7 @@ class CastingPanel;    // forward decl — m_castingPanel pointer; full def
 class wxSimplebook;    // forward decl — m_book pointer; the perspective pager.
 class PerspectiveButton; // forward decl — m_btnPrepare/m_btnPreview tabs.
 class VentEditToolbar;   // forward decl — m_ventEditToolbar overlay (Part 5).
+class TransformPanel;    // forward decl — Move / Rotate / Scale side panel.
 class SprueEditToolbar;  // forward decl — m_sprueEditToolbar overlay (Edit Sprue).
 class CanvasToast;       // forward decl — bottom-centre viewport hint pill,
 class UpdateBanner;      // forward decl — bottom-right update notification
@@ -69,6 +70,15 @@ public:
 
     // Called by GLCanvas when Escape is pressed to sync button state
     void SetActiveTool(TransformMode mode);
+
+    // Move / Rotate / Scale tools: a mode with the live side panel. Start
+    // enters it (clicking the latched tool's button again acts as OK); Commit
+    // keeps the change and Cancel restores the selection, both returning to
+    // Select. Called by the ribbon, the panel's OK / Cancel and the canvas's
+    // Enter / Esc.
+    void StartTransformTool(TransformMode mode);
+    void CommitTransformTool();
+    void CancelTransformTool();
 
     // Open the Precision Place dialog for the current selection and apply the
     // resulting absolute XZ move. Shared by the ribbon button handler and the
@@ -530,6 +540,7 @@ private:
     // Part 5: floating overlay toolbar for authoring complex vent paths. Lives
     // as a child of m_canvas, shown only while a vent is being edited.
     VentEditToolbar* m_ventEditToolbar = nullptr;
+    TransformPanel*  m_transformPanel = nullptr;   // Move / Rotate / Scale (top-right)
     void UpdateVentEditToolbar();   // canvas path-edit-changed hook target
 
     // Floating overlay toolbar for the Edit Sprue environment (Move / Select

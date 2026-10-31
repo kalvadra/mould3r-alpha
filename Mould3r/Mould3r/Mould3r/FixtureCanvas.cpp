@@ -1,6 +1,7 @@
 #include "FixtureCanvas.h"
 
 #include <wx/dcclient.h>
+#include <wx/time.h>      // wxGetLocalTimeMillis
 #include <wx/log.h>
 #include <wx/msgdlg.h>
 
@@ -195,6 +196,18 @@ FixtureCanvas::FixtureCanvas(wxWindow* parent)
     // fires once the user has interacted with the viewport — same behaviour
     // as the main canvas.
     Bind(wxEVT_KEY_DOWN, &FixtureCanvas::OnKeyDown, this);
+    // Nav cube: drop its hover highlight when the cursor leaves the canvas.
+    Bind(wxEVT_LEAVE_WINDOW, [this](wxMouseEvent& e)
+    {
+        NavCube::HandleMouse(m_navCtl, e, this, m_camera);
+        e.Skip();
+    });
+    // A quick second click on the cube arrives as a double-click; anything
+    // else keeps its old (unhandled) behaviour.
+    Bind(wxEVT_LEFT_DCLICK, [this](wxMouseEvent& e)
+    {
+        if (!NavCube::HandleMouse(m_navCtl, e, this, m_camera)) e.Skip();
+    });
 }
 
 FixtureCanvas::~FixtureCanvas()
@@ -232,6 +245,9 @@ void FixtureCanvas::InitGLOnce()
 
 void FixtureCanvas::DestroyGL()
 {
+    m_gizmo.Destroy();
+    m_navCube.Destroy();
+    m_navLabelsTried = false;
     m_meshA.Destroy();
     m_meshB.Destroy();
     if (m_litProgram) { glDeleteProgram(m_litProgram); m_litProgram = 0; }
@@ -580,6 +596,14 @@ bool FixtureCanvas::LoadHalf(HalfSlot slot, const std::string& path)
         (slot == HalfSlot::B && m_selectedHalf == Selection::B))
     {
         m_selectedHalf = Selection::None;
+        // A Move / Rotate / Scale session on the replaced half is over; keep
+        // the tool open on the (now empty) selection.
+        if (m_xfActive)
+        {
+            CommitTransformSession();
+            BeginTransformSession();
+            if (m_onXformSelection) m_onXformSelection();
+        }
     }
     m_alignHoverHalf = -1;
     m_alignSeedTri = -1;
@@ -658,6 +682,9 @@ void FixtureCanvas::OnPaint(wxPaintEvent&)
     // viewports read as the same scene from a colour-sampling standpoint.
     glClearColor(0.12f, 0.14f, 0.18f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    // A nav cube snap in flight: move the camera along before using it.
+    NavCube::AnimateFrame(m_navCtl, this, m_camera);
 
     m_camera.SetAspect(float(w) / float(h));
     const glm::mat4 view = m_camera.View();
@@ -844,11 +871,48 @@ void FixtureCanvas::OnPaint(wxPaintEvent&)
     // ---- Grid (drawn last because the grid shader uses blending) --------
     m_grid.Draw(view, proj);
 
+    // Labelled X / Y / Z reference arrows on the grid's front-left corner.
+    {
+        Gizmo::Viewport tv;
+        tv.view = view;
+        tv.proj = proj;
+        glm::vec3 triadAt;
+        float triadLen = 0.0f;
+        Gizmo::GridTriadPlacement(m_gridSettings, triadAt, triadLen);
+        m_gizmo.DrawAxisTriad(tv, triadAt, triadLen);
+    }
+
+    // ---- Move / Rotate / Scale handles (always on top) -------------------
+    if (MoveGizmoShown())
+    {
+        Gizmo::Viewport vp;
+        vp.view = view; vp.proj = proj; vp.width = w; vp.height = h;
+        m_gizmo.DrawMove(vp, GizmoPivot(), m_gizmoHover,
+                         m_gizmoDrag.valid ? m_gizmoDrag.handle : Gizmo::Handle::None);
+    }
+    else if (RotateGizmoShown())
+    {
+        Gizmo::Viewport vp;
+        vp.view = view; vp.proj = proj; vp.width = w; vp.height = h;
+        m_gizmo.DrawRotate(vp, GizmoPivot(), m_gizmoHover,
+                           m_gizmoRotDrag.valid ? &m_gizmoRotDrag : nullptr, m_gizmoRotShownDeg);
+    }
+    else if (ScaleGizmoShown())
+    {
+        Gizmo::Viewport vp;
+        vp.view = view; vp.proj = proj; vp.width = w; vp.height = h;
+        m_gizmo.DrawScale(vp, GizmoPivot(), m_gizmoHover,
+                          m_gizmoScaleDrag.valid ? m_gizmoScaleDrag.handle : Gizmo::Handle::None,
+                          m_gizmoScaleShown);
+    }
+
+    DrawNavCube(w, h);
     SwapBuffers();
 }
 
 void FixtureCanvas::OnResize(wxSizeEvent& evt)
 {
+    RepositionTransformPanel();   // keep the Move / Rotate / Scale panel top-right
     Refresh(false);
     evt.Skip();
 }
@@ -858,6 +922,9 @@ void FixtureCanvas::OnResize(wxSizeEvent& evt)
 // ---------------------------------------------------------------------------
 void FixtureCanvas::OnMouse(wxMouseEvent& evt)
 {
+    // The nav cube in the top-right corner gets first look.
+    if (NavCube::HandleMouse(m_navCtl, evt, this, m_camera)) return;
+
     const wxPoint pos = evt.GetPosition();
 
     // Button transitions: reset m_hasLast so the first subsequent motion
@@ -889,6 +956,39 @@ void FixtureCanvas::OnMouse(wxMouseEvent& evt)
                 m_selectedHalf = (hit == 0) ? Selection::A : Selection::B;
             }
             Refresh(false);
+        }
+        else if (IsTransformTool(m_transformMode))
+        {
+            // Move / Rotate / Scale: a press on a handle starts a handle drag;
+            // otherwise pick on release, so a drag from empty space orbits
+            // without dropping the selection.
+            const Gizmo::Viewport vp = GizmoViewport();
+            Gizmo::Handle h = GizmoHitTest(float(pos.x), float(pos.y));
+            if (h != Gizmo::Handle::None)
+            {
+                const bool grabbed = MoveGizmoShown()
+                    ? Gizmo::BeginMoveDrag(vp, GizmoPivot(), h, float(pos.x), float(pos.y), m_gizmoDrag)
+                    : RotateGizmoShown()
+                    ? Gizmo::BeginRotateDrag(vp, GizmoPivot(), h, float(pos.x), float(pos.y), m_gizmoRotDrag)
+                    : Gizmo::BeginScaleDrag(vp, GizmoPivot(), h, float(pos.x), float(pos.y), m_gizmoScaleDrag);
+                if (!grabbed) h = Gizmo::Handle::None;
+            }
+            if (h != Gizmo::Handle::None)
+            {
+                m_gizmoStartMove = m_xfDelta.move;
+                m_gizmoStartRot = m_xfDelta.rotDeg;
+                m_gizmoRotShownDeg = 0.0f;
+                m_gizmoStartScale = m_xfDelta.scale;
+                m_gizmoScaleShown = 1.0f;
+                m_gizmoHover = h;
+                if (!HasCapture()) CaptureMouse();
+                Refresh(false);
+            }
+            else
+            {
+                m_xfClickPending = true;
+                m_xfClickDown = pos;
+            }
         }
         else if (m_transformMode == TransformMode::AlignFace)
         {
@@ -922,6 +1022,43 @@ void FixtureCanvas::OnMouse(wxMouseEvent& evt)
         }
     }
 
+    // End of a handle drag (the session and its delta carry on).
+    if (evt.LeftUp() && (m_gizmoDrag.valid || m_gizmoRotDrag.valid || m_gizmoScaleDrag.valid))
+    {
+        if (m_xfNotifyPending) NotifyXformDelta(true);   // panel shows the final values
+        m_gizmoDrag = Gizmo::MoveDrag();
+        m_gizmoRotDrag = Gizmo::RotateDrag();
+        m_gizmoScaleDrag = Gizmo::ScaleDrag();
+        m_gizmoScaleShown = 1.0f;
+        m_gizmoRotShownDeg = 0.0f;
+        if (HasCapture()) ReleaseMouse();
+        Refresh(false);
+    }
+
+    // Move / Rotate / Scale: a click (press + release, no drag) picks a half.
+    if (evt.LeftUp() && m_xfClickPending)
+    {
+        m_xfClickPending = false;
+        if (IsTransformTool(m_transformMode) &&
+            std::abs(pos.x - m_xfClickDown.x) <= 3 && std::abs(pos.y - m_xfClickDown.y) <= 3)
+        {
+            const int hit = PickHalf(pos.x, pos.y);
+            const Selection next = hit < 0 ? Selection::None
+                                 : (hit == 0 ? Selection::A : Selection::B);
+            if (next != m_selectedHalf)
+            {
+                m_selectedHalf = next;
+                CommitTransformSession();   // keep what was done to the old half
+                BeginTransformSession();
+                if (m_onXformSelection) m_onXformSelection();
+            }
+            Refresh(false);
+        }
+    }
+    if (m_xfClickPending && m_lmb &&
+        (std::abs(pos.x - m_xfClickDown.x) > 3 || std::abs(pos.y - m_xfClickDown.y) > 3))
+        m_xfClickPending = false;   // it's a drag (orbit), not a click
+
     if (!m_hasLast)
     {
         m_lastPos = pos;
@@ -947,6 +1084,67 @@ void FixtureCanvas::OnMouse(wxMouseEvent& evt)
         m_camera.Dolly(dy * 0.05f);
         Refresh(false);
     }
+    else if (m_lmb && m_gizmoScaleDrag.valid)
+    {
+        // Scale handle drag — same rule as the Prepare canvas.
+        float f = 1.0f;
+        if (Gizmo::ScaleDragFactor(GizmoViewport(), m_gizmoScaleDrag, float(pos.x), float(pos.y), f))
+        {
+            float scale = std::max(Gizmo::kMinFactor, m_gizmoStartScale * f);
+            if (evt.ControlDown()) scale = Gizmo::SnapFactor(scale);
+            m_gizmoScaleShown = scale / std::max(1e-6f, m_gizmoStartScale);
+            if (scale != m_xfDelta.scale)
+            {
+                Xform::Delta d = m_xfDelta;
+                d.scale = scale;
+                SetTransformSessionDelta(d);
+                NotifyXformDelta(false);
+            }
+            Refresh(false);
+        }
+    }
+    else if (m_lmb && m_gizmoRotDrag.valid)
+    {
+        // Rotate ring drag — same rule as the Prepare canvas.
+        float deg = 0.0f;
+        if (Gizmo::RotateDragAngle(GizmoViewport(), m_gizmoRotDrag, float(pos.x), float(pos.y), deg))
+        {
+            if (evt.ControlDown()) deg = Gizmo::SnapAngle(deg);
+            // Readout and wedge restart at every full turn (+-360 -> 0).
+            const glm::vec3 rot = Xform::WrapTurns(
+                Xform::AddWorldRotation(m_gizmoStartRot, m_gizmoRotDrag.axis, deg));
+            m_gizmoRotShownDeg = Xform::WrapTurn(deg);
+            if (rot != m_xfDelta.rotDeg)
+            {
+                Xform::Delta d = m_xfDelta;
+                d.rotDeg = rot;
+                SetTransformSessionDelta(d);
+                NotifyXformDelta(false);
+            }
+            Refresh(false);
+        }
+    }
+    else if (m_lmb && m_gizmoDrag.valid)
+    {
+        // Move handle drag — same rule as the Prepare canvas: move at the grab
+        // plus the cursor's offset along the grabbed axis / plane; Ctrl snaps
+        // where the half's bounding-box centre lands.
+        glm::vec3 off;
+        if (Gizmo::MoveDragOffset(GizmoViewport(), m_gizmoDrag, float(pos.x), float(pos.y), off))
+        {
+            glm::vec3 move = m_gizmoStartMove + off;
+            if (evt.ControlDown())
+                move = Gizmo::SnapMoveTarget(m_xfPivot + move, m_gizmoDrag.handle,
+                                             m_gridSettings) - m_xfPivot;
+            if (move != m_xfDelta.move)
+            {
+                Xform::Delta d = m_xfDelta;
+                d.move = move;
+                SetTransformSessionDelta(d);
+                NotifyXformDelta(false);
+            }
+        }
+    }
     else if (m_lmb)
     {
         m_camera.Orbit(dx, dy);
@@ -959,6 +1157,18 @@ void FixtureCanvas::OnMouse(wxMouseEvent& evt)
         // stash the cursor and request a redraw.
         m_alignMousePos = pos;
         Refresh(false);
+    }
+
+    // Move handles: highlight the one under the cursor while no button is held.
+    if (IsTransformTool(m_transformMode) && !m_lmb && !m_mmb && !m_rmb)
+    {
+        const Gizmo::Handle h = GizmoHitTest(float(pos.x), float(pos.y));
+        if (h != m_gizmoHover)
+        {
+            m_gizmoHover = h;
+            SetCursor(wxCursor(h != Gizmo::Handle::None ? wxCURSOR_HAND : wxCURSOR_ARROW));
+            Refresh(false);
+        }
     }
 }
 
@@ -981,6 +1191,21 @@ void FixtureCanvas::OnMouseWheel(wxMouseEvent& evt)
 // ---------------------------------------------------------------------------
 void FixtureCanvas::OnKeyDown(wxKeyEvent& evt)
 {
+    // Move / Rotate / Scale: Esc = the panel's Cancel, Enter = its OK.
+    if (IsTransformTool(m_transformMode))
+    {
+        auto* editor = dynamic_cast<FixtureEditor*>(wxGetTopLevelParent(this));
+        if (evt.GetKeyCode() == WXK_ESCAPE)
+        {
+            if (editor) editor->CancelTransformTool();
+            return;
+        }
+        if (evt.GetKeyCode() == WXK_RETURN || evt.GetKeyCode() == WXK_NUMPAD_ENTER)
+        {
+            if (editor) editor->CommitTransformTool();
+            return;
+        }
+    }
     if (evt.GetKeyCode() == WXK_ESCAPE)
     {
         if (m_transformMode != TransformMode::Select)
@@ -1079,6 +1304,131 @@ void FixtureCanvas::CenterSelected()
     // exactly one entry.
     m->pos = glm::vec3(0.0f);
     Refresh(false);
+}
+
+// ---------------------------------------------------------------------------
+// Move / Rotate / Scale tool sessions (see FixtureCanvas.h / TransformSession.h)
+// ---------------------------------------------------------------------------
+void FixtureCanvas::BeginTransformSession()
+{
+    m_xfActive = true;
+    m_xfDelta = Xform::Delta();
+    m_xfSlot = m_selectedHalf;
+
+    const FixtureMesh* m = SelectedMesh();
+    if (!m) return;
+    m_xfSnap.pos = m->pos;
+    m_xfSnap.yawDeg = m->yawDeg; m_xfSnap.pitchDeg = m->pitchDeg; m_xfSnap.rollDeg = m->rollDeg;
+    m_xfSnap.scale = m->scale;
+
+    // Pivot = centre of the half's world bounding box (the CPU vertices
+    // through its model matrix; the cached object-space box if there are none).
+    const glm::mat4 M = m->BuildModelMatrix();
+    glm::vec3 lo(std::numeric_limits<float>::max());
+    glm::vec3 hi(-std::numeric_limits<float>::max());
+    if (m->cpuVerts.size() >= 3)
+    {
+        for (size_t v = 0; v + 2 < m->cpuVerts.size(); v += 3)
+        {
+            const glm::vec3 w(M * glm::vec4(m->cpuVerts[v], m->cpuVerts[v + 1], m->cpuVerts[v + 2], 1.0f));
+            lo = glm::min(lo, w);
+            hi = glm::max(hi, w);
+        }
+    }
+    else
+        Xform::ExpandByBox(M, m->aabbMin, m->aabbMax, lo, hi);
+    m_xfPivot = 0.5f * (lo + hi);
+}
+
+void FixtureCanvas::SetTransformSessionDelta(const Xform::Delta& d)
+{
+    if (!m_xfActive) return;
+    FixtureMesh* m = (m_xfSlot == Selection::A) ? &m_meshA
+                   : (m_xfSlot == Selection::B) ? &m_meshB : nullptr;
+    if (!m) return;
+    m_xfDelta = d;
+    const Xform::Pose p = Xform::ApplyDelta(m_xfSnap, m_xfPivot, d);
+    m->pos = p.pos;
+    m->yawDeg = p.yawDeg; m->pitchDeg = p.pitchDeg; m->rollDeg = p.rollDeg;
+    m->scale = p.scale;
+    Refresh(false);
+}
+
+// Tell the editor the delta changed (it rewrites the panel fields), at most
+// every 60 ms during a drag — rewriting native text fields on every mouse
+// event competes with the 3D view for redraws. `force` sends it now.
+void FixtureCanvas::NotifyXformDelta(bool force)
+{
+    if (!m_onXformDelta) return;
+    const wxLongLong now = wxGetLocalTimeMillis();
+    if (!force && (now - m_xfNotifyMs).GetValue() < 60) { m_xfNotifyPending = true; return; }
+    m_xfNotifyMs = now;
+    m_xfNotifyPending = false;
+    m_onXformDelta();
+}
+
+void FixtureCanvas::CommitTransformSession()
+{
+    m_xfActive = false;
+    m_gizmoDrag = Gizmo::MoveDrag();
+    m_gizmoRotDrag = Gizmo::RotateDrag();
+    m_gizmoScaleDrag = Gizmo::ScaleDrag();
+    m_gizmoHover = Gizmo::Handle::None;
+    m_xfSlot = Selection::None;
+    m_xfDelta = Xform::Delta();
+}
+
+void FixtureCanvas::CancelTransformSession()
+{
+    if (!m_xfActive) return;
+    if (!m_xfDelta.IsIdentity())
+        SetTransformSessionDelta(Xform::Delta());   // back to the snapshot pose
+    CommitTransformSession();
+    Refresh(false);
+}
+
+// ---------------------------------------------------------------------------
+// DrawNavCube — the view cube in the top-right corner, last thing in a frame.
+// ---------------------------------------------------------------------------
+void FixtureCanvas::DrawNavCube(int w, int h)
+{
+    if (!m_navLabelsTried)
+    {
+        m_navLabelsTried = true;
+        NavCube::BuildLabels(m_navCube);   // FRONT / BACK / ... textures
+    }
+    m_navCube.Draw(m_camera.View(), NavCube::Placement(w, h), w, h, m_navCtl.Highlight());
+}
+
+Gizmo::Viewport FixtureCanvas::GizmoViewport()
+{
+    const wxSize sz = GetClientSize();
+    Gizmo::Viewport vp;
+    vp.width = std::max(1, sz.x);
+    vp.height = std::max(1, sz.y);
+    m_camera.SetAspect(float(vp.width) / float(vp.height));
+    vp.view = m_camera.View();
+    vp.proj = m_camera.Projection();
+    return vp;
+}
+
+Gizmo::Handle FixtureCanvas::GizmoHitTest(float mx, float my)
+{
+    if (MoveGizmoShown())   return Gizmo::HitTestMove(GizmoViewport(), GizmoPivot(), mx, my);
+    if (RotateGizmoShown()) return Gizmo::HitTestRotate(GizmoViewport(), GizmoPivot(), mx, my);
+    if (ScaleGizmoShown())  return Gizmo::HitTestScale(GizmoViewport(), GizmoPivot(), mx, my);
+    return Gizmo::Handle::None;
+}
+
+void FixtureCanvas::RepositionTransformPanel()
+{
+    if (!m_transformPanel) return;
+    // Sibling of this canvas raised above it; pinned top-right of the viewport.
+    const wxPoint cpos = GetPosition();
+    const wxSize  canvas = GetClientSize();
+    const wxSize  sz = m_transformPanel->GetSize();
+    m_transformPanel->Move(cpos.x + std::max(8, canvas.x - sz.x - 12),
+                           cpos.y + NavCube::kOverlayTopPx);   // just below the nav cube
 }
 
 // ---------------------------------------------------------------------------

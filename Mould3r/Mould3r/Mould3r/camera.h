@@ -32,6 +32,8 @@ public:
     glm::vec3 Up() const;
 
     float GetDistance() const { return m_distance; }   // used by GLCanvas translate
+    float GetYawDegrees() const { return m_yawDeg; }      // nav cube snap animation
+    float GetPitchDegrees() const { return m_pitchDeg; }
 
     // Zoom to fit
     void FrameSphere(const glm::vec3& center, float radius);
@@ -45,7 +47,9 @@ private:
     glm::vec3 m_target{ 0.0f, 0.0f, 0.0f };
     float m_distance = 350.0f;
 
-    float m_yawDeg = 45.0f;
+    // Default view: from the front-right-top corner (camera at +X, +Y, +Z;
+    // Front is the +Z side, matching the nav cube).
+    float m_yawDeg = 225.0f;
     float m_pitchDeg = -35.0f;
 
     glm::vec3 m_worldUp{ 0.0f, 1.0f, 0.0f };

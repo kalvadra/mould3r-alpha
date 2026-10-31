@@ -43,6 +43,7 @@
 #include "SplitButton.h"       // split action+dropdown button for Export mode
 #include "PerspectiveButton.h" // flat tab-style perspective switch
 #include "VentEditToolbar.h"   // Part 5: floating complex-vent-path toolbar
+#include "TransformPanel.h"    // Move / Rotate / Scale live side panel
 #include "SprueEditToolbar.h"  // Edit Sprue floating toolbar
 #include "WindowEffects.h"     // DWM corner rounding for the main frame
 #include "MaterialFile.h"      // Materials menu: library folder location
@@ -676,6 +677,27 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
     });
     m_canvas->SetPathToolbar(m_ventEditToolbar);
 
+    // ---- Move / Rotate / Scale side panel ------------------------------------
+    // Same sibling-of-the-canvas overlay as the vent toolbar, pinned to the
+    // viewport's top-right corner while a transform tool is active.
+    m_transformPanel = new TransformPanel(m_preparePage);
+    m_transformPanel->SetOnChange([this](const Xform::Delta& d) {
+        if (m_canvas) m_canvas->SetTransformSessionDelta(d);
+    });
+    m_transformPanel->SetOnOk([this]() { CommitTransformTool(); });
+    m_transformPanel->SetOnCancel([this]() { CancelTransformTool(); });
+    m_canvas->SetTransformPanel(m_transformPanel);
+    m_canvas->SetOnTransformSelectionChanged([this]() {
+        if (!m_transformPanel || !m_canvas) return;
+        m_transformPanel->SetSelectionCount(m_canvas->GetSelectionCount());
+        m_canvas->RepositionTransformPanel();
+    });
+    // A handle drag on the canvas writes its delta back into the panel fields.
+    m_canvas->SetOnTransformDeltaChanged([this]() {
+        if (m_transformPanel && m_canvas)
+            m_transformPanel->SetDelta(m_canvas->GetTransformSessionDelta());
+    });
+
     // ---- Edit Sprue floating toolbar ---------------------------------------
     // Same sibling-of-the-canvas arrangement as the vent toolbar; the two never
     // show together (their modes are exclusive) and share the top-centre slot.
@@ -1304,6 +1326,9 @@ wxMenuBar* MainFrame::BuildCastingMenuBar()
 // ---------------------------------------------------------------------------
 void MainFrame::SetPerspective(Perspective which)
 {
+    // Leaving Prepare with a Move / Rotate / Scale tool open keeps its change.
+    if (which != Perspective::Prepare && m_canvas && m_canvas->IsTransformSessionActive())
+        CommitTransformTool();
     m_perspective = which;
 
     // Book page index per perspective: Prepare = 0, Preview = 1, Casting = 2.
@@ -1638,6 +1663,15 @@ wxPanel* MainFrame::CreateSidePanel(wxWindow* parent)
 // ---------------------------------------------------------------------------
 void MainFrame::SetActiveTool(TransformMode mode)
 {
+    // Leaving a Move / Rotate / Scale tool any other way than its own OK /
+    // Cancel (another ribbon tool, a perspective change, a canvas-internal
+    // transition) keeps what it did.
+    if (m_canvas && m_canvas->IsTransformSessionActive() &&
+        mode != m_canvas->GetTransformMode())
+        m_canvas->CommitTransformSession();
+    if (m_transformPanel && !GLCanvas::IsTransformTool(mode) && m_transformPanel->IsShown())
+        m_transformPanel->Hide();
+
     // Map TransformMode -> the command ID of the toggle button that should
     // appear active. Modes without an associated toggle button (Select,
     // Center, Remove*, Edit*, ...) yield -1, which clears all buttons.
@@ -1696,62 +1730,47 @@ void MainFrame::UpdateCanvasToast(TransformMode mode)
 
 void MainFrame::OnToolSelect(wxCommandEvent&) { SetActiveTool(TransformMode::Select); }
 
-void MainFrame::OnToolTranslate(wxCommandEvent&)
+// Move / Rotate / Scale are tool modes with the live side panel (they used to
+// open the modal Translate / Rotate / Scale dialogs). See StartTransformTool.
+void MainFrame::OnToolTranslate(wxCommandEvent&) { StartTransformTool(TransformMode::Translate); }
+void MainFrame::OnToolRotate(wxCommandEvent&)    { StartTransformTool(TransformMode::Rotate); }
+void MainFrame::OnToolScale(wxCommandEvent&)     { StartTransformTool(TransformMode::Scale); }
+
+void MainFrame::StartTransformTool(TransformMode mode)
 {
-    SetActiveTool(TransformMode::Select);
+    if (!m_canvas || !m_transformPanel) return;
 
-    if (!m_canvas) return;
-
-    TranslateDialog dlg(this);
-    if (dlg.ShowModal() != wxID_OK)
-        return;
-
-    if (!m_canvas->HasSelection())
+    // The latched tool's button again = OK (a toggle switching itself off).
+    if (m_canvas->GetTransformMode() == mode && m_canvas->IsTransformSessionActive())
     {
+        CommitTransformTool();
         return;
     }
 
-    const TranslateValues v = dlg.GetValues();
-    m_canvas->ApplyTranslation(v.x, v.y, v.z);
+    SetActiveTool(mode);   // commits any other tool's session, latches the button
+    m_canvas->BeginTransformSession();
+
+    const Xform::Tool tool = mode == TransformMode::Rotate ? Xform::Tool::Rotate
+                           : mode == TransformMode::Scale  ? Xform::Tool::Scale
+                                                           : Xform::Tool::Move;
+    m_transformPanel->Begin(tool, m_imperial, m_canvas->GetSelectionCount());
+    m_canvas->RepositionTransformPanel();
+    m_transformPanel->Show();
+    m_transformPanel->Raise();   // keep above the GL surface
 }
 
-void MainFrame::OnToolRotate(wxCommandEvent&)
+void MainFrame::CommitTransformTool()
 {
-    // Keep the button in its previous visual state — it's a dialog, not a mode toggle
+    if (m_canvas) m_canvas->CommitTransformSession();
     SetActiveTool(TransformMode::Select);
-
-    if (!m_canvas) return;
-
-    RotateDialog dlg(this);
-    if (dlg.ShowModal() != wxID_OK)
-        return;
-
-    if (!m_canvas->HasSelection())
-    {
-        return;
-    }
-
-    const RotateValues v = dlg.GetValues();
-    m_canvas->ApplyRotation(v.x, v.y, v.z);
+    if (m_canvas) m_canvas->SetFocus();   // keyboard back to the viewport
 }
 
-void MainFrame::OnToolScale(wxCommandEvent&)
+void MainFrame::CancelTransformTool()
 {
+    if (m_canvas) m_canvas->CancelTransformSession();
     SetActiveTool(TransformMode::Select);
-
-    if (!m_canvas) return;
-
-    ScaleDialog dlg(this);
-    if (dlg.ShowModal() != wxID_OK)
-        return;
-
-    if (!m_canvas->HasSelection())
-    {
-        return;
-    }
-
-    const ScaleValues v = dlg.GetValues();
-    m_canvas->ApplyScale(v.uniform);
+    if (m_canvas) m_canvas->SetFocus();
 }
 
 // ---------------------------------------------------------------------------
@@ -3370,6 +3389,10 @@ bool MainFrame::HistoryQuiet() const
     // once it closes.
     if (!IsEnabled())
         return false;
+    // An open Move / Rotate / Scale session is previewing live; it becomes one
+    // step when it is committed (or nothing, if cancelled).
+    if (m_canvas->IsTransformSessionActive())
+        return false;
     // Mid-gesture: a drag is in progress, or the canvas has a drag position
     // the paint pass hasn't applied yet.
     const wxMouseState ms = wxGetMouseState();
@@ -3498,6 +3521,12 @@ void MainFrame::OnUndo(wxCommandEvent&)
     if (wxTextEntry* text = FocusedTextEntry(); text && text->CanUndo())
     {
         text->Undo();
+        return;
+    }
+    // Undo during a Move / Rotate / Scale session takes back the session.
+    if (m_canvas && m_canvas->IsTransformSessionActive())
+    {
+        CancelTransformTool();
         return;
     }
     if (m_perspective != Perspective::Prepare || !HistoryQuiet())
@@ -4597,6 +4626,8 @@ void MainFrame::DoExportMouldCasts()
 void MainFrame::OnGenerateMould(wxCommandEvent&)
 {
     if (!m_canvas) return;
+    // Generate cuts what is on screen; keep an open Move / Rotate / Scale.
+    if (m_canvas->IsTransformSessionActive()) CommitTransformTool();
     // GenerateMould returns true only when both up-front validations
     // (fixtures loaded, objects to subtract) pass and the build pipeline
     // ran to its natural end. Failure leaves the previous mould state

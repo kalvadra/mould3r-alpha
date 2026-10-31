@@ -25,6 +25,7 @@
 #include "RotateDialog.h"      // OnToolRotate
 #include "ScaleDialog.h"       // OnToolScale
 #include "TranslateDialog.h"   // OnToolMove
+#include "TransformPanel.h"    // Move / Rotate / Scale live side panel
 #include "style.h"
 
 // ---------------------------------------------------------------------------
@@ -728,6 +729,26 @@ wxWindow* FixtureEditor::BuildCanvasArea(wxWindow* parent)
     // toolbar wiring can push state into it directly.
     m_canvas = new FixtureCanvas(container);
     vSizer->Add(m_canvas, 1, wxEXPAND);
+
+    // Move / Rotate / Scale side panel: a floating sibling of the canvas (NOT
+    // in the sizer), raised above it and pinned top-right by the canvas.
+    m_transformPanel = new TransformPanel(container);
+    m_transformPanel->SetOnChange([this](const Xform::Delta& d) {
+        if (m_canvas) m_canvas->SetTransformSessionDelta(d);
+    });
+    m_transformPanel->SetOnOk([this]() { CommitTransformTool(); });
+    m_transformPanel->SetOnCancel([this]() { CancelTransformTool(); });
+    m_canvas->SetTransformPanel(m_transformPanel);
+    m_canvas->SetOnTransformSelectionChanged([this]() {
+        if (!m_transformPanel || !m_canvas) return;
+        m_transformPanel->SetSelectionCount(m_canvas->GetSelectionCount());
+        m_canvas->RepositionTransformPanel();
+    });
+    // A handle drag on the canvas writes its delta back into the panel fields.
+    m_canvas->SetOnTransformDeltaChanged([this]() {
+        if (m_transformPanel && m_canvas)
+            m_transformPanel->SetDelta(m_canvas->GetTransformSessionDelta());
+    });
 
     container->SetSizer(vSizer);
     return container;
@@ -1682,15 +1703,28 @@ void FixtureEditor::UpdateGridSummary()
 // ---------------------------------------------------------------------------
 void FixtureEditor::SetActiveTool(int activeId)
 {
+    // Leaving a Move / Rotate / Scale tool other than through its own OK /
+    // Cancel keeps what it did.
+    if (m_canvas && m_canvas->IsTransformSessionActive() && activeId != m_activeToolId)
+        m_canvas->CommitTransformSession();
+    const bool toolMode = activeId == ID_FE_Move || activeId == ID_FE_Rotate ||
+                          activeId == ID_FE_Scale;
+    if (m_transformPanel && !toolMode && m_transformPanel->IsShown())
+        m_transformPanel->Hide();
+
     m_activeToolId = activeId;
     for (auto& kv : m_toolBtnSetters)
         kv.second(kv.first == activeId);
 
     if (m_canvas)
     {
-        m_canvas->SetTransformMode(activeId == ID_FE_AlignFace
-            ? FixtureCanvas::TransformMode::AlignFace
-            : FixtureCanvas::TransformMode::Select);
+        using TM = FixtureCanvas::TransformMode;
+        TM mode = TM::Select;
+        if      (activeId == ID_FE_AlignFace) mode = TM::AlignFace;
+        else if (activeId == ID_FE_Move)      mode = TM::Move;
+        else if (activeId == ID_FE_Rotate)    mode = TM::Rotate;
+        else if (activeId == ID_FE_Scale)     mode = TM::Scale;
+        m_canvas->SetTransformMode(mode);
     }
 }
 
@@ -1713,55 +1747,47 @@ void FixtureEditor::SetActiveTool(int activeId)
 // (and ESC on the canvas side calls back into SetActiveTool to clear the
 // toggle when the user bails out).
 // ---------------------------------------------------------------------------
-void FixtureEditor::OnToolMove(wxCommandEvent&)
+// Move / Rotate / Scale: tool modes with the live side panel (they used to
+// open the modal dialogs). See StartTransformTool.
+void FixtureEditor::OnToolMove(wxCommandEvent&)   { StartTransformTool(ID_FE_Move); }
+void FixtureEditor::OnToolRotate(wxCommandEvent&) { StartTransformTool(ID_FE_Rotate); }
+void FixtureEditor::OnToolScale(wxCommandEvent&)  { StartTransformTool(ID_FE_Scale); }
+
+void FixtureEditor::StartTransformTool(int toolId)
 {
-    SetActiveTool(wxID_NONE);
+    if (!m_canvas || !m_transformPanel) return;
 
-    if (!m_canvas) return;
-
-    TranslateDialog dlg(this);
-    if (dlg.ShowModal() != wxID_OK)
+    // The latched tool's button again = OK.
+    if (m_activeToolId == toolId && m_canvas->IsTransformSessionActive())
+    {
+        CommitTransformTool();
         return;
+    }
 
-    if (!m_canvas->HasSelection())
-        return;
+    SetActiveTool(toolId);   // commits any other tool's session, latches the button
+    m_canvas->BeginTransformSession();
 
-    const TranslateValues v = dlg.GetValues();
-    m_canvas->ApplyTranslation(v.x, v.y, v.z);
+    const Xform::Tool tool = toolId == ID_FE_Rotate ? Xform::Tool::Rotate
+                           : toolId == ID_FE_Scale  ? Xform::Tool::Scale
+                                                    : Xform::Tool::Move;
+    m_transformPanel->Begin(tool, !m_isMetric, m_canvas->GetSelectionCount());
+    m_canvas->RepositionTransformPanel();
+    m_transformPanel->Show();
+    m_transformPanel->Raise();   // keep above the GL surface
 }
 
-void FixtureEditor::OnToolRotate(wxCommandEvent&)
+void FixtureEditor::CommitTransformTool()
 {
+    if (m_canvas) m_canvas->CommitTransformSession();
     SetActiveTool(wxID_NONE);
-
-    if (!m_canvas) return;
-
-    RotateDialog dlg(this);
-    if (dlg.ShowModal() != wxID_OK)
-        return;
-
-    if (!m_canvas->HasSelection())
-        return;
-
-    const RotateValues v = dlg.GetValues();
-    m_canvas->ApplyRotation(v.x, v.y, v.z);
+    if (m_canvas) m_canvas->SetFocus();
 }
 
-void FixtureEditor::OnToolScale(wxCommandEvent&)
+void FixtureEditor::CancelTransformTool()
 {
+    if (m_canvas) m_canvas->CancelTransformSession();
     SetActiveTool(wxID_NONE);
-
-    if (!m_canvas) return;
-
-    ScaleDialog dlg(this);
-    if (dlg.ShowModal() != wxID_OK)
-        return;
-
-    if (!m_canvas->HasSelection())
-        return;
-
-    const ScaleValues v = dlg.GetValues();
-    m_canvas->ApplyScale(v.uniform);
+    if (m_canvas) m_canvas->SetFocus();
 }
 
 void FixtureEditor::OnToolCenter(wxCommandEvent&)
