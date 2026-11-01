@@ -1,5 +1,5 @@
-#include "AppPaths.h"
 #include "FixtureEditor.h"
+#include "AppPaths.h"
 
 #include <wx/bmpbndl.h>
 #include <wx/dcbuffer.h>  // wxAutoBufferedPaintDC — flicker-free repaint on hover/toggle for tool buttons
@@ -94,7 +94,7 @@ namespace
         wxFileName fn(svgPath);
         if (fn.IsRelative())
         {
-            fn.MakeAbsolute(wxString::FromUTF8(AppPaths::Resources().string()));
+            fn.MakeAbsolute(AppPaths::ToWx(AppPaths::Resources()));
         }
 
         wxFile file(fn.GetFullPath());

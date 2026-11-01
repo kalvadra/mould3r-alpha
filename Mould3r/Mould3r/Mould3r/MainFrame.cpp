@@ -1,4 +1,3 @@
-#include "AppPaths.h"
 #include <wx/filedlg.h>
 #include <wx/bmpbndl.h>
 #include <wx/stdpaths.h>
@@ -22,6 +21,7 @@
 #endif
 
 #include "MainFrame.h"
+#include "AppPaths.h"
 #include "GLCanvas.h"
 #include "PreviewPanel.h"    // embedded post-cut mould preview perspective
 #include "CastingPanel.h"    // embedded mould-cast (walls / base) perspective
@@ -94,7 +94,7 @@ static wxBitmapBundle LoadSvgBundle(const wxString& svgPath,
     wxFileName fn(svgPath);
     if (fn.IsRelative())
     {
-        fn.MakeAbsolute(wxString::FromUTF8(AppPaths::Resources().string()));
+        fn.MakeAbsolute(AppPaths::ToWx(AppPaths::Resources()));
     }
 
     wxFile file(fn.GetFullPath());
@@ -6133,7 +6133,7 @@ wxPanel* MainFrame::CreateLeftPanel(wxWindow* parent)
             wxFileName fn(svgPath);
             if (fn.IsRelative())
             {
-                fn.MakeAbsolute(wxString::FromUTF8(AppPaths::Resources().string()));
+                fn.MakeAbsolute(AppPaths::ToWx(AppPaths::Resources()));
             }
 
             // Read raw SVG text so we can override its colors before rendering.

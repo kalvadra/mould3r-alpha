@@ -1,5 +1,5 @@
-#include "AppPaths.h"
 #include "CastingPanel.h"
+#include "AppPaths.h"
 #include "GLCanvas.h"
 #include "MainFrame.h"        // GetIndexerRadius / GetIndexerExtraTolerance
 #include "style.h"
@@ -44,7 +44,7 @@ static wxBitmapBundle LoadSvgBundle(const wxString& svgPath,
     wxFileName fn(svgPath);
     if (fn.IsRelative())
     {
-        fn.MakeAbsolute(wxString::FromUTF8(AppPaths::Resources().string()));
+        fn.MakeAbsolute(AppPaths::ToWx(AppPaths::Resources()));
     }
 
     wxFile file(fn.GetFullPath());
