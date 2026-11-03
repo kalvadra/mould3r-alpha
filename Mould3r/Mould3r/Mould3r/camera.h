@@ -34,6 +34,7 @@ public:
     float GetDistance() const { return m_distance; }   // used by GLCanvas translate
     float GetYawDegrees() const { return m_yawDeg; }      // nav cube snap animation
     float GetPitchDegrees() const { return m_pitchDeg; }
+    glm::vec3 GetTarget() const { return m_target; }      // nav cube Home
 
     // Zoom to fit
     void FrameSphere(const glm::vec3& center, float radius);

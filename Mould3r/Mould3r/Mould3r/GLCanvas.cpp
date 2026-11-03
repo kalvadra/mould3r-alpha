@@ -190,6 +190,12 @@ GLCanvas::GLCanvas(wxWindow* parent)
     Bind(wxEVT_MOUSEWHEEL, &GLCanvas::OnMouseWheel, this);
     Bind(wxEVT_KEY_DOWN, &GLCanvas::OnKeyDown, this);
     Bind(wxEVT_KEY_UP, &GLCanvas::OnKeyUp, this);
+    // Nav cube: a drag interrupted by losing the mouse (Alt+Tab, a dialog)
+    // ends cleanly, pointer shown again.
+    Bind(wxEVT_MOUSE_CAPTURE_LOST, [this](wxMouseCaptureLostEvent&)
+    {
+        NavCube::CaptureLost(m_navCtl, this);
+    });
     // Nav cube: drop its hover highlight when the cursor leaves the canvas.
     Bind(wxEVT_LEAVE_WINDOW, [this](wxMouseEvent& e)
     {
@@ -569,7 +575,8 @@ void GLCanvas::DrawNavCube(int w, int h)
         m_navLabelsTried = true;
         NavCube::BuildLabels(m_navCube);   // FRONT / BACK / ... textures
     }
-    m_navCube.Draw(m_camera.View(), NavCube::Placement(w, h), w, h, m_navCtl.Highlight());
+    m_navCube.Draw(m_camera.View(), NavCube::Placement(w, h), w, h,
+                   m_navCtl.Highlight(), m_navCtl.HomeHot());
 }
 
 Gizmo::Viewport GLCanvas::GizmoViewport()

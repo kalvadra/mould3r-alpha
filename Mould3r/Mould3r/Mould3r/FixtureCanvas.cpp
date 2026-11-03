@@ -196,6 +196,12 @@ FixtureCanvas::FixtureCanvas(wxWindow* parent)
     // fires once the user has interacted with the viewport — same behaviour
     // as the main canvas.
     Bind(wxEVT_KEY_DOWN, &FixtureCanvas::OnKeyDown, this);
+    // Nav cube: a drag interrupted by losing the mouse (Alt+Tab, a dialog)
+    // ends cleanly, pointer shown again.
+    Bind(wxEVT_MOUSE_CAPTURE_LOST, [this](wxMouseCaptureLostEvent&)
+    {
+        NavCube::CaptureLost(m_navCtl, this);
+    });
     // Nav cube: drop its hover highlight when the cursor leaves the canvas.
     Bind(wxEVT_LEAVE_WINDOW, [this](wxMouseEvent& e)
     {
@@ -648,6 +654,8 @@ void FixtureCanvas::FrameLoadedHalves()
     // Tiny floor on radius — degenerate AABBs (a single point, or a flat
     // 2D shape) would otherwise frame to ~0 distance and clip.
     m_camera.FrameSphere(center, std::max(radius, 1.0f));
+    // The nav cube's Home returns to this framing (at the default angle).
+    m_navCtl.SetHome(m_camera.GetTarget(), m_camera.GetDistance());
 }
 
 // ---------------------------------------------------------------------------
@@ -1397,7 +1405,8 @@ void FixtureCanvas::DrawNavCube(int w, int h)
         m_navLabelsTried = true;
         NavCube::BuildLabels(m_navCube);   // FRONT / BACK / ... textures
     }
-    m_navCube.Draw(m_camera.View(), NavCube::Placement(w, h), w, h, m_navCtl.Highlight());
+    m_navCube.Draw(m_camera.View(), NavCube::Placement(w, h), w, h,
+                   m_navCtl.Highlight(), m_navCtl.HomeHot());
 }
 
 Gizmo::Viewport FixtureCanvas::GizmoViewport()

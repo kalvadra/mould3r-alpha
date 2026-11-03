@@ -18,6 +18,7 @@
 
 #ifndef NAVCUBE_NO_WX
 #include <wx/bitmap.h>
+#include <wx/cursor.h>
 #include <wx/dcmemory.h>
 #include <wx/font.h>
 #include <wx/image.h>
@@ -76,13 +77,21 @@ namespace
 // =============================================================================
 // Placement / hit test / angles
 // =============================================================================
-Rect Placement(int clientW, int /*clientH*/)
+Layout Placement(int clientW, int /*clientH*/)
 {
-    Rect r;
-    r.size = kSizePx;
-    r.x = std::max(0, clientW - kSizePx - kMarginPx);
-    r.y = kMarginPx;
-    return r;
+    Layout l;
+    l.cube.size = kSizePx;
+    l.cube.x = std::max(0, clientW - kSizePx - kMarginPx);
+    l.cube.y = kMarginPx;
+
+    // The home icon tucks into the cube viewport's empty top-left corner: its
+    // bottom-right corner sits at cube coordinates (-1.30, +1.30), outside the
+    // radius-sqrt(3) disc any view of the cube stays within.
+    const int inset = int(std::lround((kOrtho - 1.30f) / (2.0f * kOrtho) * float(kSizePx)));
+    l.home.size = kHomePx;
+    l.home.x = std::max(0, l.cube.x + inset - kHomePx);
+    l.home.y = std::max(0, l.cube.y + inset - kHomePx);
+    return l;
 }
 
 glm::ivec3 HitTest(const glm::mat4& view, const Rect& r, int mx, int my)
@@ -151,19 +160,40 @@ const char* DirectionName(const glm::ivec3& d)
 // =============================================================================
 // Controller
 // =============================================================================
-bool Controller::MouseDown(const glm::mat4& view, const Rect& r, int x, int y)
+Controller::Controller()
 {
-    if (!r.Contains(x, y)) return false;
+    const OrbitCamera fresh;   // the start-up view
+    m_homeTarget = fresh.GetTarget();
+    m_homeDist = fresh.GetDistance();
+    m_homeYaw = fresh.GetYawDegrees();
+    m_homePitch = fresh.GetPitchDegrees();
+}
+
+void Controller::SetHome(const glm::vec3& target, float distance)
+{
+    m_homeTarget = target;
+    m_homeDist = distance;
+}
+
+bool Controller::MouseDown(const glm::mat4& view, const Layout& l, int x, int y)
+{
+    if (l.home.Contains(x, y))
+    {
+        m_homePressed = true;
+        return true;
+    }
+    if (!l.cube.Contains(x, y)) return false;
     m_pressed = true;
     m_dragging = false;
     m_downX = m_lastX = x;
     m_downY = m_lastY = y;
-    m_pressDir = HitTest(view, r, x, y);
+    m_pressDir = HitTest(view, l.cube, x, y);
     return true;
 }
 
 bool Controller::MouseDrag(int x, int y, OrbitCamera& cam)
 {
+    if (m_homePressed) return true;   // just waiting for the release
     if (!m_pressed) return false;
     if (!m_dragging &&
         (std::abs(x - m_downX) > kDragPx || std::abs(y - m_downY) > kDragPx))
@@ -180,28 +210,37 @@ bool Controller::MouseDrag(int x, int y, OrbitCamera& cam)
     return true;
 }
 
-bool Controller::MouseUp(const glm::mat4& view, const Rect& r, int x, int y,
+bool Controller::MouseUp(const glm::mat4& view, const Layout& l, int x, int y,
                          OrbitCamera& cam, long long nowMs)
 {
+    if (m_homePressed)
+    {
+        m_homePressed = false;
+        if (l.home.Contains(x, y)) GoHome(cam, nowMs);
+        m_homeHover = l.home.Contains(x, y);
+        return true;
+    }
     if (!m_pressed) return false;
     m_pressed = false;
     if (!m_dragging)
     {
         // A click: snap to what's under the release (normally what was pressed).
-        const glm::ivec3 dir = HitTest(view, r, x, y);
+        const glm::ivec3 dir = HitTest(view, l.cube, x, y);
         if (dir != glm::ivec3(0)) SnapTo(dir, cam, nowMs);
+        m_hover = HitTest(view, l.cube, x, y);
     }
     m_dragging = false;
     m_pressDir = glm::ivec3(0);
-    m_hover = HitTest(view, r, x, y);
     return true;
 }
 
-bool Controller::Hover(const glm::mat4& view, const Rect& r, int x, int y)
+bool Controller::Hover(const glm::mat4& view, const Layout& l, int x, int y)
 {
-    const glm::ivec3 h = HitTest(view, r, x, y);
-    if (h == m_hover) return false;
+    const bool home = l.home.Contains(x, y);
+    const glm::ivec3 h = home ? glm::ivec3(0) : HitTest(view, l.cube, x, y);
+    if (h == m_hover && home == m_homeHover) return false;
     m_hover = h;
+    m_homeHover = home;
     return true;
 }
 
@@ -211,36 +250,53 @@ glm::ivec3 Controller::Highlight() const
     return m_hover;
 }
 
-void Controller::SnapTo(const glm::ivec3& dir, const OrbitCamera& cam, long long nowMs)
+void Controller::StartAnim(const OrbitCamera& cam, float yaw1, float pitch1, long long nowMs)
 {
-    float yaw1, pitch1;
-    TargetAngles(dir, yaw1, pitch1);
     m_yaw0 = cam.GetYawDegrees();
     m_pitch0 = cam.GetPitchDegrees();
     // The short way round in yaw (the camera's yaw is unbounded).
     float dy = std::fmod(yaw1 - m_yaw0, 360.0f);
     if (dy > 180.0f) dy -= 360.0f;
     if (dy < -180.0f) dy += 360.0f;
-    // Straight down / up the yaw is only an orientation; still take the short way.
     m_yaw1 = m_yaw0 + dy;
     m_pitch1 = pitch1;
+    m_tgt0 = m_tgt1 = cam.GetTarget();
+    m_dist0 = m_dist1 = cam.GetDistance();
+    m_animFrame = false;
     m_t0 = nowMs;
     m_animating = true;
+}
+
+void Controller::SnapTo(const glm::ivec3& dir, const OrbitCamera& cam, long long nowMs)
+{
+    float yaw1, pitch1;
+    TargetAngles(dir, yaw1, pitch1);
+    StartAnim(cam, yaw1, pitch1, nowMs);
+}
+
+void Controller::GoHome(const OrbitCamera& cam, long long nowMs)
+{
+    StartAnim(cam, m_homeYaw, m_homePitch, nowMs);
+    m_tgt1 = m_homeTarget;
+    m_dist1 = std::max(1e-4f, m_homeDist);
+    m_animFrame = true;
 }
 
 bool Controller::Animate(OrbitCamera& cam, long long nowMs)
 {
     if (!m_animating) return false;
     const float t = float(nowMs - m_t0) / float(kSnapMs);
-    if (t >= 1.0f)
-    {
-        cam.SetYawPitchDegrees(m_yaw1, m_pitch1);
-        m_animating = false;
-        return false;
-    }
-    const float e = Ease(t);
+    const float e = (t >= 1.0f) ? 1.0f : Ease(t);
     cam.SetYawPitchDegrees(m_yaw0 + (m_yaw1 - m_yaw0) * e, m_pitch0 + (m_pitch1 - m_pitch0) * e);
-    return true;
+    if (m_animFrame)
+    {
+        cam.SetTarget(m_tgt0 + (m_tgt1 - m_tgt0) * e);
+        // Zoom geometrically, so a big change in distance reads as even.
+        const float d0 = std::max(1e-4f, m_dist0);
+        cam.SetDistance(d0 * std::pow(m_dist1 / d0, e));
+    }
+    if (t >= 1.0f) m_animating = false;
+    return m_animating;
 }
 
 // =============================================================================
@@ -250,7 +306,7 @@ namespace
 {
     const char* kVs = R"GLSL(
         #version 330 core
-        layout(location = 0) in vec2 aUV;      // unit quad [0,1]^2
+        layout(location = 0) in vec2 aUV;      // unit quad [0,1]^2 / icon coords
         uniform mat4 uMVP;
         out vec2 vUV;
         void main() { vUV = aUV; gl_Position = uMVP * vec4(aUV, 0.0, 1.0); }
@@ -285,7 +341,7 @@ namespace
         return s;
     }
 
-    // Colours (linear-ish sRGB, tuned against the 0.12 / 0.14 / 0.18 backdrop).
+    // Colours (tuned against the 0.12 / 0.14 / 0.18 backdrop).
     const glm::vec3 kFaceCol(0.86f, 0.88f, 0.92f);   // middle tiles
     const glm::vec3 kRimCol(0.72f, 0.75f, 0.80f);    // edge / corner tiles
     const glm::vec3 kHotCol(0.38f, 0.64f, 1.00f);    // hovered / pressed
@@ -310,6 +366,32 @@ namespace
         M[2] = glm::vec4(f.n, 0.0f);
         M[3] = glm::vec4(f.n * lift + f.right * u0 + f.up * v0, 1.0f);
         return M;
+    }
+
+    // Home icon, in a unit square (y up): a round plate, then a house with a
+    // door cut out of its front.
+    void BuildHomeIcon(std::vector<float>& v, int& plateVerts, int& houseVerts)
+    {
+        auto tri = [&](float ax, float ay, float bx, float by, float cx, float cy)
+        { v.insert(v.end(), { ax, ay, bx, by, cx, cy }); };
+        auto rect = [&](float x0, float y0, float x1, float y1)
+        { tri(x0, y0, x1, y0, x1, y1); tri(x0, y0, x1, y1, x0, y1); };
+
+        const int seg = 28;
+        for (int i = 0; i < seg; ++i)
+        {
+            const float a0 = glm::two_pi<float>() * float(i) / float(seg);
+            const float a1 = glm::two_pi<float>() * float(i + 1) / float(seg);
+            tri(0.5f, 0.5f, 0.5f + 0.5f * std::cos(a0), 0.5f + 0.5f * std::sin(a0),
+                0.5f + 0.5f * std::cos(a1), 0.5f + 0.5f * std::sin(a1));
+        }
+        plateVerts = int(v.size() / 2);
+
+        tri(0.17f, 0.50f, 0.83f, 0.50f, 0.50f, 0.80f);   // roof
+        rect(0.27f, 0.20f, 0.44f, 0.50f);                // wall, left of the door
+        rect(0.56f, 0.20f, 0.73f, 0.50f);                // wall, right of the door
+        rect(0.44f, 0.38f, 0.56f, 0.50f);                // over the door
+        houseVerts = int(v.size() / 2) - plateVerts;
     }
 }
 
@@ -346,15 +428,27 @@ bool Renderer::Init()
     m_uUseTex = glGetUniformLocation(m_program, "uUseTex");
     m_uTex = glGetUniformLocation(m_program, "uTex");
 
+    auto upload = [](GLuint& vao, GLuint& vbo, const float* data, size_t bytes)
+    {
+        glGenVertexArrays(1, &vao);
+        glGenBuffers(1, &vbo);
+        glBindVertexArray(vao);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)bytes, data, GL_STATIC_DRAW);
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void*)0);
+        glEnableVertexAttribArray(0);
+        glBindVertexArray(0);
+    };
     const float quad[] = { 0, 0,  1, 0,  1, 1,   0, 0,  1, 1,  0, 1 };
-    glGenVertexArrays(1, &m_vao);
-    glGenBuffers(1, &m_vbo);
-    glBindVertexArray(m_vao);
-    glBindBuffer(GL_ARRAY_BUFFER, m_vbo);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
-    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void*)0);
-    glEnableVertexAttribArray(0);
-    glBindVertexArray(0);
+    upload(m_vao, m_vbo, quad, sizeof(quad));
+
+    std::vector<float> icon;
+    int plate = 0, house = 0;
+    BuildHomeIcon(icon, plate, house);
+    upload(m_iconVao, m_iconVbo, icon.data(), icon.size() * sizeof(float));
+    m_iconPlate = plate;
+    m_iconHouse = house;
+
     m_ready = true;
     return true;
 }
@@ -394,13 +488,37 @@ void Renderer::Quad(const glm::mat4& mvp, const glm::vec4& color, GLuint tex)
     glDrawArrays(GL_TRIANGLES, 0, 6);
 }
 
-void Renderer::Draw(const glm::mat4& view, const Rect& r, int clientW, int clientH,
-                    const glm::ivec3& highlight)
+void Renderer::DrawHome(const Rect& r, int clientH, bool hot)
 {
+    glViewport(r.x, clientH - r.y - r.size, r.size, r.size);
+    glDisable(GL_DEPTH_TEST);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    const glm::mat4 M = glm::ortho(0.0f, 1.0f, 0.0f, 1.0f, -1.0f, 1.0f);
+    glUniformMatrix4fv(m_uMVP, 1, GL_FALSE, &M[0][0]);
+    glUniform1i(m_uUseTex, 0);
+    glBindVertexArray(m_iconVao);
+
+    const glm::vec4 plate(kFrameCol, kOpacity);
+    glUniform4fv(m_uColor, 1, &plate[0]);
+    glDrawArrays(GL_TRIANGLES, 0, m_iconPlate);
+
+    // The house a touch more opaque than its plate, so it stays crisp.
+    const glm::vec4 house(hot ? kHotCol : kFaceCol, 0.9f);
+    glUniform4fv(m_uColor, 1, &house[0]);
+    glDrawArrays(GL_TRIANGLES, m_iconPlate, m_iconHouse);
+
+    glEnable(GL_DEPTH_TEST);
+}
+
+void Renderer::Draw(const glm::mat4& view, const Layout& l, int clientW, int clientH,
+                    const glm::ivec3& highlight, bool homeHot)
+{
+    const Rect& r = l.cube;
     if (r.size <= 0 || !Init()) return;
 
     // Own little viewport in the corner; only its depth is cleared, so the
-    // scene shows through around the cube.
+    // scene shows through around (and, at 75 %, through) the cube.
     const int glY = clientH - r.y - r.size;
     glViewport(r.x, glY, r.size, r.size);
     glEnable(GL_SCISSOR_TEST);
@@ -414,40 +532,52 @@ void Renderer::Draw(const glm::mat4& view, const Rect& r, int clientW, int clien
     GLboolean cullWas = glIsEnabled(GL_CULL_FACE);
     glDisable(GL_CULL_FACE);
     glEnable(GL_DEPTH_TEST);
-    glDepthFunc(GL_LEQUAL);
-    glDepthMask(GL_TRUE);
-    glDisable(GL_BLEND);
     glUseProgram(m_program);
     glBindVertexArray(m_vao);
 
     const float bands[4] = { -1.0f, -kInner, kInner, 1.0f };
-    for (int fi = 0; fi < 6; ++fi)
+    auto drawShell = [&]()
     {
-        const Face& f = kFaces[fi];
-        const float s = Shade(R, f.n);
-        const glm::ivec3 n = ToI(f.n), ri = ToI(f.right), up = ToI(f.up);
+        for (int fi = 0; fi < 6; ++fi)
+        {
+            const Face& f = kFaces[fi];
+            const float s = Shade(R, f.n);
+            const glm::ivec3 n = ToI(f.n), ri = ToI(f.right), up = ToI(f.up);
 
-        // The frame: a dark face just under the tiles; it shows in the gaps.
-        Quad(VP * FaceRect(f, -1.0f, 1.0f, -1.0f, 1.0f, 0.997f), glm::vec4(kFrameCol * s, 1.0f));
+            // The frame: a dark face just under the tiles; it shows in the gaps.
+            Quad(VP * FaceRect(f, -1.0f, 1.0f, -1.0f, 1.0f, 0.997f), glm::vec4(kFrameCol * s, kOpacity));
 
-        for (int i = -1; i <= 1; ++i)
-            for (int j = -1; j <= 1; ++j)
-            {
-                const glm::ivec3 dir = n + ri * i + up * j;
-                glm::vec3 c = (i == 0 && j == 0) ? kFaceCol : kRimCol;
-                if (highlight != glm::ivec3(0) && dir == highlight) c = kHotCol;
-                const float u0 = bands[i + 1] + kGap, u1 = bands[i + 2] - kGap;
-                const float v0 = bands[j + 1] + kGap, v1 = bands[j + 2] - kGap;
-                Quad(VP * FaceRect(f, u0, u1, v0, v1, 1.0f), glm::vec4(c * s, 1.0f));
-            }
-    }
+            for (int i = -1; i <= 1; ++i)
+                for (int j = -1; j <= 1; ++j)
+                {
+                    const glm::ivec3 dir = n + ri * i + up * j;
+                    glm::vec3 c = (i == 0 && j == 0) ? kFaceCol : kRimCol;
+                    if (highlight != glm::ivec3(0) && dir == highlight) c = kHotCol;
+                    const float u0 = bands[i + 1] + kGap, u1 = bands[i + 2] - kGap;
+                    const float v0 = bands[j + 1] + kGap, v1 = bands[j + 2] - kGap;
+                    Quad(VP * FaceRect(f, u0, u1, v0, v1, 1.0f), glm::vec4(c * s, kOpacity));
+                }
+        }
+    };
 
-    // Labels on the middle tiles, blended over them.
+    // Translucent but solid-looking: first lay down depth only, then blend
+    // colour where it matches, so only the nearest surface of the cube shows
+    // (never its far faces through the near ones).
+    glDepthFunc(GL_LESS);
+    glDepthMask(GL_TRUE);
+    glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+    drawShell();
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDepthFunc(GL_LEQUAL);
+    glDepthMask(GL_FALSE);
+    drawShell();
+
+    // Labels on the middle tiles.
     if (m_hasLabels)
     {
-        glEnable(GL_BLEND);
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-        glDepthMask(GL_FALSE);
         for (int fi = 0; fi < 6; ++fi)
         {
             if (!m_labelTex[fi]) continue;
@@ -459,16 +589,19 @@ void Renderer::Draw(const glm::mat4& view, const Rect& r, int clientW, int clien
             glm::vec3 ink = kInkCol;
             if (highlight == n) ink = glm::vec3(1.0f);   // white on the lit tile
             Quad(VP * FaceRect(f, -halfW, halfW, -halfH, halfH, 1.002f),
-                 glm::vec4(ink * (0.6f + 0.4f * s), 1.0f), m_labelTex[fi]);
+                 glm::vec4(ink * (0.6f + 0.4f * s), 0.95f), m_labelTex[fi]);
         }
-        glDepthMask(GL_TRUE);
-        glDisable(GL_BLEND);
     }
 
-    glBindVertexArray(0);
-    glBindTexture(GL_TEXTURE_2D, 0);
-    glUseProgram(0);
+    glDepthMask(GL_TRUE);
     glDepthFunc(GL_LESS);
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    if (l.home.size > 0) DrawHome(l.home, clientH, homeHot);
+
+    glDisable(GL_BLEND);
+    glBindVertexArray(0);
+    glUseProgram(0);
     if (cullWas) glEnable(GL_CULL_FACE);
     glViewport(0, 0, clientW, clientH);
 }
@@ -479,8 +612,10 @@ void Renderer::Destroy()
         if (t) { glDeleteTextures(1, &t); t = 0; }
     if (m_vbo) glDeleteBuffers(1, &m_vbo);
     if (m_vao) glDeleteVertexArrays(1, &m_vao);
+    if (m_iconVbo) glDeleteBuffers(1, &m_iconVbo);
+    if (m_iconVao) glDeleteVertexArrays(1, &m_iconVao);
     if (m_program) glDeleteProgram(m_program);
-    m_vbo = m_vao = m_program = 0;
+    m_vbo = m_vao = m_iconVbo = m_iconVao = m_program = 0;
     m_ready = m_failed = m_hasLabels = false;
 }
 
@@ -530,16 +665,50 @@ void BuildLabels(Renderer& r)
     dc.SelectObject(wxNullBitmap);
 }
 
+namespace
+{
+    // The canvas's own cursor while a cube drag hides the pointer.
+    wxCursor& SavedCursor() { static wxCursor c; return c; }
+    bool& PointerHidden() { static bool h = false; return h; }
+
+    // A fully transparent cursor, built in code. (wxCURSOR_BLANK is not a
+    // system cursor: on Windows wx loads it from wx/msw/wx.rc, which this
+    // app's resource file doesn't include, so it asserts and falls back to
+    // the arrow.)
+    const wxCursor& BlankCursor()
+    {
+        static wxCursor blank;
+        if (!blank.IsOk())
+        {
+            wxImage img(16, 16);                  // all black...
+            img.SetMaskColour(0, 0, 0);           // ...and black is transparent
+            img.SetOption(wxIMAGE_OPTION_CUR_HOTSPOT_X, 0);
+            img.SetOption(wxIMAGE_OPTION_CUR_HOTSPOT_Y, 0);
+            blank = wxCursor(img);
+        }
+        return blank;
+    }
+
+    void ShowPointer(wxWindow* canvas, const Controller& c)
+    {
+        if (!PointerHidden()) return;
+        PointerHidden() = false;
+        canvas->SetCursor(SavedCursor());
+        // Reappear where the drag started, not at the cube's centre.
+        canvas->WarpPointer(c.DownX(), c.DownY());
+    }
+}
+
 bool HandleMouse(Controller& c, wxMouseEvent& evt, wxWindow* canvas, OrbitCamera& cam)
 {
     const wxSize sz = canvas->GetClientSize();
-    const Rect r = Placement(sz.x, sz.y);
+    const Layout l = Placement(sz.x, sz.y);
     const wxPoint p = evt.GetPosition();
     const glm::mat4 view = cam.View();
 
     if (evt.LeftDown() || evt.LeftDClick())
     {
-        if (!c.MouseDown(view, r, p.x, p.y)) return false;
+        if (!c.MouseDown(view, l, p.x, p.y)) return false;
         if (!canvas->HasCapture()) canvas->CaptureMouse();
         canvas->Refresh(false);
         return true;
@@ -548,31 +717,67 @@ bool HandleMouse(Controller& c, wxMouseEvent& evt, wxWindow* canvas, OrbitCamera
     {
         if (!c.Pressed()) return false;
         if (canvas->HasCapture()) canvas->ReleaseMouse();
-        c.MouseUp(view, r, p.x, p.y, cam, wxGetLocalTimeMillis().GetValue());
+        ShowPointer(canvas, c);
+        c.MouseUp(view, l, p.x, p.y, cam, wxGetLocalTimeMillis().GetValue());
         canvas->Refresh(false);
         return true;
     }
     if (evt.Dragging() && c.Pressed())
     {
-        if (evt.LeftIsDown()) c.MouseDrag(p.x, p.y, cam);
+        if (evt.LeftIsDown())
+        {
+            c.MouseDrag(p.x, p.y, cam);
+            if (c.Dragging())
+            {
+                // Hold the (hidden) pointer at the cube's centre and measure
+                // each move from there, so the drag never stops at the edge of
+                // the screen. The warp's own motion event is a zero move.
+                if (!PointerHidden())
+                {
+                    SavedCursor() = canvas->GetCursor();
+                    canvas->SetCursor(BlankCursor());
+                    PointerHidden() = true;
+                    canvas->UnsetToolTip();
+                }
+                const int ax = l.cube.x + l.cube.size / 2, ay = l.cube.y + l.cube.size / 2;
+                if (p.x != ax || p.y != ay)
+                {
+                    canvas->WarpPointer(ax, ay);
+                    c.Rebase(ax, ay);
+                }
+            }
+        }
         canvas->Refresh(false);
         return true;
     }
     if (evt.Moving() || evt.Leaving())
     {
-        const bool inside = !evt.Leaving() && r.Contains(p.x, p.y);
-        const bool changed = inside ? c.Hover(view, r, p.x, p.y)
-                                    : (c.Highlight() != glm::ivec3(0) ? (c.ClearHover(), true) : false);
+        const bool inside = !evt.Leaving() && l.Contains(p.x, p.y);
+        bool changed;
+        if (inside) changed = c.Hover(view, l, p.x, p.y);
+        else
+        {
+            changed = c.Highlight() != glm::ivec3(0) || c.HomeHot();
+            c.ClearHover();
+        }
         if (changed)
         {
             const glm::ivec3 h = c.Highlight();
-            if (h != glm::ivec3(0)) canvas->SetToolTip(wxString(DirectionName(h)));
-            else                    canvas->UnsetToolTip();
+            if (c.HomeHot())             canvas->SetToolTip("Home view");
+            else if (h != glm::ivec3(0)) canvas->SetToolTip(wxString(DirectionName(h)));
+            else                         canvas->UnsetToolTip();
             canvas->Refresh(false);
         }
         return inside;
     }
     return false;
+}
+
+void CaptureLost(Controller& c, wxWindow* canvas)
+{
+    ShowPointer(canvas, c);
+    c.Cancel();
+    canvas->Refresh(false);
 }
 
 void AnimateFrame(Controller& c, wxWindow* canvas, OrbitCamera& cam)

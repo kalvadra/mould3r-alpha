@@ -8,6 +8,7 @@
 #include <wx/graphics.h> // wxGraphicsContext — rounded-rect paint for icon tool buttons
 #include <wx/msgdlg.h>   // wxMessageBox — OnGenerateFixture validation/error
 #include <wx/scrolwin.h> // wxScrolledWindow — sidebar scrolls when cards overflow
+#include <wx/settings.h> // wxSystemSettings — scrollbar width for the sidebar's text wrap
 #include <wx/stattext.h>
 #include <wx/stdpaths.h>
 #include <wx/tglbtn.h>   // wxEVT_TOGGLEBUTTON — synthesised by the makeToolBtn helper
@@ -55,6 +56,18 @@ namespace
 
     // Sidebar widths
     static const int kSidebarWidth = 300;  // matches MainFrame's left panel
+    static const int kCardPad = 10;        // left / right inset of rows inside a card
+
+    // Width available to a card's contents: the column, less the vertical
+    // scrollbar (budgeted for even when hidden, so nothing reflows when it
+    // appears) and the card's row insets. Long text in the sidebar is
+    // wrapped to this, and nothing in a card may be wider -- the column is
+    // pinned at kSidebarWidth, so anything wider would be clipped.
+    int SidebarTextWidth(const wxWindow* w)
+    {
+        const int sb = wxSystemSettings::GetMetric(wxSYS_VSCROLL_X, w);
+        return kSidebarWidth - (sb > 0 ? sb : 17) - 2 * kCardPad;
+    }
 
     // Card-internal fonts — pulled out so every CreateXxxContent helper
     // hits the same sizes without duplicating wxFont constructors.
@@ -186,6 +199,13 @@ namespace
         for (const auto& opt : options)
             outChoice->Append(opt);
         outChoice->SetSelection(0);
+        // Widen past the standard control column when the longest option
+        // needs it ("Tapered Cylinder"), so no option is ever cut off. The
+        // row is right-aligned, so a wider choice grows to the left.
+        outChoice->InvalidateBestSize();
+        const int need = outChoice->GetBestSize().x;
+        if (need > kCtrlColWidth)
+            outChoice->SetMinSize(wxSize(need, -1));
 
         row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL);
         row->AddStretchSpacer(1);
@@ -439,6 +459,11 @@ wxWindow* FixtureEditor::BuildToolbar(wxWindow* parent)
     auto* toolbar = new wxPanel(parent, wxID_ANY,
         wxDefaultPosition, wxSize(kSidebarWidth, -1));
     toolbar->SetBackgroundColour(kEditorBg);
+    // Pin the width. Left to its best size the column grows to fit its widest
+    // child, and then the vertical scrollbar takes its width back out of the
+    // cards, clipping every right-aligned field.
+    toolbar->SetMinSize(wxSize(kSidebarWidth, -1));
+    toolbar->SetMaxSize(wxSize(kSidebarWidth, -1));
 
     auto* sizer = new wxBoxSizer(wxVERTICAL);
 
@@ -666,6 +691,7 @@ wxWindow* FixtureEditor::BuildToolbar(wxWindow* parent)
         wxDefaultPosition, wxDefaultSize,
         wxVSCROLL | wxBORDER_NONE);
     scrollWin->SetScrollRate(0, 8);
+    scrollWin->ShowScrollbars(wxSHOW_SB_NEVER, wxSHOW_SB_DEFAULT);   // vertical only
     scrollWin->SetBackgroundColour(kEditorBg);
 
     auto* cardSizer = new wxBoxSizer(wxVERTICAL);
@@ -979,10 +1005,20 @@ wxPanel* FixtureEditor::CreateInjectionPointsContent(wxWindow* parent)
     // injection point can be placed (and dragged) anywhere on the fixture
     // perimeter, in addition to any fixed points listed above. Read into
     // FixtureDefinition::allowPerimeterInjection at save time.
-    m_allowPerimeterInjection = new wxCheckBox(card, wxID_ANY,
-        "Fixture Perimeter (place injection point anywhere on perimeter)");
+    // Short label + a wrapped hint underneath: a checkbox label can't wrap,
+    // and the old one-line label was wider than the sidebar.
+    m_allowPerimeterInjection = new wxCheckBox(card, wxID_ANY, "Fixture perimeter");
     m_allowPerimeterInjection->SetForegroundColour(Style::TextPrimary);
-    sizer->Add(m_allowPerimeterInjection, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
+    sizer->Add(m_allowPerimeterInjection, 0, wxLEFT | wxRIGHT, kCardPad);
+
+    auto* perimHint = new wxStaticText(card, wxID_ANY,
+        "Lets the injection point be placed anywhere on the fixture's perimeter.");
+    perimHint->SetForegroundColour(Style::TextSubtle);
+    perimHint->SetFont(kFieldLabelFont);
+    perimHint->Wrap(SidebarTextWidth(card));
+    sizer->AddSpacer(3);
+    sizer->Add(perimHint, 0, wxLEFT | wxRIGHT, kCardPad);
+    sizer->AddSpacer(2);
 
     // "Top plane" injection option — whether the top face of the fixture
     // offers injection points: Off, just the centre (world 0, 0), or anywhere
@@ -1065,6 +1101,8 @@ void FixtureEditor::RebuildInjectionList()
                     wxST_ELLIPSIZE_END);
                 lblText->SetForegroundColour(*wxWHITE);
                 lblText->SetFont(kFieldLabelFont);
+                // Ellipsize instead of widening the card for a long name.
+                lblText->SetMinSize(wxSize(20, -1));
 
                 auto* editBtn = new RoundedButton(entry, wxID_ANY, "Edit",
                     wxDefaultPosition, wxSize(44, 22));
@@ -1630,7 +1668,8 @@ wxPanel* FixtureEditor::CreateGridDefaultsContent(wxWindow* parent)
     // Human-readable digest of m_gridDefaults (unit follows the editor toggle).
     m_gridSummary = new wxStaticText(card, wxID_ANY, wxEmptyString);
     m_gridSummary->SetForegroundColour(Style::TextSubtle);
-    sizer->Add(m_gridSummary, 0, wxLEFT | wxRIGHT | wxTOP, 8);
+    m_gridSummary->SetFont(kFieldLabelFont);
+    sizer->Add(m_gridSummary, 0, wxLEFT | wxRIGHT | wxTOP, 12);
 
     auto* btnEdit = new RoundedButton(card, wxID_ANY, "Edit...",
         wxDefaultPosition, wxSize(90, 28), wxBORDER_NONE);
@@ -1670,11 +1709,13 @@ void FixtureEditor::UpdateGridSummary()
     const wxString u = m_isMetric ? "mm" : "in";
     auto len = [&](float mm) { return wxString::Format("%.4g", mm * toDisp); };
 
+    // Two short lines (shape + size, then spacing) so the summary fits the
+    // sidebar; wrapped as a backstop for very long numbers.
     wxString s;
     if (m_gridDefaults.shape == GridShape::Circular)
     {
         s = wxString::Format(
-            "Circular - r %s %s - %d spokes - spacing %s %s - major /%d",
+            "Circular, radius %s %s, %d spokes\nSpacing %s %s, major line every %d",
             len(m_gridDefaults.radius), u,
             m_gridDefaults.spokes,
             len(m_gridDefaults.spacing), u,
@@ -1683,12 +1724,22 @@ void FixtureEditor::UpdateGridSummary()
     else
     {
         s = wxString::Format(
-            "Rectangular - %s x %s %s - spacing %s %s - major /%d",
+            "Rectangular, %s x %s %s\nSpacing %s %s, major line every %d",
             len(m_gridDefaults.sizeX), len(m_gridDefaults.sizeY), u,
             len(m_gridDefaults.spacing), u,
             m_gridDefaults.majorEvery);
     }
     m_gridSummary->SetLabel(s);
+    m_gridSummary->Wrap(SidebarTextWidth(m_gridSummary) - 4);
+    if (auto* card = m_gridSummary->GetParent())
+    {
+        card->Layout();
+        if (auto* scr = wxDynamicCast(card->GetParent(), wxScrolledWindow))
+        {
+            scr->Layout();
+            scr->FitInside();
+        }
+    }
 }
 //
 // Drives toolbar visuals AND the canvas's transform mode in lock-step. The
