@@ -5,13 +5,11 @@
 //
 // Shared GL setup helpers used by every viewport canvas in the app
 // (currently MainFrame's GLCanvas and the FixtureEditor's FixtureCanvas).
-// Centralised here so the wxGLCanvas pixel-format request and the Win32
+// Centralised here so the wxGLCanvas pixel-format request and the platform-specific
 // glad function-pointer loader stay in one place — adding a third canvas
 // no longer means a third copy of either.
 //
-// Implementation pulls in <windows.h> for wglGetProcAddress and friends;
-// keep that out of the header so this include doesn't macro-pollute every
-// caller.
+// Platform GL headers and dynamic-library handles stay in the implementation.
 // =============================================================================
 namespace GLLoader
 {
@@ -22,11 +20,6 @@ namespace GLLoader
     // canvases are alive.
     extern int glArgs[];
 
-    // Win32 glad loader. Calls wglGetProcAddress first; falls back to
-    // GetProcAddress on opengl32.dll for the legacy 1.1 entry points
-    // wglGetProcAddress refuses to return.
-    //
-    // Caller must have a current GL context when this is called — otherwise
-    // wglGetProcAddress returns nothing useful.
+    // Resolve GL symbols from the platform library. Requires a current context.
     void* GetAnyGLFuncAddress(const char* name);
 }

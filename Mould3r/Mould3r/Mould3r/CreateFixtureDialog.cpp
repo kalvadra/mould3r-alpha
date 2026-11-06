@@ -14,7 +14,7 @@ namespace
     // ribbon buttons in MainFrame (9pt Segoe UI semibold).
     wxFont DialogBtnFont()
     {
-        return wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        return wxFont(Style::Ui(9), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
             wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI");
     }
 
@@ -53,7 +53,7 @@ namespace
     // StartupDialog's "SELECTED FIXTURE" preview-card header.
     wxFont FieldLabelFont()
     {
-        return wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        return wxFont(Style::Ui(8), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
             wxFONTWEIGHT_BOLD, false, "Segoe UI");
     }
 }
@@ -88,7 +88,7 @@ CreateFixtureDialog::CreateFixtureDialog(wxWindow* parent)
 
     auto* title = new wxStaticText(m_titleRow, wxID_ANY, "Create Fixture");
     title->SetForegroundColour(Style::TextPrimary);
-    title->SetFont(wxFont(16, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+    title->SetFont(wxFont(Style::Ui(16), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_BOLD, false, "Segoe UI"));
 
     // Close ✕ — wxID_CANCEL so Escape and this button share the same exit
@@ -101,7 +101,7 @@ CreateFixtureDialog::CreateFixtureDialog(wxWindow* parent)
         wxDefaultPosition, wxSize(30, 30), wxBORDER_NONE);
     btnClose->SetBackgroundColour(Style::AppBg);
     btnClose->SetForegroundColour(Style::TextMuted);
-    btnClose->SetFont(wxFont(11, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+    btnClose->SetFont(wxFont(Style::Ui(11), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
 
     btnClose->Bind(wxEVT_ENTER_WINDOW, [btnClose](wxMouseEvent& e) {
@@ -150,7 +150,7 @@ CreateFixtureDialog::CreateFixtureDialog(wxWindow* parent)
     m_nameCtrl->SetHint("e.g. ASPX Rev 2");
     m_nameCtrl->SetBackgroundColour(Style::InputBg);
     m_nameCtrl->SetForegroundColour(Style::TextPrimary);
-    m_nameCtrl->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+    m_nameCtrl->SetFont(wxFont(Style::Ui(9), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
     formSizer->Add(m_nameCtrl, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 18);
     formSizer->AddSpacer(6);
@@ -159,7 +159,7 @@ CreateFixtureDialog::CreateFixtureDialog(wxWindow* parent)
     auto* sectionHdr = new wxStaticText(m_formPanel, wxID_ANY,
         "Select Mould Halves");
     sectionHdr->SetForegroundColour(Style::TextPrimary);
-    sectionHdr->SetFont(wxFont(11, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+    sectionHdr->SetFont(wxFont(Style::Ui(11), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_BOLD, false, "Segoe UI"));
     formSizer->Add(sectionHdr, 0, wxLEFT | wxRIGHT | wxTOP, 18);
     formSizer->AddSpacer(4);
@@ -179,7 +179,7 @@ CreateFixtureDialog::CreateFixtureDialog(wxWindow* parent)
         wxDefaultPosition, wxSize(-1, 28), wxBORDER_NONE);
     m_pathACtrl->SetBackgroundColour(Style::InputBg);
     m_pathACtrl->SetForegroundColour(Style::TextPrimary);
-    m_pathACtrl->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+    m_pathACtrl->SetFont(wxFont(Style::Ui(9), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
     auto* btnSelectA = new RoundedButton(m_formPanel, ID_SelectA, "Select",
         wxDefaultPosition, wxSize(70, 28), wxBORDER_NONE);
@@ -200,7 +200,7 @@ CreateFixtureDialog::CreateFixtureDialog(wxWindow* parent)
         wxDefaultPosition, wxSize(-1, 28), wxBORDER_NONE);
     m_pathBCtrl->SetBackgroundColour(Style::InputBg);
     m_pathBCtrl->SetForegroundColour(Style::TextPrimary);
-    m_pathBCtrl->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+    m_pathBCtrl->SetFont(wxFont(Style::Ui(9), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
     auto* btnSelectB = new RoundedButton(m_formPanel, ID_SelectB, "Select",
         wxDefaultPosition, wxSize(70, 28), wxBORDER_NONE);
@@ -249,7 +249,7 @@ CreateFixtureDialog::CreateFixtureDialog(wxWindow* parent)
         "Preparing...", wxDefaultPosition, wxDefaultSize,
         wxALIGN_CENTRE_HORIZONTAL | wxST_NO_AUTORESIZE);
     m_loadingStatus->SetForegroundColour(Style::TextPrimary);
-    m_loadingStatus->SetFont(wxFont(11, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+    m_loadingStatus->SetFont(wxFont(Style::Ui(11), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_BOLD, false, "Segoe UI"));
     loadingSizer->Add(m_loadingStatus, 0, wxEXPAND | wxLEFT | wxRIGHT, 24);
     loadingSizer->AddSpacer(14);

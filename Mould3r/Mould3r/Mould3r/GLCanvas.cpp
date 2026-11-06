@@ -155,10 +155,10 @@ GLCanvas::GLCanvas(wxWindow* parent)
         wxDefaultPosition, wxDefaultSize,
         wxFULL_REPAINT_ON_RESIZE, "GLCanvas")
 {
-#if WX_CHECK_VERSION(3, 1, 0)
+#if wxCHECK_VERSION(3, 1, 0)
     wxGLContextAttrs ctxAttrs;
 #if defined(__APPLE__)
-    ctxAttrs.PlatformDefaults().CoreProfile().OGLVersion(3, 2).EndList();
+    ctxAttrs.PlatformDefaults().CoreProfile().OGLVersion(4, 1).EndList();
 #else
     ctxAttrs.PlatformDefaults().CoreProfile().OGLVersion(3, 3).EndList();
 #endif
@@ -12214,7 +12214,8 @@ void GLCanvas::OnPaint(wxPaintEvent&)
     const int w = std::max(1, sz.x);
     const int h = std::max(1, sz.y);
 
-    glViewport(0, 0, w, h);
+    glViewport(0, 0, int(w * GetContentScaleFactor()),
+        int(h * GetContentScaleFactor()));
     EnsurePickFBO(w, h);
 
     glEnable(GL_DEPTH_TEST);
@@ -12459,7 +12460,8 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         if (m_outlineProgram && m_pickColorTex)
         {
             glBindFramebuffer(GL_FRAMEBUFFER, 0);
-            glViewport(0, 0, w, h);
+            glViewport(0, 0, int(w * GetContentScaleFactor()),
+                int(h * GetContentScaleFactor()));
             glDisable(GL_DEPTH_TEST);
             glEnable(GL_BLEND);
             glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -15868,7 +15870,8 @@ int GLCanvas::PickObjectAt(int mouseX, int mouseY)
     glReadPixels(x, y, 1, 1, GL_RED_INTEGER, GL_UNSIGNED_INT, &id);
 
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glViewport(0, 0, w, h);
+    glViewport(0, 0, int(w * GetContentScaleFactor()),
+        int(h * GetContentScaleFactor()));
     glUseProgram(0);
 
     return (id == 0) ? -1 : (int)(id - 1);
@@ -15910,7 +15913,8 @@ void GLCanvas::RenderPickPass_NoRead(int w, int h)
 
     glUseProgram(0);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glViewport(0, 0, w, h);
+    glViewport(0, 0, int(w * GetContentScaleFactor()),
+        int(h * GetContentScaleFactor()));
 }
 
 void GLCanvas::ClearFixtures()

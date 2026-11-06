@@ -129,7 +129,7 @@ add_library(m3tetmesh SHARED m3tetmesh.cpp m3tetmesh.h)
 target_compile_definitions(m3tetmesh PRIVATE M3TETMESH_BUILD)
 target_link_libraries(m3tetmesh PRIVATE FloatTetwild)
 set_target_properties(m3tetmesh PROPERTIES CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN ON)
-if(NOT MSVC)
+if(UNIX AND NOT APPLE)
     # Keep the static dependencies' symbols private (MSVC exports only
     # __declspec(dllexport) anyway).
     target_link_options(m3tetmesh PRIVATE "LINKER:--exclude-libs,ALL")

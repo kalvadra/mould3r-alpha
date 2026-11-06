@@ -58,6 +58,11 @@ Mould3r is a Visual Studio project that uses [vcpkg](https://vcpkg.io/) in manif
 
 The executable is produced in the usual MSBuild output folder. On first run Mould3r looks for a `fixtures/` folder next to the executable; drop your `.fixture` files in there and they'll show up in the fixture picker.
 
+### macOS (Apple Silicon)
+
+A native CMake target and standalone `.app` packaging are available. See
+[macOS build instructions and validation scope](docs/macos.md).
+
 ## Using Mould3r
 
 On first launch the app opens to an empty workspace and prompts you to pick a fixture. Subsequent launches remember your last fixture and go straight in.

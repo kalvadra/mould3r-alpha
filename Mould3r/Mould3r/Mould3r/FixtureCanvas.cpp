@@ -153,10 +153,10 @@ FixtureCanvas::FixtureCanvas(wxWindow* parent)
         wxDefaultPosition, wxDefaultSize,
         wxFULL_REPAINT_ON_RESIZE, "FixtureCanvas")
 {
-#if WX_CHECK_VERSION(3, 1, 0)
+#if wxCHECK_VERSION(3, 1, 0)
     wxGLContextAttrs ctxAttrs;
 #if defined(__APPLE__)
-    ctxAttrs.PlatformDefaults().CoreProfile().OGLVersion(3, 2).EndList();
+    ctxAttrs.PlatformDefaults().CoreProfile().OGLVersion(4, 1).EndList();
 #else
     ctxAttrs.PlatformDefaults().CoreProfile().OGLVersion(3, 3).EndList();
 #endif
@@ -651,7 +651,8 @@ void FixtureCanvas::OnPaint(wxPaintEvent&)
     const int w = std::max(1, sz.x);
     const int h = std::max(1, sz.y);
 
-    glViewport(0, 0, w, h);
+    glViewport(0, 0, int(w * GetContentScaleFactor()),
+        int(h * GetContentScaleFactor()));
 
     glEnable(GL_DEPTH_TEST);
     // Same clear color as the main canvas (0.12, 0.14, 0.18) so the two

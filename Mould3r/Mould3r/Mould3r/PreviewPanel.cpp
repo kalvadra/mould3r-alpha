@@ -1,3 +1,4 @@
+#include "AppPaths.h"
 #include "PreviewPanel.h"
 #include "GLCanvas.h"
 #include <wx/progdlg.h>
@@ -60,8 +61,7 @@ static wxBitmapBundle LoadSvgBundle(const wxString& svgPath,
     wxFileName fn(svgPath);
     if (fn.IsRelative())
     {
-        wxFileName exeDir(wxStandardPaths::Get().GetExecutablePath());
-        fn.MakeAbsolute(exeDir.GetPath());
+        fn.MakeAbsolute(wxString::FromUTF8(AppPaths::Resources().string()));
     }
 
     wxFile file(fn.GetFullPath());
@@ -99,8 +99,8 @@ static std::string HalfLetter(int index)
 }
 
 // Feature-input field metrics, mirroring the Prepare-side mould-feature rows.
-static const int kFieldWidth = 90;   // text-entry width (px)
-static const int kUnitWidth = 28;    // fixed unit-label column (px)
+static const int kFieldWidth = Style::Ui(90);   // text-entry width (px)
+static const int kUnitWidth = Style::Ui(28);    // fixed unit-label column (px)
 static const int kFieldGap = 4;      // gap between field and unit label
 
 // A feature-style parameter row: label (left) + text field + unit label
@@ -112,7 +112,7 @@ static wxTextCtrl* AddFieldRow(wxWindow* parent, wxBoxSizer* into,
 
     auto* lbl = new wxStaticText(parent, wxID_ANY, label);
     lbl->SetForegroundColour(Style::TextMuted);
-    lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+    lbl->SetFont(wxFont(Style::Ui(8), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
 
     auto* ctrl = new wxTextCtrl(parent, wxID_ANY, defaultVal,
@@ -122,7 +122,7 @@ static wxTextCtrl* AddFieldRow(wxWindow* parent, wxBoxSizer* into,
 
     auto* unit = new wxStaticText(parent, wxID_ANY, unitStr);
     unit->SetForegroundColour(Style::TextSubtle);
-    unit->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+    unit->SetFont(wxFont(Style::Ui(8), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
     unit->SetMinSize(wxSize(kUnitWidth, -1));
 
@@ -553,7 +553,7 @@ PreviewPanel::PreviewPanel(wxWindow* parent)
         auto* lbl = new wxStaticText(host, wxID_ANY, "Sim Viewer Select:");
         lbl->SetForegroundColour(Style::TextMuted);
         lbl->SetBackgroundColour(Style::CardBg);
-        lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        lbl->SetFont(wxFont(Style::Ui(8), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
             wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
         m_resultsBar->AddControl(lbl, wxALIGN_CENTER_VERTICAL | wxRIGHT, 6);
 
@@ -614,7 +614,7 @@ PreviewPanel::PreviewPanel(wxWindow* parent)
         auto* sg = new wxBoxSizer(wxHORIZONTAL);
         auto* secLbl = new wxStaticText(m_sectionGroup, wxID_ANY, "Section:");
         secLbl->SetForegroundColour(Style::TextMuted);
-        secLbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        secLbl->SetFont(wxFont(Style::Ui(8), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
             wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
         sg->Add(secLbl, 0, wxALIGN_CENTER_VERTICAL | wxLEFT | wxRIGHT, 6);
         wxArrayString axes;
@@ -635,7 +635,7 @@ PreviewPanel::PreviewPanel(wxWindow* parent)
         sg->Add(m_sectionFlipCheck, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
         auto* colLbl = new wxStaticText(m_sectionGroup, wxID_ANY, "Colour:");
         colLbl->SetForegroundColour(Style::TextMuted);
-        colLbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        colLbl->SetFont(wxFont(Style::Ui(8), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
             wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
         sg->Add(colLbl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 6);
         wxArrayString cols;
@@ -686,7 +686,7 @@ wxPanel* PreviewPanel::BuildPhysicalSetupBar(wxWindow* parent)
 
     auto* title = new wxStaticText(bar, wxID_ANY, "PHYSICAL SETUP");
     title->SetForegroundColour(Style::TextPrimary);
-    title->SetFont(wxFont(7, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+    title->SetFont(wxFont(Style::Ui(7), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_BOLD, false, "Segoe UI"));
     row->Add(title, 0, wxALIGN_CENTER_VERTICAL | wxLEFT | wxRIGHT, 12);
 
@@ -696,7 +696,7 @@ wxPanel* PreviewPanel::BuildPhysicalSetupBar(wxWindow* parent)
         auto* lbl = new wxStaticText(bar, wxID_ANY, label);
         lbl->SetForegroundColour(Style::TextMuted);
         lbl->SetBackgroundColour(Style::CardBg);
-        lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        lbl->SetFont(wxFont(Style::Ui(8), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
             wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
         row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 10);
 
@@ -713,7 +713,7 @@ wxPanel* PreviewPanel::BuildPhysicalSetupBar(wxWindow* parent)
         auto* plus = new RoundedButton(bar, wxID_ANY, "+", wxDefaultPosition, wxSize(22, 22), wxBORDER_NONE);
         plus->SetBackgroundColour(Style::BtnSecondary);
         plus->SetForegroundColour(*wxWHITE);
-        plus->SetFont(wxFont(10, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        plus->SetFont(wxFont(Style::Ui(10), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
             wxFONTWEIGHT_BOLD, false, "Segoe UI"));
         plus->SetToolTip(tip);
         plus->Bind(wxEVT_BUTTON, [this, kind](wxCommandEvent&) { AddMaterialToLibrary(kind); });
@@ -731,7 +731,7 @@ wxPanel* PreviewPanel::BuildPhysicalSetupBar(wxWindow* parent)
     m_libraryIssues = new wxStaticText(bar, wxID_ANY, wxString::FromUTF8("\xe2\x9a\xa0 Library"));
     m_libraryIssues->SetForegroundColour(wxColour(0xE0, 0x9B, 0x20));
     m_libraryIssues->SetBackgroundColour(Style::CardBg);
-    m_libraryIssues->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+    m_libraryIssues->SetFont(wxFont(Style::Ui(8), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
     row->Add(m_libraryIssues, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 10);
     m_libraryIssues->Hide();
@@ -1268,7 +1268,7 @@ void PreviewPanel::SetGridSettings(const GridSettings& s)
 wxPanel* PreviewPanel::BuildSimPanel(wxWindow* parent)
 {
     auto* outer = new wxPanel(parent, wxID_ANY,
-        wxDefaultPosition, wxSize(280, -1));
+        wxDefaultPosition, wxSize(Style::Ui(280), -1));
     outer->SetBackgroundColour(Style::AppBg);
     auto* outerSizer = new wxBoxSizer(wxHORIZONTAL);
 
@@ -1281,7 +1281,7 @@ wxPanel* PreviewPanel::BuildSimPanel(wxWindow* parent)
     // "No bodies generated" message before anything is generated.
     auto* visTitle = new wxStaticText(column, wxID_ANY, "PREVIEW OUTPUT BODIES");
     visTitle->SetForegroundColour(Style::TextPrimary);
-    visTitle->SetFont(wxFont(7, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+    visTitle->SetFont(wxFont(Style::Ui(7), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_BOLD, false, "Segoe UI"));
     colSizer->Add(visTitle, 0, wxLEFT | wxTOP, 12);
     colSizer->AddSpacer(6);
@@ -1292,7 +1292,7 @@ wxPanel* PreviewPanel::BuildSimPanel(wxWindow* parent)
 
     m_visEmptyLabel = new wxStaticText(m_visPanel, wxID_ANY, "No bodies generated");
     m_visEmptyLabel->SetForegroundColour(Style::TextMuted);
-    m_visEmptyLabel->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_ITALIC,
+    m_visEmptyLabel->SetFont(wxFont(Style::Ui(9), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_ITALIC,
         wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
     visSizer->Add(m_visEmptyLabel, 0, wxALL, 10);
 
@@ -1308,7 +1308,7 @@ wxPanel* PreviewPanel::BuildSimPanel(wxWindow* parent)
     // Section title (matches the Prepare panel's "MOULD TOOL SETTINGS").
     auto* title = new wxStaticText(column, wxID_ANY, "SIMULATIONS");
     title->SetForegroundColour(Style::TextPrimary);
-    title->SetFont(wxFont(7, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+    title->SetFont(wxFont(Style::Ui(7), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_BOLD, false, "Segoe UI"));
     colSizer->Add(title, 0, wxLEFT | wxTOP, 12);
     colSizer->AddSpacer(8);
@@ -1335,7 +1335,7 @@ wxPanel* PreviewPanel::BuildSimPanel(wxWindow* parent)
         header->SetValue(true);
         header->SetBackgroundColour(Style::CardBg);
         header->SetForegroundColour(*wxWHITE);
-        header->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        header->SetFont(wxFont(Style::Ui(9), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
             wxFONTWEIGHT_BOLD, false, "Segoe UI"));
         header->SetBitmap(LoadSvgBundle(kChevronDownSvg, wxSize(12, 12), true));
         header->SetBitmapPosition(wxRIGHT);
@@ -1369,10 +1369,10 @@ wxPanel* PreviewPanel::BuildSimPanel(wxWindow* parent)
     auto addStart = [this](wxWindow* body, wxBoxSizer* bs, const wxString& simName)
     {
         auto* startBtn = new RoundedButton(body, wxID_ANY, "Start",
-            wxDefaultPosition, wxSize(-1, 32), wxBORDER_NONE);
+            wxDefaultPosition, wxSize(-1, Style::Ui(32)), wxBORDER_NONE);
         startBtn->SetBackgroundColour(Style::BtnPlace);
         startBtn->SetForegroundColour(*wxWHITE);
-        startBtn->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        startBtn->SetFont(wxFont(Style::Ui(9), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
             wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
         startBtn->Bind(wxEVT_BUTTON,
             [this, simName](wxCommandEvent&) { OnStartSimulation(simName); });
@@ -1405,7 +1405,7 @@ wxPanel* PreviewPanel::BuildSimPanel(wxWindow* parent)
         // tracks the dropdown (% of surface area, or absolute mm²).
         auto* sigLbl = new wxStaticText(body, wxID_ANY, "Min. significant area:");
         sigLbl->SetForegroundColour(Style::TextMuted);
-        sigLbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        sigLbl->SetFont(wxFont(Style::Ui(8), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
             wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
         bs->Add(sigLbl, 0, wxLEFT | wxRIGHT | wxTOP, 10);
 
@@ -1429,7 +1429,7 @@ wxPanel* PreviewPanel::BuildSimPanel(wxWindow* parent)
             "0 disables the filter (any flagged facet counts).");
         m_sigUnitLbl = new wxStaticText(body, wxID_ANY, "%");
         m_sigUnitLbl->SetForegroundColour(Style::TextSubtle);
-        m_sigUnitLbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        m_sigUnitLbl->SetFont(wxFont(Style::Ui(8), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
             wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
         m_sigUnitLbl->SetMinSize(wxSize(kUnitWidth, -1));
         sigRow->AddStretchSpacer(1);
@@ -1578,7 +1578,7 @@ wxPanel* PreviewPanel::BuildSimPanel(wxWindow* parent)
             "midplane together (Sim Viewer: Flow fill time).");
         note->SetForegroundColour(Style::TextMuted);
         note->SetBackgroundColour(Style::CardBg);
-        note->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        note->SetFont(wxFont(Style::Ui(8), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
             wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
         bs->Add(note, 0, wxLEFT | wxRIGHT | wxTOP, 10);
 
@@ -1649,7 +1649,7 @@ wxPanel* PreviewPanel::BuildSimPanel(wxWindow* parent)
 
         auto* denLbl = new wxStaticText(body, wxID_ANY, "Mesh density:");
         denLbl->SetForegroundColour(Style::TextMuted);
-        denLbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        denLbl->SetFont(wxFont(Style::Ui(8), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
             wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
         bs->Add(denLbl, 0, wxLEFT | wxRIGHT | wxTOP, 10);
         wxArrayString dens;
@@ -1675,17 +1675,17 @@ wxPanel* PreviewPanel::BuildSimPanel(wxWindow* parent)
             "(Sim Viewer: the 3D ... views).");
         note->SetForegroundColour(Style::TextMuted);
         note->SetBackgroundColour(Style::CardBg);
-        note->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        note->SetFont(wxFont(Style::Ui(8), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
             wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
         bs->Add(note, 0, wxLEFT | wxRIGHT | wxTOP, 10);
 
         addStart(body, bs, "3D Flow Analysis");
 
         m_flow3dExportMeshBtn = new RoundedButton(body, wxID_ANY, "Export Mesh...",
-            wxDefaultPosition, wxSize(-1, 26), wxBORDER_NONE);
+            wxDefaultPosition, wxSize(-1, Style::Ui(26)), wxBORDER_NONE);
         m_flow3dExportMeshBtn->SetBackgroundColour(Style::BtnSmall);
         m_flow3dExportMeshBtn->SetForegroundColour(Style::TextPrimary);
-        m_flow3dExportMeshBtn->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        m_flow3dExportMeshBtn->SetFont(wxFont(Style::Ui(8), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
             wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
         m_flow3dExportMeshBtn->SetToolTip(
             "Save the last 3D mesh as .vtu (opens in ParaView, with the element quality and "
@@ -1751,7 +1751,7 @@ wxPanel* PreviewPanel::BuildInfoPanel(wxWindow* parent)
     {
         auto* h = new wxStaticText(column, wxID_ANY, text);
         h->SetForegroundColour(Style::TextPrimary);
-        h->SetFont(wxFont(7, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        h->SetFont(wxFont(Style::Ui(7), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
             wxFONTWEIGHT_BOLD, false, "Segoe UI"));
         colSizer->Add(h, 0, wxLEFT | wxRIGHT | wxTOP, 12);
     };
@@ -1769,7 +1769,7 @@ wxPanel* PreviewPanel::BuildInfoPanel(wxWindow* parent)
         {
             auto* t = new wxStaticText(card, wxID_ANY, titleText);
             t->SetForegroundColour(*wxWHITE);
-            t->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            t->SetFont(wxFont(Style::Ui(9), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
                 wxFONTWEIGHT_BOLD, false, "Segoe UI"));
             cs->Add(t, 0, wxLEFT | wxRIGHT | wxTOP, 10);
         }
@@ -1786,19 +1786,19 @@ wxPanel* PreviewPanel::BuildInfoPanel(wxWindow* parent)
 
         auto* volLabel = new wxStaticText(card, wxID_ANY, "Shot Volume");
         volLabel->SetForegroundColour(Style::TextSubtle);
-        volLabel->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        volLabel->SetFont(wxFont(Style::Ui(8), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
             wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
         cs->Add(volLabel, 0, wxLEFT | wxRIGHT | wxTOP, 10);
 
         m_volPrimary = new wxStaticText(card, wxID_ANY, wxEmptyString);
         m_volPrimary->SetForegroundColour(Style::TextPrimary);
-        m_volPrimary->SetFont(wxFont(13, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        m_volPrimary->SetFont(wxFont(Style::Ui(13), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
             wxFONTWEIGHT_BOLD, false, "Segoe UI"));
         cs->Add(m_volPrimary, 0, wxLEFT | wxRIGHT | wxTOP, 10);
 
         m_volSecondary = new wxStaticText(card, wxID_ANY, wxEmptyString);
         m_volSecondary->SetForegroundColour(Style::TextMuted);
-        m_volSecondary->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        m_volSecondary->SetFont(wxFont(Style::Ui(9), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
             wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
         cs->Add(m_volSecondary, 0, wxLEFT | wxRIGHT | wxBOTTOM, 10);
     }
@@ -1814,17 +1814,17 @@ wxPanel* PreviewPanel::BuildInfoPanel(wxWindow* parent)
 
         auto* value = new wxStaticText(card, wxID_ANY, "Not run");
         value->SetForegroundColour(Style::TextMuted);
-        value->SetFont(wxFont(11, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        value->SetFont(wxFont(Style::Ui(11), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
             wxFONTWEIGHT_BOLD, false, "Segoe UI"));
         cs->Add(value, 0, wxLEFT | wxRIGHT | wxTOP, 10);
 
         auto makeBtn = [&](const wxString& label, const wxString& tip) -> RoundedButton*
         {
             auto* btn = new RoundedButton(card, wxID_ANY, label,
-                wxDefaultPosition, wxSize(-1, 24), wxBORDER_NONE);
+                wxDefaultPosition, wxSize(-1, Style::Ui(24)), wxBORDER_NONE);
             btn->SetBackgroundColour(Style::BtnSmall);
             btn->SetForegroundColour(Style::TextPrimary);
-            btn->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+            btn->SetFont(wxFont(Style::Ui(8), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
                 wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI"));
             btn->SetToolTip(tip);
             btn->Enable(false);

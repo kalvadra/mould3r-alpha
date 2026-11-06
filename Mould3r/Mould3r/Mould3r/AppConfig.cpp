@@ -1,5 +1,6 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include "AppConfig.h"
+#include "AppPaths.h"
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -45,9 +46,7 @@ namespace
 
 std::string AppConfig::GetConfigPath()
 {
-    return (fs::path(wxStandardPaths::Get()
-        .GetExecutablePath().ToStdString())
-        .parent_path() / "mould3r.cfg").string();
+    return (AppPaths::UserData() / "mould3r.cfg").string();
 }
 
 std::string AppConfig::LoadString(const std::string& key, const std::string& fallback)
