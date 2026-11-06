@@ -93,6 +93,9 @@
     <ClCompile Include="NavCube.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="DimensionInput.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="MeshUtils.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -288,6 +291,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="NavCube.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="DimensionInput.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="MeshUtils.h">

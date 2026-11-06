@@ -236,6 +236,7 @@
     <ClCompile Include="SplitButton.cpp" />
     <ClCompile Include="TransformGizmo.cpp" />
     <ClCompile Include="NavCube.cpp" />
+    <ClCompile Include="DimensionInput.cpp" />
     <ClCompile Include="TransformPanel.cpp" />
     <ClCompile Include="SprueEditToolbar.cpp" />
     <ClCompile Include="PerspectiveButton.cpp" />
@@ -308,6 +309,7 @@
     <ClInclude Include="SplitButton.h" />
     <ClInclude Include="TransformGizmo.h" />
     <ClInclude Include="NavCube.h" />
+    <ClInclude Include="DimensionInput.h" />
     <ClInclude Include="TransformPanel.h" />
     <ClInclude Include="TransformSession.h" />
     <ClInclude Include="SprueEditToolbar.h" />

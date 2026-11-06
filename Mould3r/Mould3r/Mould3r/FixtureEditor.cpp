@@ -21,6 +21,7 @@
 #include "FixtureFile.h"       // OnGenerateFixture
 #include "GridSettingsDialog.h" // Grid Defaults card "Edit…" button
 #include "RoundedButton.h"     // owner-drawn rounded button — replaces wxButton in custom-themed UI
+#include "DimensionInput.h"    // fractions / expressions / unit suffixes in dimension fields
 #include "WindowEffects.h"     // DWM corner rounding for the editor frame
 #include "InjectionPointDialog.h"  // Add/Edit injection-point flow
 #include "RotateDialog.h"      // OnToolRotate
@@ -168,6 +169,10 @@ namespace
         unit->SetForegroundColour(Style::TextSubtle);
         unit->SetFont(kFieldLabelFont);
         unit->SetMinSize(wxSize(kUnitWidth, -1));
+
+        // Fractions, expressions and unit suffixes; unit read live from the
+        // label, so the metric / imperial toggle is followed.
+        DimInput::Attach(outField, unit);
 
         row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL);
         row->AddStretchSpacer(1);
@@ -899,23 +904,14 @@ wxPanel* FixtureEditor::CreateUnitToggle(wxWindow* parent)
             recolour(m_metricSeg, m_metricLbl, toMetric);
             recolour(m_imperialSeg, m_imperialLbl, !toMetric);
 
-            // Convert every tracked mm field and swap its unit label.
-            // toMetric:   in  * 25.4 -> mm
-            // toImperial: mm / 25.4  -> in
-            const double factor = toMetric ? 25.4 : (1.0 / 25.4);
-            const wxString fmt = toMetric ? "%.2f" : "%.4f";
+            // Convert every length field (the values first, while the unit
+            // labels still name the old unit), then swap the labels.
+            DimInput::ConvertLengths(this,
+                toMetric ? DimInput::Unit::Inch : DimInput::Unit::MM,
+                toMetric ? DimInput::Unit::MM : DimInput::Unit::Inch);
             const wxString newLbl = toMetric ? "mm" : "in";
-
-            for (size_t i = 0; i < m_mmFields.size(); ++i)
-            {
-                wxTextCtrl* field = m_mmFields[i];
-                wxStaticText* lbl = m_mmUnitLabels[i];
-                if (!field || !lbl) continue;
-                lbl->SetLabel(newLbl);
-                double v = 0.0;
-                if (field->GetValue().ToDouble(&v))
-                    field->SetValue(wxString::Format(fmt, v * factor));
-            }
+            for (wxStaticText* lbl : m_mmUnitLabels)
+                if (lbl) lbl->SetLabel(newLbl);
 
             // The Grid Defaults summary is derived text (stored in mm), so
             // just re-render it in the new unit.
@@ -2149,8 +2145,8 @@ void FixtureEditor::OnGenerateFixture(wxCommandEvent&)
     def.halfBTransform = poseToTransform(poseB);
 
     // ---- Defaults from sidebar fields -------------------------------------
-    // wxTextCtrl::GetValue + ToDouble for numbers; ToDouble returns false
-    // on parse failure (e.g. user typed "abc"). We leave the optional
+    // DimInput::Read for numbers (decimals, fractions, expressions); it
+    // returns false only when nothing valid was ever entered. We leave the optional
     // unset on failure so that field falls back to the application
     // default at load time — same forgiving stance MainFrame uses.
     // Base units in the fixture file are always mm. If the user switched to
@@ -2162,14 +2158,14 @@ void FixtureEditor::OnGenerateFixture(wxCommandEvent&)
         {
             if (!ctrl) return;
             double v = 0.0;
-            if (ctrl->GetValue().ToDouble(&v))
+            if (DimInput::Read(ctrl, v))
                 dst = static_cast<float>(v * toMM);
         };
     auto readField = [](wxTextCtrl* ctrl, std::optional<float>& dst)
         {
             if (!ctrl) return;
             double v = 0.0;
-            if (ctrl->GetValue().ToDouble(&v))
+            if (DimInput::Read(ctrl, v))
                 dst = static_cast<float>(v);
         };
     auto readChoice = [](wxChoice* ch, std::optional<std::string>& dst)
