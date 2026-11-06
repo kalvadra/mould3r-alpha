@@ -1,9 +1,21 @@
 #include "FixtureFile.h"
 #include <fstream>
 #include <sstream>
+#include <algorithm>
 #include <filesystem>
 
 namespace fs = std::filesystem;
+
+// Files written by Mould3r 0.7.x and earlier on Windows store relative paths
+// with backslashes. Windows accepts either separator; macOS treats '\\' as an
+// ordinary filename character, so convert before resolving there.
+static std::string NormaliseSeparators(std::string p)
+{
+#ifndef _WIN32
+    std::replace(p.begin(), p.end(), '\\', '/');
+#endif
+    return p;
+}
 
 static std::string Trim(const std::string& s)
 {
@@ -21,12 +33,18 @@ std::string FixtureFile::GetDirectory(const std::string& path)
 std::string FixtureFile::MakeRelative(const std::string& absPath,
     const std::string& baseDir)
 {
+    if (absPath.empty()) return "";
     try {
-        return fs::relative(fs::path(absPath),
-            fs::path(baseDir)).string();
+        const fs::path rel = fs::relative(fs::path(absPath), fs::path(baseDir));
+        // fs::relative returns an EMPTY path (it does not throw) when no
+        // relative path exists, e.g. the model is on a different drive.
+        // Keep the absolute path then, or the reference would be lost.
+        if (rel.empty()) return fs::path(absPath).generic_string();
+        // Forward slashes: valid on Windows, and the only separator macOS
+        // understands, so fixtures saved on either platform open on both.
+        return rel.generic_string();
     }
     catch (...) {
-        // If relative calculation fails (e.g. different drives), fall back to absolute
         return absPath;
     }
 }
@@ -35,7 +53,7 @@ std::string FixtureFile::ResolveRelative(const std::string& relPath,
     const std::string& baseDir)
 {
     try {
-        fs::path resolved = fs::path(baseDir) / fs::path(relPath);
+        fs::path resolved = fs::path(baseDir) / fs::path(NormaliseSeparators(relPath));
         return fs::canonical(resolved).string();
     }
     catch (...) {

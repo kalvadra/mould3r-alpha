@@ -1,6 +1,6 @@
-#include "AppPaths.h"
 // AboutDialog.cpp
 #include "AboutDialog.h"
+#include "AppPaths.h"
 
 #include <wx/clipbrd.h>
 #include <wx/filename.h>
@@ -43,7 +43,7 @@ namespace
         wxFileName fn(svgPath);
         if (fn.IsRelative())
         {
-            fn.MakeAbsolute(wxString::FromUTF8(AppPaths::Resources().string()));
+            fn.MakeAbsolute(AppPaths::ToWx(AppPaths::Resources()));
         }
 
         wxFile file(fn.GetFullPath());

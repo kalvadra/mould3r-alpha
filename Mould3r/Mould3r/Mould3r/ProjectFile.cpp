@@ -1,9 +1,21 @@
 #include "ProjectFile.h"
 #include <fstream>
 #include <sstream>
+#include <algorithm>
 #include <filesystem>
 
 namespace fs = std::filesystem;
+
+// Files written by Mould3r 0.7.x and earlier on Windows store relative paths
+// with backslashes. Windows accepts either separator; macOS treats '\\' as an
+// ordinary filename character, so convert before resolving there.
+static std::string NormaliseSeparators(std::string p)
+{
+#ifndef _WIN32
+    std::replace(p.begin(), p.end(), '\\', '/');
+#endif
+    return p;
+}
 
 // ---------------------------------------------------------------------------
 // Helpers (same as FixtureFile)
@@ -46,7 +58,14 @@ std::string ProjectFile::MakeRelative(const std::string& absPath,
 {
     if (absPath.empty()) return "";
     try {
-        return fs::relative(fs::path(absPath), fs::path(baseDir)).string();
+        const fs::path rel = fs::relative(fs::path(absPath), fs::path(baseDir));
+        // fs::relative returns an EMPTY path (it does not throw) when no
+        // relative path exists, e.g. the source file is on a different drive.
+        // Keep the absolute path then, or the reference would be lost.
+        if (rel.empty()) return fs::path(absPath).generic_string();
+        // Forward slashes: valid on Windows, and the only separator macOS
+        // understands, so projects saved on either platform open on both.
+        return rel.generic_string();
     }
     catch (...) {
         return absPath;
@@ -58,7 +77,7 @@ std::string ProjectFile::ResolveRelative(const std::string& relPath,
 {
     if (relPath.empty()) return "";
     try {
-        fs::path resolved = fs::path(baseDir) / fs::path(relPath);
+        fs::path resolved = fs::path(baseDir) / fs::path(NormaliseSeparators(relPath));
         return fs::canonical(resolved).string();
     }
     catch (...) {
