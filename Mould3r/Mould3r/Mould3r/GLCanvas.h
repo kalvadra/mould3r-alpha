@@ -2,6 +2,7 @@
 
 #include <glad/glad.h>
 #include <wx/glcanvas.h>
+#include <wx/longlong.h>
 #include <vector>
 #include <array>
 #include <functional>   // std::function for scene-mutation callback
@@ -33,6 +34,9 @@
 #include "shaders.h"
 #include "MainFrame.h"
 #include "MouldFeature.h"
+#include "TransformSession.h"   // Move / Rotate / Scale tool sessions
+#include "TransformGizmo.h"     // on-canvas Move / Rotate / Scale handles
+#include "NavCube.h"            // top-right view cube
 #include "ProjectFile.h"
 #include "FeedNetwork.h"    // Flow::FeedNetwork — the 1D feed-system snapshot
 #include "Midplane.h"       // Flow::PartSurface — part surfaces for the midplane
@@ -253,6 +257,53 @@ public:
 
     // Called by MainFrame ribbon buttons
     void SetTransformMode(TransformMode mode);
+
+    // ---- Move / Rotate / Scale tool sessions --------------------------------
+    // The ribbon tools are modes with a live side panel (TransformPanel). A
+    // session snapshots the selection's poses; SetTransformSessionDelta then
+    // re-derives every pose from the snapshot (Xform::ApplyDelta), rotating /
+    // scaling about the centre of the selection's world bounding box. Commit
+    // keeps the result (one undo step, a single scene-mutated notify and the
+    // Dynamic-fixture refit), Cancel restores the snapshot exactly.
+    //
+    // In a tool mode a CLICK (press + release without dragging) picks the
+    // selection like Select mode does — committing the current session and
+    // starting a fresh one on the new selection — while a DRAG orbits, so
+    // starting an orbit on empty space doesn't drop the selection.
+    void BeginTransformSession();
+    void SetTransformSessionDelta(const Xform::Delta& d, bool refresh = true);
+    bool CommitTransformSession();          // true if the scene changed
+    void CancelTransformSession();
+    // Esc during a handle drag: put the selection back where it was at the
+    // grab and end the drag (the tool session carries on). False when no
+    // handle drag is live, so callers fall through to cancelling the tool.
+    bool CancelGizmoDrag();
+    // Unit the Move readout uses (the panel's); set when a tool starts.
+    void SetTransformImperial(bool imperial) { m_xfImperial = imperial; }
+    bool IsTransformSessionActive() const { return m_xfActive; }
+    int  GetSelectionCount() const { return (int)m_selectedIndices.size(); }
+    // Fired after a click in a tool mode changed the selection (the session
+    // has already been restarted) so the owner can reset its panel.
+    void SetOnTransformSelectionChanged(std::function<void()> cb) { m_onXformSelection = std::move(cb); }
+    // The delta the session is applying now, and a hook fired whenever an
+    // on-canvas handle drag changes it (so the owner can update the panel's
+    // fields — typed values arrive the other way, via SetTransformSessionDelta).
+    const Xform::Delta& GetTransformSessionDelta() const { return m_xfDelta; }
+    void SetOnTransformDeltaChanged(std::function<void()> cb) { m_onXformDelta = std::move(cb); }
+    // The panel overlay, pinned top-right of the viewport.
+    void SetTransformPanel(wxWindow* w) { m_transformPanel = w; RepositionTransformPanel(); }
+    void RepositionTransformPanel();
+    // The tools with a top-right card: Move / Rotate / Scale, Place and
+    // Pattern. In these a click picks (restarting a live session if there is
+    // one) and a drag orbits; Enter / Esc are the card's OK / Cancel.
+    static bool IsTransformTool(TransformMode m)
+    {
+        return m == TransformMode::Translate || m == TransformMode::Rotate ||
+               m == TransformMode::Scale || m == TransformMode::Place ||
+               m == TransformMode::Pattern;
+    }
+    // Further cards pinned in the same top-right slot (Place, Pattern).
+    void AddPinnedPanel(wxWindow* w) { m_pinnedPanels.push_back(w); RepositionTransformPanel(); }
 
     // Called by dialogs
     void ApplyRotation(float xDeg, float yDeg, float zDeg);
@@ -1976,6 +2027,71 @@ private:
     // it alone licenses the deferred drag to move one.
     bool         m_editNodeGrabbed = false;
     wxWindow*    m_pathToolbar  = nullptr;  // floating toolbar overlay (opaque)
+    wxWindow*    m_transformPanel = nullptr;  // Move / Rotate / Scale panel (top-right)
+    std::vector<wxWindow*> m_pinnedPanels;    // Place / Pattern cards, same slot
+
+    // Move / Rotate / Scale session state (see BeginTransformSession).
+    bool                                    m_xfActive = false;
+    struct XformSnap { int idx; uint64_t uid; Xform::Pose pose; };
+    std::vector<XformSnap>                  m_xfSnap;    // object index + body uid + start pose
+    glm::vec3                               m_xfPivot{ 0.0f };
+    Xform::Delta                            m_xfDelta;
+    std::function<void()>                   m_onXformSelection;
+    // Click-vs-drag detection for picking in a tool mode.
+    bool                                    m_xfClickPending = false;
+    wxPoint                                 m_xfClickDown;
+    std::function<void()>                   m_onXformDelta;
+
+    // ---- Drag readout (the value label beside the cursor during a drag) ----
+    bool                 m_xfImperial = false;   // panel's unit, for the readout
+    std::string          m_readoutText;          // text currently uploaded
+    void                 DrawGizmoReadout(const glm::mat4& view, const glm::mat4& proj, int w, int h);
+
+    // ---- Nav cube (top-right view cube, NavCube.h) ---------------------------
+    NavCube::Controller  m_navCtl;
+    NavCube::Renderer    m_navCube;
+    bool                 m_navLabelsTried = false;
+    void                 DrawNavCube(int w, int h);
+
+    // On-canvas handles (TransformGizmo.h). Shown at the session pivot plus
+    // the move so far; a drag on one drives the session delta.
+    Gizmo::GizmoRenderer m_gizmo;
+    Gizmo::Handle        m_gizmoHover = Gizmo::Handle::None;
+    Gizmo::MoveDrag      m_gizmoDrag;                 // .valid while dragging
+    glm::vec3            m_gizmoStartMove{ 0.0f };    // session move at the grab
+    Gizmo::RotateDrag    m_gizmoRotDrag;              // .valid while a ring is held
+    glm::vec3            m_gizmoStartRot{ 0.0f };     // session angles at the grab
+    float                m_gizmoRotShownDeg = 0.0f;   // turn applied so far (after snap)
+    Gizmo::ScaleDrag     m_gizmoScaleDrag;            // .valid while a scale handle is held
+    float                m_gizmoStartScale = 1.0f;    // session factor at the grab
+    float                m_gizmoScaleShown = 1.0f;    // factor applied by this drag (stalk stretch)
+    // Handle drags are applied once per frame: motion records the cursor here,
+    // OnPaint applies it (ApplyGizmoDrag).
+    wxPoint              m_gizmoDragPos;
+    bool                 m_gizmoDragCtrl = false;
+    bool                 m_gizmoDragPending = false;
+    float                m_gizmoRotPendingDeg = 0.0f;   // ring angle, accumulated per event
+    void                 ApplyGizmoDrag();
+    // Rate-limited "delta changed" to the owner's panel (NotifyXformDelta).
+    wxLongLong           m_xfNotifyMs = 0;
+    bool                 m_xfNotifyPending = false;
+    void                 NotifyXformDelta(bool force);
+    bool             MoveGizmoShown() const
+    {
+        return m_transformMode == TransformMode::Translate && m_xfActive && !m_xfSnap.empty();
+    }
+    bool             RotateGizmoShown() const
+    {
+        return m_transformMode == TransformMode::Rotate && m_xfActive && !m_xfSnap.empty();
+    }
+    bool             ScaleGizmoShown() const
+    {
+        return m_transformMode == TransformMode::Scale && m_xfActive && !m_xfSnap.empty();
+    }
+    // The handle set for the current tool under the cursor (or None).
+    Gizmo::Handle    GizmoHitTest(float mx, float my);
+    glm::vec3        GizmoPivot() const { return m_xfPivot + m_xfDelta.move; }
+    Gizmo::Viewport  GizmoViewport();
     wxWindow*    m_sprueToolbar = nullptr;  // Edit Sprue toolbar overlay (opaque)
     wxWindow*    m_canvasToast  = nullptr;  // bottom-centre hint overlay (opaque)
     std::function<void()> m_onPathEditChanged;  // toolbar reconfigure hook

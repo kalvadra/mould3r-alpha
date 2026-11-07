@@ -90,6 +90,12 @@
     <ClCompile Include="GridRenderer.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="NavCube.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="DimensionInput.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="MeshUtils.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -204,6 +210,18 @@
     <ClCompile Include="SplitButton.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="TransformGizmo.cpp">
+      <Filter>Source Files\TransformHandlers</Filter>
+    </ClCompile>
+    <ClCompile Include="TransformPanel.cpp">
+      <Filter>Source Files\TransformHandlers</Filter>
+    </ClCompile>
+    <ClCompile Include="ToolPanels.cpp">
+      <Filter>Source Files\TransformHandlers</Filter>
+    </ClCompile>
+    <ClCompile Include="CanvasToast.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="SprueEditToolbar.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -276,6 +294,12 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="GridRenderer.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="NavCube.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="DimensionInput.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="MeshUtils.h">
@@ -397,6 +421,21 @@
     </ClInclude>
     <ClInclude Include="SplitButton.h">
       <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="TransformGizmo.h">
+      <Filter>Header Files\TransformHandlers</Filter>
+    </ClInclude>
+    <ClInclude Include="TransformPanel.h">
+      <Filter>Header Files\TransformHandlers</Filter>
+    </ClInclude>
+    <ClInclude Include="ToolPanels.h">
+      <Filter>Header Files\TransformHandlers</Filter>
+    </ClInclude>
+    <ClInclude Include="CanvasToast.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="TransformSession.h">
+      <Filter>Header Files\TransformHandlers</Filter>
     </ClInclude>
     <ClInclude Include="SprueEditToolbar.h">
       <Filter>Header Files</Filter>

@@ -315,11 +315,19 @@ void GridRenderer::Draw(const glm::mat4& view, const glm::mat4& proj)
     glBlendFunc(GL_ONE_MINUS_DST_COLOR, GL_ONE_MINUS_SRC_ALPHA);
     glEnable(GL_POLYGON_OFFSET_FILL);
     glPolygonOffset(-1.0f, -1.0f);
+    // Depth-TESTED but never depth-WRITTEN. The grid is one quad covering the
+    // whole grid area, lines and the transparent gaps between them alike,
+    // lifted and offset toward the camera; writing its depth left an
+    // invisible floor ~0.1 mm above the parting plane that hid everything
+    // drawn after it near y = 0 -- the vent / runner / gate path lines, cross-
+    // sections, shallow vents and the other translucent feature solids.
+    glDepthMask(GL_FALSE);
 
     glBindVertexArray(m_vao);
     glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, (void*)0);
     glBindVertexArray(0);
 
+    glDepthMask(GL_TRUE);
     glDisable(GL_POLYGON_OFFSET_FILL);
     glDisable(GL_BLEND);
 

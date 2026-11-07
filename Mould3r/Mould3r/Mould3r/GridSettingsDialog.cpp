@@ -1,5 +1,6 @@
 // GridSettingsDialog.cpp
 #include "GridSettingsDialog.h"
+#include "DimensionInput.h"   // fractions / expressions / unit suffixes in number fields
 #include "WindowEffects.h"   // DWM corner rounding for this dialog frame
 
 static constexpr double kMMPerInch = 25.4;
@@ -35,6 +36,7 @@ GridSettingsDialog::GridSettingsDialog(wxWindow* parent,
                 wxDefaultPosition, wxSize(110, -1));
             auto* unitLbl = new wxStaticText(parent, wxID_ANY, unit);
             m_unitLabels.push_back(unitLbl);
+            DimInput::Attach(ctrl, unitLbl);   // unit follows the mm / in switch
 
             row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 6);
             row->Add(ctrl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
@@ -176,16 +178,11 @@ void GridSettingsDialog::OnUnitChanged(wxCommandEvent&)
     if (nowImperial == m_displayImperial)
         return;
 
-    wxTextCtrl* fields[] = { m_ctrlX, m_ctrlY, m_ctrlRadius, m_ctrlSpacing };
-    for (auto* c : fields)
-    {
-        if (!c) continue;
-        double v = 0.0;
-        if (!c->GetValue().ToDouble(&v)) continue;
-        if (nowImperial) v /= kMMPerInch;   // mm -> in
-        else             v *= kMMPerInch;   // in -> mm
-        c->SetValue(wxString::Format("%.4g", v));
-    }
+    // Convert the length fields (values first, while their labels still name
+    // the old unit; fractions and expressions are read too).
+    DimInput::ConvertLengths(this,
+        nowImperial ? DimInput::Unit::MM : DimInput::Unit::Inch,
+        nowImperial ? DimInput::Unit::Inch : DimInput::Unit::MM);
 
     for (auto* lbl : m_unitLabels)
         lbl->SetLabel(nowImperial ? "in" : "mm");
@@ -198,7 +195,7 @@ float GridSettingsDialog::ParseLenMM(wxTextCtrl* ctrl, float fallbackMM) const
 {
     if (!ctrl) return fallbackMM;
     double v = 0.0;
-    if (!ctrl->GetValue().ToDouble(&v))
+    if (!DimInput::Read(ctrl, v))
         return fallbackMM;
     if (m_units->GetSelection() == 1)   // inches selected
         v *= kMMPerInch;

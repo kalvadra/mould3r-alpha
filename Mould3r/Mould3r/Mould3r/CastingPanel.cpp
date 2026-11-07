@@ -1,4 +1,5 @@
 #include "CastingPanel.h"
+#include "DimensionInput.h"   // fractions / expressions / unit suffixes in number fields
 #include "AppPaths.h"
 #include "GLCanvas.h"
 #include "MainFrame.h"        // GetIndexerRadius / GetIndexerExtraTolerance
@@ -613,6 +614,8 @@ wxPanel* CastingPanel::BuildPartCard(wxWindow* parent, const wxString& title,
         row->Add(ToolLabel(body, label), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 6);
         fieldOut = ToolField(body, defVal);
         unitOut = ToolUnit(body, false);
+        // Unit from the dropdown beside the field.
+        { wxChoice* u = unitOut; DimInput::Attach(fieldOut, [u] { return u->GetSelection() == 1 ? DimInput::Unit::Inch : DimInput::Unit::MM; }); }
         row->Add(fieldOut, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 6);
         row->Add(unitOut, 0, wxALIGN_CENTER_VERTICAL);
         bs->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 8);
@@ -694,18 +697,18 @@ MouldCastPart CastingPanel::ReadPartUI(const PartUI& ui) const
         p.type = ui.type->GetStringSelection().ToStdString();
 
     double t = 0.0;
-    if (ui.thickness && !ui.thickness->GetValue().ToDouble(&t)) t = 0.0;
+    if (ui.thickness && !DimInput::Read(ui.thickness, t)) t = 0.0;
     p.thickness = t;
     p.inches = ui.unit && ui.unit->GetSelection() == 1;
 
     double ex = 0.0;
-    if (ui.extra && !ui.extra->GetValue().ToDouble(&ex)) ex = 0.0;
+    if (ui.extra && !DimInput::Read(ui.extra, ex)) ex = 0.0;
     p.extraDistance = (ex > 0.0) ? ex : 0.0;
     p.extraDistanceInches = ui.extraUnit && ui.extraUnit->GetSelection() == 1;
 
     auto readVal = [](wxTextCtrl* c) -> double {
         double v = 0.0;
-        if (c && c->GetValue().ToDouble(&v) && v > 0.0) return v;
+        if (c && DimInput::Read(c, v) && v > 0.0) return v;
         return 0.0;
     };
     p.tongueWidth = readVal(ui.tongueW);
@@ -714,7 +717,7 @@ MouldCastPart CastingPanel::ReadPartUI(const PartUI& ui) const
     p.tongueThicknessInches = ui.tongueTUnit && ui.tongueTUnit->GetSelection() == 1;
     // Groove tolerance may legitimately be 0, so don't clamp it away.
     double gt = 0.0;
-    if (ui.grooveTol && !ui.grooveTol->GetValue().ToDouble(&gt)) gt = 0.0;
+    if (ui.grooveTol && !DimInput::Read(ui.grooveTol, gt)) gt = 0.0;
     p.grooveTolerance = (gt > 0.0) ? gt : 0.0;
     p.grooveToleranceInches = ui.grooveTolUnit && ui.grooveTolUnit->GetSelection() == 1;
     return p;

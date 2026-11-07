@@ -2,6 +2,7 @@
 
 #include <glad/glad.h>
 #include <wx/glcanvas.h>
+#include <wx/longlong.h>
 
 #include <array>
 #include <cstdint>
@@ -13,6 +14,11 @@
 #include "camera.h"
 #include "FileImporter.h"
 #include "FixtureFile.h"   // InjectionPoint — passed by value to SetInjectionPoints
+#include "TransformSession.h"   // Move / Rotate / Scale tool sessions
+#include "TransformGizmo.h"     // on-canvas Move / Rotate / Scale handles
+#include "NavCube.h"            // top-right view cube
+
+#include <functional>
 #include "GridRenderer.h"
 #include "shaders.h"
 
@@ -112,11 +118,43 @@ public:
     void SetHalfVisible(HalfSlot slot, bool visible);
 
     // ---- Selection / transform mode ----------------------------------------
-    // Subset of TransformMode from MainFrame.h. Move/Rotate/Scale are dialog-
-    // driven in the fixture editor (matching MainFrame's UX), so they need no
-    // persistent mode of their own. AlignFace is the only persistent picking
-    // mode here.
-    enum class TransformMode { Select, AlignFace };
+    // Subset of TransformMode from MainFrame.h. AlignFace is a persistent
+    // picking mode; Move / Rotate / Scale are tool modes with the live side
+    // panel (TransformPanel), the same model as the Prepare canvas.
+    enum class TransformMode { Select, AlignFace, Move, Rotate, Scale };
+    static bool IsTransformTool(TransformMode m)
+    {
+        return m == TransformMode::Move || m == TransformMode::Rotate ||
+               m == TransformMode::Scale;
+    }
+
+    // ---- Move / Rotate / Scale tool sessions --------------------------------
+    // Same contract as GLCanvas's: snapshot the selected half's pose, re-derive
+    // it from the snapshot for every delta (Xform::ApplyDelta), rotate / scale
+    // about the centre of its world bounding box. Commit keeps, Cancel
+    // restores. In a tool mode a click (no drag) picks the half; a drag orbits.
+    void BeginTransformSession();
+    void SetTransformSessionDelta(const Xform::Delta& d);
+    void CommitTransformSession();
+    void CancelTransformSession();
+    // Esc during a handle drag: undo just that drag (see GLCanvas).
+    bool CancelGizmoDrag();
+    // Unit the Move readout uses (the panel's); set when a tool starts.
+    void SetTransformImperial(bool imperial) { m_xfImperial = imperial; }
+    bool IsTransformSessionActive() const { return m_xfActive; }
+    int  GetSelectionCount() const { return HasSelection() ? 1 : 0; }
+    // Fired when a click in a tool mode (or a re-import) changed the selection;
+    // the session has already been restarted.
+    void SetOnTransformSelectionChanged(std::function<void()> cb) { m_onXformSelection = std::move(cb); }
+    // Current session delta, and a hook fired when a handle drag changes it.
+    const Xform::Delta& GetTransformSessionDelta() const { return m_xfDelta; }
+    void SetOnTransformDeltaChanged(std::function<void()> cb) { m_onXformDelta = std::move(cb); }
+    // The panel overlay (a sibling of this canvas), pinned top-right.
+    void SetTransformPanel(wxWindow* w) { m_transformPanel = w; RepositionTransformPanel(); }
+    void RepositionTransformPanel();
+    // Bottom-centre hint pill (CanvasToast), a sibling raised above this canvas.
+    void SetCanvasToast(wxWindow* w) { m_canvasToast = w; RepositionCanvasToast(); }
+    void RepositionCanvasToast();
 
     void SetTransformMode(TransformMode m);
     TransformMode GetTransformMode() const { return m_transformMode; }
@@ -370,6 +408,62 @@ private:
     enum class Selection { None, A, B };
     Selection     m_selectedHalf = Selection::None;
     TransformMode m_transformMode = TransformMode::Select;
+
+    // Move / Rotate / Scale session (see BeginTransformSession).
+    bool                  m_xfActive = false;
+    Selection             m_xfSlot = Selection::None;   // the half snapshotted
+    Xform::Pose           m_xfSnap;
+    glm::vec3             m_xfPivot{ 0.0f };
+    Xform::Delta          m_xfDelta;
+    wxWindow*             m_transformPanel = nullptr;
+    wxWindow*             m_canvasToast = nullptr;
+    std::function<void()> m_onXformSelection;
+    bool                  m_xfClickPending = false;   // click-vs-drag pick
+    wxPoint               m_xfClickDown;
+    std::function<void()> m_onXformDelta;
+    wxLongLong            m_xfNotifyMs = 0;          // rate limit (NotifyXformDelta)
+    bool                  m_xfNotifyPending = false;
+    void                  NotifyXformDelta(bool force);
+
+    // ---- Drag readout (the value label beside the cursor during a drag) ----
+    bool                 m_xfImperial = false;   // panel's unit, for the readout
+    std::string          m_readoutText;          // text currently uploaded
+    void                 DrawGizmoReadout(const glm::mat4& view, const glm::mat4& proj, int w, int h);
+    wxPoint              m_gizmoDragPos;         // cursor during a handle drag
+    bool                 m_gizmoDragCtrl = false;
+
+    // ---- Nav cube (top-right view cube, NavCube.h) ---------------------------
+    NavCube::Controller  m_navCtl;
+    NavCube::Renderer    m_navCube;
+    bool                 m_navLabelsTried = false;
+    void                 DrawNavCube(int w, int h);
+
+    // On-canvas handles — the same TransformGizmo the Prepare canvas uses.
+    Gizmo::GizmoRenderer  m_gizmo;
+    Gizmo::Handle         m_gizmoHover = Gizmo::Handle::None;
+    Gizmo::MoveDrag       m_gizmoDrag;                // .valid while dragging
+    glm::vec3             m_gizmoStartMove{ 0.0f };
+    Gizmo::RotateDrag     m_gizmoRotDrag;             // .valid while a ring is held
+    glm::vec3             m_gizmoStartRot{ 0.0f };
+    float                 m_gizmoRotShownDeg = 0.0f;
+    Gizmo::ScaleDrag      m_gizmoScaleDrag;           // .valid while a scale handle is held
+    float                 m_gizmoStartScale = 1.0f;
+    float                 m_gizmoScaleShown = 1.0f;
+    bool MoveGizmoShown() const
+    {
+        return m_transformMode == TransformMode::Move && m_xfActive && m_xfSlot != Selection::None;
+    }
+    bool RotateGizmoShown() const
+    {
+        return m_transformMode == TransformMode::Rotate && m_xfActive && m_xfSlot != Selection::None;
+    }
+    bool ScaleGizmoShown() const
+    {
+        return m_transformMode == TransformMode::Scale && m_xfActive && m_xfSlot != Selection::None;
+    }
+    Gizmo::Handle GizmoHitTest(float mx, float my);
+    glm::vec3       GizmoPivot() const { return m_xfPivot + m_xfDelta.move; }
+    Gizmo::Viewport GizmoViewport();
 
     // ---- AlignFace hover state --------------------------------------------
     // Same deferred-cast pattern the main canvas uses: motion events stash

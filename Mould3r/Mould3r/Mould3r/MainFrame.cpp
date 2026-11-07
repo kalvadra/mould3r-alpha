@@ -41,9 +41,13 @@
 #include "AppConfig.h"
 #include "MeshImportSettings.h"
 #include "RoundedButton.h"     // rounded button for sidebar / toolbar action buttons
+#include "DimensionInput.h"    // fractions / expressions / unit suffixes in dimension fields
 #include "SplitButton.h"       // split action+dropdown button for Export mode
 #include "PerspectiveButton.h" // flat tab-style perspective switch
 #include "VentEditToolbar.h"   // Part 5: floating complex-vent-path toolbar
+#include "TransformPanel.h"    // Move / Rotate / Scale live side panel
+#include "ToolPanels.h"       // Place / Pattern cards, same style
+#include "CanvasToast.h"      // bottom-centre viewport hint pill
 #include "SprueEditToolbar.h"  // Edit Sprue floating toolbar
 #include "WindowEffects.h"     // DWM corner rounding for the main frame
 #include "MaterialFile.h"      // Materials menu: library folder location
@@ -116,110 +120,6 @@ static wxBitmapBundle LoadSvgBundle(const wxString& svgPath,
     return wxBitmapBundle::FromSVG(utf8.data(), size);
 }
 
-// ---------------------------------------------------------------------------
-// CanvasToast — a small self-painted hint pill pinned to the bottom-centre of
-// the 3D viewport.
-//
-// Why: a few modes are signalled only by the cursor (PlaceInsert swaps to a
-// hand, meaning "click a body to parent to"), which is easy to miss. This says
-// it in words, without stealing focus or needing to be dismissed.
-//
-// Construction rules match VentEditToolbar: a SIBLING of the canvas raised
-// above it (a true child of a wxGLCanvas can be overdrawn by SwapBuffers), one
-// HWND, no nested native controls, everything painted here. Defined in this
-// .cpp rather than its own file pair so the .vcxproj needs no new entries —
-// same arrangement as InsertEditDialog further down.
-//
-// NOT time-limited: it appears when a mode raises it and goes away when that
-// mode ends. A guidance hint that fades out mid-task is worse than one that
-// stays put, and the mode is the natural lifetime. Swapping in an auto-fade is
-// a wxTimer away if that turns out to be the wrong call.
-//
-// The pill is opaque and does swallow clicks in its own footprint. It sits low
-// and is only as wide as its text, so it rarely covers anything you need to
-// click; if it ever does, WS_EX_TRANSPARENT on the HWND makes it click-through.
-// ---------------------------------------------------------------------------
-static constexpr int kToastH = 38;
-static constexpr int kToastPadX = 20;
-
-class CanvasToast : public wxPanel
-{
-public:
-    explicit CanvasToast(wxWindow* parent);
-
-    // Set the message, resize to fit it, show and raise. Re-showing the message
-    // already on screen is a no-op, so it is safe to call every mode change.
-    // The CALLER re-pins us afterwards (GLCanvas::RepositionCanvasToast) — the
-    // size just changed and the canvas owns the centring.
-    void ShowMessage(const wxString& msg);
-    void HideToast();
-
-private:
-    void OnPaint(wxPaintEvent&);
-    void ApplyPillShape();
-
-    wxString m_msg;
-};
-
-CanvasToast::CanvasToast(wxWindow* parent)
-    : wxPanel(parent, wxID_ANY, wxDefaultPosition, wxSize(200, kToastH),
-        wxBORDER_NONE)
-{
-    SetBackgroundStyle(wxBG_STYLE_PAINT);   // we paint everything ourselves
-    SetBackgroundColour(Style::CardBg);
-    Bind(wxEVT_PAINT, &CanvasToast::OnPaint, this);
-    Hide();   // nothing to say until a mode raises us
-}
-
-// Clip the HWND to a pill so the corners are genuinely cut away and the
-// viewport shows through, rather than the card colour squaring off outside the
-// drawn outline. wxWindow has no SetShape (that is wxNonOwnedWindow, top-level
-// only), so this goes native — same technique as VentEditToolbar. SetWindowRgn
-// takes ownership of the region on success, so it must not be deleted then.
-void CanvasToast::ApplyPillShape()
-{
-#ifdef __WXMSW__
-    HWND hwnd = (HWND)GetHWND();
-    if (!hwnd) return;
-
-    const wxSize sz = GetSize();
-    if (sz.x <= 0 || sz.y <= 0) return;
-
-    // +1 because CreateRoundRectRgn treats right/bottom as exclusive; without
-    // it the region shaves the last row and column and eats the 1px border.
-    HRGN rgn = ::CreateRoundRectRgn(0, 0, sz.x + 1, sz.y + 1, sz.y, sz.y);
-    if (!rgn) return;
-
-    if (!::SetWindowRgn(hwnd, rgn, TRUE))
-        ::DeleteObject(rgn);
-#endif
-}
-
-void CanvasToast::ShowMessage(const wxString& msg)
-{
-    if (IsShown() && msg == m_msg) return;
-    m_msg = msg;
-
-    // Size to the text. wxClientDC measures with this window's font, which is
-    // the same one OnPaint draws with.
-    int tw = 0, th = 0;
-    {
-        wxClientDC dc(this);
-        dc.SetFont(GetFont());
-        dc.GetTextExtent(m_msg, &tw, &th);
-    }
-    SetSize(tw + kToastPadX * 2, kToastH);
-    ApplyPillShape();   // re-clip: the width just changed
-
-    if (!IsShown()) Show();
-    Raise();            // keep above the GL surface
-    Refresh(false);
-}
-
-void CanvasToast::HideToast()
-{
-    if (IsShown()) Hide();
-}
 
 // ---------------------------------------------------------------------------
 // UpdateBanner — the U4 non-modal "an update is available" card, pinned to
@@ -412,30 +312,6 @@ void UpdateBanner::OnMouse(wxMouseEvent& e)
     }
 }
 
-void CanvasToast::OnPaint(wxPaintEvent&)
-{
-    wxAutoBufferedPaintDC dc(this);
-    dc.SetBackground(wxBrush(Style::CardBg));
-    dc.Clear();
-
-    wxGraphicsContext* gc = wxGraphicsContext::Create(dc);
-    if (!gc) return;
-    gc->SetAntialiasMode(wxANTIALIAS_DEFAULT);
-
-    const wxSize sz = GetClientSize();
-    const double radius = (sz.y - 1.0) / 2.0;   // full pill
-
-    gc->SetBrush(wxBrush(Style::CardBg));
-    gc->SetPen(wxPen(Style::Divider, 1));
-    gc->DrawRoundedRectangle(0.5, 0.5, sz.x - 1.0, sz.y - 1.0, radius);
-
-    gc->SetFont(GetFont(), Style::TextPrimary);
-    double tw, th;
-    gc->GetTextExtent(m_msg, &tw, &th);
-    gc->DrawText(m_msg, (sz.x - tw) / 2.0, (sz.y - th) / 2.0);
-
-    delete gc;
-}
 
 // ---------------------------------------------------------------------------
 // Drag-and-drop target for the 3D viewport.
@@ -675,6 +551,59 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
         }
     });
     m_canvas->SetPathToolbar(m_ventEditToolbar);
+
+    // ---- Move / Rotate / Scale side panel ------------------------------------
+    // Same sibling-of-the-canvas overlay as the vent toolbar, pinned to the
+    // viewport's top-right corner while a transform tool is active.
+    // Enter in a sidebar / card field commits it and hands the keyboard back
+    // to the 3D view (DimensionInput).
+    DimInput::SetEnterFocusTarget(this, m_canvas);
+
+    m_transformPanel = new TransformPanel(m_preparePage);
+    m_transformPanel->SetOnChange([this](const Xform::Delta& d) {
+        if (m_canvas) m_canvas->SetTransformSessionDelta(d);
+    });
+    m_transformPanel->SetOnOk([this]() { CommitTransformTool(); });
+    m_transformPanel->SetOnCancel([this]() { CancelTransformTool(); });
+    m_canvas->SetTransformPanel(m_transformPanel);
+
+    // Place / Pattern cards: same look, same top-right slot.
+    m_placePanel = new PlacePanel(m_preparePage);
+    m_placePanel->SetOnChange([this](double xMM, double zMM) {
+        if (!m_canvas) return;
+        // The session snapshot is where the selection was when Place began;
+        // the typed point is absolute, so the move is the difference.
+        Xform::Delta d;
+        d.move = glm::vec3(float(xMM - m_placeOriginX), 0.0f, float(zMM - m_placeOriginZ));
+        m_canvas->SetTransformSessionDelta(d);
+    });
+    m_placePanel->SetOnOk([this]() { CommitTransformTool(); });
+    m_placePanel->SetOnCancel([this]() { CancelTransformTool(); });
+    m_canvas->AddPinnedPanel(m_placePanel);
+
+    m_patternPanel = new PatternPanel(m_preparePage);
+    m_patternPanel->SetOnOk([this]() { CommitTransformTool(); });   // applies the pattern
+    m_patternPanel->SetOnCancel([this]() { CancelTransformTool(); });
+    m_canvas->AddPinnedPanel(m_patternPanel);
+
+    m_canvas->SetOnTransformSelectionChanged([this]() {
+        if (!m_canvas) return;
+        const TransformMode mode = m_canvas->GetTransformMode();
+        if (mode == TransformMode::Place)
+            ResetPlacePanel();   // the session restarted on the new selection
+        else if (mode == TransformMode::Pattern)
+        {
+            if (m_patternPanel) m_patternPanel->SetSelectionCount(m_canvas->GetSelectionCount());
+        }
+        else if (m_transformPanel)
+            m_transformPanel->SetSelectionCount(m_canvas->GetSelectionCount());
+        m_canvas->RepositionTransformPanel();
+    });
+    // A handle drag on the canvas writes its delta back into the panel fields.
+    m_canvas->SetOnTransformDeltaChanged([this]() {
+        if (m_transformPanel && m_canvas)
+            m_transformPanel->SetDelta(m_canvas->GetTransformSessionDelta());
+    });
 
     // ---- Edit Sprue floating toolbar ---------------------------------------
     // Same sibling-of-the-canvas arrangement as the vent toolbar; the two never
@@ -951,6 +880,9 @@ public:
             grid->Add(ctrl, 0, wxALIGN_CENTER_VERTICAL);
             auto* us = new wxStaticText(this, wxID_ANY, unitSuffix);
             m_unitLabels.push_back(us);
+            // mm^3 / mm^2 / ratio: no length suffix applies, but fractions
+            // and expressions do.
+            DimInput::Attach(ctrl, DimInput::Unit::None);
             grid->Add(us, 0, wxALIGN_CENTER_VERTICAL);
         };
         addRow("Minimum region volume:", m_ctrlVol,  m_volMM3 / VolFactor(),  u + "^3");
@@ -967,7 +899,7 @@ public:
     double GetSignificanceRatio() const
     {
         double v;
-        if (m_ctrlRatio->GetValue().ToCDouble(&v))
+        if (DimInput::Read(m_ctrlRatio, v))
         {
             if (v < 0.0) v = 0.0;
             if (v > 1.0) v = 1.0;
@@ -992,7 +924,7 @@ private:
     double ParseVal(wxTextCtrl* ctrl, double fallbackMM, double factor) const
     {
         double v;
-        if (ctrl->GetValue().ToCDouble(&v))
+        if (DimInput::Read(ctrl, v))
         {
             if (v < 0.0) v = 0.0;
             return v * factor;
@@ -1304,6 +1236,9 @@ wxMenuBar* MainFrame::BuildCastingMenuBar()
 // ---------------------------------------------------------------------------
 void MainFrame::SetPerspective(Perspective which)
 {
+    // Leaving Prepare with a Move / Rotate / Scale tool open keeps its change.
+    if (which != Perspective::Prepare && m_canvas && m_canvas->IsTransformSessionActive())
+        CommitTransformTool();
     m_perspective = which;
 
     // Book page index per perspective: Prepare = 0, Preview = 1, Casting = 2.
@@ -1638,6 +1573,14 @@ wxPanel* MainFrame::CreateSidePanel(wxWindow* parent)
 // ---------------------------------------------------------------------------
 void MainFrame::SetActiveTool(TransformMode mode)
 {
+    // Leaving a Move / Rotate / Scale tool any other way than its own OK /
+    // Cancel (another ribbon tool, a perspective change, a canvas-internal
+    // transition) keeps what it did.
+    if (m_canvas && m_canvas->IsTransformSessionActive() &&
+        mode != m_canvas->GetTransformMode())
+        m_canvas->CommitTransformSession();
+    ShowToolPanelFor(mode);   // hide every card but this tool's
+
     // Map TransformMode -> the command ID of the toggle button that should
     // appear active. Modes without an associated toggle button (Select,
     // Center, Remove*, Edit*, ...) yield -1, which clears all buttons.
@@ -1648,6 +1591,7 @@ void MainFrame::SetActiveTool(TransformMode mode)
     case TransformMode::Rotate:        activeId = ID_ToolRotate;        break;
     case TransformMode::Scale:         activeId = ID_ToolScale;         break;
     case TransformMode::Pattern:       activeId = ID_ToolPattern;       break;
+    case TransformMode::Place:         activeId = ID_ToolPrecisionPlace; break;
     case TransformMode::PlaceVent:     activeId = ID_ToolPlaceVent;     break;
     case TransformMode::PlaceRunner:   activeId = ID_PlaceRunner;       break;
     case TransformMode::PlaceGate:     activeId = ID_PlaceGate;         break;
@@ -1683,6 +1627,10 @@ void MainFrame::UpdateCanvasToast(TransformMode mode)
 
     if (mode == TransformMode::PlaceInsert)
         m_canvasToast->ShowMessage("Select body to add insert to");
+    else if (mode == TransformMode::AlignFace)
+        m_canvasToast->ShowMessage("Select face to align with the parting plane.");
+    else if (mode == TransformMode::AlignMidplane)
+        m_canvasToast->ShowMessage("Select two faces to align the midplane with the parting plane.");
     else
         m_canvasToast->HideToast();
 
@@ -1696,134 +1644,149 @@ void MainFrame::UpdateCanvasToast(TransformMode mode)
 
 void MainFrame::OnToolSelect(wxCommandEvent&) { SetActiveTool(TransformMode::Select); }
 
-void MainFrame::OnToolTranslate(wxCommandEvent&)
+// Move / Rotate / Scale are tool modes with the live side panel (they used to
+// open the modal Translate / Rotate / Scale dialogs). See StartTransformTool.
+void MainFrame::OnToolTranslate(wxCommandEvent&) { StartTransformTool(TransformMode::Translate); }
+void MainFrame::OnToolRotate(wxCommandEvent&)    { StartTransformTool(TransformMode::Rotate); }
+void MainFrame::OnToolScale(wxCommandEvent&)     { StartTransformTool(TransformMode::Scale); }
+
+void MainFrame::StartTransformTool(TransformMode mode)
 {
-    SetActiveTool(TransformMode::Select);
+    if (!m_canvas || !m_transformPanel) return;
 
-    if (!m_canvas) return;
-
-    TranslateDialog dlg(this);
-    if (dlg.ShowModal() != wxID_OK)
-        return;
-
-    if (!m_canvas->HasSelection())
+    // The latched tool's button again = OK (a toggle switching itself off).
+    if (m_canvas->GetTransformMode() == mode && m_canvas->IsTransformSessionActive())
     {
+        CommitTransformTool();
         return;
     }
 
-    const TranslateValues v = dlg.GetValues();
-    m_canvas->ApplyTranslation(v.x, v.y, v.z);
+    SetActiveTool(mode);   // commits any other tool's session, latches the button
+    m_canvas->BeginTransformSession();
+
+    const Xform::Tool tool = mode == TransformMode::Rotate ? Xform::Tool::Rotate
+                           : mode == TransformMode::Scale  ? Xform::Tool::Scale
+                                                           : Xform::Tool::Move;
+    m_canvas->SetTransformImperial(m_imperial);   // the drag readout's unit
+    m_transformPanel->Begin(tool, m_imperial, m_canvas->GetSelectionCount());
+    m_canvas->RepositionTransformPanel();
+    m_transformPanel->Show();
+    m_transformPanel->Raise();   // keep above the GL surface
 }
 
-void MainFrame::OnToolRotate(wxCommandEvent&)
+void MainFrame::CommitTransformTool()
 {
-    // Keep the button in its previous visual state — it's a dialog, not a mode toggle
-    SetActiveTool(TransformMode::Select);
-
-    if (!m_canvas) return;
-
-    RotateDialog dlg(this);
-    if (dlg.ShowModal() != wxID_OK)
-        return;
-
-    if (!m_canvas->HasSelection())
+    // Pattern has no live session: OK is where its copies are made.
+    if (m_canvas && m_patternPanel && m_canvas->GetTransformMode() == TransformMode::Pattern &&
+        m_canvas->HasSelection())
     {
-        return;
+        const PatternValues v = m_patternPanel->GetValues();
+        if (v.type == PatternValues::Type::Circular)
+            m_canvas->ApplyCircularPattern(v.number, v.overrideRadius, v.radius, v.rotateCopies);
+        else
+            m_canvas->ApplyGridPattern(v.numberH, v.numberV, v.mirrorH, v.mirrorV,
+                v.overrideLengthWidth, v.length, v.width);
     }
-
-    const RotateValues v = dlg.GetValues();
-    m_canvas->ApplyRotation(v.x, v.y, v.z);
+    if (m_canvas) m_canvas->CommitTransformSession();
+    SetActiveTool(TransformMode::Select);
+    if (m_canvas) m_canvas->SetFocus();   // keyboard back to the viewport
 }
 
-void MainFrame::OnToolScale(wxCommandEvent&)
+void MainFrame::CancelTransformTool()
 {
+    // Esc / Cancel during a handle drag undoes just that drag; the tool stays.
+    if (m_canvas && m_canvas->CancelGizmoDrag()) return;
+    if (m_canvas) m_canvas->CancelTransformSession();
     SetActiveTool(TransformMode::Select);
-
-    if (!m_canvas) return;
-
-    ScaleDialog dlg(this);
-    if (dlg.ShowModal() != wxID_OK)
-        return;
-
-    if (!m_canvas->HasSelection())
-    {
-        return;
-    }
-
-    const ScaleValues v = dlg.GetValues();
-    m_canvas->ApplyScale(v.uniform);
+    if (m_canvas) m_canvas->SetFocus();
 }
 
 // ---------------------------------------------------------------------------
-// Pattern — opens the PatternDialog. UI scaffolding only for now; the
-// canvas-side pattern application will be wired up in a follow-up change.
+// ShowToolPanelFor — exactly one top-right card per tool: Move / Rotate /
+// Scale share the TransformPanel, Place and Pattern have their own. Every
+// other mode hides them all. (Showing is left to the Start* functions, once
+// the card's contents are ready.)
+// ---------------------------------------------------------------------------
+void MainFrame::ShowToolPanelFor(TransformMode mode)
+{
+    const bool xform = mode == TransformMode::Translate || mode == TransformMode::Rotate ||
+                       mode == TransformMode::Scale;
+    if (m_transformPanel && !xform && m_transformPanel->IsShown()) m_transformPanel->Hide();
+    if (m_placePanel && mode != TransformMode::Place && m_placePanel->IsShown()) m_placePanel->Hide();
+    if (m_patternPanel && mode != TransformMode::Pattern && m_patternPanel->IsShown()) m_patternPanel->Hide();
+}
+
+// ---------------------------------------------------------------------------
+// Pattern — the card in the top-right slot (was the modal PatternDialog). The
+// options persist between uses; OK makes the copies (CommitTransformTool),
+// Cancel / Esc closes. Pressing the latched button again closes it too.
 // ---------------------------------------------------------------------------
 void MainFrame::OnToolPattern(wxCommandEvent&)
 {
-    // Dialog tool, not a placement-mode toggle — clear any active toggle so
-    // the button doesn't appear stuck on after the dialog closes (matches the
-    // Translate/Rotate/Scale convention).
-    SetActiveTool(TransformMode::Select);
+    StartPatternTool();
+}
 
-    if (!m_canvas) return;
-
-    PatternDialog dlg(this);
-    if (dlg.ShowModal() != wxID_OK)
-        return;
-
-    if (!m_canvas->HasSelection())
-        return;
-
-    const PatternValues v = dlg.GetValues();
-
-    switch (v.type)
+void MainFrame::StartPatternTool()
+{
+    if (!m_canvas || !m_patternPanel) return;
+    if (m_canvas->GetTransformMode() == TransformMode::Pattern)
     {
-    case PatternValues::Type::Circular:
-        m_canvas->ApplyCircularPattern(v.number, v.overrideRadius, v.radius,
-            v.rotateCopies);
-        break;
-
-    case PatternValues::Type::Grid:
-        m_canvas->ApplyGridPattern(v.numberH, v.numberV,
-            v.mirrorH, v.mirrorV,
-            v.overrideLengthWidth, v.length, v.width);
-        break;
+        CancelTransformTool();
+        return;
     }
+    SetActiveTool(TransformMode::Pattern);   // commits any other tool, latches the button
+    m_patternPanel->Begin(m_imperial, m_canvas->GetSelectionCount());
+    m_canvas->RepositionTransformPanel();
+    m_patternPanel->Show();
+    m_patternPanel->Raise();   // keep above the GL surface
 }
 
 // ---------------------------------------------------------------------------
-// Precision Place — opens a dialog for an absolute XZ target and moves the
-// selection there. A dialog tool (not a placement-mode toggle), so the button
-// clears its toggle the moment the dialog opens, matching Translate/Rotate/
-// Scale/Pattern. Also reachable by double-clicking a body on the canvas.
+// Place — absolute X / Z for the selection's centre (the average of the
+// selected bodies' origins), in the top-right card (was the modal
+// PrecisionPlaceDialog). A live tool session like Move: the selection follows
+// the typed point, OK keeps it (one undo step), Cancel puts it back. Also
+// reached by double-clicking a body.
 // ---------------------------------------------------------------------------
 void MainFrame::OnToolPrecisionPlace(wxCommandEvent&)
 {
-    SetActiveTool(TransformMode::Select);
-    PrecisionPlaceSelected();
+    StartPlaceTool();
 }
 
 void MainFrame::PrecisionPlaceSelected()
 {
-    if (!m_canvas) return;
+    StartPlaceTool();
+}
 
-    // Pre-fill the dialog with the selection's current XZ so the fields show
-    // where the object is now. Falls back to (0, 0) when nothing is selected
-    // (e.g. the button was pressed with an empty selection); the post-OK
-    // HasSelection guard then makes the dialog a no-op, matching the other
-    // transform tools.
-    float curX = 0.0f, curZ = 0.0f;
-    m_canvas->GetSelectionCenterXZ(curX, curZ);
+void MainFrame::StartPlaceTool()
+{
+    if (!m_canvas || !m_placePanel) return;
 
-    PrecisionPlaceDialog dlg(this, curX, curZ);
-    if (dlg.ShowModal() != wxID_OK)
+    // The latched button again = OK, as for Move / Rotate / Scale.
+    if (m_canvas->GetTransformMode() == TransformMode::Place && m_canvas->IsTransformSessionActive())
+    {
+        CommitTransformTool();
         return;
+    }
+    SetActiveTool(TransformMode::Place);
+    m_canvas->BeginTransformSession();
+    m_canvas->SetTransformImperial(m_imperial);
+    ResetPlacePanel();
+    m_canvas->RepositionTransformPanel();
+    m_placePanel->Show();
+    m_placePanel->Raise();
+}
 
-    if (!m_canvas->HasSelection())
-        return;
-
-    const PrecisionPlaceValues v = dlg.GetValues();
-    m_canvas->MoveSelectionToXZ(v.x, v.z);
+// Fill the Place card from the selection as it stands (the session has just
+// been started or restarted on it).
+void MainFrame::ResetPlacePanel()
+{
+    if (!m_canvas || !m_placePanel) return;
+    float cx = 0.0f, cz = 0.0f;
+    m_canvas->GetSelectionCenterXZ(cx, cz);   // stays (0, 0) with nothing selected
+    m_placeOriginX = cx;
+    m_placeOriginZ = cz;
+    m_placePanel->Begin(m_imperial, m_canvas->GetSelectionCount(), cx, cz);
 }
 
 // ---------------------------------------------------------------------------
@@ -2603,22 +2566,10 @@ void MainFrame::OnSetMetric(wxCommandEvent&)
 {
     if (!m_imperial) return;   // already metric
 
-    // Convert all mm-based field values: displayed inches → mm
-    wxTextCtrl* mmFields[] = {
-        m_ventLength, m_ventWidth, m_ventOverrunStart, m_ventOverrunEnd,
-        m_sprueDiameter, m_sprueColdSlugDepth, m_sprueLength, m_sprueOverrun,
-        m_runnerDiameter, m_runnerColdSlugDepth,
-        m_gateDiameter, m_subRunnerDiameter,
-        m_gateOverrun, m_gateWidth, m_gateHeight, m_gateLength,
-        m_runnerWidth, m_runnerHeight, m_subRunnerWidth, m_subRunnerHeight
-    };
-    for (auto* ctrl : mmFields)
-    {
-        if (!ctrl) continue;
-        double v = 0.0;
-        if (ctrl->GetValue().ToDouble(&v))
-            ctrl->SetValue(wxString::Format("%.4g", v * 25.4));
-    }
+    // Convert every length field on this window: displayed inches -> mm.
+    // (Every field attached to an "mm"/"in" unit label, so the ejector and
+    // indexer fields are converted too -- the old hand-kept list missed them.)
+    DimInput::ConvertLengths(this, DimInput::Unit::Inch, DimInput::Unit::MM);
 
     // Update labels
     for (auto* lbl : m_mmUnitLabels)
@@ -2631,22 +2582,8 @@ void MainFrame::OnSetImperial(wxCommandEvent&)
 {
     if (m_imperial) return;   // already imperial
 
-    // Convert all mm-based field values: displayed mm → inches
-    wxTextCtrl* mmFields[] = {
-        m_ventLength, m_ventWidth, m_ventOverrunStart, m_ventOverrunEnd,
-        m_sprueDiameter, m_sprueColdSlugDepth, m_sprueLength, m_sprueOverrun,
-        m_runnerDiameter, m_runnerColdSlugDepth,
-        m_gateDiameter, m_subRunnerDiameter,
-        m_gateOverrun, m_gateWidth, m_gateHeight, m_gateLength,
-        m_runnerWidth, m_runnerHeight, m_subRunnerWidth, m_subRunnerHeight
-    };
-    for (auto* ctrl : mmFields)
-    {
-        if (!ctrl) continue;
-        double v = 0.0;
-        if (ctrl->GetValue().ToDouble(&v))
-            ctrl->SetValue(wxString::Format("%.4g", v / 25.4));
-    }
+    // Convert every length field on this window: displayed mm -> inches.
+    DimInput::ConvertLengths(this, DimInput::Unit::MM, DimInput::Unit::Inch);
 
     // Update labels
     for (auto* lbl : m_mmUnitLabels)
@@ -2701,7 +2638,7 @@ void MainFrame::GetVentDimensions(float& outLength, float& outWidth,
     {
         if (!ctrl) return defaultVal;
         double v = defaultVal;
-        if (!ctrl->GetValue().ToDouble(&v)) return defaultVal;
+        if (!DimInput::Read(ctrl, v)) return defaultVal;
         return (v > 0.0) ? static_cast<float>(v) : defaultVal;
     };
 
@@ -2716,7 +2653,7 @@ float MainFrame::GetSprueDiameter() const
 {
     if (!m_sprueDiameter) return 5.0f;
     double v = 5.0;
-    if (!m_sprueDiameter->GetValue().ToDouble(&v)) return 5.0f;
+    if (!DimInput::Read(m_sprueDiameter, v)) return 5.0f;
     if (v <= 0.0) v = 5.0;
     return static_cast<float>(v) * (m_imperial ? 25.4f : 1.0f);
 }
@@ -2725,7 +2662,7 @@ float MainFrame::GetSprueDraftAngle() const
 {
     if (!m_sprueDraftAngle) return 1.0f;
     double v = 1.0;
-    if (!m_sprueDraftAngle->GetValue().ToDouble(&v)) return 1.0f;
+    if (!DimInput::Read(m_sprueDraftAngle, v)) return 1.0f;
     if (v < 0.0) v = 0.0;
     if (v > 45.0) v = 45.0;
     return static_cast<float>(v);   // degrees — no unit conversion
@@ -2735,7 +2672,7 @@ float MainFrame::GetSprueColdSlugDepth() const
 {
     if (!m_sprueColdSlugDepth) return 5.0f;
     double v = 5.0;
-    if (!m_sprueColdSlugDepth->GetValue().ToDouble(&v)) return 5.0f;
+    if (!DimInput::Read(m_sprueColdSlugDepth, v)) return 5.0f;
     if (v < 0.0) v = 0.0;
     return static_cast<float>(v) * (m_imperial ? 25.4f : 1.0f);
 }
@@ -2744,7 +2681,7 @@ float MainFrame::GetSprueLength() const
 {
     if (!m_sprueLength) return 20.0f;
     double v = 20.0;
-    if (!m_sprueLength->GetValue().ToDouble(&v)) return 20.0f;
+    if (!DimInput::Read(m_sprueLength, v)) return 20.0f;
     if (v <= 0.0) v = 20.0;
     return static_cast<float>(v) * (m_imperial ? 25.4f : 1.0f);
 }
@@ -2755,7 +2692,7 @@ float MainFrame::GetSprueOverrun() const
     // clamp to 0. Read and converted like the other length fields.
     if (!m_sprueOverrun) return 0.0f;
     double v = 0.0;
-    if (!m_sprueOverrun->GetValue().ToDouble(&v)) return 0.0f;
+    if (!DimInput::Read(m_sprueOverrun, v)) return 0.0f;
     if (v < 0.0) v = 0.0;
     return static_cast<float>(v) * (m_imperial ? 25.4f : 1.0f);
 }
@@ -2764,7 +2701,7 @@ float MainFrame::GetRunnerDiameter() const
 {
     if (!m_runnerDiameter) return 5.0f;
     double v = 5.0;
-    if (!m_runnerDiameter->GetValue().ToDouble(&v)) return 5.0f;
+    if (!DimInput::Read(m_runnerDiameter, v)) return 5.0f;
     if (v <= 0.0) v = 5.0;
     return static_cast<float>(v) * (m_imperial ? 25.4f : 1.0f);
 }
@@ -2773,7 +2710,7 @@ float MainFrame::GetRunnerColdPlugDist() const
 {
     if (!m_runnerColdSlugDepth) return 5.0f;
     double v = 5.0;
-    if (!m_runnerColdSlugDepth->GetValue().ToDouble(&v)) return 5.0f;
+    if (!DimInput::Read(m_runnerColdSlugDepth, v)) return 5.0f;
     if (v < 0.0) v = 0.0;
     return static_cast<float>(v) * (m_imperial ? 25.4f : 1.0f);
 }
@@ -2782,7 +2719,7 @@ float MainFrame::GetGateDiameter() const
 {
     if (!m_gateDiameter) return 3.0f;
     double v = 3.0;
-    if (!m_gateDiameter->GetValue().ToDouble(&v)) return 3.0f;
+    if (!DimInput::Read(m_gateDiameter, v)) return 3.0f;
     if (v < 0.0) v = 0.0;
     return static_cast<float>(v) * (m_imperial ? 25.4f : 1.0f);
 }
@@ -2791,7 +2728,7 @@ float MainFrame::GetGateDraftAngle() const
 {
     if (!m_gateDraftAngle) return 1.0f;
     double v = 1.0;
-    if (!m_gateDraftAngle->GetValue().ToDouble(&v)) return 1.0f;
+    if (!DimInput::Read(m_gateDraftAngle, v)) return 1.0f;
     if (v < 0.0) v = 0.0;
     return static_cast<float>(v);   // degrees — no unit conversion
 }
@@ -2806,7 +2743,7 @@ float MainFrame::GetGateOverrun() const
 {
     if (!m_gateOverrun) return 0.0f;
     double v = 0.0;
-    if (!m_gateOverrun->GetValue().ToDouble(&v)) return 0.0f;
+    if (!DimInput::Read(m_gateOverrun, v)) return 0.0f;
     if (v < 0.0) v = 0.0;
     return static_cast<float>(v) * (m_imperial ? 25.4f : 1.0f);
 }
@@ -2824,7 +2761,7 @@ static float ReadGateLenField(const wxTextCtrl* ctrl, double def, bool imperial)
 {
     if (!ctrl) return static_cast<float>(def);
     double v = def;
-    if (!ctrl->GetValue().ToDouble(&v)) return static_cast<float>(def);
+    if (!DimInput::Read(ctrl, v)) return static_cast<float>(def);
     if (v < 0.0) v = 0.0;
     return static_cast<float>(v) * (imperial ? 25.4f : 1.0f);
 }
@@ -2839,7 +2776,7 @@ float MainFrame::GetGateTaperAngle() const
 {
     if (!m_gateTaperAngle) return 15.0f;
     double v = 15.0;
-    if (!m_gateTaperAngle->GetValue().ToDouble(&v)) return 15.0f;
+    if (!DimInput::Read(m_gateTaperAngle, v)) return 15.0f;
     v = std::clamp(v, 0.0, 80.0);
     return static_cast<float>(v);   // degrees — no unit conversion
 }
@@ -2899,7 +2836,7 @@ float MainFrame::GetSubRunnerDiameter() const
 {
     if (!m_subRunnerDiameter) return 5.0f;
     double v = 5.0;
-    if (!m_subRunnerDiameter->GetValue().ToDouble(&v)) return 5.0f;
+    if (!DimInput::Read(m_subRunnerDiameter, v)) return 5.0f;
     if (v <= 0.0) v = 5.0;
     return static_cast<float>(v) * (m_imperial ? 25.4f : 1.0f);
 }
@@ -2915,14 +2852,14 @@ namespace
     {
         if (!ctrl) return def;
         double v = def;
-        if (!ctrl->GetValue().ToDouble(&v) || v <= 0.0) return def;
+        if (!DimInput::Read(ctrl, v) || v <= 0.0) return def;
         return static_cast<float>(v) * (imperial ? 25.4f : 1.0f);
     }
     float ReadDraftDeg(const wxTextCtrl* ctrl)
     {
         if (!ctrl) return kChannelDefaultDraftDeg;
         double v = kChannelDefaultDraftDeg;
-        if (!ctrl->GetValue().ToDouble(&v)) return kChannelDefaultDraftDeg;
+        if (!DimInput::Read(ctrl, v)) return kChannelDefaultDraftDeg;
         return static_cast<float>(std::clamp(v, 0.0, 60.0));   // degrees
     }
     GateSide ReadChannelSide(const wxChoice* ch)
@@ -3023,7 +2960,7 @@ float MainFrame::GetEjectorDiameter() const
 {
     if (!m_ejectorDiameter) return 3.0f;
     double v = 3.0;
-    if (!m_ejectorDiameter->GetValue().ToDouble(&v)) return 3.0f;
+    if (!DimInput::Read(m_ejectorDiameter, v)) return 3.0f;
     if (v <= 0.0) v = 3.0;
     return static_cast<float>(v) * (m_imperial ? 25.4f : 1.0f);
 }
@@ -3032,7 +2969,7 @@ float MainFrame::GetEjectorLength() const
 {
     if (!m_ejectorLength) return 25.0f;
     double v = 25.0;
-    if (!m_ejectorLength->GetValue().ToDouble(&v)) return 25.0f;
+    if (!DimInput::Read(m_ejectorLength, v)) return 25.0f;
     if (v <= 0.0) v = 25.0;
     return static_cast<float>(v) * (m_imperial ? 25.4f : 1.0f);
 }
@@ -3043,7 +2980,7 @@ float MainFrame::GetIndexerRadius() const
 {
     if (!m_indexerRadius) return 3.0f;
     double v = 3.0;
-    if (!m_indexerRadius->GetValue().ToDouble(&v)) return 3.0f;
+    if (!DimInput::Read(m_indexerRadius, v)) return 3.0f;
     if (v <= 0.0) v = 3.0;
     return static_cast<float>(v) * (m_imperial ? 25.4f : 1.0f);
 }
@@ -3056,7 +2993,7 @@ float MainFrame::GetIndexerExtraTolerance() const
 {
     if (!m_indexerExtraTolerance) return 0.1f;
     double v = 0.1;
-    if (!m_indexerExtraTolerance->GetValue().ToDouble(&v)) return 0.1f;
+    if (!DimInput::Read(m_indexerExtraTolerance, v)) return 0.1f;
     if (v < 0.0) v = 0.0;
     return static_cast<float>(v) * (m_imperial ? 25.4f : 1.0f);
 }
@@ -3070,7 +3007,7 @@ float MainFrame::GetInsertCutScale() const
 {
     if (!m_insertCutScale) return 1.0f;
     double v = 100.0;
-    if (!m_insertCutScale->GetValue().ToDouble(&v)) return 1.0f;
+    if (!DimInput::Read(m_insertCutScale, v)) return 1.0f;
     if (v <= 0.0) v = 100.0;
     return static_cast<float>(v * 0.01);
 }
@@ -3370,6 +3307,10 @@ bool MainFrame::HistoryQuiet() const
     // once it closes.
     if (!IsEnabled())
         return false;
+    // An open Move / Rotate / Scale session is previewing live; it becomes one
+    // step when it is committed (or nothing, if cancelled).
+    if (m_canvas->IsTransformSessionActive())
+        return false;
     // Mid-gesture: a drag is in progress, or the canvas has a drag position
     // the paint pass hasn't applied yet.
     const wxMouseState ms = wxGetMouseState();
@@ -3498,6 +3439,12 @@ void MainFrame::OnUndo(wxCommandEvent&)
     if (wxTextEntry* text = FocusedTextEntry(); text && text->CanUndo())
     {
         text->Undo();
+        return;
+    }
+    // Undo during a Move / Rotate / Scale session takes back the session.
+    if (m_canvas && m_canvas->IsTransformSessionActive())
+    {
+        CancelTransformTool();
         return;
     }
     if (m_perspective != Perspective::Prepare || !HistoryQuiet())
@@ -4597,6 +4544,8 @@ void MainFrame::DoExportMouldCasts()
 void MainFrame::OnGenerateMould(wxCommandEvent&)
 {
     if (!m_canvas) return;
+    // Generate cuts what is on screen; keep an open Move / Rotate / Scale.
+    if (m_canvas->IsTransformSessionActive()) CommitTransformTool();
     // GenerateMould returns true only when both up-front validations
     // (fixtures loaded, objects to subtract) pass and the build pipeline
     // ran to its natural end. Failure leaves the previous mould state
@@ -4895,6 +4844,7 @@ wxPanel* MainFrame::CreateVentsContent(wxWindow* parent)
         ctrl->SetForegroundColour(kTextDefault);
         auto* unit = new wxStaticText(m_ventDimsPanel, wxID_ANY, "mm");
         m_mmUnitLabels.push_back(unit);
+        DimInput::Attach(ctrl, unit);
         unit->SetForegroundColour(Style::TextSubtle);
         unit->SetFont(wxFont(Style::Ui(8), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
             wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
@@ -5045,6 +4995,7 @@ wxPanel* MainFrame::CreateSpruesContent(wxWindow* parent)
         ctrl->SetBackgroundColour(Style::BtnSmall); ctrl->SetForegroundColour(kTextDefault);
         auto* u = new wxStaticText(dimsPanel, wxID_ANY, unitStr);
         if (unitStr == "mm") m_mmUnitLabels.push_back(u);
+        DimInput::Attach(ctrl, u);
         u->SetForegroundColour(Style::TextSubtle);
         u->SetFont(wxFont(Style::Ui(8), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
         u->SetMinSize(wxSize(kUnitWidth, -1));
@@ -5217,6 +5168,7 @@ wxPanel* MainFrame::CreateRunnersContent(wxWindow* parent)
         ctrl->SetForegroundColour(kTextDefault);
         auto* unit = new wxStaticText(parent_, wxID_ANY, unitStr);
         if (unitStr == "mm") m_mmUnitLabels.push_back(unit);
+        DimInput::Attach(ctrl, unit);
         unit->SetForegroundColour(Style::TextSubtle);
         unit->SetFont(wxFont(Style::Ui(8), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
             wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
@@ -5269,6 +5221,7 @@ wxPanel* MainFrame::CreateRunnersContent(wxWindow* parent)
 
         auto* unit = new wxStaticText(dimsPanel, wxID_ANY, "mm");
         m_mmUnitLabels.push_back(unit);
+        DimInput::Attach(m_runnerColdSlugDepth, unit);
         unit->SetForegroundColour(Style::TextSubtle);
         unit->SetFont(wxFont(Style::Ui(8), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
             wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
@@ -5396,6 +5349,7 @@ wxPanel* MainFrame::CreateGatesContent(wxWindow* parent)
         ctrl->SetBackgroundColour(Style::BtnSmall); ctrl->SetForegroundColour(kTextDefault);
         auto* u = new wxStaticText(parent_, wxID_ANY, unitStr);
         if (unitStr == "mm") m_mmUnitLabels.push_back(u);
+        DimInput::Attach(ctrl, u);
         u->SetForegroundColour(Style::TextSubtle);
         u->SetFont(wxFont(Style::Ui(8), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
         u->SetMinSize(wxSize(kUnitWidth, -1));
@@ -5694,6 +5648,7 @@ wxPanel* MainFrame::CreateEjectorsContent(wxWindow* parent)
         ctrl->SetBackgroundColour(Style::BtnSmall); ctrl->SetForegroundColour(kTextDefault);
         auto* u = new wxStaticText(parent_, wxID_ANY, unitStr);
         if (unitStr == "mm") m_mmUnitLabels.push_back(u);
+        DimInput::Attach(ctrl, u);
         u->SetForegroundColour(Style::TextSubtle);
         u->SetFont(wxFont(Style::Ui(8), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
         u->SetMinSize(wxSize(kUnitWidth, -1));
@@ -5858,6 +5813,7 @@ wxPanel* MainFrame::CreateInsertsContent(wxWindow* parent)
         ctrl->SetBackgroundColour(Style::BtnSmall); ctrl->SetForegroundColour(kTextDefault);
         auto* u = new wxStaticText(parent_, wxID_ANY, unitStr);
         if (unitStr == "mm") m_mmUnitLabels.push_back(u);
+        DimInput::Attach(ctrl, u);
         u->SetForegroundColour(Style::TextSubtle);
         u->SetFont(wxFont(Style::Ui(8), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
         u->SetMinSize(wxSize(kUnitWidth, -1));
@@ -5989,6 +5945,7 @@ wxPanel* MainFrame::CreateIndexersContent(wxWindow* parent)
         ctrl->SetBackgroundColour(Style::BtnSmall); ctrl->SetForegroundColour(kTextDefault);
         auto* u = new wxStaticText(parent_, wxID_ANY, unitStr);
         if (unitStr == "mm") m_mmUnitLabels.push_back(u);
+        DimInput::Attach(ctrl, u);
         u->SetForegroundColour(Style::TextSubtle);
         u->SetFont(wxFont(Style::Ui(8), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
         u->SetMinSize(wxSize(kUnitWidth, -1));

@@ -234,6 +234,12 @@
     <ClCompile Include="RotateDialog.cpp" />
     <ClCompile Include="RoundedButton.cpp" />
     <ClCompile Include="SplitButton.cpp" />
+    <ClCompile Include="TransformGizmo.cpp" />
+    <ClCompile Include="NavCube.cpp" />
+    <ClCompile Include="DimensionInput.cpp" />
+    <ClCompile Include="ToolPanels.cpp" />
+    <ClCompile Include="CanvasToast.cpp" />
+    <ClCompile Include="TransformPanel.cpp" />
     <ClCompile Include="SprueEditToolbar.cpp" />
     <ClCompile Include="PerspectiveButton.cpp" />
     <ClCompile Include="VentEditToolbar.cpp" />
@@ -303,6 +309,13 @@
     <ClInclude Include="RotateDialog.h" />
     <ClInclude Include="RoundedButton.h" />
     <ClInclude Include="SplitButton.h" />
+    <ClInclude Include="TransformGizmo.h" />
+    <ClInclude Include="NavCube.h" />
+    <ClInclude Include="DimensionInput.h" />
+    <ClInclude Include="ToolPanels.h" />
+    <ClInclude Include="CanvasToast.h" />
+    <ClInclude Include="TransformPanel.h" />
+    <ClInclude Include="TransformSession.h" />
     <ClInclude Include="SprueEditToolbar.h" />
     <ClInclude Include="PerspectiveButton.h" />
     <ClInclude Include="VentEditToolbar.h" />

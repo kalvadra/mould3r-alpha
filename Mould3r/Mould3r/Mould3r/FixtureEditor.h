@@ -100,6 +100,14 @@ public:
     // step — see the implementation for the AlignFace-vs-Select mapping.
     void SetActiveTool(int activeId);
 
+    // Move / Rotate / Scale: tool modes with the live side panel, the same
+    // model as MainFrame's (see MainFrame::StartTransformTool). Clicking the
+    // latched tool's button again acts as OK. Commit / Cancel return to Select
+    // and are also reached from the canvas's Enter / Esc.
+    void StartTransformTool(int toolId);   // ID_FE_Move / ID_FE_Rotate / ID_FE_Scale
+    void CommitTransformTool();
+    void CancelTransformTool();
+
 private:
     void BuildUI();
 
@@ -253,6 +261,8 @@ private:
     // so future runtime code (transform handlers, file-load wiring) can
     // push state into the canvas without re-walking the widget tree.
     FixtureCanvas* m_canvas = nullptr;
+    class TransformPanel* m_transformPanel = nullptr;   // Move / Rotate / Scale (top-right)
+    class CanvasToast*    m_canvasToast = nullptr;      // bottom-centre hint (Align Face)
 
     // ---- Feature-defaults sidebar fields ----------------------------------
     // Same naming convention as MainFrame's matching members — keeps the

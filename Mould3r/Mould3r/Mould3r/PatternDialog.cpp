@@ -1,4 +1,5 @@
 #include "PatternDialog.h"
+#include "DimensionInput.h"   // fractions / expressions / unit suffixes in number fields
 #include "WindowEffects.h"   // DWM corner rounding for this dialog frame
 
 PatternDialog::PatternDialog(wxWindow* parent)
@@ -57,6 +58,7 @@ PatternDialog::PatternDialog(wxWindow* parent)
             m_radius = new wxTextCtrl(m_radiusRow, wxID_ANY, "50.0",
                 wxDefaultPosition, wxSize(120, -1));
             auto* unit = new wxStaticText(m_radiusRow, wxID_ANY, "mm");
+            DimInput::Attach(m_radius, unit);
             row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 6);
             row->Add(m_radius, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
             row->Add(unit, 0, wxALIGN_CENTER_VERTICAL);
@@ -124,6 +126,7 @@ PatternDialog::PatternDialog(wxWindow* parent)
                     ctrl = new wxTextCtrl(m_lwRows, wxID_ANY, dflt,
                         wxDefaultPosition, wxSize(120, -1));
                     auto* unit = new wxStaticText(m_lwRows, wxID_ANY, "mm");
+                    DimInput::Attach(ctrl, unit);
                     row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 6);
                     row->Add(ctrl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
                     row->Add(unit, 0, wxALIGN_CENTER_VERTICAL);
@@ -203,7 +206,7 @@ int PatternDialog::ParseInt(wxTextCtrl* ctrl, int fallback) const
 float PatternDialog::ParseFloat(wxTextCtrl* ctrl, float fallback) const
 {
     double v = 0.0;
-    if (!ctrl->GetValue().ToDouble(&v))
+    if (!DimInput::Read(ctrl, v))
         return fallback;
     return static_cast<float>(v);
 }

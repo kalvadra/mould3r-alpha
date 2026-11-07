@@ -1,4 +1,5 @@
 #include "MouldCastDialog.h"
+#include "DimensionInput.h"   // fractions / expressions / unit suffixes in number fields
 #include "WindowEffects.h"   // DWM corner rounding for this dialog frame
 
 #include <wx/statbox.h>
@@ -124,6 +125,8 @@ MouldCastDialog::PartControls MouldCastDialog::BuildPartSection(wxWindow* parent
         pc.unit = new wxChoice(host, wxID_ANY,
             wxDefaultPosition, wxSize(56, -1), units);
         pc.unit->SetSelection(initial.inches ? 1 : 0);
+        // Unit from the dropdown beside the field.
+        { wxChoice* u = pc.unit; DimInput::Attach(pc.thickness, [u] { return u->GetSelection() == 1 ? DimInput::Unit::Inch : DimInput::Unit::MM; }); }
 
         row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 6);
         row->Add(pc.thickness, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 6);
@@ -152,6 +155,7 @@ MouldCastDialog::PartControls MouldCastDialog::BuildPartSection(wxWindow* parent
         pc.extraUnit = new wxChoice(host, wxID_ANY,
             wxDefaultPosition, wxSize(56, -1), units);
         pc.extraUnit->SetSelection(initial.extraDistanceInches ? 1 : 0);
+        { wxChoice* u = pc.extraUnit; DimInput::Attach(pc.extra, [u] { return u->GetSelection() == 1 ? DimInput::Unit::Inch : DimInput::Unit::MM; }); }
 
         row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 6);
         row->Add(pc.extra, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 6);
@@ -175,6 +179,7 @@ MouldCastDialog::PartControls MouldCastDialog::BuildPartSection(wxWindow* parent
             unitSel = new wxChoice(host, wxID_ANY,
                 wxDefaultPosition, wxSize(56, -1), units);
             unitSel->SetSelection(defInches ? 1 : 0);
+            { wxChoice* u = unitSel; DimInput::Attach(ctrl, [u] { return u->GetSelection() == 1 ? DimInput::Unit::Inch : DimInput::Unit::MM; }); }
             row->Add(l, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 6);
             row->Add(ctrl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 6);
             row->Add(unitSel, 0, wxALIGN_CENTER_VERTICAL);
@@ -233,21 +238,21 @@ MouldCastPart MouldCastDialog::ReadPart(const PartControls& pc) const
         p.type = pc.type->GetStringSelection().ToStdString();
 
     double t = 0.0;
-    if (pc.thickness && !pc.thickness->GetValue().ToDouble(&t))
+    if (pc.thickness && !DimInput::Read(pc.thickness, t))
         t = 0.0;
     p.thickness = t;
 
     p.inches = pc.unit && pc.unit->GetSelection() == 1;
 
     double ex = 0.0;
-    if (pc.extra && !pc.extra->GetValue().ToDouble(&ex))
+    if (pc.extra && !DimInput::Read(pc.extra, ex))
         ex = 0.0;
     p.extraDistance = (ex > 0.0) ? ex : 0.0;
     p.extraDistanceInches = pc.extraUnit && pc.extraUnit->GetSelection() == 1;
 
     auto readVal = [](wxTextCtrl* c) -> double {
         double v = 0.0;
-        if (c && c->GetValue().ToDouble(&v) && v > 0.0) return v;
+        if (c && DimInput::Read(c, v) && v > 0.0) return v;
         return 0.0;
     };
     p.tongueWidth = readVal(pc.tongueW);
@@ -256,7 +261,7 @@ MouldCastPart MouldCastDialog::ReadPart(const PartControls& pc) const
     p.tongueThicknessInches = pc.tongueTUnit && pc.tongueTUnit->GetSelection() == 1;
     // Groove tolerance may legitimately be 0, so don't clamp it away.
     double gt = 0.0;
-    if (pc.grooveTol && !pc.grooveTol->GetValue().ToDouble(&gt)) gt = 0.0;
+    if (pc.grooveTol && !DimInput::Read(pc.grooveTol, gt)) gt = 0.0;
     p.grooveTolerance = (gt > 0.0) ? gt : 0.0;
     p.grooveToleranceInches = pc.grooveTolUnit && pc.grooveTolUnit->GetSelection() == 1;
     return p;

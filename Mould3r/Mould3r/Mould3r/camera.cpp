@@ -78,7 +78,12 @@ glm::vec3 OrbitCamera::Forward() const
 
 glm::vec3 OrbitCamera::Right() const
 {
-    return glm::normalize(glm::cross(Forward(), m_worldUp));
+    // Horizontal, from the yaw alone: the same vector as
+    // normalize(cross(Forward(), worldUp)) at any pitch short of straight
+    // up / down, and still well defined at exactly +-90 (nav cube Top /
+    // Bottom), where that cross product vanishes.
+    const float yaw = glm::radians(m_yawDeg);
+    return glm::vec3(-std::sin(yaw), 0.0f, std::cos(yaw));
 }
 
 glm::vec3 OrbitCamera::Up() const
@@ -141,8 +146,9 @@ void OrbitCamera::FrameSphere(const glm::vec3& center, float radius)
 
 void OrbitCamera::ClampPitch()
 {
-    // Avoid looking straight up/down to prevent flips
-    m_pitchDeg = std::clamp(m_pitchDeg, -89.0f, 89.0f);
+    // Straight up / down is allowed (Right() comes from the yaw, so the view
+    // never flips); no further, which would turn the view upside down.
+    m_pitchDeg = std::clamp(m_pitchDeg, -90.0f, 90.0f);
 }
 
 void OrbitCamera::ClampDistance()

@@ -38,6 +38,9 @@ class CastingPanel;    // forward decl — m_castingPanel pointer; full def
 class wxSimplebook;    // forward decl — m_book pointer; the perspective pager.
 class PerspectiveButton; // forward decl — m_btnPrepare/m_btnPreview tabs.
 class VentEditToolbar;   // forward decl — m_ventEditToolbar overlay (Part 5).
+class TransformPanel;    // forward decl — Move / Rotate / Scale side panel.
+class PlacePanel;        // forward decl — Place tool card (ToolPanels.h).
+class PatternPanel;      // forward decl — Pattern tool card (ToolPanels.h).
 class SprueEditToolbar;  // forward decl — m_sprueEditToolbar overlay (Edit Sprue).
 class CanvasToast;       // forward decl — bottom-centre viewport hint pill,
 class UpdateBanner;      // forward decl — bottom-right update notification
@@ -46,7 +49,7 @@ class UpdateChecker;     // forward decl — background startup update check.
                          // defined entirely in MainFrame.cpp (same no-header
                          // arrangement as InsertEditDialog above)
 
-enum class TransformMode { Select, Translate, Rotate, Scale, Pattern, PlaceVent, PlaceRunner, PlaceGate, PlaceEjector, PlaceInsert, PlaceIndexer, RemoveVent, RemoveRunner, RemoveGate, RemoveSprue, RemoveEjector, RemoveInsert, RemoveIndexer, EditVent, EditRunner, EditGate, EditEjector, EditInsert, EditIndexer, EditSprue, SelectInjectionPoint, AlignFace, AlignMidplane };
+enum class TransformMode { Select, Translate, Rotate, Scale, Pattern, PlaceVent, PlaceRunner, PlaceGate, PlaceEjector, PlaceInsert, PlaceIndexer, RemoveVent, RemoveRunner, RemoveGate, RemoveSprue, RemoveEjector, RemoveInsert, RemoveIndexer, EditVent, EditRunner, EditGate, EditEjector, EditInsert, EditIndexer, EditSprue, SelectInjectionPoint, AlignFace, AlignMidplane, Place };
 
 // Sub-tool active while editing a Complex vent path (Part 5). Shared between
 // GLCanvas (which owns the authoring logic) and the floating VentEditToolbar
@@ -69,6 +72,20 @@ public:
 
     // Called by GLCanvas when Escape is pressed to sync button state
     void SetActiveTool(TransformMode mode);
+
+    // Move / Rotate / Scale tools: a mode with the live side panel. Start
+    // enters it (clicking the latched tool's button again acts as OK); Commit
+    // keeps the change and Cancel restores the selection, both returning to
+    // Select. Called by the ribbon, the panel's OK / Cancel and the canvas's
+    // Enter / Esc.
+    void StartTransformTool(TransformMode mode);
+    void CommitTransformTool();
+    void CancelTransformTool();
+    // Place / Pattern: the same top-right card style as Move / Rotate / Scale.
+    // Place is a live tool session (absolute X / Z for the selection centre);
+    // Pattern applies on OK. Both finish through Commit / CancelTransformTool.
+    void StartPlaceTool();
+    void StartPatternTool();
 
     // Open the Precision Place dialog for the current selection and apply the
     // resulting absolute XZ move. Shared by the ribbon button handler and the
@@ -530,6 +547,13 @@ private:
     // Part 5: floating overlay toolbar for authoring complex vent paths. Lives
     // as a child of m_canvas, shown only while a vent is being edited.
     VentEditToolbar* m_ventEditToolbar = nullptr;
+    TransformPanel*  m_transformPanel = nullptr;   // Move / Rotate / Scale (top-right)
+    PlacePanel*      m_placePanel = nullptr;       // Place (same slot)
+    PatternPanel*    m_patternPanel = nullptr;     // Pattern (same slot)
+    double           m_placeOriginX = 0.0;         // selection centre (mm) when the
+    double           m_placeOriginZ = 0.0;         // Place session started
+    void             ResetPlacePanel();            // re-read the selection centre
+    void             ShowToolPanelFor(TransformMode mode);   // one card at a time
     void UpdateVentEditToolbar();   // canvas path-edit-changed hook target
 
     // Floating overlay toolbar for the Edit Sprue environment (Move / Select
