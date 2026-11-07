@@ -1,4 +1,5 @@
 #include "ProceduralFixtureDialog.h"
+#include "DimensionInput.h"   // fractions / expressions / unit suffixes in number fields
 #include "WindowEffects.h"   // DWM corner rounding, matching the sibling dialogs
 
 ProceduralFixtureDialog::ProceduralFixtureDialog(wxWindow* parent,
@@ -37,6 +38,7 @@ ProceduralFixtureDialog::ProceduralFixtureDialog(wxWindow* parent,
             wxString::Format("%.3f", initVal),
             wxDefaultPosition, wxSize(120, -1));
         auto* unit = new wxStaticText(this, wxID_ANY, "mm");
+        DimInput::Attach(ctrl, unit);
 
         row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 6);
         row->Add(ctrl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
@@ -94,7 +96,7 @@ ProceduralFixtureDialog::ProceduralFixtureDialog(wxWindow* parent,
 float ProceduralFixtureDialog::ParseField(wxTextCtrl* ctrl, float fallback) const
 {
     double val = 0.0;
-    if (!ctrl->GetValue().ToDouble(&val))
+    if (!DimInput::Read(ctrl, val))
         return fallback;
     return static_cast<float>(val);
 }

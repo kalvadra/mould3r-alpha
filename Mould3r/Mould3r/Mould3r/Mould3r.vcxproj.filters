@@ -216,6 +216,12 @@
     <ClCompile Include="TransformPanel.cpp">
       <Filter>Source Files\TransformHandlers</Filter>
     </ClCompile>
+    <ClCompile Include="ToolPanels.cpp">
+      <Filter>Source Files\TransformHandlers</Filter>
+    </ClCompile>
+    <ClCompile Include="CanvasToast.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="SprueEditToolbar.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -421,6 +427,12 @@
     </ClInclude>
     <ClInclude Include="TransformPanel.h">
       <Filter>Header Files\TransformHandlers</Filter>
+    </ClInclude>
+    <ClInclude Include="ToolPanels.h">
+      <Filter>Header Files\TransformHandlers</Filter>
+    </ClInclude>
+    <ClInclude Include="CanvasToast.h">
+      <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="TransformSession.h">
       <Filter>Header Files\TransformHandlers</Filter>

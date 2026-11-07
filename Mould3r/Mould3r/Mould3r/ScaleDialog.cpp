@@ -1,4 +1,5 @@
 #include "ScaleDialog.h"
+#include "DimensionInput.h"   // fractions / expressions / unit suffixes in number fields
 #include "WindowEffects.h"   // DWM corner rounding for this dialog frame
 
 ScaleDialog::ScaleDialog(wxWindow* parent)
@@ -14,6 +15,7 @@ ScaleDialog::ScaleDialog(wxWindow* parent)
     m_ctrlUniform = new wxTextCtrl(this, wxID_ANY, "1.0",
         wxDefaultPosition, wxSize(120, -1));
     auto* unit = new wxStaticText(this, wxID_ANY, "x");
+    DimInput::Attach(m_ctrlUniform, unit);
 
     row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 6);
     row->Add(m_ctrlUniform, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
@@ -40,7 +42,7 @@ ScaleDialog::ScaleDialog(wxWindow* parent)
 float ScaleDialog::ParseField(wxTextCtrl* ctrl) const
 {
     double val = 1.0;
-    if (!ctrl->GetValue().ToDouble(&val))
+    if (!DimInput::Read(ctrl, val))
         val = 1.0;
     return static_cast<float>(val);
 }

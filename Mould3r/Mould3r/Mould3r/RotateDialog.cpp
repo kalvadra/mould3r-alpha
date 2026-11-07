@@ -1,4 +1,5 @@
 #include "RotateDialog.h"
+#include "DimensionInput.h"   // fractions / expressions / unit suffixes in number fields
 #include "WindowEffects.h"   // DWM corner rounding for this dialog frame
 
 RotateDialog::RotateDialog(wxWindow* parent)
@@ -19,6 +20,7 @@ RotateDialog::RotateDialog(wxWindow* parent)
                 wxDefaultPosition, wxSize(120, -1));
 
             auto* unit = new wxStaticText(this, wxID_ANY, "deg");
+            DimInput::Attach(ctrl, unit);
 
             row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 6);
             row->Add(ctrl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
@@ -48,7 +50,7 @@ RotateDialog::RotateDialog(wxWindow* parent)
 float RotateDialog::ParseField(wxTextCtrl* ctrl) const
 {
     double val = 0.0;
-    if (!ctrl->GetValue().ToDouble(&val))
+    if (!DimInput::Read(ctrl, val))
         val = 0.0;
     return static_cast<float>(val);
 }

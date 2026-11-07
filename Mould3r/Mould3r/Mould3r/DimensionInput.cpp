@@ -16,7 +16,9 @@
 
 #ifndef DIMINPUT_NO_WX
 #include <wx/colour.h>
+#include <wx/dialog.h>
 #include <wx/event.h>
+#include <wx/panel.h>
 #include <wx/stattext.h>
 #include <wx/textctrl.h>
 #include <wx/toplevel.h>
@@ -358,8 +360,9 @@ namespace
 {
     struct FieldInfo
     {
-        wxStaticText* unitLabel = nullptr;   // live unit, or...
-        Unit          fixed = Unit::None;    // ...this when there's no label
+        wxStaticText* unitLabel = nullptr;   // live unit from a label, or...
+        std::function<Unit()> unitOf;        // ...from any other source, or...
+        Unit          fixed = Unit::None;    // ...this
         double        lastGood = 0.0;
         bool          hasGood = false;
         bool          tinted = false;
@@ -372,7 +375,14 @@ namespace
         return r;
     }
 
-    const wxColour kErrorBg(112, 42, 48);
+    // Error tint that suits the field: dark red on the app's dark inputs,
+    // pale red on native light ones (so black text stays readable).
+    wxColour ErrorBg(const wxColour& normal)
+    {
+        const bool light = normal.IsOk() &&
+            (0.299 * normal.Red() + 0.587 * normal.Green() + 0.114 * normal.Blue()) > 140.0;
+        return light ? wxColour(255, 206, 206) : wxColour(112, 42, 48);
+    }
 
     std::string Utf8(const wxString& s)
     {
@@ -382,7 +392,9 @@ namespace
 
     Unit FieldUnit(const FieldInfo& fi)
     {
-        return fi.unitLabel ? UnitFromLabel(fi.unitLabel) : fi.fixed;
+        if (fi.unitLabel) return UnitFromLabel(fi.unitLabel);
+        if (fi.unitOf)    return fi.unitOf();
+        return fi.fixed;
     }
 
     // Re-read the text: remember it if valid, tint the field if not.
@@ -401,7 +413,7 @@ namespace
         if (bad != fi.tinted)
         {
             fi.tinted = bad;
-            f->SetBackgroundColour(bad ? kErrorBg : fi.normalBg);
+            f->SetBackgroundColour(bad ? ErrorBg(fi.normalBg) : fi.normalBg);
             f->Refresh();
         }
         if (bad)
@@ -426,11 +438,40 @@ namespace
         Validate(f);
     }
 
-    void AttachImpl(wxTextCtrl* field, wxStaticText* label, Unit fixed)
+    std::unordered_map<const wxWindow*, wxWindow*>& FocusTargets()
+    {
+        static std::unordered_map<const wxWindow*, wxWindow*> t;
+        return t;
+    }
+
+    // After Enter: move the keyboard focus off `f` so the field visibly lets go.
+    void Defocus(wxTextCtrl* f)
+    {
+        wxWindow* top = wxGetTopLevelParent(f);
+        auto it = FocusTargets().find(top);
+        if (it != FocusTargets().end() && it->second && it->second->IsShownOnScreen())
+        {
+            it->second->SetFocus();
+            return;
+        }
+        // No registered target: the nearest panel takes it itself (a plain
+        // SetFocus would hand it straight back to its first child).
+        for (wxWindow* w = f->GetParent(); w && !w->IsTopLevel(); w = w->GetParent())
+            if (auto* panel = wxDynamicCast(w, wxPanel))
+            {
+                panel->SetFocusIgnoringChildren();
+                return;
+            }
+        if (top) top->SetFocus();
+    }
+
+    void AttachImpl(wxTextCtrl* field, wxStaticText* label, Unit fixed,
+                    std::function<Unit()> unitOf = {})
     {
         if (!field) return;
         FieldInfo fi;
         fi.unitLabel = label;
+        fi.unitOf = std::move(unitOf);
         fi.fixed = fixed;
         fi.normalBg = field->GetBackgroundColour();
         Registry()[field] = fi;
@@ -438,6 +479,29 @@ namespace
 
         field->Bind(wxEVT_TEXT, [field](wxCommandEvent& e) { Validate(field); e.Skip(); });
         field->Bind(wxEVT_KILL_FOCUS, [field](wxFocusEvent& e) { Commit(field); e.Skip(); });
+        // Enter. Caught as a CHAR_HOOK, which reaches the focused field before
+        // anything else: a plain single-line field on Windows never sees
+        // Enter as a KEY_DOWN -- tab navigation swallows it first.
+        field->Bind(wxEVT_CHAR_HOOK, [field](wxKeyEvent& e)
+        {
+            if (e.GetKeyCode() != WXK_RETURN && e.GetKeyCode() != WXK_NUMPAD_ENTER)
+            {
+                e.Skip();
+                return;
+            }
+            Commit(field);
+            // Owners that use Enter (a card's OK, a dialog's default button)
+            // get it, now that the value is committed.
+            if (field->HasFlag(wxTE_PROCESS_ENTER) ||
+                wxDynamicCast(wxGetTopLevelParent(field), wxDialog))
+            {
+                e.Skip();
+                return;
+            }
+            Defocus(field);   // consumed: apply and let go of the field
+        });
+        // Belt and braces where Enter does arrive as a key (wxTE_PROCESS_ENTER
+        // fields, other platforms): committing twice is harmless.
         field->Bind(wxEVT_KEY_DOWN, [field](wxKeyEvent& e)
         {
             if (e.GetKeyCode() == WXK_RETURN || e.GetKeyCode() == WXK_NUMPAD_ENTER)
@@ -463,8 +527,34 @@ Unit UnitFromLabel(const wxStaticText* label)
     return Unit::None;
 }
 
+void SetEnterFocusTarget(wxWindow* topLevel, wxWindow* target)
+{
+    if (!topLevel) return;
+    FocusTargets()[topLevel] = target;
+    // Forget it with the window (top-level windows can be recreated).
+    topLevel->Bind(wxEVT_DESTROY, [topLevel](wxWindowDestroyEvent& e)
+    {
+        if (e.GetEventObject() == topLevel) FocusTargets().erase(topLevel);
+        e.Skip();
+    });
+}
+
 void Attach(wxTextCtrl* field, wxStaticText* unitLabel) { AttachImpl(field, unitLabel, Unit::None); }
 void Attach(wxTextCtrl* field, Unit fixed) { AttachImpl(field, nullptr, fixed); }
+void Attach(wxTextCtrl* field, std::function<Unit()> unitOf)
+{
+    AttachImpl(field, nullptr, Unit::None, std::move(unitOf));
+}
+
+bool ReadExact(const wxTextCtrl* field, double& out)
+{
+    if (!field) return false;
+    auto it = Registry().find(field);
+    const Unit u = (it == Registry().end()) ? Unit::None : FieldUnit(it->second);
+    return Evaluate(Utf8(field->GetValue()), u, out);
+}
+
+void Revalidate(wxTextCtrl* field) { if (field) Validate(field); }
 
 bool Read(const wxTextCtrl* field, double& out)
 {

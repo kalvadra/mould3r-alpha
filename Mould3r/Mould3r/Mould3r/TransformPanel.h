@@ -71,7 +71,6 @@ private:
 
     wxStaticText* m_title = nullptr;
     wxStaticText* m_status = nullptr;
-    wxStaticText* m_note = nullptr;
 
     // X / Y / Z rows (Move, Rotate) and the factor row (Scale).
     wxTextCtrl*   m_fx = nullptr;

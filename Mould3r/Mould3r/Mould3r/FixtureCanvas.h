@@ -137,6 +137,10 @@ public:
     void SetTransformSessionDelta(const Xform::Delta& d);
     void CommitTransformSession();
     void CancelTransformSession();
+    // Esc during a handle drag: undo just that drag (see GLCanvas).
+    bool CancelGizmoDrag();
+    // Unit the Move readout uses (the panel's); set when a tool starts.
+    void SetTransformImperial(bool imperial) { m_xfImperial = imperial; }
     bool IsTransformSessionActive() const { return m_xfActive; }
     int  GetSelectionCount() const { return HasSelection() ? 1 : 0; }
     // Fired when a click in a tool mode (or a re-import) changed the selection;
@@ -148,6 +152,9 @@ public:
     // The panel overlay (a sibling of this canvas), pinned top-right.
     void SetTransformPanel(wxWindow* w) { m_transformPanel = w; RepositionTransformPanel(); }
     void RepositionTransformPanel();
+    // Bottom-centre hint pill (CanvasToast), a sibling raised above this canvas.
+    void SetCanvasToast(wxWindow* w) { m_canvasToast = w; RepositionCanvasToast(); }
+    void RepositionCanvasToast();
 
     void SetTransformMode(TransformMode m);
     TransformMode GetTransformMode() const { return m_transformMode; }
@@ -409,6 +416,7 @@ private:
     glm::vec3             m_xfPivot{ 0.0f };
     Xform::Delta          m_xfDelta;
     wxWindow*             m_transformPanel = nullptr;
+    wxWindow*             m_canvasToast = nullptr;
     std::function<void()> m_onXformSelection;
     bool                  m_xfClickPending = false;   // click-vs-drag pick
     wxPoint               m_xfClickDown;
@@ -416,6 +424,13 @@ private:
     wxLongLong            m_xfNotifyMs = 0;          // rate limit (NotifyXformDelta)
     bool                  m_xfNotifyPending = false;
     void                  NotifyXformDelta(bool force);
+
+    // ---- Drag readout (the value label beside the cursor during a drag) ----
+    bool                 m_xfImperial = false;   // panel's unit, for the readout
+    std::string          m_readoutText;          // text currently uploaded
+    void                 DrawGizmoReadout(const glm::mat4& view, const glm::mat4& proj, int w, int h);
+    wxPoint              m_gizmoDragPos;         // cursor during a handle drag
+    bool                 m_gizmoDragCtrl = false;
 
     // ---- Nav cube (top-right view cube, NavCube.h) ---------------------------
     NavCube::Controller  m_navCtl;

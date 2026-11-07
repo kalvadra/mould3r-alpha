@@ -262,6 +262,7 @@ private:
     // push state into the canvas without re-walking the widget tree.
     FixtureCanvas* m_canvas = nullptr;
     class TransformPanel* m_transformPanel = nullptr;   // Move / Rotate / Scale (top-right)
+    class CanvasToast*    m_canvasToast = nullptr;      // bottom-centre hint (Align Face)
 
     // ---- Feature-defaults sidebar fields ----------------------------------
     // Same naming convention as MainFrame's matching members — keeps the

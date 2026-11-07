@@ -283,6 +283,8 @@ void GLCanvas::SetTransformMode(TransformMode mode)
     case TransformMode::Translate:
     case TransformMode::Rotate:
     case TransformMode::Scale:
+    case TransformMode::Place:
+    case TransformMode::Pattern:
         SetCursor(wxCursor(wxCURSOR_ARROW));    break;
     case TransformMode::PlaceVent:
         SetCursor(wxCursor(wxCURSOR_CROSS));    break;
@@ -540,6 +542,34 @@ bool GLCanvas::CommitTransformSession()
     return changed;
 }
 
+bool GLCanvas::CancelGizmoDrag()
+{
+    if (!m_xfActive || !(m_gizmoDrag.valid || m_gizmoRotDrag.valid || m_gizmoScaleDrag.valid))
+        return false;
+    // Only the grabbed handle's component changed during the drag, so the
+    // values at the grab are exactly where to go back to.
+    Xform::Delta d = m_xfDelta;
+    d.move = m_gizmoStartMove;
+    d.rotDeg = m_gizmoStartRot;
+    d.scale = m_gizmoStartScale;
+    m_gizmoDrag = Gizmo::MoveDrag();
+    m_gizmoRotDrag = Gizmo::RotateDrag();
+    m_gizmoScaleDrag = Gizmo::ScaleDrag();
+    m_gizmoDragPending = false;
+    m_gizmoScaleShown = 1.0f;
+    m_gizmoRotShownDeg = 0.0f;
+    // The button is still down: forget it, so the rest of this press neither
+    // orbits nor picks.
+    m_lmb = false;
+    m_hasLast = false;
+    if (HasCapture()) ReleaseMouse();
+    if (m_context) SetCurrent(*m_context);
+    SetTransformSessionDelta(d);
+    NotifyXformDelta(true);
+    Refresh(false);
+    return true;
+}
+
 void GLCanvas::CancelTransformSession()
 {
     if (!m_xfActive) return;
@@ -563,6 +593,33 @@ Gizmo::Handle GLCanvas::GizmoHitTest(float mx, float my)
     if (RotateGizmoShown()) return Gizmo::HitTestRotate(GizmoViewport(), GizmoPivot(), mx, my);
     if (ScaleGizmoShown())  return Gizmo::HitTestScale(GizmoViewport(), GizmoPivot(), mx, my);
     return Gizmo::Handle::None;
+}
+
+// ---------------------------------------------------------------------------
+// DrawGizmoReadout -- the value label beside the cursor during a handle drag:
+// this drag's amount (the panel keeps the session totals).
+// ---------------------------------------------------------------------------
+void GLCanvas::DrawGizmoReadout(const glm::mat4& view, const glm::mat4& proj, int w, int h)
+{
+    const Gizmo::Handle handle =
+        m_gizmoDrag.valid      ? m_gizmoDrag.handle :
+        m_gizmoRotDrag.valid   ? m_gizmoRotDrag.handle :
+        m_gizmoScaleDrag.valid ? m_gizmoScaleDrag.handle : Gizmo::Handle::None;
+    if (handle == Gizmo::Handle::None) return;
+
+    const std::string text = Gizmo::DragReadout(handle, m_xfDelta.move - m_gizmoStartMove,
+        m_gizmoRotShownDeg, m_gizmoScaleShown, m_xfImperial, m_gizmoDragCtrl);
+    if (text != m_readoutText)
+    {
+        std::vector<unsigned char> cov;
+        int tw = 0, th = 0;
+        if (Gizmo::RasterizeText(text, cov, tw, th))
+            m_gizmo.SetReadout(cov.data(), tw, th);
+        m_readoutText = text;
+    }
+    Gizmo::Viewport vp;
+    vp.view = view; vp.proj = proj; vp.width = w; vp.height = h;
+    m_gizmo.DrawReadout(vp, float(m_gizmoDragPos.x), float(m_gizmoDragPos.y));
 }
 
 // ---------------------------------------------------------------------------
@@ -594,15 +651,19 @@ Gizmo::Viewport GLCanvas::GizmoViewport()
 
 void GLCanvas::RepositionTransformPanel()
 {
-    if (!m_transformPanel) return;
-    // Sibling of this canvas raised above it, like the path toolbar; pinned to
-    // the top-right corner of the viewport.
+    // Siblings of this canvas raised above it, like the path toolbar; pinned
+    // to the top-right corner of the viewport, just below the nav cube. Only
+    // one of the cards is ever shown at a time.
     const wxPoint cpos = GetPosition();
     const wxSize  canvas = GetClientSize();
-    const wxSize  sz = m_transformPanel->GetSize();
-    const int x = cpos.x + std::max(8, canvas.x - sz.x - 12);
-    const int y = cpos.y + NavCube::kOverlayTopPx;   // just below the nav cube
-    m_transformPanel->Move(x, y);
+    auto pin = [&](wxWindow* w)
+    {
+        if (!w) return;
+        const wxSize sz = w->GetSize();
+        w->Move(cpos.x + std::max(8, canvas.x - sz.x - 12), cpos.y + NavCube::kOverlayTopPx);
+    };
+    pin(m_transformPanel);
+    for (wxWindow* w : m_pinnedPanels) pin(w);
 }
 
 void GLCanvas::CenterSelectedObject()
@@ -11349,6 +11410,7 @@ void GLCanvas::InitGLOnce()
 void GLCanvas::DestroyGL()
 {
     m_gizmo.Destroy();
+    m_readoutText.clear();   // its texture went with the renderer
     m_navCube.Destroy();
     m_navLabelsTried = false;
     DestroyBodyStore();
@@ -12655,7 +12717,14 @@ void GLCanvas::OnPaint(wxPaintEvent&)
     const int transparentIndex = cameraAboveGrid ? 0 : 1;
     const int opaqueIndex = cameraAboveGrid ? 1 : 0;
 
-    // Draw opaque fixture first
+    // Draw opaque fixture first. Nudged slightly AWAY from the camera: its
+    // parting face lies exactly on y = 0, the same plane as the vent / runner /
+    // gate path lines and the flat faces of one-sided features, which are
+    // drawn later -- unbiased, those tie with it in depth and mostly fail
+    // GL_LESS (or flicker). Anything genuinely inside the half is still well
+    // behind the face, so it stays hidden.
+    glEnable(GL_POLYGON_OFFSET_FILL);
+    glPolygonOffset(1.0f, 2.0f);
     if (opaqueIndex < (int)m_fixtures.size())
     {
         const SceneObject& obj = m_fixtures[opaqueIndex];
@@ -12669,6 +12738,8 @@ void GLCanvas::OnPaint(wxPaintEvent&)
             glBindVertexArray(0);
         }
     }
+    glPolygonOffset(0.0f, 0.0f);
+    glDisable(GL_POLYGON_OFFSET_FILL);
 
     // Draw transparent fixture second so it blends over everything behind it
     glEnable(GL_BLEND);
@@ -12681,8 +12752,10 @@ void GLCanvas::OnPaint(wxPaintEvent&)
     // this, fragments on both faces share the same post-projection depth and
     // floating-point rounding flips individual pixels frame-to-frame, which
     // shows up as flicker along the parting line.
+    // (Pushed further than the opaque half's own nudge above, so it still
+    // loses to that face.)
     glEnable(GL_POLYGON_OFFSET_FILL);
-    glPolygonOffset(1.0f, 1.0f);
+    glPolygonOffset(2.0f, 4.0f);
 
     if (transparentIndex < (int)m_fixtures.size())
     {
@@ -14536,6 +14609,7 @@ void GLCanvas::OnPaint(wxPaintEvent&)
                           m_gizmoScaleDrag.valid ? m_gizmoScaleDrag.handle : Gizmo::Handle::None,
                           m_gizmoScaleShown);
     }
+    DrawGizmoReadout(view, proj, w, h);   // value label beside the cursor while dragging
 
     DrawNavCube(w, h);
     SwapBuffers();
@@ -14683,6 +14757,8 @@ void GLCanvas::OnMouse(wxMouseEvent& evt)
                 m_gizmoRotPendingDeg = 0.0f;
                 m_gizmoDragPending = false;
                 m_gizmoStartScale = m_xfDelta.scale;
+                m_gizmoDragPos = p;            // readout position before the first move
+                m_gizmoDragCtrl = evt.ControlDown();
                 m_gizmoScaleShown = 1.0f;
                 m_gizmoHover = h;
                 if (!HasCapture()) CaptureMouse();
@@ -15959,7 +16035,8 @@ void GLCanvas::OnKeyDown(wxKeyEvent& evt)
 
     if (evt.GetKeyCode() == WXK_ESCAPE && IsTransformTool(m_transformMode))
     {
-        // Move / Rotate / Scale: Esc is the panel's Cancel.
+        // Move / Rotate / Scale: Esc is the panel's Cancel (which first just
+        // undoes a handle drag in progress -- MainFrame::CancelTransformTool).
         if (auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(this)))
             frame->CancelTransformTool();
     }

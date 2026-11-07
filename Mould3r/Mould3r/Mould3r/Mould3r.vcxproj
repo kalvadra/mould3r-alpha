@@ -237,6 +237,8 @@
     <ClCompile Include="TransformGizmo.cpp" />
     <ClCompile Include="NavCube.cpp" />
     <ClCompile Include="DimensionInput.cpp" />
+    <ClCompile Include="ToolPanels.cpp" />
+    <ClCompile Include="CanvasToast.cpp" />
     <ClCompile Include="TransformPanel.cpp" />
     <ClCompile Include="SprueEditToolbar.cpp" />
     <ClCompile Include="PerspectiveButton.cpp" />
@@ -310,6 +312,8 @@
     <ClInclude Include="TransformGizmo.h" />
     <ClInclude Include="NavCube.h" />
     <ClInclude Include="DimensionInput.h" />
+    <ClInclude Include="ToolPanels.h" />
+    <ClInclude Include="CanvasToast.h" />
     <ClInclude Include="TransformPanel.h" />
     <ClInclude Include="TransformSession.h" />
     <ClInclude Include="SprueEditToolbar.h" />

@@ -1,11 +1,26 @@
+// The CRT headers (via glm / <cmath>) arrive before the wx ones used for the
+// readout text, so wx's own opt-out would come too late for the project's SDL
+// checks (C4996) -- same as GLCanvas.cpp / NavCube.cpp.
+#define _CRT_SECURE_NO_WARNINGS
+
 #include "TransformGizmo.h"
 
 #include <glm/gtc/constants.hpp>
+#include <glm/gtc/matrix_transform.hpp>   // glm::ortho (readout)
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <limits>
 #include <vector>
+
+#ifndef GIZMO_NO_WX
+#include <wx/bitmap.h>
+#include <wx/dcmemory.h>
+#include <wx/font.h>
+#include <wx/image.h>
+#include <wx/settings.h>
+#endif
 
 namespace Gizmo
 {
@@ -29,7 +44,6 @@ namespace
     // Hit tolerances, pixels.
     constexpr float kAxisTolPx  = 7.0f;
     constexpr float kFreeTolPx  = 10.0f;
-    constexpr float kMinAxisPx  = 12.0f;   // shorter than this on screen: end-on, not pickable
     constexpr float kMinPlaneDot = 0.2f;   // |cos| between plane normal and view: edge-on below
 
     const glm::vec3 kAxes[3] = { { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 } };
@@ -51,6 +65,26 @@ namespace
     void PlaneAxes(int n, int& a, int& b) { a = (n + 1) % 3; b = (n + 2) % 3; if (a > b) std::swap(a, b); }
 
     glm::vec3 CameraPos(const Viewport& vp) { return glm::vec3(glm::inverse(vp.view)[3]); }
+
+    float Ramp(float x, float lo, float hi) { return glm::clamp((x - lo) / (hi - lo), 0.0f, 1.0f); }
+
+    // How usable an axis handle (arrow / scale stalk) is from here: 0 when it
+    // points (nearly) at the camera -- drawn hidden and not hittable -- rising
+    // to 1 once it is clearly side-on. The hit tests and the renderer share
+    // it, so whatever is visible can be grabbed and nothing hidden can be.
+    constexpr float kAxisHideSin = 0.11f;   // ~12 px of a 110 px arrow
+    float AxisVisibility(const Viewport& vp, const glm::vec3& pivot, int axis)
+    {
+        const glm::vec3 view = glm::normalize(pivot - CameraPos(vp));
+        const float c = glm::dot(view, kAxes[axis]);
+        return Ramp(std::sqrt(std::max(0.0f, 1.0f - c * c)), kAxisHideSin, kAxisHideSin + 0.17f);
+    }
+    // Same for a plane square (normal axis n): 0 when seen edge-on.
+    float PlaneVisibility(const Viewport& vp, const glm::vec3& pivot, int n)
+    {
+        const glm::vec3 view = glm::normalize(pivot - CameraPos(vp));
+        return Ramp(std::abs(glm::dot(view, kAxes[n])), kMinPlaneDot, kMinPlaneDot + 0.15f);
+    }
 
     bool ToScreen(const Viewport& vp, const glm::vec3& p, glm::vec2& out)
     {
@@ -151,20 +185,19 @@ Handle HitTestMove(const Viewport& vp, const glm::vec3& pivot, float mx, float m
     for (int i = 0; i < 3; ++i)
     {
         glm::vec2 a, b;
+        if (AxisVisibility(vp, pivot, i) <= 0.0f) continue;   // pointing at the camera
         if (!ToScreen(vp, pivot + kAxes[i] * (kShaftStart * L), a) ||
             !ToScreen(vp, pivot + kAxes[i] * L, b)) continue;
-        if (glm::length(b - a) < kMinAxisPx) continue;   // pointing at the camera
         const float d = SegmentDistance(m, a, b);
         if (d <= bestD) { bestD = d; best = axisHandles[i]; }
     }
     if (best != Handle::None) return best;
 
     // 3. Plane squares.
-    const glm::vec3 view = glm::normalize(pivot - CameraPos(vp));
     const Handle planeHandles[3] = { Handle::PlaneYZ, Handle::PlaneXZ, Handle::PlaneXY };
     for (int n = 0; n < 3; ++n)
     {
-        if (std::abs(glm::dot(view, kAxes[n])) < kMinPlaneDot) continue;   // edge-on
+        if (PlaneVisibility(vp, pivot, n) <= 0.0f) continue;   // edge-on
         int a, b;
         PlaneAxes(n, a, b);
         const glm::vec3 A = kAxes[a] * L, B = kAxes[b] * L;
@@ -380,9 +413,9 @@ Handle HitTestScale(const Viewport& vp, const glm::vec3& pivot, float mx, float 
     for (int i = 0; i < 3; ++i)
     {
         glm::vec2 a, b;
+        if (AxisVisibility(vp, pivot, i) <= 0.0f) continue;   // pointing at the camera
         if (!ToScreen(vp, pivot + kAxes[i] * (kShaftStart * L), a) ||
             !ToScreen(vp, pivot + kAxes[i] * ((kScaleCubePos + kScaleCubeR) * L), b)) continue;
-        if (glm::length(b - a) < kMinAxisPx) continue;   // pointing at the camera
         const float d = SegmentDistance(m, a, b);
         if (d <= bestD) { bestD = d; best = axes[i]; }
     }
@@ -506,21 +539,166 @@ void GridTriadPlacement(const GridSettings& g, glm::vec3& origin, float& length)
 }
 
 // =============================================================================
+// Drag readout text
+// =============================================================================
+namespace
+{
+    const char* kMinus = "\xE2\x88\x92";   // U+2212, so +/- columns line up
+
+    std::string Signed(double v, int places)
+    {
+        char buf[48];
+        std::snprintf(buf, sizeof(buf), "%.*f", places, std::abs(v));
+        const bool zero = std::string(buf).find_first_not_of("0.") == std::string::npos;
+        return std::string(zero ? "" : (v < 0.0 ? kMinus : "+")) + buf;
+    }
+}
+
+std::string DragReadout(Handle h, const glm::vec3& moveMM, float rotDeg, float factor,
+                        bool imperial, bool snapping)
+{
+    static const char* kAxisName[3] = { "X", "Y", "Z" };
+    std::string out;
+    switch (h)
+    {
+    case Handle::X: case Handle::Y: case Handle::Z:
+    case Handle::PlaneYZ: case Handle::PlaneXZ: case Handle::PlaneXY: case Handle::Free:
+    {
+        // The components this handle frees.
+        bool use[3] = { false, false, false };
+        if (h == Handle::X) use[0] = true;
+        else if (h == Handle::Y) use[1] = true;
+        else if (h == Handle::Z) use[2] = true;
+        else if (h == Handle::Free) use[0] = use[1] = use[2] = true;
+        else { const int n = AxisIndex(h); use[(n + 1) % 3] = use[(n + 2) % 3] = true; }
+        const double k = imperial ? 1.0 / 25.4 : 1.0;
+        const int places = imperial ? 3 : 2;
+        for (int i = 0; i < 3; ++i)
+        {
+            if (!use[i]) continue;
+            if (!out.empty()) out += "   ";
+            out += std::string(kAxisName[i]) + " " + Signed(moveMM[i] * k, places);
+        }
+        out += imperial ? " in" : " mm";
+        break;
+    }
+    case Handle::RotX: case Handle::RotY: case Handle::RotZ:
+    {
+        const int i = (h == Handle::RotX) ? 0 : (h == Handle::RotY) ? 1 : 2;
+        out = std::string(kAxisName[i]) + " " + Signed(rotDeg, 1) + "\xC2\xB0";   // degree sign
+        break;
+    }
+    case Handle::ScaleX: case Handle::ScaleY: case Handle::ScaleZ: case Handle::ScaleUniform:
+    {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%.3f", factor);
+        out = std::string("\xC3\x97") + buf;   // multiplication sign
+        break;
+    }
+    default:
+        return std::string();
+    }
+    if (snapping) out += "  \xC2\xB7 snap";   // middle dot
+    return out;
+}
+
+#ifndef GIZMO_NO_WX
+bool RasterizeText(const std::string& utf8, std::vector<unsigned char>& coverage,
+                   int& width, int& height)
+{
+    const wxString text = wxString::FromUTF8(utf8.c_str());
+    wxFont font = wxSystemSettings::GetFont(wxSYS_DEFAULT_GUI_FONT);
+    font.SetWeight(wxFONTWEIGHT_BOLD);
+
+    // Measure, then draw white on black; the red channel is the coverage.
+    wxBitmap probe(1, 1, 24);
+    wxMemoryDC dc(probe);
+    dc.SetFont(font);
+    const wxSize ext = dc.GetTextExtent(text);
+    if (ext.x <= 0 || ext.y <= 0) return false;
+    const int padX = 9, padY = 4;
+    width = ext.x + 2 * padX;
+    height = ext.y + 2 * padY;
+
+    wxBitmap bmp(width, height, 24);
+    dc.SelectObject(bmp);
+    dc.SetBackground(*wxBLACK_BRUSH);
+    dc.Clear();
+    dc.SetFont(font);
+    dc.SetTextForeground(*wxWHITE);
+    dc.DrawText(text, padX, padY);
+    dc.SelectObject(wxNullBitmap);
+
+    const wxImage img = bmp.ConvertToImage();
+    if (!img.IsOk()) return false;
+    const unsigned char* px = img.GetData();
+    coverage.assign(size_t(width) * height, 0);
+    for (int i = 0; i < width * height; ++i) coverage[i] = px[3 * i];
+    return true;
+}
+#endif
+
+// =============================================================================
 // GizmoRenderer
 // =============================================================================
 namespace
 {
+    // Handles draw in flat colour. The shader keeps an optional headlight
+    // (uLit, off by default -- see DrawMesh).
+    // uDimBack darkens whatever lies on the far side of the pivot from the
+    // camera -- the back halves of the rotate rings.
     const char* kVs = R"GLSL(
         #version 330 core
         layout(location = 0) in vec3 aPos;
+        layout(location = 1) in vec3 aNormal;
         uniform mat4 uMVP;
-        void main() { gl_Position = uMVP * vec4(aPos, 1.0); }
+        uniform mat4 uModel;
+        uniform mat3 uNormalMat;   // model -> view, inverse-transpose
+        out vec3 vN;
+        out vec3 vWorld;
+        out vec2 vUV;              // the unit quad's own position (readout texture)
+        void main()
+        {
+            vUV = aPos.xy;
+            vN = uNormalMat * aNormal;
+            vWorld = vec3(uModel * vec4(aPos, 1.0));
+            gl_Position = uMVP * vec4(aPos, 1.0);
+        }
     )GLSL";
     const char* kFs = R"GLSL(
         #version 330 core
+        in vec3 vN;
+        in vec3 vWorld;
+        in vec2 vUV;
         out vec4 FragColor;
         uniform vec4 uColor;
-        void main() { FragColor = uColor; }
+        uniform int  uUseTex;
+        uniform sampler2D uTex;
+        uniform int  uLit;
+        uniform int  uDimBack;
+        uniform vec3 uPivot;
+        uniform vec3 uCam;
+        void main()
+        {
+            vec3 c = uColor.rgb;
+            float a = uColor.a;
+            if (uLit == 1)
+            {
+                vec3 n = normalize(vN);
+                vec3 L = normalize(vec3(-0.35, 0.55, 0.75));
+                float d = max(dot(n, L), 0.0);
+                float spec = pow(max(dot(reflect(-L, n), vec3(0.0, 0.0, 1.0)), 0.0), 24.0);
+                c = c * (0.50 + 0.55 * d) + vec3(0.22 * spec);
+            }
+            if (uDimBack == 1 && dot(vWorld - uPivot, uCam - uPivot) < 0.0)
+            {
+                c *= 0.55;
+                a *= 0.55;
+            }
+            if (uUseTex == 1)
+                a *= texture(uTex, vec2(vUV.x, 1.0 - vUV.y)).r;   // rows top-down
+            FragColor = vec4(c, a);
+        }
     )GLSL";
 
     GLuint Compile(GLenum type, const char* src)
@@ -587,7 +765,16 @@ bool GizmoRenderer::Init()
     }
     m_uMVP = glGetUniformLocation(m_program, "uMVP");
     m_uColor = glGetUniformLocation(m_program, "uColor");
+    m_uModel = glGetUniformLocation(m_program, "uModel");
+    m_uNormalMat = glGetUniformLocation(m_program, "uNormalMat");
+    m_uLit = glGetUniformLocation(m_program, "uLit");
+    m_uDimBack = glGetUniformLocation(m_program, "uDimBack");
+    m_uPivot = glGetUniformLocation(m_program, "uPivot");
+    m_uCam = glGetUniformLocation(m_program, "uCam");
+    m_uUseTex = glGetUniformLocation(m_program, "uUseTex");
+    m_uTex = glGetUniformLocation(m_program, "uTex");
 
+    // Interleaved position + normal (6 floats per vertex).
     auto upload = [](Mesh& m, const std::vector<float>& v, const std::vector<uint32_t>& idx)
     {
         glGenVertexArrays(1, &m.vao);
@@ -598,21 +785,28 @@ bool GizmoRenderer::Init()
         glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(v.size() * sizeof(float)), v.data(), GL_STATIC_DRAW);
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m.ebo);
         glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)(idx.size() * sizeof(uint32_t)), idx.data(), GL_STATIC_DRAW);
-        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)0);
         glEnableVertexAttribArray(0);
+        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)(3 * sizeof(float)));
+        glEnableVertexAttribArray(1);
         glBindVertexArray(0);
         m.count = (GLsizei)idx.size();
     };
+    auto vert = [](std::vector<float>& v, const glm::vec3& p, const glm::vec3& n)
+    {
+        v.insert(v.end(), { p.x, p.y, p.z, n.x, n.y, n.z });
+    };
 
-    const int seg = 16;
-    // Cylinder (sides) and cone (sides + base), around +Y.
+    const int seg = 20;
+    // Cylinder sides around +Y, radius 1, y in [0, 1].
     {
         std::vector<float> v; std::vector<uint32_t> idx;
         for (int i = 0; i < seg; ++i)
         {
             const float a = glm::two_pi<float>() * float(i) / float(seg);
-            v.insert(v.end(), { std::cos(a), 0.0f, std::sin(a) });
-            v.insert(v.end(), { std::cos(a), 1.0f, std::sin(a) });
+            const glm::vec3 n(std::cos(a), 0.0f, std::sin(a));
+            vert(v, glm::vec3(n.x, 0.0f, n.z), n);
+            vert(v, glm::vec3(n.x, 1.0f, n.z), n);
         }
         for (uint32_t i = 0; i < (uint32_t)seg; ++i)
         {
@@ -621,32 +815,45 @@ bool GizmoRenderer::Init()
         }
         upload(m_cylinder, v, idx);
     }
+    // Cone: base radius 1 at y = 0, apex at y = 1. Each side facet has its own
+    // apex vertex so the shading stays smooth around the cone; the base is a
+    // separate flat disc.
     {
         std::vector<float> v; std::vector<uint32_t> idx;
-        v.insert(v.end(), { 0.0f, 1.0f, 0.0f });   // apex 0
-        v.insert(v.end(), { 0.0f, 0.0f, 0.0f });   // base centre 1
+        auto sideN = [](float a) { return glm::normalize(glm::vec3(std::cos(a), 1.0f, std::sin(a))); };
+        for (int i = 0; i < seg; ++i)
+        {
+            const float a0 = glm::two_pi<float>() * float(i) / float(seg);
+            const float a1 = glm::two_pi<float>() * float(i + 1) / float(seg);
+            const uint32_t base = (uint32_t)(v.size() / 6);
+            vert(v, glm::vec3(0.0f, 1.0f, 0.0f), sideN(0.5f * (a0 + a1)));
+            vert(v, glm::vec3(std::cos(a0), 0.0f, std::sin(a0)), sideN(a0));
+            vert(v, glm::vec3(std::cos(a1), 0.0f, std::sin(a1)), sideN(a1));
+            idx.insert(idx.end(), { base, base + 1, base + 2 });
+        }
+        const uint32_t centre = (uint32_t)(v.size() / 6);
+        vert(v, glm::vec3(0.0f), glm::vec3(0, -1, 0));
         for (int i = 0; i < seg; ++i)
         {
             const float a = glm::two_pi<float>() * float(i) / float(seg);
-            v.insert(v.end(), { std::cos(a), 0.0f, std::sin(a) });
+            vert(v, glm::vec3(std::cos(a), 0.0f, std::sin(a)), glm::vec3(0, -1, 0));
         }
         for (uint32_t i = 0; i < (uint32_t)seg; ++i)
-        {
-            const uint32_t r0 = 2 + i, r1 = 2 + (i + 1) % seg;
-            idx.insert(idx.end(), { 0u, r0, r1, 1u, r1, r0 });
-        }
+            idx.insert(idx.end(), { centre, centre + 1 + (i + 1) % seg, centre + 1 + i });
         upload(m_cone, v, idx);
     }
+    // Sphere, radius 1.
     {
         std::vector<float> v; std::vector<uint32_t> idx;
-        const int lat = 10, lon = 16;
+        const int lat = 12, lon = 20;
         for (int i = 0; i <= lat; ++i)
         {
             const float ph = glm::pi<float>() * float(i) / float(lat);
             for (int j = 0; j <= lon; ++j)
             {
                 const float th = glm::two_pi<float>() * float(j) / float(lon);
-                v.insert(v.end(), { std::sin(ph) * std::cos(th), std::cos(ph), std::sin(ph) * std::sin(th) });
+                const glm::vec3 p(std::sin(ph) * std::cos(th), std::cos(ph), std::sin(ph) * std::sin(th));
+                vert(v, p, p);
             }
         }
         for (int i = 0; i < lat; ++i)
@@ -657,15 +864,17 @@ bool GizmoRenderer::Init()
             }
         upload(m_sphere, v, idx);
     }
+    // Unit square [0,1]^2 in the XY plane (drawn unlit).
     {
-        const std::vector<float> v = { 0, 0, 0,  1, 0, 0,  1, 1, 0,  0, 1, 0 };
-        const std::vector<uint32_t> idx = { 0, 1, 2, 0, 2, 3 };
-        upload(m_quad, v, idx);
+        std::vector<float> v;
+        for (const glm::vec3& p : { glm::vec3(0, 0, 0), glm::vec3(1, 0, 0), glm::vec3(1, 1, 0), glm::vec3(0, 1, 0) })
+            vert(v, p, glm::vec3(0, 0, 1));
+        upload(m_quad, v, { 0, 1, 2, 0, 2, 3 });
     }
+    // Torus about +Y in the XZ plane: major radius 1, tube kRingTube.
     {
-        // Torus about +Y in the XZ plane: major radius 1, tube kRingTube.
         std::vector<float> v; std::vector<uint32_t> idx;
-        const int maj = 96, mn = 8;
+        const int maj = 96, mn = 10;
         for (int i = 0; i < maj; ++i)
         {
             const float u = glm::two_pi<float>() * float(i) / float(maj);
@@ -673,8 +882,8 @@ bool GizmoRenderer::Init()
             for (int j = 0; j < mn; ++j)
             {
                 const float w = glm::two_pi<float>() * float(j) / float(mn);
-                const glm::vec3 p = c * (1.0f + kRingTube * std::cos(w)) + glm::vec3(0, kRingTube * std::sin(w), 0);
-                v.insert(v.end(), { p.x, p.y, p.z });
+                const glm::vec3 n = c * std::cos(w) + glm::vec3(0, std::sin(w), 0);
+                vert(v, c + n * kRingTube, n);
             }
         }
         for (uint32_t i = 0; i < (uint32_t)maj; ++i)
@@ -686,13 +895,21 @@ bool GizmoRenderer::Init()
             }
         upload(m_torus, v, idx);
     }
+    // Cube [-1, 1]^3 with flat faces (4 vertices per face).
     {
-        std::vector<float> v;
-        for (int c = 0; c < 8; ++c)
-            v.insert(v.end(), { (c & 1) ? 1.0f : -1.0f, (c & 2) ? 1.0f : -1.0f, (c & 4) ? 1.0f : -1.0f });
-        const std::vector<uint32_t> idx = {
-            0, 2, 3, 0, 3, 1,   4, 5, 7, 4, 7, 6,   0, 1, 5, 0, 5, 4,
-            2, 6, 7, 2, 7, 3,   0, 4, 6, 0, 6, 2,   1, 3, 7, 1, 7, 5 };
+        std::vector<float> v; std::vector<uint32_t> idx;
+        for (int f = 0; f < 6; ++f)
+        {
+            const int ax = f / 2;
+            const float sgn = (f % 2) ? 1.0f : -1.0f;
+            glm::vec3 n(0.0f); n[ax] = sgn;
+            const glm::vec3 u = kAxes[(ax + 1) % 3], w = kAxes[(ax + 2) % 3];
+            const uint32_t base = (uint32_t)(v.size() / 6);
+            const float sx[4] = { -1, 1, 1, -1 }, sy[4] = { -1, -1, 1, 1 };
+            for (int k = 0; k < 4; ++k) vert(v, n + u * sx[k] + w * sy[k], n);
+            if (sgn > 0) idx.insert(idx.end(), { base, base + 1, base + 2, base, base + 2, base + 3 });
+            else         idx.insert(idx.end(), { base, base + 2, base + 1, base, base + 3, base + 2 });
+        }
         upload(m_cube, v, idx);
     }
     glGenVertexArrays(1, &m_fanVao);
@@ -701,18 +918,51 @@ bool GizmoRenderer::Init()
     glBindBuffer(GL_ARRAY_BUFFER, m_fanVbo);
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
     glEnableVertexAttribArray(0);
+    glDisableVertexAttribArray(1);   // flat pieces only: no normals needed
     glBindVertexArray(0);
 
     m_ready = true;
     return true;
 }
 
-void GizmoRenderer::DrawMesh(const Mesh& m, const glm::mat4& mvp, const glm::vec4& color)
+// Per-draw setup shared by every Draw*: camera matrices for DrawMesh, and the
+// uniforms that default the same for every piece.
+void GizmoRenderer::BeginFrame(const Viewport& vp, const glm::vec3& pivot)
 {
+    m_view = vp.view;
+    m_VP = vp.proj * vp.view;
+    glUseProgram(m_program);
+    glUniform1i(m_uLit, 0);
+    glUniform1i(m_uDimBack, 0);
+    glUniform3fv(m_uPivot, 1, &pivot[0]);
+    const glm::vec3 cam = CameraPos(vp);
+    glUniform3fv(m_uCam, 1, &cam[0]);
+    glUniform1i(m_uUseTex, 0);
+}
+
+void GizmoRenderer::DrawMesh(const Mesh& m, const glm::mat4& model, const glm::vec4& color, bool lit)
+{
+    const glm::mat4 mvp = m_VP * model;
+    // Inverse-transpose so normals survive the meshes' non-uniform scaling
+    // (thin shafts, flat cones).
+    const glm::mat3 nm = glm::transpose(glm::inverse(glm::mat3(m_view * model)));
     glUniformMatrix4fv(m_uMVP, 1, GL_FALSE, &mvp[0][0]);
+    glUniformMatrix4fv(m_uModel, 1, GL_FALSE, &model[0][0]);
+    glUniformMatrix3fv(m_uNormalMat, 1, GL_FALSE, &nm[0][0]);
     glUniform4fv(m_uColor, 1, &color[0]);
+    glUniform1i(m_uLit, lit ? 1 : 0);
     glBindVertexArray(m.vao);
     glDrawElements(GL_TRIANGLES, m.count, GL_UNSIGNED_INT, nullptr);
+}
+
+// For the dynamic, already-world-space pieces (wedge, labels): unlit.
+void GizmoRenderer::SetFlat(const glm::vec4& color)
+{
+    const glm::mat4 I(1.0f);
+    glUniformMatrix4fv(m_uMVP, 1, GL_FALSE, &m_VP[0][0]);
+    glUniformMatrix4fv(m_uModel, 1, GL_FALSE, &I[0][0]);
+    glUniform4fv(m_uColor, 1, &color[0]);
+    glUniform1i(m_uLit, 0);
 }
 
 void GizmoRenderer::DrawMove(const Viewport& vp, const glm::vec3& pivot, Handle hover, Handle active)
@@ -720,7 +970,6 @@ void GizmoRenderer::DrawMove(const Viewport& vp, const glm::vec3& pivot, Handle 
     if (!Init()) return;
 
     const float L = HandleLength(vp, pivot);
-    const glm::mat4 VP = vp.proj * vp.view;
     const bool dragging = active != Handle::None;
 
     // While dragging, the grabbed handle is lit and the rest fade back.
@@ -736,7 +985,7 @@ void GizmoRenderer::DrawMove(const Viewport& vp, const glm::vec3& pivot, Handle 
     glEnable(GL_DEPTH_TEST);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    glUseProgram(m_program);
+    BeginFrame(vp, pivot);
 
     // Guide line along the grabbed axis.
     const Handle axisH[3] = { Handle::X, Handle::Y, Handle::Z };
@@ -744,19 +993,22 @@ void GizmoRenderer::DrawMove(const Viewport& vp, const glm::vec3& pivot, Handle 
     {
         const int i = AxisIndex(active);
         glDepthMask(GL_FALSE);
-        DrawMesh(m_cylinder, VP * AlongAxis(pivot - kAxes[i] * (40.0f * L), i, 80.0f * L, kShaftR * L * 0.6f),
-                 glm::vec4(glm::vec3(kAxisColor[i]), 0.45f));
+        DrawMesh(m_cylinder, AlongAxis(pivot - kAxes[i] * (40.0f * L), i, 80.0f * L, kShaftR * L * 0.6f),
+                 glm::vec4(glm::vec3(kAxisColor[i]), 0.45f), /*lit=*/false);
         glDepthMask(GL_TRUE);
     }
 
-    // Axis arrows: shaft + cone head.
+    // Axis arrows: shaft + cone head. One pointing at the camera fades out
+    // (it can't be dragged from this view -- see AxisVisibility).
     for (int i = 0; i < 3; ++i)
     {
-        const glm::vec4 c = colorFor(axisH[i], kAxisColor[i]);
+        glm::vec4 c = colorFor(axisH[i], kAxisColor[i]);
+        if (axisH[i] != active) c.a *= AxisVisibility(vp, pivot, i);
+        if (c.a <= 0.0f) continue;
         if (c.a < 1.0f) glDepthMask(GL_FALSE);
-        DrawMesh(m_cylinder, VP * AlongAxis(pivot + kAxes[i] * (kShaftStart * L), i,
+        DrawMesh(m_cylinder, AlongAxis(pivot + kAxes[i] * (kShaftStart * L), i,
                                             (kHeadStart - kShaftStart) * L, kShaftR * L), c);
-        DrawMesh(m_cone, VP * AlongAxis(pivot + kAxes[i] * (kHeadStart * L), i,
+        DrawMesh(m_cone, AlongAxis(pivot + kAxes[i] * (kHeadStart * L), i,
                                         (1.0f - kHeadStart) * L, kHeadR * L), c);
         glDepthMask(GL_TRUE);
     }
@@ -768,7 +1020,7 @@ void GizmoRenderer::DrawMove(const Viewport& vp, const glm::vec3& pivot, Handle 
         glm::mat4 M(1.0f);
         M[0][0] = M[1][1] = M[2][2] = kBallR * L;
         M[3] = glm::vec4(pivot, 1.0f);
-        DrawMesh(m_sphere, VP * M, c);
+        DrawMesh(m_sphere, M, c);
         glDepthMask(GL_TRUE);
     }
 
@@ -782,13 +1034,15 @@ void GizmoRenderer::DrawMove(const Viewport& vp, const glm::vec3& pivot, Handle 
         glm::vec4 c = colorFor(planeH[n], kAxisColor[n]);
         if (!dragging) c.a = (planeH[n] == hover) ? 0.75f : 0.40f;
         else if (planeH[n] == active) c.a = 0.75f;
+        if (planeH[n] != active) c.a *= PlaneVisibility(vp, pivot, n);   // fades edge-on
+        if (c.a <= 0.0f) continue;
         glm::mat4 M(1.0f);
         const float s = (kPlaneHi - kPlaneLo) * L;
         M[0] = glm::vec4(kAxes[a] * s, 0.0f);
         M[1] = glm::vec4(kAxes[b] * s, 0.0f);
         M[2] = glm::vec4(kAxes[n], 0.0f);
         M[3] = glm::vec4(pivot + (kAxes[a] + kAxes[b]) * (kPlaneLo * L), 1.0f);
-        DrawMesh(m_quad, VP * M, c);
+        DrawMesh(m_quad, M, c, /*lit=*/false);
     }
     glDepthMask(GL_TRUE);
 
@@ -804,7 +1058,6 @@ void GizmoRenderer::DrawRotate(const Viewport& vp, const glm::vec3& pivot,
 
     const float L = HandleLength(vp, pivot);
     const float R = kRingRadius * L;
-    const glm::mat4 VP = vp.proj * vp.view;
     const bool dragging = drag && drag->valid;
     const Handle active = dragging ? drag->handle : Handle::None;
     const Handle rings[3] = { Handle::RotX, Handle::RotY, Handle::RotZ };
@@ -813,26 +1066,29 @@ void GizmoRenderer::DrawRotate(const Viewport& vp, const glm::vec3& pivot,
     glEnable(GL_DEPTH_TEST);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    glUseProgram(m_program);
+    BeginFrame(vp, pivot);
 
     // Rings: the ring about axis i lies in the plane normal to it, coloured
-    // like that axis. Held ring lit, others faded; hover lit.
+    // like that axis. Held ring lit, others faded; hover lit. The half of each
+    // ring behind the pivot is dimmed, so front and back read apart.
+    glUniform1i(m_uDimBack, 1);
     for (int i = 0; i < 3; ++i)
     {
         glm::vec4 c = kAxisColor[i];
         if (dragging) c = (rings[i] == active) ? kHot : glm::vec4(glm::vec3(c), 0.25f);
         else if (rings[i] == hover) c = kHot;
         if (c.a < 1.0f) glDepthMask(GL_FALSE);
-        DrawMesh(m_torus, VP * AlongAxis(pivot, i, R, R), c);
+        DrawMesh(m_torus, AlongAxis(pivot, i, R, R), c);
         glDepthMask(GL_TRUE);
     }
+    glUniform1i(m_uDimBack, 0);
 
     // Small centre dot marking the pivot.
     {
         glm::mat4 M(1.0f);
         M[0][0] = M[1][1] = M[2][2] = kBallR * 0.6f * L;
         M[3] = glm::vec4(pivot, 1.0f);
-        DrawMesh(m_sphere, VP * M, kBall);
+        DrawMesh(m_sphere, M, kBall);
     }
 
     // Sweep wedge from the grab direction through the angle turned so far
@@ -856,9 +1112,7 @@ void GizmoRenderer::DrawRotate(const Viewport& vp, const glm::vec3& pivot,
         glBindVertexArray(m_fanVao);
         glBindBuffer(GL_ARRAY_BUFFER, m_fanVbo);
         glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(fan.size() * sizeof(float)), fan.data(), GL_STREAM_DRAW);
-        const glm::vec4 c(glm::vec3(kHot), 0.28f);
-        glUniformMatrix4fv(m_uMVP, 1, GL_FALSE, &VP[0][0]);
-        glUniform4fv(m_uColor, 1, &c[0]);
+        SetFlat(glm::vec4(glm::vec3(kHot), 0.28f));
         glDepthMask(GL_FALSE);
         glDrawArrays(GL_TRIANGLE_FAN, 0, (GLsizei)(fan.size() / 3));
         glDepthMask(GL_TRUE);
@@ -875,7 +1129,6 @@ void GizmoRenderer::DrawScale(const Viewport& vp, const glm::vec3& pivot,
     if (!Init()) return;
 
     const float L = HandleLength(vp, pivot);
-    const glm::mat4 VP = vp.proj * vp.view;
     const bool dragging = active != Handle::None;
     // Stalks stretch with the factor (uniform, so all three), within reason so
     // they stay on screen and grabbable-looking.
@@ -892,21 +1145,23 @@ void GizmoRenderer::DrawScale(const Viewport& vp, const glm::vec3& pivot,
     glEnable(GL_DEPTH_TEST);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    glUseProgram(m_program);
+    BeginFrame(vp, pivot);
 
     const Handle axes[3] = { Handle::ScaleX, Handle::ScaleY, Handle::ScaleZ };
     for (int i = 0; i < 3; ++i)
     {
-        const glm::vec4 c = colorFor(axes[i], kAxisColor[i]);
+        glm::vec4 c = colorFor(axes[i], kAxisColor[i]);
+        if (axes[i] != active) c.a *= AxisVisibility(vp, pivot, i);   // end-on: fades
+        if (c.a <= 0.0f) continue;
         if (c.a < 1.0f) glDepthMask(GL_FALSE);
         const float cubeAt = kScaleCubePos * k * L;
         const float stalk = cubeAt - kScaleCubeR * L - kShaftStart * L;
         if (stalk > 0.0f)
-            DrawMesh(m_cylinder, VP * AlongAxis(pivot + kAxes[i] * (kShaftStart * L), i, stalk, kShaftR * L), c);
+            DrawMesh(m_cylinder, AlongAxis(pivot + kAxes[i] * (kShaftStart * L), i, stalk, kShaftR * L), c);
         glm::mat4 M(1.0f);
         M[0][0] = M[1][1] = M[2][2] = kScaleCubeR * L;
         M[3] = glm::vec4(pivot + kAxes[i] * cubeAt, 1.0f);
-        DrawMesh(m_cube, VP * M, c);
+        DrawMesh(m_cube, M, c);
         glDepthMask(GL_TRUE);
     }
     {
@@ -915,7 +1170,7 @@ void GizmoRenderer::DrawScale(const Viewport& vp, const glm::vec3& pivot,
         glm::mat4 M(1.0f);
         M[0][0] = M[1][1] = M[2][2] = kCentreCubeR * L;
         M[3] = glm::vec4(pivot, 1.0f);
-        DrawMesh(m_cube, VP * M, c);
+        DrawMesh(m_cube, M, c);
         glDepthMask(GL_TRUE);
     }
 
@@ -944,7 +1199,6 @@ void GizmoRenderer::DrawAxisTriad(const Viewport& vp, const glm::vec3& origin, f
     if (!Init() || !(length > 0.0f)) return;
 
     const float L = length;
-    const glm::mat4 VP = vp.proj * vp.view;
 
     // Part of the scene: depth-tested like everything else, nothing cleared.
     // Lifted a hair off y = 0 so the X / Z shafts don't z-fight the floor.
@@ -952,21 +1206,21 @@ void GizmoRenderer::DrawAxisTriad(const Viewport& vp, const glm::vec3& origin, f
     glEnable(GL_DEPTH_TEST);
     glDepthMask(GL_TRUE);
     glDisable(GL_BLEND);
-    glUseProgram(m_program);
+    BeginFrame(vp, o);
 
     constexpr float kShaft = 0.028f, kHead = 0.075f, kHeadLen = 0.24f;
     for (int i = 0; i < 3; ++i)
     {
         const glm::vec4 c = kAxisColor[i];
-        DrawMesh(m_cylinder, VP * AlongAxis(o, i, (1.0f - kHeadLen) * L, kShaft * L), c);
-        DrawMesh(m_cone, VP * AlongAxis(o + kAxes[i] * ((1.0f - kHeadLen) * L), i,
+        DrawMesh(m_cylinder, AlongAxis(o, i, (1.0f - kHeadLen) * L, kShaft * L), c);
+        DrawMesh(m_cone, AlongAxis(o + kAxes[i] * ((1.0f - kHeadLen) * L), i,
                                         kHeadLen * L, kHead * L), c);
     }
     {
         glm::mat4 M(1.0f);
         M[0][0] = M[1][1] = M[2][2] = 0.055f * L;
         M[3] = glm::vec4(o, 1.0f);
-        DrawMesh(m_sphere, VP * M, kBall);
+        DrawMesh(m_sphere, M, kBall);
     }
 
     // Labels just past each tip, as camera-facing strokes (the view matrix's
@@ -980,7 +1234,6 @@ void GizmoRenderer::DrawAxisTriad(const Viewport& vp, const glm::vec3& origin, f
 
     glBindVertexArray(m_fanVao);
     glBindBuffer(GL_ARRAY_BUFFER, m_fanVbo);
-    glUniformMatrix4fv(m_uMVP, 1, GL_FALSE, &VP[0][0]);
     for (int i = 0; i < 3; ++i)
     {
         // Raised by half a glyph so the X / Z labels stand on the floor
@@ -1003,7 +1256,7 @@ void GizmoRenderer::DrawAxisTriad(const Viewport& vp, const glm::vec3& origin, f
             for (int j : { 0, 1, 2, 0, 2, 3 }) tri.insert(tri.end(), { q[j].x, q[j].y, q[j].z });
         }
         glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(tri.size() * sizeof(float)), tri.data(), GL_DYNAMIC_DRAW);
-        glUniform4fv(m_uColor, 1, &kAxisColor[i][0]);
+        SetFlat(kAxisColor[i]);
         glDrawArrays(GL_TRIANGLES, 0, (GLsizei)(tri.size() / 3));
     }
 
@@ -1011,8 +1264,81 @@ void GizmoRenderer::DrawAxisTriad(const Viewport& vp, const glm::vec3& origin, f
     glUseProgram(0);
 }
 
+void GizmoRenderer::SetReadout(const unsigned char* coverage, int width, int height)
+{
+    if (!Init() || !coverage || width <= 0 || height <= 0) return;
+    if (!m_readoutTex) glGenTextures(1, &m_readoutTex);
+    glBindTexture(GL_TEXTURE_2D, m_readoutTex);
+    GLint align = 4;
+    glGetIntegerv(GL_UNPACK_ALIGNMENT, &align);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, width, height, 0, GL_RED, GL_UNSIGNED_BYTE, coverage);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, align);
+    // Drawn 1:1 with screen pixels, so nearest keeps the text crisp.
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    m_readoutW = width;
+    m_readoutH = height;
+}
+
+void GizmoRenderer::DrawReadout(const Viewport& vp, float mx, float my)
+{
+    if (!Init() || !m_readoutTex || m_readoutW <= 0) return;
+    const float w = float(m_readoutW), h = float(m_readoutH);
+    const float W = float(vp.width), H = float(vp.height);
+
+    // Below-right of the cursor; flipped to the other side near an edge.
+    float x = mx + 18.0f, y = my + 20.0f;
+    if (x + w > W - 4.0f) x = mx - 18.0f - w;
+    if (y + h > H - 4.0f) y = my - 20.0f - h;
+    x = std::floor(std::max(4.0f, x));
+    y = std::floor(std::max(4.0f, y));
+
+    // Screen space, y down, one unit per pixel.
+    glUseProgram(m_program);
+    m_VP = glm::ortho(0.0f, W, H, 0.0f, -1.0f, 1.0f);
+    m_view = glm::mat4(1.0f);
+    glUniform1i(m_uDimBack, 0);
+    glDisable(GL_DEPTH_TEST);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    auto rect = [](float rx, float ry, float rw, float rh)
+    {
+        // Unit quad (0,0)-(1,1) onto the pixel rect, v = 0 at its bottom edge
+        // so the texture (rows top-down) reads upright.
+        glm::mat4 M(1.0f);
+        M[0] = glm::vec4(rw, 0.0f, 0.0f, 0.0f);
+        M[1] = glm::vec4(0.0f, -rh, 0.0f, 0.0f);
+        M[3] = glm::vec4(rx, ry + rh, 0.0f, 1.0f);
+        return M;
+    };
+    glUniform1i(m_uUseTex, 0);
+    DrawMesh(m_quad, rect(x - 1.0f, y - 1.0f, w + 2.0f, h + 2.0f), glm::vec4(1.0f, 1.0f, 1.0f, 0.16f), false);
+    DrawMesh(m_quad, rect(x, y, w, h), glm::vec4(0.10f, 0.11f, 0.14f, 0.88f), false);
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, m_readoutTex);
+    glUniform1i(m_uTex, 0);
+    glUniform1i(m_uUseTex, 1);
+    DrawMesh(m_quad, rect(x, y, w, h), glm::vec4(kHot.r, kHot.g, kHot.b, 1.0f), false);
+    glUniform1i(m_uUseTex, 0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    glBindVertexArray(0);
+    glUseProgram(0);
+    glDisable(GL_BLEND);
+    glEnable(GL_DEPTH_TEST);
+}
+
 void GizmoRenderer::Destroy()
 {
+    if (m_readoutTex) glDeleteTextures(1, &m_readoutTex);
+    m_readoutTex = 0;
+    m_readoutW = m_readoutH = 0;
     if (m_fanVbo) glDeleteBuffers(1, &m_fanVbo);
     if (m_fanVao) glDeleteVertexArrays(1, &m_fanVao);
     m_fanVbo = m_fanVao = 0;

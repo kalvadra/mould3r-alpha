@@ -45,6 +45,8 @@
 #include "PerspectiveButton.h" // flat tab-style perspective switch
 #include "VentEditToolbar.h"   // Part 5: floating complex-vent-path toolbar
 #include "TransformPanel.h"    // Move / Rotate / Scale live side panel
+#include "ToolPanels.h"       // Place / Pattern cards, same style
+#include "CanvasToast.h"      // bottom-centre viewport hint pill
 #include "SprueEditToolbar.h"  // Edit Sprue floating toolbar
 #include "WindowEffects.h"     // DWM corner rounding for the main frame
 #include "MaterialFile.h"      // Materials menu: library folder location
@@ -118,110 +120,6 @@ static wxBitmapBundle LoadSvgBundle(const wxString& svgPath,
     return wxBitmapBundle::FromSVG(utf8.data(), size);
 }
 
-// ---------------------------------------------------------------------------
-// CanvasToast — a small self-painted hint pill pinned to the bottom-centre of
-// the 3D viewport.
-//
-// Why: a few modes are signalled only by the cursor (PlaceInsert swaps to a
-// hand, meaning "click a body to parent to"), which is easy to miss. This says
-// it in words, without stealing focus or needing to be dismissed.
-//
-// Construction rules match VentEditToolbar: a SIBLING of the canvas raised
-// above it (a true child of a wxGLCanvas can be overdrawn by SwapBuffers), one
-// HWND, no nested native controls, everything painted here. Defined in this
-// .cpp rather than its own file pair so the .vcxproj needs no new entries —
-// same arrangement as InsertEditDialog further down.
-//
-// NOT time-limited: it appears when a mode raises it and goes away when that
-// mode ends. A guidance hint that fades out mid-task is worse than one that
-// stays put, and the mode is the natural lifetime. Swapping in an auto-fade is
-// a wxTimer away if that turns out to be the wrong call.
-//
-// The pill is opaque and does swallow clicks in its own footprint. It sits low
-// and is only as wide as its text, so it rarely covers anything you need to
-// click; if it ever does, WS_EX_TRANSPARENT on the HWND makes it click-through.
-// ---------------------------------------------------------------------------
-static constexpr int kToastH = 38;
-static constexpr int kToastPadX = 20;
-
-class CanvasToast : public wxPanel
-{
-public:
-    explicit CanvasToast(wxWindow* parent);
-
-    // Set the message, resize to fit it, show and raise. Re-showing the message
-    // already on screen is a no-op, so it is safe to call every mode change.
-    // The CALLER re-pins us afterwards (GLCanvas::RepositionCanvasToast) — the
-    // size just changed and the canvas owns the centring.
-    void ShowMessage(const wxString& msg);
-    void HideToast();
-
-private:
-    void OnPaint(wxPaintEvent&);
-    void ApplyPillShape();
-
-    wxString m_msg;
-};
-
-CanvasToast::CanvasToast(wxWindow* parent)
-    : wxPanel(parent, wxID_ANY, wxDefaultPosition, wxSize(200, kToastH),
-        wxBORDER_NONE)
-{
-    SetBackgroundStyle(wxBG_STYLE_PAINT);   // we paint everything ourselves
-    SetBackgroundColour(Style::CardBg);
-    Bind(wxEVT_PAINT, &CanvasToast::OnPaint, this);
-    Hide();   // nothing to say until a mode raises us
-}
-
-// Clip the HWND to a pill so the corners are genuinely cut away and the
-// viewport shows through, rather than the card colour squaring off outside the
-// drawn outline. wxWindow has no SetShape (that is wxNonOwnedWindow, top-level
-// only), so this goes native — same technique as VentEditToolbar. SetWindowRgn
-// takes ownership of the region on success, so it must not be deleted then.
-void CanvasToast::ApplyPillShape()
-{
-#ifdef __WXMSW__
-    HWND hwnd = (HWND)GetHWND();
-    if (!hwnd) return;
-
-    const wxSize sz = GetSize();
-    if (sz.x <= 0 || sz.y <= 0) return;
-
-    // +1 because CreateRoundRectRgn treats right/bottom as exclusive; without
-    // it the region shaves the last row and column and eats the 1px border.
-    HRGN rgn = ::CreateRoundRectRgn(0, 0, sz.x + 1, sz.y + 1, sz.y, sz.y);
-    if (!rgn) return;
-
-    if (!::SetWindowRgn(hwnd, rgn, TRUE))
-        ::DeleteObject(rgn);
-#endif
-}
-
-void CanvasToast::ShowMessage(const wxString& msg)
-{
-    if (IsShown() && msg == m_msg) return;
-    m_msg = msg;
-
-    // Size to the text. wxClientDC measures with this window's font, which is
-    // the same one OnPaint draws with.
-    int tw = 0, th = 0;
-    {
-        wxClientDC dc(this);
-        dc.SetFont(GetFont());
-        dc.GetTextExtent(m_msg, &tw, &th);
-    }
-    SetSize(tw + kToastPadX * 2, kToastH);
-    ApplyPillShape();   // re-clip: the width just changed
-
-    if (!IsShown()) Show();
-    Raise();            // keep above the GL surface
-    Refresh(false);
-}
-
-void CanvasToast::HideToast()
-{
-    if (IsShown()) Hide();
-}
 
 // ---------------------------------------------------------------------------
 // UpdateBanner — the U4 non-modal "an update is available" card, pinned to
@@ -414,30 +312,6 @@ void UpdateBanner::OnMouse(wxMouseEvent& e)
     }
 }
 
-void CanvasToast::OnPaint(wxPaintEvent&)
-{
-    wxAutoBufferedPaintDC dc(this);
-    dc.SetBackground(wxBrush(Style::CardBg));
-    dc.Clear();
-
-    wxGraphicsContext* gc = wxGraphicsContext::Create(dc);
-    if (!gc) return;
-    gc->SetAntialiasMode(wxANTIALIAS_DEFAULT);
-
-    const wxSize sz = GetClientSize();
-    const double radius = (sz.y - 1.0) / 2.0;   // full pill
-
-    gc->SetBrush(wxBrush(Style::CardBg));
-    gc->SetPen(wxPen(Style::Divider, 1));
-    gc->DrawRoundedRectangle(0.5, 0.5, sz.x - 1.0, sz.y - 1.0, radius);
-
-    gc->SetFont(GetFont(), Style::TextPrimary);
-    double tw, th;
-    gc->GetTextExtent(m_msg, &tw, &th);
-    gc->DrawText(m_msg, (sz.x - tw) / 2.0, (sz.y - th) / 2.0);
-
-    delete gc;
-}
 
 // ---------------------------------------------------------------------------
 // Drag-and-drop target for the 3D viewport.
@@ -681,6 +555,10 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
     // ---- Move / Rotate / Scale side panel ------------------------------------
     // Same sibling-of-the-canvas overlay as the vent toolbar, pinned to the
     // viewport's top-right corner while a transform tool is active.
+    // Enter in a sidebar / card field commits it and hands the keyboard back
+    // to the 3D view (DimensionInput).
+    DimInput::SetEnterFocusTarget(this, m_canvas);
+
     m_transformPanel = new TransformPanel(m_preparePage);
     m_transformPanel->SetOnChange([this](const Xform::Delta& d) {
         if (m_canvas) m_canvas->SetTransformSessionDelta(d);
@@ -688,9 +566,37 @@ MainFrame::MainFrame(const FixtureDefinition& fixture)
     m_transformPanel->SetOnOk([this]() { CommitTransformTool(); });
     m_transformPanel->SetOnCancel([this]() { CancelTransformTool(); });
     m_canvas->SetTransformPanel(m_transformPanel);
+
+    // Place / Pattern cards: same look, same top-right slot.
+    m_placePanel = new PlacePanel(m_preparePage);
+    m_placePanel->SetOnChange([this](double xMM, double zMM) {
+        if (!m_canvas) return;
+        // The session snapshot is where the selection was when Place began;
+        // the typed point is absolute, so the move is the difference.
+        Xform::Delta d;
+        d.move = glm::vec3(float(xMM - m_placeOriginX), 0.0f, float(zMM - m_placeOriginZ));
+        m_canvas->SetTransformSessionDelta(d);
+    });
+    m_placePanel->SetOnOk([this]() { CommitTransformTool(); });
+    m_placePanel->SetOnCancel([this]() { CancelTransformTool(); });
+    m_canvas->AddPinnedPanel(m_placePanel);
+
+    m_patternPanel = new PatternPanel(m_preparePage);
+    m_patternPanel->SetOnOk([this]() { CommitTransformTool(); });   // applies the pattern
+    m_patternPanel->SetOnCancel([this]() { CancelTransformTool(); });
+    m_canvas->AddPinnedPanel(m_patternPanel);
+
     m_canvas->SetOnTransformSelectionChanged([this]() {
-        if (!m_transformPanel || !m_canvas) return;
-        m_transformPanel->SetSelectionCount(m_canvas->GetSelectionCount());
+        if (!m_canvas) return;
+        const TransformMode mode = m_canvas->GetTransformMode();
+        if (mode == TransformMode::Place)
+            ResetPlacePanel();   // the session restarted on the new selection
+        else if (mode == TransformMode::Pattern)
+        {
+            if (m_patternPanel) m_patternPanel->SetSelectionCount(m_canvas->GetSelectionCount());
+        }
+        else if (m_transformPanel)
+            m_transformPanel->SetSelectionCount(m_canvas->GetSelectionCount());
         m_canvas->RepositionTransformPanel();
     });
     // A handle drag on the canvas writes its delta back into the panel fields.
@@ -974,6 +880,9 @@ public:
             grid->Add(ctrl, 0, wxALIGN_CENTER_VERTICAL);
             auto* us = new wxStaticText(this, wxID_ANY, unitSuffix);
             m_unitLabels.push_back(us);
+            // mm^3 / mm^2 / ratio: no length suffix applies, but fractions
+            // and expressions do.
+            DimInput::Attach(ctrl, DimInput::Unit::None);
             grid->Add(us, 0, wxALIGN_CENTER_VERTICAL);
         };
         addRow("Minimum region volume:", m_ctrlVol,  m_volMM3 / VolFactor(),  u + "^3");
@@ -990,7 +899,7 @@ public:
     double GetSignificanceRatio() const
     {
         double v;
-        if (m_ctrlRatio->GetValue().ToCDouble(&v))
+        if (DimInput::Read(m_ctrlRatio, v))
         {
             if (v < 0.0) v = 0.0;
             if (v > 1.0) v = 1.0;
@@ -1015,7 +924,7 @@ private:
     double ParseVal(wxTextCtrl* ctrl, double fallbackMM, double factor) const
     {
         double v;
-        if (ctrl->GetValue().ToCDouble(&v))
+        if (DimInput::Read(ctrl, v))
         {
             if (v < 0.0) v = 0.0;
             return v * factor;
@@ -1670,8 +1579,7 @@ void MainFrame::SetActiveTool(TransformMode mode)
     if (m_canvas && m_canvas->IsTransformSessionActive() &&
         mode != m_canvas->GetTransformMode())
         m_canvas->CommitTransformSession();
-    if (m_transformPanel && !GLCanvas::IsTransformTool(mode) && m_transformPanel->IsShown())
-        m_transformPanel->Hide();
+    ShowToolPanelFor(mode);   // hide every card but this tool's
 
     // Map TransformMode -> the command ID of the toggle button that should
     // appear active. Modes without an associated toggle button (Select,
@@ -1683,6 +1591,7 @@ void MainFrame::SetActiveTool(TransformMode mode)
     case TransformMode::Rotate:        activeId = ID_ToolRotate;        break;
     case TransformMode::Scale:         activeId = ID_ToolScale;         break;
     case TransformMode::Pattern:       activeId = ID_ToolPattern;       break;
+    case TransformMode::Place:         activeId = ID_ToolPrecisionPlace; break;
     case TransformMode::PlaceVent:     activeId = ID_ToolPlaceVent;     break;
     case TransformMode::PlaceRunner:   activeId = ID_PlaceRunner;       break;
     case TransformMode::PlaceGate:     activeId = ID_PlaceGate;         break;
@@ -1718,6 +1627,10 @@ void MainFrame::UpdateCanvasToast(TransformMode mode)
 
     if (mode == TransformMode::PlaceInsert)
         m_canvasToast->ShowMessage("Select body to add insert to");
+    else if (mode == TransformMode::AlignFace)
+        m_canvasToast->ShowMessage("Select face to align with the parting plane.");
+    else if (mode == TransformMode::AlignMidplane)
+        m_canvasToast->ShowMessage("Select two faces to align the midplane with the parting plane.");
     else
         m_canvasToast->HideToast();
 
@@ -1754,6 +1667,7 @@ void MainFrame::StartTransformTool(TransformMode mode)
     const Xform::Tool tool = mode == TransformMode::Rotate ? Xform::Tool::Rotate
                            : mode == TransformMode::Scale  ? Xform::Tool::Scale
                                                            : Xform::Tool::Move;
+    m_canvas->SetTransformImperial(m_imperial);   // the drag readout's unit
     m_transformPanel->Begin(tool, m_imperial, m_canvas->GetSelectionCount());
     m_canvas->RepositionTransformPanel();
     m_transformPanel->Show();
@@ -1762,6 +1676,17 @@ void MainFrame::StartTransformTool(TransformMode mode)
 
 void MainFrame::CommitTransformTool()
 {
+    // Pattern has no live session: OK is where its copies are made.
+    if (m_canvas && m_patternPanel && m_canvas->GetTransformMode() == TransformMode::Pattern &&
+        m_canvas->HasSelection())
+    {
+        const PatternValues v = m_patternPanel->GetValues();
+        if (v.type == PatternValues::Type::Circular)
+            m_canvas->ApplyCircularPattern(v.number, v.overrideRadius, v.radius, v.rotateCopies);
+        else
+            m_canvas->ApplyGridPattern(v.numberH, v.numberV, v.mirrorH, v.mirrorV,
+                v.overrideLengthWidth, v.length, v.width);
+    }
     if (m_canvas) m_canvas->CommitTransformSession();
     SetActiveTool(TransformMode::Select);
     if (m_canvas) m_canvas->SetFocus();   // keyboard back to the viewport
@@ -1769,81 +1694,99 @@ void MainFrame::CommitTransformTool()
 
 void MainFrame::CancelTransformTool()
 {
+    // Esc / Cancel during a handle drag undoes just that drag; the tool stays.
+    if (m_canvas && m_canvas->CancelGizmoDrag()) return;
     if (m_canvas) m_canvas->CancelTransformSession();
     SetActiveTool(TransformMode::Select);
     if (m_canvas) m_canvas->SetFocus();
 }
 
 // ---------------------------------------------------------------------------
-// Pattern — opens the PatternDialog. UI scaffolding only for now; the
-// canvas-side pattern application will be wired up in a follow-up change.
+// ShowToolPanelFor — exactly one top-right card per tool: Move / Rotate /
+// Scale share the TransformPanel, Place and Pattern have their own. Every
+// other mode hides them all. (Showing is left to the Start* functions, once
+// the card's contents are ready.)
 // ---------------------------------------------------------------------------
-void MainFrame::OnToolPattern(wxCommandEvent&)
+void MainFrame::ShowToolPanelFor(TransformMode mode)
 {
-    // Dialog tool, not a placement-mode toggle — clear any active toggle so
-    // the button doesn't appear stuck on after the dialog closes (matches the
-    // Translate/Rotate/Scale convention).
-    SetActiveTool(TransformMode::Select);
-
-    if (!m_canvas) return;
-
-    PatternDialog dlg(this);
-    if (dlg.ShowModal() != wxID_OK)
-        return;
-
-    if (!m_canvas->HasSelection())
-        return;
-
-    const PatternValues v = dlg.GetValues();
-
-    switch (v.type)
-    {
-    case PatternValues::Type::Circular:
-        m_canvas->ApplyCircularPattern(v.number, v.overrideRadius, v.radius,
-            v.rotateCopies);
-        break;
-
-    case PatternValues::Type::Grid:
-        m_canvas->ApplyGridPattern(v.numberH, v.numberV,
-            v.mirrorH, v.mirrorV,
-            v.overrideLengthWidth, v.length, v.width);
-        break;
-    }
+    const bool xform = mode == TransformMode::Translate || mode == TransformMode::Rotate ||
+                       mode == TransformMode::Scale;
+    if (m_transformPanel && !xform && m_transformPanel->IsShown()) m_transformPanel->Hide();
+    if (m_placePanel && mode != TransformMode::Place && m_placePanel->IsShown()) m_placePanel->Hide();
+    if (m_patternPanel && mode != TransformMode::Pattern && m_patternPanel->IsShown()) m_patternPanel->Hide();
 }
 
 // ---------------------------------------------------------------------------
-// Precision Place — opens a dialog for an absolute XZ target and moves the
-// selection there. A dialog tool (not a placement-mode toggle), so the button
-// clears its toggle the moment the dialog opens, matching Translate/Rotate/
-// Scale/Pattern. Also reachable by double-clicking a body on the canvas.
+// Pattern — the card in the top-right slot (was the modal PatternDialog). The
+// options persist between uses; OK makes the copies (CommitTransformTool),
+// Cancel / Esc closes. Pressing the latched button again closes it too.
+// ---------------------------------------------------------------------------
+void MainFrame::OnToolPattern(wxCommandEvent&)
+{
+    StartPatternTool();
+}
+
+void MainFrame::StartPatternTool()
+{
+    if (!m_canvas || !m_patternPanel) return;
+    if (m_canvas->GetTransformMode() == TransformMode::Pattern)
+    {
+        CancelTransformTool();
+        return;
+    }
+    SetActiveTool(TransformMode::Pattern);   // commits any other tool, latches the button
+    m_patternPanel->Begin(m_imperial, m_canvas->GetSelectionCount());
+    m_canvas->RepositionTransformPanel();
+    m_patternPanel->Show();
+    m_patternPanel->Raise();   // keep above the GL surface
+}
+
+// ---------------------------------------------------------------------------
+// Place — absolute X / Z for the selection's centre (the average of the
+// selected bodies' origins), in the top-right card (was the modal
+// PrecisionPlaceDialog). A live tool session like Move: the selection follows
+// the typed point, OK keeps it (one undo step), Cancel puts it back. Also
+// reached by double-clicking a body.
 // ---------------------------------------------------------------------------
 void MainFrame::OnToolPrecisionPlace(wxCommandEvent&)
 {
-    SetActiveTool(TransformMode::Select);
-    PrecisionPlaceSelected();
+    StartPlaceTool();
 }
 
 void MainFrame::PrecisionPlaceSelected()
 {
-    if (!m_canvas) return;
+    StartPlaceTool();
+}
 
-    // Pre-fill the dialog with the selection's current XZ so the fields show
-    // where the object is now. Falls back to (0, 0) when nothing is selected
-    // (e.g. the button was pressed with an empty selection); the post-OK
-    // HasSelection guard then makes the dialog a no-op, matching the other
-    // transform tools.
-    float curX = 0.0f, curZ = 0.0f;
-    m_canvas->GetSelectionCenterXZ(curX, curZ);
+void MainFrame::StartPlaceTool()
+{
+    if (!m_canvas || !m_placePanel) return;
 
-    PrecisionPlaceDialog dlg(this, curX, curZ);
-    if (dlg.ShowModal() != wxID_OK)
+    // The latched button again = OK, as for Move / Rotate / Scale.
+    if (m_canvas->GetTransformMode() == TransformMode::Place && m_canvas->IsTransformSessionActive())
+    {
+        CommitTransformTool();
         return;
+    }
+    SetActiveTool(TransformMode::Place);
+    m_canvas->BeginTransformSession();
+    m_canvas->SetTransformImperial(m_imperial);
+    ResetPlacePanel();
+    m_canvas->RepositionTransformPanel();
+    m_placePanel->Show();
+    m_placePanel->Raise();
+}
 
-    if (!m_canvas->HasSelection())
-        return;
-
-    const PrecisionPlaceValues v = dlg.GetValues();
-    m_canvas->MoveSelectionToXZ(v.x, v.z);
+// Fill the Place card from the selection as it stands (the session has just
+// been started or restarted on it).
+void MainFrame::ResetPlacePanel()
+{
+    if (!m_canvas || !m_placePanel) return;
+    float cx = 0.0f, cz = 0.0f;
+    m_canvas->GetSelectionCenterXZ(cx, cz);   // stays (0, 0) with nothing selected
+    m_placeOriginX = cx;
+    m_placeOriginZ = cz;
+    m_placePanel->Begin(m_imperial, m_canvas->GetSelectionCount(), cx, cz);
 }
 
 // ---------------------------------------------------------------------------

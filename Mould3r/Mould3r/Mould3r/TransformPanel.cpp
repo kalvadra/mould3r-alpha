@@ -1,5 +1,6 @@
 #include "TransformPanel.h"
 #include "RoundedButton.h"
+#include "DimensionInput.h"   // fractions / expressions / unit suffixes
 #include "style.h"
 
 #include <wx/dcbuffer.h>
@@ -38,13 +39,15 @@ namespace
         return s;
     }
 
-    // Empty reads as `emptyValue`; anything else must parse completely.
+    // Empty reads as `emptyValue`; anything else must evaluate completely
+    // (decimals, fractions, expressions, a unit suffix -- DimensionInput.h).
+    // Mid-typing ("1/") is a failure, so the live preview holds.
     bool ParseField(const wxTextCtrl* c, double emptyValue, double& out)
     {
         wxString t = c->GetValue();
         t.Trim(true).Trim(false);
         if (t.IsEmpty()) { out = emptyValue; return true; }
-        return t.ToDouble(&out) && std::isfinite(out);
+        return DimInput::ReadExact(c, out) && std::isfinite(out);
     }
 }
 
@@ -80,11 +83,6 @@ TransformPanel::TransformPanel(wxWindow* parent)
     m_fz = MakeRow(m_main, "Z:", m_uz, m_rowZ);
     m_ff = MakeRow(m_main, "Factor:", m_uf, m_rowF);
 
-    m_note = new wxStaticText(this, wxID_ANY, "");
-    m_note->SetFont(UiFont(7));
-    m_note->SetForegroundColour(Style::TextMuted);
-    m_note->SetBackgroundColour(Style::CardBg);
-    m_main->Add(m_note, 0, wxLEFT | wxRIGHT | wxTOP, kPad);
 
     // ---- Buttons -----------------------------------------------------------------
     auto* btns = new wxBoxSizer(wxHORIZONTAL);
@@ -132,6 +130,9 @@ wxTextCtrl* TransformPanel::MakeRow(wxSizer* parentSz, const wxString& label,
     unit->SetFont(UiFont(8));
     unit->SetForegroundColour(Style::TextSubtle);
     unit->SetBackgroundColour(Style::CardBg);
+    // Unit read live from the label, which Begin() switches between mm / in /
+    // degrees / factor per tool.
+    DimInput::Attach(ctrl, unit);
 
     row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL);
     row->AddStretchSpacer(1);
@@ -167,18 +168,15 @@ void TransformPanel::Begin(Xform::Tool tool, bool imperial, int selectionCount)
     case Xform::Tool::Rotate:
         m_title->SetLabel("ROTATE");
         for (wxStaticText* u : { m_ux, m_uy, m_uz }) u->SetLabel(wxString::FromUTF8("\xC2\xB0"));
-        m_note->SetLabel(wxString::FromUTF8("About the selection centre, world axes (Z \xE2\x86\x92 X \xE2\x86\x92 Y)"));
         break;
     case Xform::Tool::Scale:
         m_title->SetLabel("SCALE");
         m_uf->SetLabel(wxString::FromUTF8("\xC3\x97"));
-        m_note->SetLabel("Uniform, about the selection centre");
         break;
     case Xform::Tool::Move:
     default:
         m_title->SetLabel("MOVE");
         for (wxStaticText* u : { m_ux, m_uy, m_uz }) u->SetLabel(imperial ? "in" : "mm");
-        m_note->SetLabel("Offset along the world axes");
         break;
     }
 
@@ -216,6 +214,7 @@ void TransformPanel::WriteFields()
     if (m_tool == Xform::Tool::Scale)
     {
         m_ff->ChangeValue(Fmt(m_delta.scale, 4));
+        DimInput::Revalidate(m_ff);
         return;
     }
     const glm::vec3 v = (m_tool == Xform::Tool::Rotate)
@@ -225,6 +224,9 @@ void TransformPanel::WriteFields()
     m_fx->ChangeValue(Fmt(v.x, digits));
     m_fy->ChangeValue(Fmt(v.y, digits));
     m_fz->ChangeValue(Fmt(v.z, digits));
+    // ChangeValue sends no text event: clear any red tint left by half-typed
+    // text that a handle drag has just overwritten.
+    for (wxTextCtrl* c : { m_fx, m_fy, m_fz }) DimInput::Revalidate(c);
 }
 
 bool TransformPanel::ReadFields(Xform::Delta& out) const

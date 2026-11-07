@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <string>
+#include <vector>
 
 #include "GridSettings.h"
 
@@ -188,6 +190,23 @@ namespace Gizmo
     // zoom, so it reads as part of the floor.
     void GridTriadPlacement(const GridSettings& g, glm::vec3& origin, float& length);
 
+    // ---- Drag readout --------------------------------------------------------
+    // The label shown beside the cursor during a handle drag, for THIS drag
+    // (the panel keeps the session totals): "X +12.50 mm", "X +1.20  Z -3.40
+    // mm", "Y +45.0deg", "x1.250"; " . snap" while Ctrl snaps. UTF-8.
+    //   moveMM    -- this drag's move, world mm (Move handles)
+    //   rotDeg    -- this drag's turn (Rotate rings)
+    //   factor    -- this drag's scale factor (Scale handles)
+    std::string DragReadout(Handle h, const glm::vec3& moveMM, float rotDeg, float factor,
+                            bool imperial, bool snapping);
+
+#ifndef GIZMO_NO_WX
+    // Render `utf8` with the UI font into an 8-bit coverage mask (rows top to
+    // bottom) for GizmoRenderer::SetReadout. False if wx couldn't draw it.
+    bool RasterizeText(const std::string& utf8, std::vector<unsigned char>& coverage,
+                       int& width, int& height);
+#endif
+
     // -------------------------------------------------------------------------
     // GizmoRenderer — draws the handles. Create one per canvas; GL resources are
     // made lazily on the first Draw, in whichever context is current.
@@ -211,18 +230,32 @@ namespace Gizmo
         // it is drawn IN the scene (depth-tested, no depth clear), right after
         // the grid; the X / Y / Z labels face the camera.
         void DrawAxisTriad(const Viewport& vp, const glm::vec3& origin, float length);
+
+        // Drag readout: upload the label (coverage mask from RasterizeText;
+        // only when its text changes), then draw it beside the cursor at
+        // client pixel (mx, my), kept inside the viewport.
+        void SetReadout(const unsigned char* coverage, int width, int height);
+        void DrawReadout(const Viewport& vp, float mx, float my);
         void Destroy();   // call with the owning context current
 
     private:
         struct Mesh { GLuint vao = 0, vbo = 0, ebo = 0; GLsizei count = 0; };
         bool Init();
-        void DrawMesh(const Mesh& m, const glm::mat4& mvp, const glm::vec4& color);
+        void BeginFrame(const Viewport& vp, const glm::vec3& pivot);
+        // `model` maps the unit mesh into the world. Handles draw in flat
+        // colour (the house style); `lit` switches on the shader's optional
+        // headlight shading, which nothing currently uses.
+        void DrawMesh(const Mesh& m, const glm::mat4& model, const glm::vec4& color, bool lit = false);
+        void SetFlat(const glm::vec4& color);   // world-space, unlit (wedge, labels)
 
         bool   m_ready = false;
         bool   m_failed = false;
         GLuint m_program = 0;
         GLint  m_uMVP = -1;
         GLint  m_uColor = -1;
+        GLint  m_uModel = -1, m_uNormalMat = -1, m_uLit = -1;
+        GLint  m_uDimBack = -1, m_uPivot = -1, m_uCam = -1;
+        glm::mat4 m_view{ 1.0f }, m_VP{ 1.0f };   // set by BeginFrame
         Mesh   m_cylinder;   // radius 1, y in [0, 1]
         Mesh   m_cone;       // base radius 1 at y = 0, apex at y = 1
         Mesh   m_sphere;     // radius 1
@@ -230,5 +263,8 @@ namespace Gizmo
         Mesh   m_torus;      // ring in the XZ plane about +Y: radius 1, tube kRingTube
         Mesh   m_cube;       // [-1, 1]^3
         GLuint m_fanVao = 0, m_fanVbo = 0;   // dynamic sweep wedge (rotate drags)
+        GLuint m_readoutTex = 0;
+        int    m_readoutW = 0, m_readoutH = 0;
+        GLint  m_uUseTex = -1, m_uTex = -1;
     };
 }

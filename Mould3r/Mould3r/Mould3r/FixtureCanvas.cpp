@@ -252,6 +252,7 @@ void FixtureCanvas::InitGLOnce()
 void FixtureCanvas::DestroyGL()
 {
     m_gizmo.Destroy();
+    m_readoutText.clear();   // its texture went with the renderer
     m_navCube.Destroy();
     m_navLabelsTried = false;
     m_meshA.Destroy();
@@ -913,6 +914,7 @@ void FixtureCanvas::OnPaint(wxPaintEvent&)
                           m_gizmoScaleDrag.valid ? m_gizmoScaleDrag.handle : Gizmo::Handle::None,
                           m_gizmoScaleShown);
     }
+    DrawGizmoReadout(view, proj, w, h);   // value label beside the cursor while dragging
 
     DrawNavCube(w, h);
     SwapBuffers();
@@ -921,6 +923,7 @@ void FixtureCanvas::OnPaint(wxPaintEvent&)
 void FixtureCanvas::OnResize(wxSizeEvent& evt)
 {
     RepositionTransformPanel();   // keep the Move / Rotate / Scale panel top-right
+    RepositionCanvasToast();      // and the hint pill bottom-centre
     Refresh(false);
     evt.Skip();
 }
@@ -987,6 +990,8 @@ void FixtureCanvas::OnMouse(wxMouseEvent& evt)
                 m_gizmoStartRot = m_xfDelta.rotDeg;
                 m_gizmoRotShownDeg = 0.0f;
                 m_gizmoStartScale = m_xfDelta.scale;
+                m_gizmoDragPos = pos;          // readout position before the first move
+                m_gizmoDragCtrl = evt.ControlDown();
                 m_gizmoScaleShown = 1.0f;
                 m_gizmoHover = h;
                 if (!HasCapture()) CaptureMouse();
@@ -1094,6 +1099,8 @@ void FixtureCanvas::OnMouse(wxMouseEvent& evt)
     }
     else if (m_lmb && m_gizmoScaleDrag.valid)
     {
+        m_gizmoDragPos = pos;                 // for the readout
+        m_gizmoDragCtrl = evt.ControlDown();
         // Scale handle drag — same rule as the Prepare canvas.
         float f = 1.0f;
         if (Gizmo::ScaleDragFactor(GizmoViewport(), m_gizmoScaleDrag, float(pos.x), float(pos.y), f))
@@ -1113,6 +1120,8 @@ void FixtureCanvas::OnMouse(wxMouseEvent& evt)
     }
     else if (m_lmb && m_gizmoRotDrag.valid)
     {
+        m_gizmoDragPos = pos;                 // for the readout
+        m_gizmoDragCtrl = evt.ControlDown();
         // Rotate ring drag — same rule as the Prepare canvas.
         float deg = 0.0f;
         if (Gizmo::RotateDragAngle(GizmoViewport(), m_gizmoRotDrag, float(pos.x), float(pos.y), deg))
@@ -1134,6 +1143,8 @@ void FixtureCanvas::OnMouse(wxMouseEvent& evt)
     }
     else if (m_lmb && m_gizmoDrag.valid)
     {
+        m_gizmoDragPos = pos;                 // for the readout
+        m_gizmoDragCtrl = evt.ControlDown();
         // Move handle drag — same rule as the Prepare canvas: move at the grab
         // plus the cursor's offset along the grabbed axis / plane; Ctrl snaps
         // where the half's bounding-box centre lands.
@@ -1375,6 +1386,28 @@ void FixtureCanvas::NotifyXformDelta(bool force)
     m_onXformDelta();
 }
 
+bool FixtureCanvas::CancelGizmoDrag()
+{
+    if (!m_xfActive || !(m_gizmoDrag.valid || m_gizmoRotDrag.valid || m_gizmoScaleDrag.valid))
+        return false;
+    Xform::Delta d = m_xfDelta;
+    d.move = m_gizmoStartMove;
+    d.rotDeg = m_gizmoStartRot;
+    d.scale = m_gizmoStartScale;
+    m_gizmoDrag = Gizmo::MoveDrag();
+    m_gizmoRotDrag = Gizmo::RotateDrag();
+    m_gizmoScaleDrag = Gizmo::ScaleDrag();
+    m_gizmoScaleShown = 1.0f;
+    m_gizmoRotShownDeg = 0.0f;
+    m_lmb = false;          // the rest of this press neither orbits nor picks
+    m_hasLast = false;
+    if (HasCapture()) ReleaseMouse();
+    SetTransformSessionDelta(d);
+    NotifyXformDelta(true);
+    Refresh(false);
+    return true;
+}
+
 void FixtureCanvas::CommitTransformSession()
 {
     m_xfActive = false;
@@ -1393,6 +1426,33 @@ void FixtureCanvas::CancelTransformSession()
         SetTransformSessionDelta(Xform::Delta());   // back to the snapshot pose
     CommitTransformSession();
     Refresh(false);
+}
+
+// ---------------------------------------------------------------------------
+// DrawGizmoReadout -- the value label beside the cursor during a handle drag:
+// this drag's amount (the panel keeps the session totals).
+// ---------------------------------------------------------------------------
+void FixtureCanvas::DrawGizmoReadout(const glm::mat4& view, const glm::mat4& proj, int w, int h)
+{
+    const Gizmo::Handle handle =
+        m_gizmoDrag.valid      ? m_gizmoDrag.handle :
+        m_gizmoRotDrag.valid   ? m_gizmoRotDrag.handle :
+        m_gizmoScaleDrag.valid ? m_gizmoScaleDrag.handle : Gizmo::Handle::None;
+    if (handle == Gizmo::Handle::None) return;
+
+    const std::string text = Gizmo::DragReadout(handle, m_xfDelta.move - m_gizmoStartMove,
+        m_gizmoRotShownDeg, m_gizmoScaleShown, m_xfImperial, m_gizmoDragCtrl);
+    if (text != m_readoutText)
+    {
+        std::vector<unsigned char> cov;
+        int tw = 0, th = 0;
+        if (Gizmo::RasterizeText(text, cov, tw, th))
+            m_gizmo.SetReadout(cov.data(), tw, th);
+        m_readoutText = text;
+    }
+    Gizmo::Viewport vp;
+    vp.view = view; vp.proj = proj; vp.width = w; vp.height = h;
+    m_gizmo.DrawReadout(vp, float(m_gizmoDragPos.x), float(m_gizmoDragPos.y));
 }
 
 // ---------------------------------------------------------------------------
@@ -1427,6 +1487,17 @@ Gizmo::Handle FixtureCanvas::GizmoHitTest(float mx, float my)
     if (RotateGizmoShown()) return Gizmo::HitTestRotate(GizmoViewport(), GizmoPivot(), mx, my);
     if (ScaleGizmoShown())  return Gizmo::HitTestScale(GizmoViewport(), GizmoPivot(), mx, my);
     return Gizmo::Handle::None;
+}
+
+// Same placement as GLCanvas::RepositionCanvasToast: centred, near the bottom.
+void FixtureCanvas::RepositionCanvasToast()
+{
+    if (!m_canvasToast) return;
+    const wxPoint cpos = GetPosition();
+    const wxSize  canvas = GetClientSize();
+    const wxSize  bar = m_canvasToast->GetSize();
+    m_canvasToast->Move(cpos.x + std::max(8, (canvas.x - bar.x) / 2),
+                        cpos.y + std::max(8, canvas.y - bar.y - 28));
 }
 
 void FixtureCanvas::RepositionTransformPanel()

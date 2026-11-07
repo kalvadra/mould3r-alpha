@@ -28,6 +28,7 @@
 #include "ScaleDialog.h"       // OnToolScale
 #include "TranslateDialog.h"   // OnToolMove
 #include "TransformPanel.h"    // Move / Rotate / Scale live side panel
+#include "CanvasToast.h"      // bottom-centre hint pill
 #include "style.h"
 
 // ---------------------------------------------------------------------------
@@ -759,6 +760,9 @@ wxWindow* FixtureEditor::BuildCanvasArea(wxWindow* parent)
     // the main GLCanvas. Stored in m_canvas so the import handlers and
     // toolbar wiring can push state into it directly.
     m_canvas = new FixtureCanvas(container);
+    // Enter in a sidebar field commits it and hands the keyboard back to the
+    // 3D view (DimensionInput).
+    DimInput::SetEnterFocusTarget(this, m_canvas);
     vSizer->Add(m_canvas, 1, wxEXPAND);
 
     // Move / Rotate / Scale side panel: a floating sibling of the canvas (NOT
@@ -780,6 +784,10 @@ wxWindow* FixtureEditor::BuildCanvasArea(wxWindow* parent)
         if (m_transformPanel && m_canvas)
             m_transformPanel->SetDelta(m_canvas->GetTransformSessionDelta());
     });
+
+    // Bottom-centre hint pill (Align Face), the same one the main window uses.
+    m_canvasToast = new CanvasToast(container);
+    m_canvas->SetCanvasToast(m_canvasToast);
 
     container->SetSizer(vSizer);
     return container;
@@ -1773,6 +1781,16 @@ void FixtureEditor::SetActiveTool(int activeId)
         else if (activeId == ID_FE_Scale)     mode = TM::Scale;
         m_canvas->SetTransformMode(mode);
     }
+
+    // Hint for the pick-driven tool, as in the main window.
+    if (m_canvasToast)
+    {
+        if (activeId == ID_FE_AlignFace)
+            m_canvasToast->ShowMessage("Select face to align with the parting plane.");
+        else
+            m_canvasToast->HideToast();
+        if (m_canvas) m_canvas->RepositionCanvasToast();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1817,6 +1835,7 @@ void FixtureEditor::StartTransformTool(int toolId)
     const Xform::Tool tool = toolId == ID_FE_Rotate ? Xform::Tool::Rotate
                            : toolId == ID_FE_Scale  ? Xform::Tool::Scale
                                                     : Xform::Tool::Move;
+    m_canvas->SetTransformImperial(!m_isMetric);   // the drag readout's unit
     m_transformPanel->Begin(tool, !m_isMetric, m_canvas->GetSelectionCount());
     m_canvas->RepositionTransformPanel();
     m_transformPanel->Show();
@@ -1832,6 +1851,8 @@ void FixtureEditor::CommitTransformTool()
 
 void FixtureEditor::CancelTransformTool()
 {
+    // Esc / Cancel during a handle drag undoes just that drag; the tool stays.
+    if (m_canvas && m_canvas->CancelGizmoDrag()) return;
     if (m_canvas) m_canvas->CancelTransformSession();
     SetActiveTool(wxID_NONE);
     if (m_canvas) m_canvas->SetFocus();

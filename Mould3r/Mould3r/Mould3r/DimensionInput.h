@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <string>
 
 #ifndef DIMINPUT_NO_WX
@@ -64,6 +65,8 @@ namespace DimInput
     // `fixed` when no label is given.
     void Attach(wxTextCtrl* field, wxStaticText* unitLabel);
     void Attach(wxTextCtrl* field, Unit fixed);
+    // ...or from any live source, e.g. an mm / in dropdown beside the field.
+    void Attach(wxTextCtrl* field, std::function<Unit()> unitOf);
 
     // The field's value in its current unit. For an attached field whose text
     // can't be read right now, the last value that could be (still true).
@@ -71,9 +74,27 @@ namespace DimInput
     // wxTextCtrl; an unattached one is simply evaluated with Unit::None.
     bool Read(const wxTextCtrl* field, double& out);
 
+    // The field's CURRENT text only, in its unit: false while it can't be
+    // read (no last-value fallback). For callers that must tell "mid-typing"
+    // from a real value, like the live Move / Rotate / Scale panel.
+    bool ReadExact(const wxTextCtrl* field, double& out);
+
+    // Re-check the field after the program rewrote it with ChangeValue()
+    // (which sends no text event): clears a stale red tint, updates the
+    // last good value.
+    void Revalidate(wxTextCtrl* field);
+
     // Metric / imperial switch: rewrite every attached field under top-level
     // window `root` whose unit is currently `from` (MM or Inch) into `to`.
     // Call BEFORE relabelling the unit labels.
     void ConvertLengths(wxWindow* root, Unit from, Unit to);
+
+    // Enter in an attached field commits it (decimal shown) and takes the
+    // focus off it. The focus goes to the window registered here for the
+    // field's top-level window (the main window and the Fixture Editor pass
+    // their 3D view), else to the nearest enclosing panel. Fields that use
+    // Enter themselves (wxTE_PROCESS_ENTER: the tool cards' OK) and fields in
+    // dialogs (the default button) keep it -- they are committed first.
+    void SetEnterFocusTarget(wxWindow* topLevel, wxWindow* target);
 #endif
 }

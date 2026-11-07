@@ -274,6 +274,12 @@ public:
     void SetTransformSessionDelta(const Xform::Delta& d, bool refresh = true);
     bool CommitTransformSession();          // true if the scene changed
     void CancelTransformSession();
+    // Esc during a handle drag: put the selection back where it was at the
+    // grab and end the drag (the tool session carries on). False when no
+    // handle drag is live, so callers fall through to cancelling the tool.
+    bool CancelGizmoDrag();
+    // Unit the Move readout uses (the panel's); set when a tool starts.
+    void SetTransformImperial(bool imperial) { m_xfImperial = imperial; }
     bool IsTransformSessionActive() const { return m_xfActive; }
     int  GetSelectionCount() const { return (int)m_selectedIndices.size(); }
     // Fired after a click in a tool mode changed the selection (the session
@@ -287,11 +293,17 @@ public:
     // The panel overlay, pinned top-right of the viewport.
     void SetTransformPanel(wxWindow* w) { m_transformPanel = w; RepositionTransformPanel(); }
     void RepositionTransformPanel();
+    // The tools with a top-right card: Move / Rotate / Scale, Place and
+    // Pattern. In these a click picks (restarting a live session if there is
+    // one) and a drag orbits; Enter / Esc are the card's OK / Cancel.
     static bool IsTransformTool(TransformMode m)
     {
         return m == TransformMode::Translate || m == TransformMode::Rotate ||
-               m == TransformMode::Scale;
+               m == TransformMode::Scale || m == TransformMode::Place ||
+               m == TransformMode::Pattern;
     }
+    // Further cards pinned in the same top-right slot (Place, Pattern).
+    void AddPinnedPanel(wxWindow* w) { m_pinnedPanels.push_back(w); RepositionTransformPanel(); }
 
     // Called by dialogs
     void ApplyRotation(float xDeg, float yDeg, float zDeg);
@@ -1985,6 +1997,7 @@ private:
     bool         m_editNodeGrabbed = false;
     wxWindow*    m_pathToolbar  = nullptr;  // floating toolbar overlay (opaque)
     wxWindow*    m_transformPanel = nullptr;  // Move / Rotate / Scale panel (top-right)
+    std::vector<wxWindow*> m_pinnedPanels;    // Place / Pattern cards, same slot
 
     // Move / Rotate / Scale session state (see BeginTransformSession).
     bool                                    m_xfActive = false;
@@ -1997,6 +2010,11 @@ private:
     bool                                    m_xfClickPending = false;
     wxPoint                                 m_xfClickDown;
     std::function<void()>                   m_onXformDelta;
+
+    // ---- Drag readout (the value label beside the cursor during a drag) ----
+    bool                 m_xfImperial = false;   // panel's unit, for the readout
+    std::string          m_readoutText;          // text currently uploaded
+    void                 DrawGizmoReadout(const glm::mat4& view, const glm::mat4& proj, int w, int h);
 
     // ---- Nav cube (top-right view cube, NavCube.h) ---------------------------
     NavCube::Controller  m_navCtl;

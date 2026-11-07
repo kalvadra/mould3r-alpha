@@ -1,4 +1,5 @@
 #include "PrecisionPlaceDialog.h"
+#include "DimensionInput.h"   // fractions / expressions / unit suffixes in number fields
 #include "WindowEffects.h"   // DWM corner rounding for this dialog frame
 
 PrecisionPlaceDialog::PrecisionPlaceDialog(wxWindow* parent, float initX, float initZ)
@@ -17,6 +18,7 @@ PrecisionPlaceDialog::PrecisionPlaceDialog(wxWindow* parent, float initX, float 
                 wxString::Format("%.3f", initVal),
                 wxDefaultPosition, wxSize(120, -1));
             auto* unit = new wxStaticText(this, wxID_ANY, "mm");
+            DimInput::Attach(ctrl, unit);
 
             row->Add(lbl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 6);
             row->Add(ctrl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
@@ -42,7 +44,7 @@ PrecisionPlaceDialog::PrecisionPlaceDialog(wxWindow* parent, float initX, float 
 float PrecisionPlaceDialog::ParseField(wxTextCtrl* ctrl) const
 {
     double val = 0.0;
-    if (!ctrl->GetValue().ToDouble(&val))
+    if (!DimInput::Read(ctrl, val))
         val = 0.0;
     return static_cast<float>(val);
 }
