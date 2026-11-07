@@ -144,6 +144,37 @@ static GLuint Link(GLuint vs, GLuint fs)
     return p;
 }
 
+// Vertex + geometry + fragment. Returns 0 (and logs) if any stage fails, so
+// the caller can fall back instead of drawing with a broken program.
+static GLuint LinkWithGeometry(GLuint vs, GLuint gs, GLuint fs)
+{
+    GLint ok = 0;
+    for (GLuint s : { vs, gs, fs })
+    {
+        glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+        if (!ok) { glDeleteShader(vs); glDeleteShader(gs); glDeleteShader(fs); return 0; }
+    }
+    GLuint p = glCreateProgram();
+    glAttachShader(p, vs);
+    glAttachShader(p, gs);
+    glAttachShader(p, fs);
+    glLinkProgram(p);
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        GLint len = 0;
+        glGetProgramiv(p, GL_INFO_LOG_LENGTH, &len);
+        std::string log(len, '\0');
+        glGetProgramInfoLog(p, len, &len, log.data());
+        wxLogWarning("Wide-line program link failed; using 1px lines:\n%s", log);
+        glDeleteProgram(p);
+        p = 0;
+    }
+    glDeleteShader(vs);
+    glDeleteShader(gs);
+    glDeleteShader(fs);
+    return p;
+}
+
 // glArgs[] (pixel-format / context attributes) now lives in GLLoader.h —
 // shared with FixtureCanvas so adding a third viewport doesn't fork the
 // pixel-format request.
@@ -156,10 +187,10 @@ GLCanvas::GLCanvas(wxWindow* parent)
         wxDefaultPosition, wxDefaultSize,
         wxFULL_REPAINT_ON_RESIZE, "GLCanvas")
 {
-#if WX_CHECK_VERSION(3, 1, 0)
+#if wxCHECK_VERSION(3, 1, 0)
     wxGLContextAttrs ctxAttrs;
 #if defined(__APPLE__)
-    ctxAttrs.PlatformDefaults().CoreProfile().OGLVersion(3, 2).EndList();
+    ctxAttrs.PlatformDefaults().CoreProfile().OGLVersion(4, 1).EndList();
 #else
     ctxAttrs.PlatformDefaults().CoreProfile().OGLVersion(3, 3).EndList();
 #endif
@@ -6804,15 +6835,14 @@ void GLCanvas::RenderPreview(const glm::mat4& view, const glm::mat4& proj,
         ((m_showDebugRays && m_debugRayVertCount > 0) ||
             (m_showDebugContacts && m_debugContactVertCount > 0)))
     {
-        glUseProgram(m_flatProgram);
         const glm::mat4 VP = proj * view;
-        glUniformMatrix4fv(m_flat_uVP, 1, GL_FALSE, &VP[0][0]);
 
         if (m_showDebugRays && m_debugRayVao && m_debugRayVertCount > 0)
         {
             const glm::vec4 rayColor(1.0f, 0.85f, 0.10f, 1.0f);  // yellow
-            glUniform4fv(m_flat_uColor, 1, &rayColor[0]);
-            glLineWidth(2.0f);
+            UseLineProgram(2.0f);
+            glUniformMatrix4fv(m_line_uVP, 1, GL_FALSE, &VP[0][0]);
+            glUniform4fv(m_line_uColor, 1, &rayColor[0]);
             glBindVertexArray(m_debugRayVao);
             glDrawArrays(GL_LINES, 0, m_debugRayVertCount);
             glBindVertexArray(0);
@@ -6821,12 +6851,13 @@ void GLCanvas::RenderPreview(const glm::mat4& view, const glm::mat4& proj,
         if (m_showDebugContacts && m_debugContactVao && m_debugContactVertCount > 0)
         {
             const glm::vec4 contactColor(0.95f, 0.12f, 0.12f, 1.0f);  // red
-            glUniform4fv(m_flat_uColor, 1, &contactColor[0]);
-            glPointSize(9.0f);
+            UsePointProgram(9.0f);
+            glUniformMatrix4fv(m_point_uVP, 1, GL_FALSE, &VP[0][0]);
+            glUniform4fv(m_point_uColor, 1, &contactColor[0]);
             glBindVertexArray(m_debugContactVao);
             glDrawArrays(GL_POINTS, 0, m_debugContactVertCount);
             glBindVertexArray(0);
-            glPointSize(1.0f);
+            EndPoints();
         }
         glUseProgram(0);
     }
@@ -6836,26 +6867,27 @@ void GLCanvas::RenderPreview(const glm::mat4& view, const glm::mat4& proj,
     // read through the steel they run inside.
     if (m_flatProgram && m_showDebugOverlay && !m_debugOverlay.empty())
     {
-        glUseProgram(m_flatProgram);
         const glm::mat4 VP = proj * view;
-        glUniformMatrix4fv(m_flat_uVP, 1, GL_FALSE, &VP[0][0]);
         const GLboolean depthWas = glIsEnabled(GL_DEPTH_TEST);
         if (m_debugOverlayOnTop) glDisable(GL_DEPTH_TEST);
         for (const DebugOverlayGL& b : m_debugOverlay)
         {
             if (!b.vao || b.count <= 0) continue;
             const glm::vec4 col(b.color, 1.0f);
-            glUniform4fv(m_flat_uColor, 1, &col[0]);
             glBindVertexArray(b.vao);
             if (b.points)
             {
-                glPointSize(b.size);
+                UsePointProgram(b.size);
+                glUniformMatrix4fv(m_point_uVP, 1, GL_FALSE, &VP[0][0]);
+                glUniform4fv(m_point_uColor, 1, &col[0]);
                 glDrawArrays(GL_POINTS, 0, b.count);
-                glPointSize(1.0f);
+                EndPoints();
             }
             else
             {
-                glLineWidth(b.size);
+                UseLineProgram(b.size);
+                glUniformMatrix4fv(m_line_uVP, 1, GL_FALSE, &VP[0][0]);
+                glUniform4fv(m_line_uColor, 1, &col[0]);
                 glDrawArrays(GL_LINES, 0, b.count);
                 glLineWidth(1.0f);
             }
@@ -10837,6 +10869,45 @@ void GLCanvas::MoveEditGateHandle(int node, bool isOut, int mouseX, int mouseY, 
 }
 
 // ---------------------------------------------------------------------------
+// Wide lines / sized points — see m_lineProgram in GLCanvas.h.
+// Widths are in logical pixels and scaled by the content scale factor, so a
+// 2px line looks the same on Retina as on a standard display. On Windows the
+// factor is 1, matching the old glLineWidth(widthPx) exactly.
+// ---------------------------------------------------------------------------
+void GLCanvas::UseLineProgram(float widthPx)
+{
+    glUseProgram(m_lineProgram);
+    if (m_lineProgramOwned)
+    {
+        // Viewport rather than client size: correct in physical pixels on
+        // Retina and for whatever framebuffer is bound.
+        GLint vp[4] = { 0, 0, 1, 1 };
+        glGetIntegerv(GL_VIEWPORT, vp);
+        glUniform2f(m_line_uViewport, (float)std::max(vp[2], 1), (float)std::max(vp[3], 1));
+    }
+    SetLineWidth(widthPx);
+}
+
+void GLCanvas::SetLineWidth(float widthPx)
+{
+    const float px = widthPx * (float)GetContentScaleFactor();
+    if (m_lineProgramOwned) glUniform1f(m_line_uWidth, px);
+    else                    glLineWidth(px);   // fallback: driver wide lines
+}
+
+void GLCanvas::UsePointProgram(float sizePx)
+{
+    glEnable(GL_PROGRAM_POINT_SIZE);
+    glUseProgram(m_pointProgram);
+    glUniform1f(m_point_uSize, sizePx * (float)GetContentScaleFactor());
+}
+
+void GLCanvas::EndPoints()
+{
+    glDisable(GL_PROGRAM_POINT_SIZE);
+}
+
+// ---------------------------------------------------------------------------
 // RebuildHandleLineVBO — fill the stem buffer with node->handle segments for
 // the edited smooth vent (one GL_LINES pair per visible arm).
 // ---------------------------------------------------------------------------
@@ -11330,6 +11401,40 @@ void GLCanvas::InitGLOnce()
         m_flat_uColor = glGetUniformLocation(m_flatProgram, "uColor");
     }
 
+    // Wide-line program: flat shader + quad-expanding geometry shader.
+    {
+        GLuint lvs = Compile(GL_VERTEX_SHADER, m_shaders.vsFlat);
+        GLuint lgs = Compile(GL_GEOMETRY_SHADER, m_shaders.gsWideLine);
+        GLuint lfs = Compile(GL_FRAGMENT_SHADER, m_shaders.fsFlat);
+        m_lineProgram = LinkWithGeometry(lvs, lgs, lfs);
+        m_lineProgramOwned = (m_lineProgram != 0);
+        if (m_lineProgramOwned)
+        {
+            m_line_uVP = glGetUniformLocation(m_lineProgram, "uVP");
+            m_line_uColor = glGetUniformLocation(m_lineProgram, "uColor");
+            m_line_uViewport = glGetUniformLocation(m_lineProgram, "uViewport");
+            m_line_uWidth = glGetUniformLocation(m_lineProgram, "uWidth");
+        }
+        else
+        {
+            // Fallback: alias the flat program; UseLineProgram uses glLineWidth.
+            m_lineProgram = m_flatProgram;
+            m_line_uVP = m_flat_uVP;
+            m_line_uColor = m_flat_uColor;
+            m_line_uViewport = m_line_uWidth = -1;
+        }
+    }
+
+    // Sized-point program for the debug overlays.
+    {
+        GLuint pvs = Compile(GL_VERTEX_SHADER, m_shaders.vsFlatPoint);
+        GLuint pfs = Compile(GL_FRAGMENT_SHADER, m_shaders.fsFlat);
+        m_pointProgram = Link(pvs, pfs);
+        m_point_uVP = glGetUniformLocation(m_pointProgram, "uVP");
+        m_point_uColor = glGetUniformLocation(m_pointProgram, "uColor");
+        m_point_uSize = glGetUniformLocation(m_pointProgram, "uPointSize");
+    }
+
     // Vent path line VBO (dynamic, rebuilt whenever paths change)
     glGenVertexArrays(1, &m_pathVAO);
     glGenBuffers(1, &m_pathVBO);
@@ -11429,6 +11534,9 @@ void GLCanvas::DestroyGL()
     m_sprue.DestroyGL();
 
     if (m_outlineProgram) { glDeleteProgram(m_outlineProgram);        m_outlineProgram = 0; }
+    if (m_lineProgram && m_lineProgramOwned) glDeleteProgram(m_lineProgram);
+    m_lineProgram = 0;  m_lineProgramOwned = false;
+    if (m_pointProgram) { glDeleteProgram(m_pointProgram);         m_pointProgram = 0; }
     if (m_flatProgram) { glDeleteProgram(m_flatProgram);           m_flatProgram = 0; }
     if (m_fullscreenVAO) { glDeleteVertexArrays(1, &m_fullscreenVAO); m_fullscreenVAO = 0; }
     if (m_pathVBO) { glDeleteBuffers(1, &m_pathVBO);              m_pathVBO = 0; }
@@ -12529,7 +12637,8 @@ void GLCanvas::OnPaint(wxPaintEvent&)
     const int w = std::max(1, sz.x);
     const int h = std::max(1, sz.y);
 
-    glViewport(0, 0, w, h);
+    glViewport(0, 0, int(w * GetContentScaleFactor()),
+        int(h * GetContentScaleFactor()));
     EnsurePickFBO(w, h);
 
     glEnable(GL_DEPTH_TEST);
@@ -12804,7 +12913,8 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         if (m_outlineProgram && m_pickColorTex)
         {
             glBindFramebuffer(GL_FRAMEBUFFER, 0);
-            glViewport(0, 0, w, h);
+            glViewport(0, 0, int(w * GetContentScaleFactor()),
+                int(h * GetContentScaleFactor()));
             glDisable(GL_DEPTH_TEST);
             glEnable(GL_BLEND);
             glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -13792,14 +13902,13 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         // testing z-fights it against the fixture faces and it disappears.
         // Draw with depth test off so the highlight always reads on top.
         glDisable(GL_DEPTH_TEST);
-        glLineWidth(3.0f);
-        glUseProgram(m_flatProgram);
+        UseLineProgram(3.0f);
         const glm::mat4 VP = proj * view;
-        glUniformMatrix4fv(m_flat_uVP, 1, GL_FALSE, &VP[0][0]);
+        glUniformMatrix4fv(m_line_uVP, 1, GL_FALSE, &VP[0][0]);
         const glm::vec4 perimColor(0.65f, 0.10f, 0.90f, 1.0f);   // purple — matches
         // the injection-point markers, since a valid perimeter is a continuous
         // injection target the user can click along.
-        glUniform4fv(m_flat_uColor, 1, &perimColor[0]);
+        glUniform4fv(m_line_uColor, 1, &perimColor[0]);
         glDrawArrays(GL_LINE_LOOP, 0, (GLsizei)m_fixturePerimeter.size());
         glBindVertexArray(0);
         glLineWidth(1.0f);
@@ -13833,12 +13942,11 @@ void GLCanvas::OnPaint(wxPaintEvent&)
             verts.data(), GL_DYNAMIC_DRAW);
 
         glDisable(GL_DEPTH_TEST);
-        glLineWidth(3.0f);
-        glUseProgram(m_flatProgram);
+        UseLineProgram(3.0f);
         const glm::mat4 VP = proj * view;
-        glUniformMatrix4fv(m_flat_uVP, 1, GL_FALSE, &VP[0][0]);
+        glUniformMatrix4fv(m_line_uVP, 1, GL_FALSE, &VP[0][0]);
         const glm::vec4 topColor(0.65f, 0.10f, 0.90f, 1.0f);   // purple, as the markers
-        glUniform4fv(m_flat_uColor, 1, &topColor[0]);
+        glUniform4fv(m_line_uColor, 1, &topColor[0]);
         glDrawArrays(GL_LINE_LOOP, 0, (GLsizei)m_fixturePerimeter.size());
         glBindVertexArray(0);
         glLineWidth(1.0f);
@@ -13848,14 +13956,13 @@ void GLCanvas::OnPaint(wxPaintEvent&)
     if (m_flatProgram && m_sprue.pathVAO && m_sprue.pathVertexCount > 0)
     {
         glEnable(GL_DEPTH_TEST);
-        glLineWidth(2.5f);
-        glUseProgram(m_flatProgram);
+        UseLineProgram(2.5f);
 
         const glm::mat4 VP = proj * view;
-        glUniformMatrix4fv(m_flat_uVP, 1, GL_FALSE, &VP[0][0]);
+        glUniformMatrix4fv(m_line_uVP, 1, GL_FALSE, &VP[0][0]);
 
         const glm::vec4 sprueLineColor(0.65f, 0.10f, 0.90f, 1.0f);   // purple
-        glUniform4fv(m_flat_uColor, 1, &sprueLineColor[0]);
+        glUniform4fv(m_line_uColor, 1, &sprueLineColor[0]);
 
         glBindVertexArray(m_sprue.pathVAO);
         glDrawArrays(GL_LINES, 0, m_sprue.pathVertexCount);
@@ -13869,14 +13976,13 @@ void GLCanvas::OnPaint(wxPaintEvent&)
     if (m_flatProgram && m_sprue.xsecVAO && m_sprue.xsecVertexCount > 0)
     {
         glEnable(GL_DEPTH_TEST);
-        glLineWidth(2.0f);
-        glUseProgram(m_flatProgram);
+        UseLineProgram(2.0f);
 
         const glm::mat4 VP = proj * view;
-        glUniformMatrix4fv(m_flat_uVP, 1, GL_FALSE, &VP[0][0]);
+        glUniformMatrix4fv(m_line_uVP, 1, GL_FALSE, &VP[0][0]);
 
         const glm::vec4 sprueCircleColor(0.65f, 0.10f, 0.90f, 1.0f);   // purple
-        glUniform4fv(m_flat_uColor, 1, &sprueCircleColor[0]);
+        glUniform4fv(m_line_uColor, 1, &sprueCircleColor[0]);
 
         glBindVertexArray(m_sprue.xsecVAO);
         glDrawArrays(GL_LINES, 0, m_sprue.xsecVertexCount);
@@ -13890,14 +13996,13 @@ void GLCanvas::OnPaint(wxPaintEvent&)
     if (m_flatProgram && m_runnerPathVAO && m_runnerPathVertexCount > 0)
     {
         glEnable(GL_DEPTH_TEST);
-        glLineWidth(2.5f);
-        glUseProgram(m_flatProgram);
+        UseLineProgram(2.5f);
 
         const glm::mat4 VP = proj * view;
-        glUniformMatrix4fv(m_flat_uVP, 1, GL_FALSE, &VP[0][0]);
+        glUniformMatrix4fv(m_line_uVP, 1, GL_FALSE, &VP[0][0]);
 
         const glm::vec4 runnerLineColor(0.10f, 0.40f, 0.95f, 1.0f);   // blue
-        glUniform4fv(m_flat_uColor, 1, &runnerLineColor[0]);
+        glUniform4fv(m_line_uColor, 1, &runnerLineColor[0]);
 
         glBindVertexArray(m_runnerPathVAO);
         glDrawArrays(GL_LINES, 0, m_runnerPathVertexCount);
@@ -13911,14 +14016,13 @@ void GLCanvas::OnPaint(wxPaintEvent&)
     if (m_flatProgram && m_gatePathVAO && m_gatePathVertexCount > 0)
     {
         glEnable(GL_DEPTH_TEST);
-        glLineWidth(2.5f);
-        glUseProgram(m_flatProgram);
+        UseLineProgram(2.5f);
 
         const glm::mat4 VP = proj * view;
-        glUniformMatrix4fv(m_flat_uVP, 1, GL_FALSE, &VP[0][0]);
+        glUniformMatrix4fv(m_line_uVP, 1, GL_FALSE, &VP[0][0]);
 
         const glm::vec4 gateLineColor(1.0f, 0.85f, 0.10f, 1.0f);   // yellow, matches gate spheres
-        glUniform4fv(m_flat_uColor, 1, &gateLineColor[0]);
+        glUniform4fv(m_line_uColor, 1, &gateLineColor[0]);
 
         glBindVertexArray(m_gatePathVAO);
         glDrawArrays(GL_LINES, 0, m_gatePathVertexCount);
@@ -13932,14 +14036,13 @@ void GLCanvas::OnPaint(wxPaintEvent&)
     if (m_flatProgram && m_pathVAO && m_pathVertexCount > 0)
     {
         glEnable(GL_DEPTH_TEST);
-        glLineWidth(2.0f);
-        glUseProgram(m_flatProgram);
+        UseLineProgram(2.0f);
 
         const glm::mat4 VP = proj * view;
-        glUniformMatrix4fv(m_flat_uVP, 1, GL_FALSE, &VP[0][0]);
+        glUniformMatrix4fv(m_line_uVP, 1, GL_FALSE, &VP[0][0]);
 
         const glm::vec4 lineColor(0.10f, 0.92f, 0.25f, 1.0f);
-        glUniform4fv(m_flat_uColor, 1, &lineColor[0]);
+        glUniform4fv(m_line_uColor, 1, &lineColor[0]);
 
         glBindVertexArray(m_pathVAO);
         glDrawArrays(GL_LINES, 0, m_pathVertexCount);
@@ -13965,14 +14068,13 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         if (m_handleLineVertexCount > 0)
         {
             glEnable(GL_DEPTH_TEST);
-            glLineWidth(1.5f);
-            glUseProgram(m_flatProgram);
+            UseLineProgram(1.5f);
 
             const glm::mat4 VP = proj * view;
-            glUniformMatrix4fv(m_flat_uVP, 1, GL_FALSE, &VP[0][0]);
+            glUniformMatrix4fv(m_line_uVP, 1, GL_FALSE, &VP[0][0]);
 
             const glm::vec4 handleColor(0.85f, 0.40f, 0.85f, 1.0f);   // magenta
-            glUniform4fv(m_flat_uColor, 1, &handleColor[0]);
+            glUniform4fv(m_line_uColor, 1, &handleColor[0]);
 
             glBindVertexArray(m_handleLineVAO);
             glDrawArrays(GL_LINES, 0, m_handleLineVertexCount);
@@ -13986,15 +14088,14 @@ void GLCanvas::OnPaint(wxPaintEvent&)
     if (m_flatProgram && m_xsecVAO && m_xsecVertexCount > 0)
     {
         glEnable(GL_DEPTH_TEST);
-        glLineWidth(2.0f);
-        glUseProgram(m_flatProgram);
+        UseLineProgram(2.0f);
 
         const glm::mat4 VP = proj * view;
-        glUniformMatrix4fv(m_flat_uVP, 1, GL_FALSE, &VP[0][0]);
+        glUniformMatrix4fv(m_line_uVP, 1, GL_FALSE, &VP[0][0]);
 
         // Slightly brighter yellow-green to distinguish from path lines
         const glm::vec4 xsecColor(0.60f, 1.00f, 0.20f, 1.0f);
-        glUniform4fv(m_flat_uColor, 1, &xsecColor[0]);
+        glUniform4fv(m_line_uColor, 1, &xsecColor[0]);
 
         glBindVertexArray(m_xsecVAO);
         glDrawArrays(GL_LINES, 0, m_xsecVertexCount);
@@ -14565,14 +14666,13 @@ void GLCanvas::OnPaint(wxPaintEvent&)
         glEnableVertexAttribArray(0);
 
         glDisable(GL_DEPTH_TEST);   // always draw on top
-        glLineWidth(2.0f);
-        glUseProgram(m_flatProgram);
+        UseLineProgram(2.0f);
 
         const glm::mat4 VP = proj * view;
-        glUniformMatrix4fv(m_flat_uVP, 1, GL_FALSE, &VP[0][0]);
+        glUniformMatrix4fv(m_line_uVP, 1, GL_FALSE, &VP[0][0]);
 
         const glm::vec4 perimColor(1.0f, 0.4f, 0.0f, 1.0f);   // orange
-        glUniform4fv(m_flat_uColor, 1, &perimColor[0]);
+        glUniform4fv(m_line_uColor, 1, &perimColor[0]);
 
         glDrawArrays(GL_LINE_LOOP, 0,
             (GLsizei)m_fixturePerimeter.size());
@@ -16413,7 +16513,8 @@ int GLCanvas::PickObjectAt(int mouseX, int mouseY)
     glReadPixels(x, y, 1, 1, GL_RED_INTEGER, GL_UNSIGNED_INT, &id);
 
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glViewport(0, 0, w, h);
+    glViewport(0, 0, int(w * GetContentScaleFactor()),
+        int(h * GetContentScaleFactor()));
     glUseProgram(0);
 
     return (id == 0) ? -1 : (int)(id - 1);
@@ -16455,7 +16556,8 @@ void GLCanvas::RenderPickPass_NoRead(int w, int h)
 
     glUseProgram(0);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glViewport(0, 0, w, h);
+    glViewport(0, 0, int(w * GetContentScaleFactor()),
+        int(h * GetContentScaleFactor()));
 }
 
 void GLCanvas::ClearFixtures()

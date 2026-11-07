@@ -131,6 +131,18 @@ int RunMeshWorker(const std::filesystem::path& inPath, const std::filesystem::pa
     TetMesh::Params p;
     std::string error;
 
+    // fTetWild always writes a debug copy of the surface it tracked to
+    // "__tracked_surface.stl" in the current working directory (m3tetmesh
+    // leaves its output_path empty, and there is no option to turn it off).
+    // The worker inherits Mould3r's working directory: the install folder,
+    // or the source tree under the VS debugger. Work in the job's temp folder
+    // instead (%LOCALAPPDATA%\Mould3r\mesh) and delete the file afterwards.
+    // This changes only this worker process, never the main app.
+    std::error_code ec;
+    const std::filesystem::path jobDir = outPath.parent_path();
+    const bool inJobDir = !jobDir.empty() &&
+        (std::filesystem::current_path(jobDir, ec), !ec);
+
     if (!TetMesh::ReadJobInput(inPath, s, p, error))
     {
         r.status = TetMesh::StatusBadJobFile;
@@ -146,6 +158,9 @@ int RunMeshWorker(const std::filesystem::path& inPath, const std::filesystem::pa
                     "third_party/m3tetmesh/build_windows.bat, then rebuild Mould3r.";
 #endif
     }
+
+    // Only delete from the job folder we moved into, never from anywhere else.
+    if (inJobDir) std::filesystem::remove(jobDir / "__tracked_surface.stl", ec);
 
     if (!TetMesh::WriteJobOutput(outPath, r, error))
         return TetMesh::StatusBadJobFile;

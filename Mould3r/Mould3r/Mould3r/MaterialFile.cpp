@@ -10,6 +10,7 @@
 #include <charconv>
 #include <cmath>
 #include <filesystem>
+#include "AppPaths.h"
 #include <fstream>
 #include <sstream>
 #include <system_error>
@@ -608,8 +609,7 @@ bool MaterialFile::Save(const std::string& path, const MouldMaterialData& data,
 // directory holding the running executable.
 std::string MaterialFile::LibraryRoot()
 {
-    return (fs::path(wxStandardPaths::Get().GetExecutablePath().ToStdString())
-            .parent_path() / "Materials").string();
+    return (AppPaths::UserData() / "Materials").string();
 }
 
 std::string MaterialFile::LibraryFolder(MaterialKind kind)

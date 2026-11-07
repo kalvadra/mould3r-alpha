@@ -1,4 +1,5 @@
 #include "Mould3r.h"
+#include "AppPaths.h"
 #include "MainFrame.h"
 #include "AppConfig.h"
 #include "FixtureFile.h"
@@ -25,6 +26,14 @@ bool MyApp::OnInit()
         m_meshWorkerExitCode = RunMeshWorker(std::filesystem::path(argv[2].ToStdWstring()),
                                              std::filesystem::path(argv[3].ToStdWstring()));
         return true;   // OnRun hands the exit code back without an event loop
+    }
+
+    SetAppName("Mould3r");
+    try { AppPaths::PrepareUserData(); }
+    catch (const std::exception& e) {
+        wxMessageBox(wxString::FromUTF8(e.what()), "Cannot initialise Mould3r data",
+                     wxOK | wxICON_ERROR);
+        return false;
     }
 
     const std::string lastFixture = AppConfig::LoadLastFixture();

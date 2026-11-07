@@ -1936,6 +1936,37 @@ private:
     GLint  m_flat_uVP = -1;
     GLint  m_flat_uColor = -1;
 
+    // Wide-line program (flat shader + geometry shader that expands each
+    // segment to a screen-space quad). Replaces glLineWidth, which macOS
+    // core-profile contexts cap at 1px. If it fails to build, these alias the
+    // flat program and UseLineProgram falls back to glLineWidth.
+    GLuint m_lineProgram = 0;
+    bool   m_lineProgramOwned = false;   // false when aliasing m_flatProgram
+    GLint  m_line_uVP = -1;
+    GLint  m_line_uColor = -1;
+    GLint  m_line_uViewport = -1;
+    GLint  m_line_uWidth = -1;
+
+    // Sized-point program (point size written by the vertex shader).
+    GLuint m_pointProgram = 0;
+    GLint  m_point_uVP = -1;
+    GLint  m_point_uColor = -1;
+    GLint  m_point_uSize = -1;
+
+    // Bind the wide-line program for a draw at `widthPx` logical pixels
+    // (scaled to framebuffer pixels on Retina). Caller then sets m_line_uVP /
+    // m_line_uColor and issues GL_LINES / GL_LINE_STRIP / GL_LINE_LOOP draws.
+    // Call again (or SetLineWidth) to change width; finish with
+    // glLineWidth(1.0f), which only matters on the fallback path.
+    void UseLineProgram(float widthPx);
+    void SetLineWidth(float widthPx);
+
+    // Bind the sized-point program at `sizePx` logical pixels and enable
+    // GL_PROGRAM_POINT_SIZE. Caller sets m_point_uVP / m_point_uColor and
+    // draws GL_POINTS, then calls EndPoints().
+    void UsePointProgram(float sizePx);
+    void EndPoints();
+
     // Fixture-perimeter highlight loop (Fixture Perimeter injection). A dynamic
     // GL_LINE_LOOP uploaded from m_fixturePerimeter in the render pass while the
     // Select Injection Point tool is active and perimeter injection is allowed.

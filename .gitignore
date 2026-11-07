@@ -81,3 +81,21 @@ Thumbs.db
 
 **/wxWidgets*/build/
 **/wxWidgets*/lib/
+
+#############################
+# 3D mesher (fTetWild) debug output
+#############################
+
+# fTetWild writes __tracked_surface.stl to the working directory on every
+# 3D mesh run. MeshWorker.cpp now keeps it in the temp job folder; this
+# stops a stray copy from being committed again.
+*_tracked_surface.stl
+
+#############################
+# Installer builds
+#############################
+
+# Uncomment to stop committing new installers (attach them to GitHub
+# Releases instead). Installers already in the repo stay tracked until
+# removed with: git rm -r --cached Mould3r/Mould3r/Mould3r/installer/Output
+# **/installer/Output/

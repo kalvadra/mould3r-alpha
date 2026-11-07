@@ -287,4 +287,67 @@ public:
         }
         )GLSL";
 
+    // Wide lines (vsFlat + gsWideLine + fsFlat). glLineWidth > 1 is not
+    // available in a core-profile context on macOS (and is deprecated
+    // everywhere in core), so each segment is expanded here into a
+    // screen-space quad uWidth pixels wide, with square caps so the joints of
+    // strips and loops have no gaps. Accepts GL_LINES, GL_LINE_STRIP and
+    // GL_LINE_LOOP draws. Depth comes from the original endpoints, so depth
+    // testing behaves as it did with real lines.
+    const char* gsWideLine = R"GLSL(
+        #version 330 core
+        layout(lines) in;
+        layout(triangle_strip, max_vertices = 4) out;
+        uniform vec2  uViewport;   // framebuffer size, pixels (from GL_VIEWPORT)
+        uniform float uWidth;      // line width, framebuffer pixels
+        void main()
+        {
+            vec4 p0 = gl_in[0].gl_Position;
+            vec4 p1 = gl_in[1].gl_Position;
+
+            // Clip against the near plane (z >= -w) before dividing by w, so a
+            // segment that passes behind the camera can't flip or explode.
+            float d0 = p0.z + p0.w;
+            float d1 = p1.z + p1.w;
+            if (d0 < 0.0 && d1 < 0.0) return;
+            if (d0 < 0.0)      p0 = mix(p0, p1, d0 / (d0 - d1));
+            else if (d1 < 0.0) p1 = mix(p1, p0, d1 / (d1 - d0));
+
+            // Direction and normal in pixel space.
+            vec2 s0 = (p0.xy / p0.w) * 0.5 * uViewport;
+            vec2 s1 = (p1.xy / p1.w) * 0.5 * uViewport;
+            vec2 dir = s1 - s0;
+            float len = length(dir);
+            dir = (len > 1e-4) ? dir / len : vec2(1.0, 0.0);
+            vec2 nrm = vec2(-dir.y, dir.x);
+
+            // Half-width offsets, converted from pixels back to clip space
+            // (scaled by w so they survive the perspective divide).
+            vec2 toNdc = 2.0 / uViewport;
+            vec2 offN = nrm * (0.5 * uWidth) * toNdc;
+            vec2 offT = dir * (0.5 * uWidth) * toNdc;
+
+            gl_Position = vec4(p0.xy + (-offT + offN) * p0.w, p0.zw); EmitVertex();
+            gl_Position = vec4(p0.xy + (-offT - offN) * p0.w, p0.zw); EmitVertex();
+            gl_Position = vec4(p1.xy + ( offT + offN) * p1.w, p1.zw); EmitVertex();
+            gl_Position = vec4(p1.xy + ( offT - offN) * p1.w, p1.zw); EmitVertex();
+            EndPrimitive();
+        }
+        )GLSL";
+
+    // Sized points (vsFlatPoint + fsFlat). Point size comes from the shader
+    // (GL_PROGRAM_POINT_SIZE) rather than glPointSize, which works the same in
+    // every core-profile implementation.
+    const char* vsFlatPoint = R"GLSL(
+        #version 330 core
+        layout(location = 0) in vec3 aPos;
+        uniform mat4  uVP;
+        uniform float uPointSize;  // framebuffer pixels
+        void main()
+        {
+            gl_Position = uVP * vec4(aPos, 1.0);
+            gl_PointSize = uPointSize;
+        }
+        )GLSL";
+
 };

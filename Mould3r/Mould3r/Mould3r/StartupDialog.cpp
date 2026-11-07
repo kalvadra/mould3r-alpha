@@ -1,6 +1,7 @@
 #include "StartupDialog.h"
 #include <wx/stdpaths.h>
 #include <filesystem>
+#include "AppPaths.h"
 #include <vector>
 #include "style.h"
 #include "FixtureEditor.h"
@@ -24,7 +25,7 @@ namespace
     // MainFrame (9pt Segoe UI semibold).
     wxFont DialogBtnFont()
     {
-        return wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        return wxFont(Style::Ui(9), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
             wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI");
     }
 
@@ -84,9 +85,7 @@ StartupDialog::StartupDialog(wxWindow* parent)
     SetSizer(outer);
 
     // Default fixtures folder: 'fixtures/' next to the executable
-    m_fixturesFolder = (fs::path(wxStandardPaths::Get()
-        .GetExecutablePath().ToStdString())
-        .parent_path() / "fixtures").string();
+    m_fixturesFolder = AppPaths::Fixtures().string();
 
     auto* main = new wxBoxSizer(wxVERTICAL);
 
@@ -106,7 +105,7 @@ StartupDialog::StartupDialog(wxWindow* parent)
 
     auto* title = new wxStaticText(m_titleRow, wxID_ANY, "Select Fixture");
     title->SetForegroundColour(Style::TextPrimary);
-    title->SetFont(wxFont(16, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+    title->SetFont(wxFont(Style::Ui(16), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_BOLD, false, "Segoe UI"));
 
     // Close button — keeps wxID_CANCEL because (a) wxDialog's default
@@ -121,7 +120,7 @@ StartupDialog::StartupDialog(wxWindow* parent)
         wxDefaultPosition, wxSize(30, 30), wxBORDER_NONE);
     btnClose->SetBackgroundColour(Style::AppBg);
     btnClose->SetForegroundColour(Style::TextMuted);
-    btnClose->SetFont(wxFont(11, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+    btnClose->SetFont(wxFont(Style::Ui(11), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
 
     // Subtle hover — brighten the X on enter, restore on leave. wxButton on
@@ -164,7 +163,7 @@ StartupDialog::StartupDialog(wxWindow* parent)
         "A fixture is a set of blank mould halves that the design features will be cut from.\n"
         "It may also include ejector information.");
     subtitle->SetForegroundColour(Style::TextPrimary);
-    subtitle->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+    subtitle->SetFont(wxFont(Style::Ui(9), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
 
     main->Add(subtitle, 0, wxLEFT | wxTOP | wxBOTTOM, 18);
@@ -179,7 +178,7 @@ StartupDialog::StartupDialog(wxWindow* parent)
         wxLC_REPORT | wxLC_SINGLE_SEL | wxBORDER_NONE);
     m_list->SetBackgroundColour(Style::SectionHeaderBg);
     m_list->SetForegroundColour(Style::TextPrimary);
-    m_list->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+    m_list->SetFont(wxFont(Style::Ui(9), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
 
     // Original column widths (240/130/130). The "Mould Half A/B" labels
@@ -199,7 +198,7 @@ StartupDialog::StartupDialog(wxWindow* parent)
     auto* previewHeader = new wxStaticText(previewPanel, wxID_ANY,
         "SELECTED FIXTURE");
     previewHeader->SetForegroundColour(Style::TextSubtle);
-    previewHeader->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+    previewHeader->SetFont(wxFont(Style::Ui(8), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
         wxFONTWEIGHT_BOLD, false, "Segoe UI"));
     previewInner->Add(previewHeader, 0, wxLEFT | wxTOP, 10);
 
@@ -213,7 +212,7 @@ StartupDialog::StartupDialog(wxWindow* parent)
     for (auto* lbl : { m_lblModelA, m_lblModelB })
     {
         lbl->SetForegroundColour(Style::TextPrimary);
-        lbl->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        lbl->SetFont(wxFont(Style::Ui(8), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
             wxFONTWEIGHT_NORMAL, false, "Segoe UI"));
         previewInner->Add(lbl, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
     }

@@ -14,13 +14,13 @@ namespace
     // AboutDialog / StartupDialog / the ribbon).
     wxFont DialogBtnFont()
     {
-        return wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        return wxFont(Style::Ui(9), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
             wxFONTWEIGHT_SEMIBOLD, false, "Segoe UI");
     }
 
     wxFont UIFont(int pt, wxFontWeight weight = wxFONTWEIGHT_NORMAL)
     {
-        return wxFont(pt, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
+        return wxFont(Style::Ui(pt), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL,
             weight, false, "Segoe UI");
     }
 }
